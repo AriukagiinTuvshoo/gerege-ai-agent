@@ -2420,7 +2420,7 @@
 
         const widgetInput = document.getElementById('access-modal-widget-code');
         if (widgetInput) {
-          widgetInput.value = `<script src="${window.location.origin}/widget.js" data-page-id="${page.page_id}" data-title="${page.name || 'AI Assistant'}"></script>`;
+          widgetInput.value = '<script src="' + window.location.origin + '/widget.js" data-page-id="' + page.page_id + '" data-title="' + (page.name || 'AI Assistant') + '"><' + '/script>';
         }
         const manychatInput = document.getElementById('access-modal-manychat-url');
         if (manychatInput) {
