@@ -133,6 +133,23 @@ def init_db():
         )
     """)
 
+    # 5. Харилцагчийн 3-Түвшинт Санах Ой (Entity & Episodic Memory - Mem0 & Zep загвар)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            customer_name TEXT,
+            phone TEXT,
+            interests TEXT,
+            notes TEXT,
+            last_topic TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(page_id, user_id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_memories_page_user ON user_memories (page_id, user_id)")
+
     # Багануудыг аюулгүй нэмэх (Migration check)
     tables_to_migrate = [
         ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
@@ -774,6 +791,69 @@ def is_session_human_takeover(sender_id: str) -> bool:
     row = cursor.fetchone()
     conn.close()
     return bool(row and row[0] == 1)
+
+# ==================== 3-TIER CONVERSATION MEMORY (MEM0 & ZEP MODEL) ====================
+
+def get_user_memory(page_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    """Хэрэглэгчийн санах ойг татаж авах (Нэр, утас, сонирхол, өмнөх хүсэлт)"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT page_id, user_id, customer_name, phone, interests, notes, last_topic, updated_at
+        FROM user_memories
+        WHERE page_id = ? AND user_id = ?
+    """, (str(page_id), str(user_id)))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def upsert_user_memory(
+    page_id: str,
+    user_id: str,
+    customer_name: Optional[str] = None,
+    phone: Optional[str] = None,
+    interests: Optional[str] = None,
+    notes: Optional[str] = None,
+    last_topic: Optional[str] = None
+):
+    """Хэрэглэгчийн санах ойг үүсгэх эсвэл шинэчлэх (Idempotent update)"""
+    if not page_id or not user_id:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Өмнөх мэдээлэл байгаа эсэхийг шалгах
+    cursor.execute("SELECT customer_name, phone, interests, notes, last_topic FROM user_memories WHERE page_id = ? AND user_id = ?", (str(page_id), str(user_id)))
+    existing = cursor.fetchone()
+    
+    if existing:
+        new_name = customer_name if customer_name else existing[0]
+        new_phone = phone if phone else existing[1]
+        
+        # Сонирхол нэмэгдсэн бол залгах
+        old_interests = existing[2] or ""
+        if interests and interests not in old_interests:
+            new_interests = f"{old_interests}, {interests}".strip(", ")
+        else:
+            new_interests = interests or old_interests
+            
+        new_notes = notes if notes else existing[3]
+        new_topic = last_topic if last_topic else existing[4]
+        
+        cursor.execute("""
+            UPDATE user_memories
+            SET customer_name = ?, phone = ?, interests = ?, notes = ?, last_topic = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE page_id = ? AND user_id = ?
+        """, (new_name, new_phone, new_interests, new_notes, new_topic, str(page_id), str(user_id)))
+    else:
+        cursor.execute("""
+            INSERT INTO user_memories (page_id, user_id, customer_name, phone, interests, notes, last_topic)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (str(page_id), str(user_id), customer_name, phone, interests, notes, last_topic))
+        
+    conn.commit()
+    conn.close()
 
 if __name__ == "__main__":
     init_db()

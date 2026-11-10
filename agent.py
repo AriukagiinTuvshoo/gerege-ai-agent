@@ -22,8 +22,24 @@ ESCALATION_KEYWORDS = [
     "хүнтэй ярих", "хүн байна уу", "оператор", "менежер", "гомдол", "хүнтэй холбогдох"
 ]
 
-def build_system_instruction_for_page(page_data: Optional[Dict[str, Any]] = None) -> str:
-    """Олон хуудасны (Multi-Tenant) мэдлэг ба өгөгдлийг AI Prompt болгон бүтээх"""
+def build_system_instruction_for_page(page_data: Optional[Dict[str, Any]] = None, user_memory: Optional[Dict[str, Any]] = None) -> str:
+    """Олон хуудасны (Multi-Tenant) мэдлэг, 3-Түвшинт Санах Ой ба Монгол Хэлний Найруулга Зүйг нэгтгэн AI Prompt бүтээх"""
+    # 0. Санах ойн блок (Mem0 & Zep загвар)
+    memory_block = ""
+    if user_memory:
+        c_name = user_memory.get("customer_name") or "Хараахан нэрээ хэлээгүй"
+        c_phone = user_memory.get("phone") or "Утас байхгүй"
+        c_interests = user_memory.get("interests") or "Тодорхойгүй"
+        c_notes = user_memory.get("notes") or "Тэмдэглэлгүй"
+        memory_block = f"""
+🧠 ХАРИЛЦАГЧИЙН 3-ТҮВШИНТ ХУВИЙН САНАХ ОЙ (MEM0 & ZEP ЗАГВАР):
+- Хэрэглэгчийн нэр: {c_name}
+- Утасны дугаар: {c_phone}
+- Сонирхсон үйлчилгээ/Бараа: {c_interests}
+- Өмнөх тэмдэглэл: {c_notes}
+* САНАМЖ: Хэрэглэгч өмнө нь харилцаж байсан бол "Тавтай морилно уу, {c_name}!" гэх мэтээр нэрээр нь хүндэтгэн дуудаж, өмнөх сонирхол хэрэгцээг нь мэдэрч харилцах нь өндөр итгэлцэл төрүүлнэ!
+"""
+
     if page_data and page_data.get("knowledge_json"):
         try:
             k_raw = page_data["knowledge_json"]
@@ -60,6 +76,8 @@ def build_system_instruction_for_page(page_data: Optional[Dict[str, Any]] = None
 Та бол "{page_name}" байгууллагын албан ёсны ухаалаг AI туслах ба харилцагчийн ахлах зөвлөх юм.
 Байгууллагын танилцуулга: {comp.get('description', page_name)}
 
+{memory_block}
+
 БАНКНЫ ШИЛЖҮҮЛГИЙН ДАНС:
 {bank_str}
 
@@ -76,12 +94,24 @@ def build_system_instruction_for_page(page_data: Optional[Dict[str, Any]] = None
 
 БОДЛОГО БА НӨХЦӨЛ: {policies}
 
-🧠 ДЭЭД ТҮВШНИЙ ОЮУН ДҮГНЭЛТ БА ХАРИЛЦААНЫ СТАНДАРТ (REASONING & CHAIN-OF-THOUGHT):
-Та бол зүгээр л текст хуулж өгдөг робот биш, харин хэрэглэгчийн хэрэгцээг мэдэрч, асуудлыг шийдэж, борлуулалтыг амжилттай хаадаг дээд зэрэглэлийн менежер юм:
-1. ОЙЛГОХ & ТУНГААХ: Хэрэглэгчийн асуулт, сэтгэл хөдлөл, цаад зорилгыг (үнэ асуух, цаг авах, карго шалгах, эргэлзэх, гомдол) сайтар тунгаана. Шаардлагатай бол <thought>...</thought> шошго дотор дотоод бодлоо дүгнэж болно (хэрэглэгчид ил харагдахгүй).
-2. БАРИМТЛАХ ҮНЭН: Дээрх мэдээллийн сангаас (дансны дугаар, хүлээн авагчийн нэр, үнэ тариф, хаяг) 100% бодит үнэнийг баримтална. Мэдээллийн санд байхгүй зүйлийг хэзээ ч өөрөө зохиож (hallucination) ярьж болохгүй.
-3. БОРЛУУЛАЛТЫГ ХААХ (Closing & Guidance): Зөвхөн хуурай хариулаад зогсохгүй, хэрэглэгчийг дараагийн бодит үйлдэл рүү (жишээ нь: "Та цагаа товлох уу?", "Баримтын зургаа явуулбал системээр шууд баталгаажуулж өгье") эелдэг, ухаалгаар чиглүүлнэ.
-4. ХЭЛ НАЙРУУЛГА: Компьютер шиг хөшүүн биш, маш найрсаг, цэвэр, соёлтой монгол хэлээр харилцана.
+🇲🇳 МОНГОЛ ХЭЛНИЙ НАЙРУУЛГА ЗҮЙН МАСТЕР СТАНДАРТ (МУИС, Ц.Сүхбаатарын суурь дүрэм):
+Та бол зүгээр л текст хуулж орчуулдаг робот биш! Харин монгол хэлний амьд найруулга, эелдэг соёл, борлуулалтын ухааныг төгс эзэмшсэн зөвлөх:
+1. ҮГ БУРУУ СОНГОХООС СЭРГИЙЛЭХ: Үгийн утгын нарийн ялгаа, цар хүрээг сайтар тунгаана. Хэт чамирхсан, нүсэр эсвэл явцуу биш, хамгийн оновчтой монгол үгийг сонгоно.
+2. ҮГ ИЛҮҮДЭХ (НУРШИХ)-ИЙГ ХОРИГЛОХ: Ижил утгатай үгсийг давхардуулан өгүүлбэрийг сунжруулахгүй, санаагаа цэгцтэй, оновчтой илэрхийлнэ.
+3. ҮГ ДУТАХААС СЭРГИЙЛЭХ: Хэлэх гэсэн санаа, хаашаа холбогдох, ямар үйлдэл хийхийг дутуу хаяж хэрэглэгчийг төөрөгдүүлэхгүй.
+4. ҮГ ДАВТАХЫГ ЗАСАХ: Нэг догол мөрөнд нэг үгээ ("манай", "байна", "болно", "гээд") олон дахин давтахгүй, баялаг үгийн сангаар уран найруулна.
+5. ӨНГӨ АЯСЫГ ТОХИРУУЛАХ: Хэт хөшүүн албаны үгс эсвэл гудамжны этгээд яриа холихгүй. Дулаан, найрсаг, эелдэг, нэр төртэй өнгө аясыг чанд барина.
+
+🚫 АНГЛИ ХЭЛНИЙ РОБОТ КАЛЬК ХЭЛЛЭГҮҮДИЙГ ХАТУУ ХОРИГЛОНО:
+- "Би танд юугаар туслах вэ?" ➡️ ХАТУУ ХОРИГЛОНО. Оронд нь: "Сайн байна уу? Танд өнөөдөр ямар үйлчилгээ илүү сонирхолтой байна вэ?", "Танд ямар асуулт байна, би дуртайяа тайлбарлаж өгье." гэж ярина.
+- "Би танд туслахдаа баяртай байна" ➡️ ХАТУУ ХОРИГЛОНО. Оронд нь: "Танд үйлчлэхдээ таатай байх болно", "Хүссэн үедээ асуугаарай." гэж найруулна.
+- "Танд гайхалтай өдрийг хүсье" ➡️ ХАТУУ ХОРИГЛОНО. Оронд нь: "Танд амжилт хүсье!", "Өдрийг таатай өнгөрүүлээрэй!" гэж ерөөнө.
+- "Би хиймэл оюун ухаан учраас..." ➡️ Өөрийгөө хиймэл гэж өчүүхэн дөвийлгөхгүй, байгууллагын нэрийн өмнөөс хариуцлагатай ярина.
+
+🧠 ДЭЭД ТҮВШНИЙ ОЮУН ДҮГНЭЛТ БА ХАРИЛЦААНЫ СТАНДАРТ (REASONING & DUAL-BRAIN):
+1. ОЙЛГОХ & ТУНГААХ: Хэрэглэгчийн сэтгэл хөдлөл, цаад хэрэгцээг <thought>...</thought> шошго дотор дотоод бодолдоо дүгнэж болно (хэрэглэгчид ил харагдахгүй).
+2. БАРИМТЛАХ ҮНЭН: Мэдээллийн санд байхгүй зүйлийг хэзээ ч өөрөө зохиож (hallucination) ярьж болохгүй.
+3. БОРЛУУЛАЛТЫН ЗӨӨЛӨН ХААЛТ (Soft Closing): Хэрэглэгчийг дараагийн бодит үйлдэл рүү (цаг товлох, баримтаа шалгуулах, утасны дугаараа үлдээх) эелдэг найрсаг сонголт санал болгон чиглүүлнэ.
 
 ТАНЫ ҮҮРЭГ БА ДҮРЭМ:
 1. Хэрэв хэрэглэгч нэр, утсаа өгвөл заавал 'register_customer' багажийг дуудаж баазад хадгална.
@@ -354,6 +384,14 @@ class AIAgent:
                         notes=notes or text,
                         page_id=page_id
                     )
+                    database.upsert_user_memory(
+                        page_id=page_id,
+                        user_id=sender_id,
+                        customer_name=name,
+                        phone=phone,
+                        interests=service or page_name,
+                        notes=notes or text
+                    )
                     registered = True
                     reg_info = {"id": r_id, "name": name, "phone": phone, "service": service or page_name}
                     return f"Амжилттай бүртгэгдлээ. Дугаар: #{r_id}"
@@ -370,10 +408,13 @@ class AIAgent:
                         res.append("; ".join([f"{k}: {v}" for k, v in r.items() if v]))
                     return "\n---\n".join(res)
 
+                # Хэрэглэгчийн санах ойг татаж авах (Mem0 & Zep загвар)
+                user_memory = database.get_user_memory(page_id, sender_id)
+
                 session_key = f"{page_id}_{sender_id}"
                 if session_key not in self.chat_sessions:
                     config = types.GenerateContentConfig(
-                        system_instruction=build_system_instruction_for_page(page_data),
+                        system_instruction=build_system_instruction_for_page(page_data, user_memory=user_memory),
                         tools=[register_customer, check_sheet_cargo_status],
                         temperature=0.7,
                     )
@@ -394,7 +435,7 @@ class AIAgent:
                     logger.warning(f"Chat session send_message error, refreshing session: {send_err}")
                     self.chat_sessions.pop(session_key, None)
                     config = types.GenerateContentConfig(
-                        system_instruction=build_system_instruction_for_page(page_data),
+                        system_instruction=build_system_instruction_for_page(page_data, user_memory=user_memory),
                         tools=[register_customer, check_sheet_cargo_status],
                         temperature=0.7,
                     )
@@ -429,6 +470,13 @@ class AIAgent:
                             sender_id=sender_id,
                             notes=text,
                             page_id=page_id
+                        )
+                        database.upsert_user_memory(
+                            page_id=page_id,
+                            user_id=sender_id,
+                            customer_name=detected["name"],
+                            phone=detected["phone"],
+                            notes=text
                         )
                         registered = True
                         reg_info = {"id": r_id, "name": detected["name"], "phone": detected["phone"]}
