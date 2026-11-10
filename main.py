@@ -58,7 +58,10 @@ async def send_meta_message(recipient_id: str, text: str, page_token: Optional[s
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(url, json=payload, timeout=10.0)
-            logger.info(f"Meta Graph API status: {res.status_code}")
+            if res.status_code != 200:
+                logger.error(f"Meta Graph API error [{res.status_code}]: {res.text}")
+            else:
+                logger.info(f"Meta Graph API status: {res.status_code} (Sent to {recipient_id})")
     except Exception as e:
         logger.error(f"Meta илгээх алдаа: {e}")
 
@@ -845,6 +848,63 @@ async def update_keys(payload: Dict[str, str], request: Request):
 async def serve_dashboard():
     with open("dashboard.html", "r", encoding="utf-8") as f:
         return f.read()
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def serve_privacy_policy():
+    return """<!DOCTYPE html>
+<html lang="mn">
+<head>
+  <meta charset="UTF-8">
+  <title>Privacy Policy - AI Agent Hub</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen p-6 md:p-12 font-sans">
+  <div class="max-w-3xl mx-auto space-y-6 bg-slate-900/80 p-8 rounded-2xl border border-slate-800">
+    <h1 class="text-3xl font-bold text-white">Нууцлалын Бодлого (Privacy Policy)</h1>
+    <p class="text-xs text-slate-400">Сүүлд шинэчлэгдсэн: 2026-11-11</p>
+    
+    <div class="space-y-4 text-sm text-slate-300 leading-relaxed">
+      <h2 class="text-lg font-semibold text-white">1. Ерөнхий зүйл</h2>
+      <p>Энэхүү систем нь Facebook Messenger, Instagram болон бусад сувгаар ирсэн харилцагчийн асуулт, хүсэлтэд хиймэл оюун ухааны тусламжтайгаар шуурхай хариулах зориулалттай харилцагчийн үйлчилгээний автоматжуулсан платформ юм.</p>
+
+      <h2 class="text-lg font-semibold text-white">2. Бид ямар мэдээлэл цуглуулдаг вэ?</h2>
+      <p>Бид зөвхөн хэрэглэгчийн бичсэн чат мессеж, лавлагаа, холбоо барих утас болон нэр, гүйлгээний баримтын мэдээллийг хэрэглэгчийн хүсэлтээр үйлчилгээ үзүүлэх зорилгоор түр бүртгэнэ.</p>
+
+      <h2 class="text-lg font-semibold text-white">3. Мэдээллийн ашиглалт</h2>
+      <p>Цуглуулсан мэдээллийг зөвхөн тухайн байгууллага, хуудасны үйлчилгээ үзүүлэх, захиалга/бүртгэлийг баталгаажуулахад ашиглах бөгөөд гуравдагч этгээдэд зарж борлуулахгүй.</p>
+
+      <h2 class="text-lg font-semibold text-white">4. Мэдээлэл устгах (User Data Deletion)</h2>
+      <p>Хэрэглэгч өөрийн бүртгэгдсэн мэдээллийг устгуулахыг хүсвэл тухайн хуудасны чатаар "Бүртгэл устгах" эсвэл админд мэдэгдэн шууд устгуулах бүрэн эрхтэй.</p>
+
+      <h2 class="text-lg font-semibold text-white">5. Холбоо барих</h2>
+      <p>Асуулт, санал байвал хуудасны чатаар болон системийн удирдлагад хандана уу.</p>
+    </div>
+  </div>
+</body>
+</html>"""
+
+@app.get("/terms", response_class=HTMLResponse)
+async def serve_terms_of_service():
+    return """<!DOCTYPE html>
+<html lang="mn">
+<head>
+  <meta charset="UTF-8">
+  <title>Terms of Service - AI Agent Hub</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen p-6 md:p-12 font-sans">
+  <div class="max-w-3xl mx-auto space-y-6 bg-slate-900/80 p-8 rounded-2xl border border-slate-800">
+    <h1 class="text-3xl font-bold text-white">Үйлчилгээний Нөхцөл (Terms of Service)</h1>
+    <p class="text-xs text-slate-400">Сүүлд шинэчлэгдсэн: 2026-11-11</p>
+    <div class="space-y-4 text-sm text-slate-300 leading-relaxed">
+      <p>Манай автоматжуулсан харилцагчийн үйлчилгээний AI туслахыг ашигласнаар та энэхүү нөхцөлийг зөвшөөрсөнд тооцогдоно.</p>
+      <p>AI систем нь мэдээлэл олгох зорилготой бөгөөд албан ёсны шийдвэрийг байгууллагын хүний менежер эцэслэн баталгаажуулна.</p>
+    </div>
+  </div>
+</body>
+</html>"""
 
 if __name__ == "__main__":
     import uvicorn
