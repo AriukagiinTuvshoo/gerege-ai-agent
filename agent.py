@@ -382,8 +382,27 @@ class AIAgent:
                 if sheet_context:
                     message_payload = f"{text}\n\n{sheet_context}"
 
-                response = chat.send_message(message_payload)
-                reply_text = response.text or ""
+                try:
+                    response = chat.send_message(message_payload)
+                    reply_text = response.text or ""
+                except Exception as send_err:
+                    logger.warning(f"Chat session send_message error, refreshing session: {send_err}")
+                    self.chat_sessions.pop(session_key, None)
+                    config = types.GenerateContentConfig(
+                        system_instruction=build_system_instruction_for_page(page_data),
+                        tools=[register_customer, check_sheet_cargo_status],
+                        temperature=0.7,
+                    )
+                    new_chat = client.chats.create(
+                        model=self.model_name,
+                        config=config
+                    )
+                    self.chat_sessions[session_key] = new_chat
+                    response = new_chat.send_message(message_payload)
+                    reply_text = response.text or ""
+
+                if not reply_text:
+                    reply_text = f"Сайн байна уу? {page_name}-д тавтай морилно уу! Танд ямар мэдээлэл хэрэгтэй байна вэ?"
 
                 # Токен тоолох ба хуудасны баазад нэмэх
                 tokens_spent = self.estimate_tokens(text, reply_text)

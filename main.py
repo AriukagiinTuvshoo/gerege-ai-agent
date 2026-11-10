@@ -2,6 +2,7 @@ import os
 import io
 import json
 import logging
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
@@ -174,7 +175,7 @@ async def auth_login(payload: Dict[str, Any], response: Response):
     elif login_type in ["client", "magic"]:
         identifier = str(payload.get("identifier") or payload.get("username") or payload.get("token") or "").strip()
         password = payload.get("password")
-        client_page = database.authenticate_client(identifier, password)
+        client_page, err_msg = database.authenticate_client_detailed(identifier, password)
         if client_page:
             page_id = client_page["page_id"]
             token = database.create_session(role="client", page_id=page_id)
@@ -189,7 +190,7 @@ async def auth_login(payload: Dict[str, Any], response: Response):
                 "tokens_used": client_page.get("tokens_used", 0),
                 "monthly_token_limit": client_page.get("monthly_token_limit", 100000)
             }
-        return JSONResponse({"success": False, "error": "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"}, status_code=401)
+        return JSONResponse({"success": False, "error": err_msg or "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"}, status_code=401)
 
     return JSONResponse({"success": False, "error": "Үл мэдэгдэх төрөл"}, status_code=400)
 
@@ -415,16 +416,21 @@ async def get_pages(request: Request):
     pages = database.get_all_pages(mask_secrets=True)
     return JSONResponse({"total": len(pages), "data": pages})
 
+@app.get("/api/pages/detail")
 @app.get("/api/pages/{page_id}")
-async def get_page_detail(page_id: str, request: Request):
+async def get_page_detail(request: Request, page_id: Optional[str] = None):
+    target_id = request.query_params.get("page_id") or page_id
+    if not target_id:
+        return JSONResponse({"error": "page_id missing"}, status_code=400)
+
     user = await get_current_user(
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    if user and user.get("role") == "client" and user.get("page_id") != page_id:
+    if user and user.get("role") == "client" and user.get("page_id") != target_id:
         return JSONResponse({"error": "Хандах эрхгүй хуудас байна!"}, status_code=403)
 
-    p = database.get_page(page_id, mask_secrets=True)
+    p = database.get_page(target_id, mask_secrets=True)
     if not p:
         return JSONResponse({"error": "Page not found"}, status_code=404)
     return JSONResponse(p)
@@ -439,7 +445,8 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
     if user and user.get("role") == "client":
         return JSONResponse({"error": "Зөвхөн Супер Админ шинэ харилцагчийн хуудас нэмэх эрхтэй!"}, status_code=403)
 
-    page_id = str(payload.get("page_id", "")).strip()
+    raw_page_id = str(payload.get("page_id", "")).strip()
+    page_id = database.sanitize_page_id(raw_page_id)
     name = str(payload.get("name", "")).strip()
     category = str(payload.get("category", "general")).strip()
     token = str(payload.get("page_access_token", "")).strip()
@@ -466,9 +473,14 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
     agent.reset_sessions()
     return {"status": "success", "message": f"{name} хуудас амжилттай хадгалагдлаа!", "page_id": page_id}
 
+@app.delete("/api/pages")
 @app.delete("/api/pages/{page_id}")
-async def delete_page_endpoint(page_id: str, request: Request):
+async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
     """Хуудас устгах (Зөвхөн Админ эрхтэй)"""
+    target_id = request.query_params.get("page_id") or page_id
+    if not target_id:
+        return JSONResponse({"error": "page_id missing"}, status_code=400)
+
     user = await get_current_user(
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
@@ -476,20 +488,25 @@ async def delete_page_endpoint(page_id: str, request: Request):
     if user and user.get("role") == "client":
         return JSONResponse({"error": "Устгах эрхгүй!"}, status_code=403)
 
-    success = database.delete_page(page_id)
+    success = database.delete_page(str(target_id))
     if not success:
         return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
     agent.reset_sessions()
-    return {"status": "deleted", "page_id": page_id}
+    return {"status": "deleted", "page_id": target_id}
 
+@app.post("/api/pages/gemini_key")
 @app.post("/api/pages/{page_id}/gemini_key")
-async def update_page_gemini_key_endpoint(page_id: str, payload: Dict[str, Any], request: Request):
+async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Request, page_id: Optional[str] = None):
     """Харилцагчийн хувийн Gemini API түлхүүр шинэчлэх (Админ болон тухайн Client өөрөө засаж болно)"""
+    target_id = payload.get("page_id") or page_id
+    if not target_id:
+        return JSONResponse({"error": "page_id missing"}, status_code=400)
+
     user = await get_current_user(
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    if user and user.get("role") == "client" and user.get("page_id") != page_id:
+    if user and user.get("role") == "client" and user.get("page_id") != target_id:
         return JSONResponse({"error": "Та зөвхөн өөрийнхөө хуудасны түлхүүрийг засах эрхтэй!"}, status_code=403)
 
     gemini_key = str(payload.get("gemini_api_key", "")).strip()
@@ -498,12 +515,13 @@ async def update_page_gemini_key_endpoint(page_id: str, payload: Dict[str, Any],
         try: monthly_limit = int(monthly_limit)
         except Exception: monthly_limit = None
 
-    database.update_page_gemini_key(page_id, gemini_key, monthly_limit)
+    database.update_page_gemini_key(str(target_id), gemini_key, monthly_limit)
     agent.reset_sessions()
     return {"status": "success", "message": "Gemini API тохиргоо амжилттай шинэчлэгдлээ!"}
 
+@app.post("/api/pages/credentials")
 @app.post("/api/pages/{page_id}/credentials")
-async def set_page_credentials_endpoint(page_id: str, payload: Dict[str, Any], request: Request):
+async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Request, page_id: Optional[str] = None):
     """Харилцагчид зориулсан нэвтрэх эрх & Magic Link үүсгэх (Зөвхөн Админ)"""
     user = await get_current_user(
         authorization=request.headers.get("Authorization"),
@@ -512,12 +530,16 @@ async def set_page_credentials_endpoint(page_id: str, payload: Dict[str, Any], r
     if user and user.get("role") == "client":
         return JSONResponse({"error": "Эрх хүрэхгүй!"}, status_code=403)
 
+    target_page_id = payload.get("page_id") or page_id
+    if not target_page_id:
+        return JSONResponse({"error": "Хуудасны ID шаардлагатай"}, status_code=400)
+
     username = str(payload.get("username", "")).strip()
     password = payload.get("password")
     if not username:
         return JSONResponse({"error": "Хэрэглэгчийн нэр оруулна уу"}, status_code=400)
 
-    res = database.set_client_credentials(page_id, username, password)
+    res = database.set_client_credentials(str(target_page_id), username, password)
     return {"status": "success", "data": res}
 
 # -------------------------------------------------------------
@@ -624,6 +646,38 @@ async def export_csv(
     return Response(
         content=csv_data.encode("utf-8-sig"),
         media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
+
+@app.get("/api/export/excel")
+async def export_excel(
+    request: Request,
+    page_id: Optional[str] = Query(None),
+    token: Optional[str] = Query(None)
+):
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        auth_token=token
+    )
+    
+    target_page = None
+    if user and user.get("role") == "client":
+        target_page = user.get("page_id")
+    else:
+        target_page = page_id
+        
+    excel_stream = database.generate_excel(page_id=target_page)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"leads_{target_page or 'all'}_{timestamp}.xlsx"
+    
+    return Response(
+        content=excel_stream.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -787,6 +841,7 @@ async def update_keys(payload: Dict[str, str], request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/admin", response_class=HTMLResponse)
 async def serve_dashboard():
     with open("dashboard.html", "r", encoding="utf-8") as f:
         return f.read()

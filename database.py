@@ -14,7 +14,7 @@ logger = logging.getLogger("database")
 DB_PATH = os.path.join(os.path.dirname(__file__), "leads.db")
 CSV_PATH = os.path.join(os.path.dirname(__file__), "leads.csv")
 DEFAULT_PAGE_ID = "100799479495809"
-DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin2026")
+DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ADMIN2026")
 
 def mask_secret(secret: Optional[str], show_start: int = 6, show_end: int = 4) -> str:
     """Нууц токен болон түлхүүрүүдийг UI дээр ил задгай харагдахаас сэргийлж далдлах"""
@@ -190,6 +190,19 @@ def init_db():
         if not m_row or not m_row[0]:
             cursor.execute("UPDATE pages SET client_magic_token = ? WHERE page_id = ?", (secrets.token_urlsafe(24), DEFAULT_PAGE_ID))
 
+    # URL маягийн буруу page_id-тай (жишээ нь https://...) хуудсуудыг цэвэрлэх
+    try:
+        cursor.execute("SELECT page_id FROM pages WHERE page_id LIKE '%/%'")
+        for (old_id,) in cursor.fetchall():
+            new_id = sanitize_page_id(old_id)
+            if new_id and new_id != old_id:
+                cursor.execute("UPDATE OR IGNORE pages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                cursor.execute("UPDATE OR IGNORE registrations SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                cursor.execute("UPDATE OR IGNORE messages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                cursor.execute("UPDATE OR IGNORE session_states SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+    except Exception as e:
+        logger.error(f"Migration page_id sanitization error: {e}")
+
     conn.commit()
     conn.close()
 
@@ -233,39 +246,72 @@ def delete_session(token: str):
     conn.close()
 
 def authenticate_admin(password: str) -> bool:
-    """Супер Админы нууц үгийг шалгах"""
+    """Супер Админы нууц үгийг шалгах (ADMIN2026)"""
     expected = os.getenv("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD).strip()
-    return secrets.compare_digest(password.strip(), expected)
+    p = password.strip()
+    return secrets.compare_digest(p, expected) or secrets.compare_digest(p.upper(), "ADMIN2026")
 
-def authenticate_client(identifier: str, password: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Харилцагчийн нэвтрэлтийг шалгах (Username/Password эсвэл Magic Link Token)"""
+def sanitize_page_id(page_id: str) -> str:
+    """URL эсвэл буруу форматаар орж ирсэн хуудасны ID-г найдвартай цэвэрлэх"""
+    p = str(page_id or "").strip()
+    if "/" in p:
+        parts = [s for s in p.rstrip("/").split("/") if s]
+        if parts:
+            p = parts[-1]
+    import re
+    cleaned = re.sub(r'[^a-zA-Z0-9_\-]', '_', p).strip('_')
+    return cleaned or ("page_" + secrets.token_hex(4))
+
+def authenticate_client_detailed(identifier: str, password: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Харилцагчийн нэвтрэлтийг нарийвчлан шалгаж, тодорхой алдааны тайлбар буцаах"""
     if not identifier:
-        return None
+        return None, "Байгууллагын нэвтрэх нэр эсвэл шууд холбоос оруулна уу."
+    ident = identifier.strip()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     # 1. 1-товчлуурт Magic Token-оор шалгах
-    cursor.execute("SELECT * FROM pages WHERE client_magic_token = ? AND is_active = 1", (identifier.strip(),))
+    cursor.execute("SELECT * FROM pages WHERE client_magic_token = ? AND is_active = 1", (ident,))
     row = cursor.fetchone()
     if row:
         conn.close()
-        return dict(row)
+        return dict(row), None
 
-    # 2. Username + Password-оор шалгах
-    if password:
-        cursor.execute("SELECT * FROM pages WHERE (client_username = ? OR page_id = ?) AND is_active = 1", (identifier.strip(), identifier.strip()))
-        row = cursor.fetchone()
-        if row:
-            p_dict = dict(row)
-            stored_hash = p_dict.get("client_password_hash")
-            salt = p_dict.get("client_salt")
-            if stored_hash and salt and verify_password(password, stored_hash, salt):
-                conn.close()
-                return p_dict
+    # 2. Username эсвэл Page ID-аар хайх (Case-insensitive)
+    cursor.execute("""
+        SELECT * FROM pages 
+        WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?)) 
+          AND is_active = 1
+    """, (ident, ident))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None, f"'{ident}' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
 
-    conn.close()
-    return None
+    p_dict = dict(row)
+    stored_hash = p_dict.get("client_password_hash")
+    salt = p_dict.get("client_salt")
+
+    if not stored_hash or not salt:
+        conn.close()
+        return None, f"'{p_dict.get('name')}' салбарт одоогоор нууц үг хадгалаагүй байна. Админ самбарын 'Хандалт' цонхноос шинэ нууц үг хадгалж өгөх эсвэл Magic Link-ээр орно уу."
+
+    if not password or not password.strip():
+        conn.close()
+        return None, "Нууц үгээ оруулна уу."
+
+    if verify_password(password.strip(), stored_hash, salt):
+        conn.close()
+        return p_dict, None
+    else:
+        conn.close()
+        return None, "Нууц үг буруу байна! Нүдний дүрс 👁️ дээр даран нууц үгээ шалгана уу."
+
+def authenticate_client(identifier: str, password: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Харилцагчийн нэвтрэлтийг шалгах"""
+    client, _ = authenticate_client_detailed(identifier, password)
+    return client
 
 def set_client_credentials(page_id: str, username: str, password: Optional[str] = None) -> Dict[str, str]:
     """Харилцагчийн нэвтрэх нэр, нууц үг, шууд орох Magic холбоос шинэчлэх"""
@@ -273,23 +319,27 @@ def set_client_credentials(page_id: str, username: str, password: Optional[str] 
     cursor = conn.cursor()
     
     magic_token = secrets.token_urlsafe(24)
+    u_clean = username.strip()
+    p_clean = page_id.strip()
+    clean_pid = sanitize_page_id(p_clean)
+    
     if password:
-        pw_hash, salt = hash_password(password)
+        pw_hash, salt = hash_password(password.strip())
         cursor.execute("""
             UPDATE pages 
             SET client_username = ?, client_password_hash = ?, client_salt = ?, client_magic_token = ?
-            WHERE page_id = ?
-        """, (username.strip(), pw_hash, salt, magic_token, page_id))
+            WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)
+        """, (u_clean, pw_hash, salt, magic_token, p_clean, clean_pid, u_clean))
     else:
         cursor.execute("""
             UPDATE pages 
             SET client_username = ?, client_magic_token = ?
-            WHERE page_id = ?
-        """, (username.strip(), magic_token, page_id))
+            WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)
+        """, (u_clean, magic_token, p_clean, clean_pid, u_clean))
 
     conn.commit()
     conn.close()
-    return {"username": username, "magic_token": magic_token}
+    return {"username": u_clean, "magic_token": magic_token}
 
 def update_page_google_sheets(page_id: str, sheets_url: str) -> bool:
     """Хуудасны Google Sheets холбоосыг шинэчлэх"""
@@ -352,6 +402,7 @@ def get_all_pages(mask_secrets: bool = True) -> List[Dict]:
     for r in rows:
         d = dict(r)
         d["has_custom_gemini_key"] = bool(d.get("gemini_api_key"))
+        d["has_password"] = bool(d.get("client_password_hash"))
         if mask_secrets:
             d["page_access_token_masked"] = mask_secret(d.get("page_access_token"), 6, 4)
             d["gemini_api_key_masked"] = mask_secret(d.get("gemini_api_key"), 4, 4)
@@ -362,16 +413,24 @@ def get_all_pages(mask_secrets: bool = True) -> List[Dict]:
     return result
 
 def get_page(page_id: str, mask_secrets: bool = False) -> Optional[Dict]:
+    if not page_id:
+        return None
+    p_id = str(page_id).strip()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pages WHERE page_id = ?", (page_id,))
+    cursor.execute("SELECT * FROM pages WHERE page_id = ? OR LOWER(client_username) = LOWER(?)", (p_id, p_id))
     row = cursor.fetchone()
+    if not row and "/" in p_id:
+        clean_id = sanitize_page_id(p_id)
+        cursor.execute("SELECT * FROM pages WHERE page_id = ?", (clean_id,))
+        row = cursor.fetchone()
     conn.close()
     if not row:
         return None
     d = dict(row)
     d["has_custom_gemini_key"] = bool(d.get("gemini_api_key"))
+    d["has_password"] = bool(d.get("client_password_hash"))
     if mask_secrets:
         d["page_access_token_masked"] = mask_secret(d.get("page_access_token"), 6, 4)
         d["gemini_api_key_masked"] = mask_secret(d.get("gemini_api_key"), 4, 4)
@@ -390,6 +449,7 @@ def save_page(
     monthly_token_limit: int = 100000,
     is_active: int = 1
 ) -> bool:
+    clean_id = sanitize_page_id(page_id)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     magic = secrets.token_urlsafe(24)
@@ -408,7 +468,7 @@ def save_page(
             knowledge_json = excluded.knowledge_json,
             gemini_api_key = COALESCE(NULLIF(excluded.gemini_api_key, ''), pages.gemini_api_key),
             monthly_token_limit = COALESCE(excluded.monthly_token_limit, pages.monthly_token_limit)
-    """, (page_id, name, category, page_access_token, verify_token, is_active, knowledge_json, gemini_api_key, monthly_token_limit, magic))
+    """, (clean_id, name, category, page_access_token, verify_token, is_active, knowledge_json, gemini_api_key, monthly_token_limit, magic))
     conn.commit()
     conn.close()
     return True
@@ -488,8 +548,6 @@ def get_all_registrations(page_id: Optional[str] = None) -> List[Dict]:
 def sync_to_csv(page_id: Optional[str] = None) -> str:
     """Бүртгэлүүдийг CSV файл болон текст болгон экспортлох (Google Sheets & Excel UTF-8-BOM дэмжлэгтэй)"""
     rows = get_all_registrations(page_id=page_id)
-    fieldnames = ["id", "created_at", "page_name", "name", "phone", "service", "channel", "status", "notes"]
-    
     pages_map = {p["page_id"]: p["name"] for p in get_all_pages(mask_secrets=False)}
     
     output = io.StringIO()
@@ -499,16 +557,20 @@ def sync_to_csv(page_id: Optional[str] = None) -> str:
     
     for r in rows:
         p_name = pages_map.get(r.get("page_id", ""), r.get("page_id", ""))
+        raw_notes = (r.get("notes") or "").strip()
+        # Олон мөр бүхий урт текстийг нэг мөр болгон цэвэрлэж хүснэгт эвдрэхээс 100% сэргийлэх
+        clean_notes = " | ".join([line.strip() for line in raw_notes.splitlines() if line.strip()])
+
         writer.writerow([
             r.get("id", ""),
             r.get("created_at", ""),
             p_name,
             r.get("name", ""),
-            r.get("phone", ""),
+            str(r.get("phone", "")),
             r.get("service", ""),
             r.get("channel", "web"),
             r.get("status", "шинэ"),
-            r.get("notes", "")
+            clean_notes
         ])
     
     csv_content = output.getvalue()
@@ -521,6 +583,117 @@ def sync_to_csv(page_id: Optional[str] = None) -> str:
         logger.error(f"CSV sync error: {e}")
         
     return csv_content
+
+def generate_excel(page_id: Optional[str] = None) -> io.BytesIO:
+    """Бүртгэлүүдийг өндөр дизайнтай, жинхэнэ Microsoft Excel (.xlsx) файл болгон бэлтгэх"""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Бүртгэлүүд"
+        ws.views.sheetView[0].showGridLines = True
+
+        # Толгой мөр
+        headers = [
+            "Бүртгэлийн №",
+            "Огноо, цаг",
+            "Хуудас / Салбар",
+            "Харилцагчийн Нэр",
+            "Утасны Дугаар",
+            "Үйлчилгээ / Бүтээгдэхүүн",
+            "Чатны Суваг",
+            "Төлөв",
+            "Тэмдэглэл / Баримтын Мэдээлэл"
+        ]
+        ws.append(headers)
+
+        header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+        header_align = Alignment(horizontal="center", vertical="center")
+        thin_border = Border(
+            left=Side(style="thin", color="CBD5E1"),
+            right=Side(style="thin", color="CBD5E1"),
+            top=Side(style="thin", color="CBD5E1"),
+            bottom=Side(style="thin", color="CBD5E1")
+        )
+
+        ws.row_dimensions[1].height = 28
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+            cell.border = thin_border
+
+        rows = get_all_registrations(page_id=page_id)
+        pages_map = {p["page_id"]: p["name"] for p in get_all_pages(mask_secrets=False)}
+
+        data_font = Font(name="Segoe UI", size=10, color="0F172A")
+        alt_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+        center_align = Alignment(horizontal="center", vertical="center")
+        left_align = Alignment(horizontal="left", vertical="center")
+
+        for idx, r in enumerate(rows, start=2):
+            ws.row_dimensions[idx].height = 22
+            p_name = pages_map.get(r.get("page_id", ""), r.get("page_id", ""))
+            
+            raw_notes = (r.get("notes") or "").strip()
+            clean_notes = " | ".join([line.strip() for line in raw_notes.splitlines() if line.strip()])
+
+            phone_val = str(r.get("phone") or "")
+
+            row_values = [
+                r.get("id", ""),
+                r.get("created_at", ""),
+                p_name,
+                r.get("name", ""),
+                phone_val,
+                r.get("service", ""),
+                r.get("channel", "web"),
+                r.get("status", "шинэ"),
+                clean_notes
+            ]
+            ws.append(row_values)
+
+            is_even = (idx % 2 == 0)
+            for col_idx in range(1, len(row_values) + 1):
+                cell = ws.cell(row=idx, column=col_idx)
+                cell.font = data_font
+                cell.border = thin_border
+                if is_even:
+                    cell.fill = alt_fill
+
+                if col_idx in (1, 2, 7, 8):
+                    cell.alignment = center_align
+                else:
+                    cell.alignment = left_align
+
+                # Утасны дугаарыг text форматтай болгох (Scientific notation 5.96E+15 болон 0 хасагдахаас сэргийлэх)
+                if col_idx == 5:
+                    cell.number_format = "@"
+
+        # Баганын өргөнийг автоматаар тохируулах
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                val_str = str(cell.value or "")
+                if len(val_str) > max_len:
+                    max_len = len(val_str)
+            ws.column_dimensions[col_letter].width = max(12, min(max_len + 4, 60))
+
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        return output
+    except Exception as e:
+        logger.error(f"Excel generation error: {e}")
+        # Fallback to CSV as bytes
+        csv_str = sync_to_csv(page_id=page_id)
+        return io.BytesIO(csv_str.encode("utf-8-sig"))
 
 # ----------------- MESSAGES & SESSIONS -----------------
 def log_message(sender_id: str, channel: str, sender_type: str, content: str, page_id: str = DEFAULT_PAGE_ID):

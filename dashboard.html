@@ -250,10 +250,10 @@
           <span class="hidden sm:inline">Google Sheets</span>
         </button>
 
-        <a id="btn-export-excel" href="/api/export/csv" download class="btn-action-secondary px-3 py-1.5 rounded-xl text-xs font-medium transition flex items-center gap-1.5" title="Excel (.xlsx / .csv) татах">
-          <i class="fa-solid fa-download text-xs"></i>
-          <span class="hidden sm:inline">Excel</span>
-        </a>
+        <button id="btn-export-excel" onclick="downloadExcel()" class="btn-action-secondary px-3 py-1.5 rounded-xl text-xs font-medium transition flex items-center gap-1.5 shadow-sm" title="Жинхэнэ Microsoft Excel (.xlsx) татах">
+          <i class="fa-solid fa-file-excel text-emerald-400 text-xs"></i>
+          <span class="hidden sm:inline">Excel (.xlsx)</span>
+        </button>
 
         <span id="user-role-badge" class="px-2.5 py-1.5 rounded-xl text-[11px] font-semibold bg-zinc-800/80 border border-zinc-700/80 text-zinc-300 flex items-center gap-1.5">
           <i class="fa-solid fa-shield-halved text-zinc-400 text-xs"></i>
@@ -586,10 +586,10 @@
               <i class="fa-solid fa-table-cells text-emerald-400"></i>
               <span>Google Sheets</span>
             </button>
-            <a href="/api/export/csv" download class="btn-action-secondary px-3.5 py-2 rounded-xl text-xs font-medium transition flex items-center gap-1.5" title="Excel (.xlsx / .csv) татах">
-              <i class="fa-solid fa-download"></i>
-              <span>Excel Татах</span>
-            </a>
+            <button onclick="downloadExcel()" class="btn-action-secondary px-3.5 py-2 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow-sm" title="Жинхэнэ Microsoft Excel (.xlsx) татах">
+              <i class="fa-solid fa-file-excel text-emerald-400"></i>
+              <span>Excel (.xlsx) Татах</span>
+            </button>
           </div>
         </div>
 
@@ -866,10 +866,31 @@
             <input id="settings-meta-token" type="password" placeholder="EAAQP..." class="w-full bg-[#090d16] border border-white/[0.08] rounded-xl p-2.5 text-white font-mono">
           </div>
 
-          <div class="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06] space-y-1.5 text-slate-400">
-            <div class="font-bold text-white">Нийтийн Meta Webhook Тохиргоо (Бүх хуудсанд адилхан):</div>
-            <div>Callback URL: <span class="font-mono text-indigo-400 select-all">https://sterling-infrastructure-interference-parts.trycloudflare.com/webhook</span></div>
-            <div>Verify Token: <span class="font-mono text-emerald-400 select-all">agent_verify_secret_token_123</span></div>
+          <div class="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-3 text-xs">
+            <div class="font-bold text-zinc-200 flex items-center justify-between">
+              <span>Нийтийн Meta Webhook Тохиргоо (Бүх хуудсанд адилхан):</span>
+              <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Идэвхтэй</span>
+            </div>
+            
+            <div class="space-y-1.5">
+              <label class="text-zinc-400 block text-[11px]">Callback URL:</label>
+              <div class="flex gap-2">
+                <input id="settings-webhook-callback-url" readonly type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 font-mono text-xs text-emerald-300 select-all focus:outline-none">
+                <button type="button" onclick="copyWebhookCallbackUrl()" class="px-3 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 font-semibold transition flex items-center gap-1 shrink-0">
+                  <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="space-y-1.5">
+              <label class="text-zinc-400 block text-[11px]">Verify Token:</label>
+              <div class="flex gap-2">
+                <input id="settings-webhook-verify-token" readonly value="agent_verify_secret_token_123" type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 font-mono text-xs text-zinc-300 select-all focus:outline-none">
+                <button type="button" onclick="copyWebhookVerifyToken()" class="px-3 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 font-semibold transition flex items-center gap-1 shrink-0">
+                  <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
+                </button>
+              </div>
+            </div>
           </div>
 
           <div class="flex justify-between items-center pt-3">
@@ -1088,7 +1109,13 @@
             </div>
             <div>
               <label class="text-zinc-400 block mb-1 text-[11px]">Нууц үг:</label>
-              <input id="access-modal-password" type="text" placeholder="Шинэ нууц үг" class="w-full bg-black/40 border border-white/[0.08] rounded-xl p-2.5 text-white focus:outline-none focus:border-zinc-500 font-mono text-xs">
+              <div class="relative">
+                <input id="access-modal-password" type="password" placeholder="Шинэ нууц үг" class="w-full bg-black/40 border border-white/[0.08] rounded-xl p-2.5 text-white focus:outline-none focus:border-zinc-500 font-mono text-xs pr-9">
+                <button type="button" onclick="togglePasswordVisibility('access-modal-password', 'icon-toggle-modal-pass')" class="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white transition p-1" title="Нууц үг харах / нуух">
+                  <i id="icon-toggle-modal-pass" class="fa-solid fa-eye text-xs"></i>
+                </button>
+              </div>
+              <div id="access-modal-pass-status" class="text-[10px] text-zinc-500 mt-1"></div>
             </div>
           </div>
         </div>
@@ -1233,62 +1260,78 @@
   <div id="auth-modal" class="fixed inset-0 z-50 bg-[#07090e]/95 backdrop-blur-2xl hidden flex items-center justify-center p-4">
     <div class="glass-card max-w-md w-full rounded-3xl p-8 border border-white/[0.12] space-y-6 shadow-2xl animate-in fade-in zoom-in-95 duration-200">
       
-      <div class="text-center space-y-2">
-        <div class="w-14 h-14 mx-auto rounded-3xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 flex items-center justify-center text-white text-2xl shadow-glow">
-          <i class="fa-solid fa-shield-halved"></i>
-        </div>
-        <h2 class="text-xl font-extrabold text-white tracking-tight">AI Agency Hub</h2>
-        <p class="text-xs text-slate-400">Системд нэвтрэх эрхээ сонгоно уу</p>
-      </div>
-
-      <!-- Login Tab Selector -->
-      <div class="p-1 rounded-2xl bg-white/[0.04] border border-white/[0.08] grid grid-cols-2 gap-1 text-xs font-bold">
-        <button id="login-tab-btn-admin" onclick="switchLoginTab('admin')" class="py-2.5 rounded-xl bg-indigo-600 text-white transition flex items-center justify-center gap-2 shadow-sm">
-          <span>👑 Супер Админ</span>
-        </button>
-        <button id="login-tab-btn-client" onclick="switchLoginTab('client')" class="py-2.5 rounded-xl text-slate-400 hover:text-white transition flex items-center justify-center gap-2">
-          <span>🏢 Харилцагч</span>
-        </button>
-      </div>
-
-      <!-- Admin Login Form -->
-      <form id="form-login-admin" onsubmit="handleAdminLoginSubmit(event)" class="space-y-4 text-xs">
-        <div>
-          <label class="text-slate-300 block mb-1.5 font-semibold">Админы Нууц Үг:</label>
-          <div class="relative">
-            <input id="login-admin-pass" type="password" value="admin2026" required placeholder="Нууц үгээ оруулна уу" class="w-full bg-[#090d16] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500 font-mono pr-10">
-            <i class="fa-solid fa-lock absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-500"></i>
+      <!-- 1. CLIENT LOGIN VIEW (Default for all public visitors & clients) -->
+      <div id="view-login-client" class="space-y-6">
+        <div class="text-center space-y-2">
+          <div class="w-14 h-14 mx-auto rounded-3xl bg-gradient-to-tr from-cyan-600 via-indigo-600 to-indigo-500 flex items-center justify-center text-white text-2xl shadow-glow">
+            <i class="fa-solid fa-building-user"></i>
           </div>
-          <p class="text-[11px] text-slate-500 mt-1">Анхдагч нууц үг: <code class="text-indigo-400">admin2026</code></p>
+          <h2 class="text-xl font-extrabold text-white tracking-tight">Харилцагчийн Портал</h2>
+          <p class="text-xs text-slate-400">Байгууллагын нэвтрэх нэр эсвэл хандалтын кодоор нэвтэрнэ үү</p>
         </div>
 
-        <button type="submit" class="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-glow transition flex items-center justify-center gap-2">
-          <span>Супер Админаар Нэвтрэх</span>
-          <i class="fa-solid fa-arrow-right"></i>
-        </button>
+        <form id="form-login-client" onsubmit="handleClientLoginSubmit(event)" class="space-y-4 text-xs">
+          <div>
+            <label class="text-slate-300 block mb-1.5 font-semibold">Байгууллагын Нэвтрэх Нэр эсвэл Шууд Токен:</label>
+            <input id="login-client-id" type="text" required placeholder="жишээ: cargo, salon_owner эсвэл код" class="w-full bg-[#090d16] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-cyan-500 font-mono">
+          </div>
+          <div>
+            <label class="text-slate-300 block mb-1.5 font-semibold">Нууц Үг (Шууд линкээр орсон бол хоосон үлдээж болно):</label>
+            <div class="relative">
+              <input id="login-client-pass" type="password" placeholder="Нууц үгээ оруулна уу" class="w-full bg-[#090d16] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-cyan-500 font-mono pr-11">
+              <button type="button" onclick="togglePasswordVisibility('login-client-pass', 'icon-toggle-client-pass')" class="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white transition p-1" title="Нууц үг харах / нуух">
+                <i id="icon-toggle-client-pass" class="fa-solid fa-eye text-sm"></i>
+              </button>
+            </div>
+          </div>
 
-        <button type="button" onclick="quickAdminLogin()" class="w-full py-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-indigo-300 hover:text-white border border-white/[0.08] text-xs font-semibold transition flex items-center justify-center gap-1.5">
-          <i class="fa-solid fa-bolt text-amber-400"></i>
-          <span>1-Товшилтоор Шууд Нэвтрэх</span>
-        </button>
-      </form>
+          <button type="submit" class="w-full py-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs shadow-glow transition flex items-center justify-center gap-2">
+            <span>Системд Нэвтрэх</span>
+            <i class="fa-solid fa-arrow-right"></i>
+          </button>
+        </form>
 
-      <!-- Client Login Form -->
-      <form id="form-login-client" onsubmit="handleClientLoginSubmit(event)" class="space-y-4 text-xs hidden">
-        <div>
-          <label class="text-slate-300 block mb-1.5 font-semibold">Нэвтрэх Нэр эсвэл Magic Link Token:</label>
-          <input id="login-client-id" type="text" required placeholder="жишээ: salon_owner эсвэл шууд токен" class="w-full bg-[#090d16] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500 font-mono">
+        <!-- Subtle Discrete Admin Gate (Never exposes password or super-admin prompts) -->
+        <div class="pt-4 border-t border-white/[0.06] text-center">
+          <button type="button" onclick="switchToAdminLogin()" class="text-[11px] text-zinc-600 hover:text-zinc-400 transition inline-flex items-center gap-1.5" title="Системийн удирдлага">
+            <i class="fa-solid fa-lock text-[10px]"></i>
+            <span>Системийн удирдлага</span>
+          </button>
         </div>
-        <div>
-          <label class="text-slate-300 block mb-1.5 font-semibold">Нууц Үг (Токентой бол хоосон үлдээж болно):</label>
-          <input id="login-client-pass" type="password" placeholder="Нууц үг" class="w-full bg-[#090d16] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-indigo-500 font-mono">
+      </div>
+
+      <!-- 2. SUPER ADMIN LOGIN VIEW (Hidden & Stealth) -->
+      <div id="view-login-admin" class="space-y-6 hidden">
+        <div class="text-center space-y-2">
+          <div class="w-14 h-14 mx-auto rounded-3xl bg-gradient-to-tr from-zinc-700 via-zinc-800 to-zinc-900 border border-zinc-700 flex items-center justify-center text-white text-2xl shadow-sm">
+            <i class="fa-solid fa-shield-halved text-zinc-200"></i>
+          </div>
+          <h2 class="text-xl font-extrabold text-white tracking-tight">Системийн Удирдлага</h2>
+          <p class="text-xs text-zinc-400">Супер Админы хамгаалалтын нууц үгээ оруулна уу</p>
         </div>
 
-        <button type="submit" class="w-full py-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs shadow-glow transition flex items-center justify-center gap-2">
-          <span>Харилцагчаар Нэвтрэх</span>
-          <i class="fa-solid fa-arrow-right"></i>
-        </button>
-      </form>
+        <form id="form-login-admin" onsubmit="handleAdminLoginSubmit(event)" class="space-y-4 text-xs">
+          <div>
+            <label class="text-zinc-300 block mb-1.5 font-semibold">Админы Нууц Үг:</label>
+            <div class="relative">
+              <input id="login-admin-pass" type="password" required placeholder="Нууц үгээ оруулна уу" class="w-full bg-[#090d16] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-zinc-500 font-mono pr-11">
+              <button type="button" onclick="togglePasswordVisibility('login-admin-pass', 'icon-toggle-admin-pass')" class="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white transition p-1" title="Нууц үг харах / нуух">
+                <i id="icon-toggle-admin-pass" class="fa-solid fa-eye text-sm"></i>
+              </button>
+            </div>
+          </div>
+
+          <button type="submit" class="w-full py-3 rounded-xl bg-zinc-100 hover:bg-white text-zinc-950 font-bold text-xs transition flex items-center justify-center gap-2 shadow-sm">
+            <span>Админаар Нэвтрэх</span>
+            <i class="fa-solid fa-arrow-right"></i>
+          </button>
+
+          <button type="button" onclick="switchToClientLogin()" class="w-full py-2.5 rounded-xl bg-transparent hover:bg-white/[0.04] text-zinc-400 hover:text-zinc-200 text-xs font-semibold transition flex items-center justify-center gap-1.5">
+            <i class="fa-solid fa-arrow-left"></i>
+            <span>← Харилцагчийн Портал руу буцах</span>
+          </button>
+        </form>
+      </div>
 
     </div>
   </div>
@@ -1300,6 +1343,7 @@
     let leadsData = [];
     let allPages = [];
     let activePageId = "100799479495809";
+    let simulatorSenderId = 'sim_' + Math.random().toString(36).substring(2, 9);
 
     // Tab Switching
     function switchTab(tabId) {
@@ -1367,12 +1411,36 @@
       // Token display
       document.getElementById('settings-meta-token').value = p.page_access_token || '';
 
+      // Webhook Callback URL display dynamically
+      const webhookElem = document.getElementById('settings-webhook-callback-url');
+      if (webhookElem) {
+        webhookElem.value = window.location.origin + '/webhook';
+      }
+
       // Delete button visibility (hide on default)
       const delBtn = document.getElementById('btn-delete-page');
       if (p.page_id === '100799479495809') {
         delBtn.classList.add('hidden');
       } else {
         delBtn.classList.remove('hidden');
+      }
+    }
+
+    function copyWebhookCallbackUrl() {
+      const el = document.getElementById('settings-webhook-callback-url');
+      if (el) {
+        el.select();
+        navigator.clipboard.writeText(el.value);
+        showToast('Webhook Callback URL хуулагдлаа! Meta-дээ paste хийнэ үү.');
+      }
+    }
+
+    function copyWebhookVerifyToken() {
+      const el = document.getElementById('settings-webhook-verify-token');
+      if (el) {
+        el.select();
+        navigator.clipboard.writeText(el.value);
+        showToast('Verify Token хуулагдлаа!');
       }
     }
 
@@ -1410,7 +1478,13 @@
 
     async function submitNewPage(e) {
       e.preventDefault();
-      const page_id = document.getElementById('modal-page-id').value.trim();
+      let page_id = document.getElementById('modal-page-id').value.trim();
+      if (page_id.includes('/')) {
+        const parts = page_id.split('/').filter(Boolean);
+        if (parts.length > 0) page_id = parts[parts.length - 1];
+      }
+      page_id = page_id.replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/^_+|_+$/g, '') || ('page_' + Math.random().toString(36).substring(2, 8));
+
       const name = document.getElementById('modal-page-name').value.trim();
       const token = document.getElementById('modal-page-token').value.trim();
       const bank_name = document.getElementById('modal-bank-name').value.trim();
@@ -1477,6 +1551,13 @@
     }
 
     function clearSimulatorChat() {
+      simulatorSenderId = 'sim_' + Math.random().toString(36).substring(2, 9);
+      fetch('/api/sessions/web_simulator_user/takeover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ takeover: false })
+      }).catch(() => {});
+
       const box = document.getElementById('sim-messages');
       box.innerHTML = `
         <div class="text-center my-2">
@@ -1493,6 +1574,7 @@
           </div>
         </div>
       `;
+      showToast('Чат симулятор шинэчлэгдлээ!');
     }
 
     function handleFileSelect(e) {
@@ -1571,6 +1653,7 @@
           formData.append('file', currentSelectedFile);
           if (text) formData.append('text', text);
           formData.append('page_id', activePageId);
+          formData.append('sender_id', simulatorSenderId);
 
           const res = await fetch('/api/upload-receipt', { method: 'POST', body: formData });
           const json = await res.json();
@@ -1580,10 +1663,16 @@
           const res = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: text, sender_id: 'web_simulator_user', page_id: activePageId })
+            body: JSON.stringify({ message: text, sender_id: simulatorSenderId, page_id: activePageId })
           });
           const json = await res.json();
-          reply = json.reply || "Хариу ирсэнгүй.";
+          if (json.human_takeover) {
+            reply = "👤 Хүний удирдлага идэвхжсэн байна (AI хариулахыг түр зогсоосон). Чат цэвэрлэх (эргэдэг) товч дээр даран AI-г шинээр эхлүүлнэ үү.";
+          } else if (json.limit_exceeded) {
+            reply = json.reply || "⚠️ Сарын AI ашиглалтын квот дууссан байна.";
+          } else {
+            reply = json.reply || (json.error ? ("⚠️ Алдаа: " + json.error) : "Сайн байна уу? Танд ямар тусламж хэрэгтэй байна вэ?");
+          }
         }
 
         const typingEl = document.getElementById(typingId);
@@ -2017,6 +2106,13 @@
             return;
           }
           document.getElementById('auth-modal').classList.remove('hidden');
+          
+          // Хэрэв URL дээр ?admin эсвэл /admin эсвэл #admin байвал Админы нууц цонхыг нээнэ, бусад үед 100% Харилцагчийн портал гарна
+          if (urlParams.has('admin') || window.location.pathname.includes('/admin') || window.location.hash === '#admin') {
+            switchToAdminLogin();
+          } else {
+            switchToClientLogin();
+          }
           return;
         }
 
@@ -2076,23 +2172,38 @@
       }
     }
 
-    function switchLoginTab(tab) {
-      const btnAdmin = document.getElementById('login-tab-btn-admin');
-      const btnClient = document.getElementById('login-tab-btn-client');
-      const formAdmin = document.getElementById('form-login-admin');
-      const formClient = document.getElementById('form-login-client');
-
-      if (tab === 'admin') {
-        btnAdmin.className = "py-2.5 rounded-xl bg-indigo-600 text-white transition flex items-center justify-center gap-2 shadow-sm";
-        btnClient.className = "py-2.5 rounded-xl text-slate-400 hover:text-white transition flex items-center justify-center gap-2";
-        formAdmin.classList.remove('hidden');
-        formClient.classList.add('hidden');
-      } else {
-        btnClient.className = "py-2.5 rounded-xl bg-cyan-600 text-white transition flex items-center justify-center gap-2 shadow-sm";
-        btnAdmin.className = "py-2.5 rounded-xl text-slate-400 hover:text-white transition flex items-center justify-center gap-2";
-        formClient.classList.remove('hidden');
-        formAdmin.classList.add('hidden');
+    function switchToAdminLogin() {
+      const clientView = document.getElementById('view-login-client');
+      const adminView = document.getElementById('view-login-admin');
+      if (clientView && adminView) {
+        clientView.classList.add('hidden');
+        adminView.classList.remove('hidden');
+        const passInput = document.getElementById('login-admin-pass');
+        if (passInput) passInput.focus();
       }
+    }
+
+    function switchToClientLogin() {
+      const clientView = document.getElementById('view-login-client');
+      const adminView = document.getElementById('view-login-admin');
+      if (clientView && adminView) {
+        adminView.classList.add('hidden');
+        clientView.classList.remove('hidden');
+        const idInput = document.getElementById('login-client-id');
+        if (idInput) idInput.focus();
+      }
+    }
+
+    // Супер Админы нууц товчлол (Ctrl + Shift + A эсвэл Alt + A)
+    window.addEventListener('keydown', (e) => {
+      if (((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'a') || (e.altKey && e.key.toLowerCase() === 'a')) {
+        switchToAdminLogin();
+      }
+    });
+
+    function switchLoginTab(tab) {
+      if (tab === 'admin') switchToAdminLogin();
+      else switchToClientLogin();
     }
 
     async function handleAdminLoginSubmit(e) {
@@ -2117,7 +2228,7 @@
         const res = await fetch('/api/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'admin', password: 'admin2026' })
+          body: JSON.stringify({ type: 'admin', password: 'ADMIN2026' })
         });
         const data = await res.json();
         if (data.success) {
@@ -2158,10 +2269,30 @@
       window.location.reload();
     }
 
+    // ==================== PASSWORD VISIBILITY TOGGLE ====================
+    function togglePasswordVisibility(inputId, iconId) {
+      const input = document.getElementById(inputId);
+      const icon = document.getElementById(iconId);
+      if (!input) return;
+      if (input.type === 'password') {
+        input.type = 'text';
+        if (icon) {
+          icon.classList.remove('fa-eye');
+          icon.classList.add('fa-eye-slash', 'text-cyan-400');
+        }
+      } else {
+        input.type = 'password';
+        if (icon) {
+          icon.classList.remove('fa-eye-slash', 'text-cyan-400');
+          icon.classList.add('fa-eye');
+        }
+      }
+    }
+
     // ==================== ADMIN: CLIENT ACCESS & MAGIC LINK MODAL ====================
     async function openClientAccessModal() {
       try {
-        const res = await fetch('/api/pages/' + encodeURIComponent(activePageId));
+        const res = await fetch('/api/pages/detail?page_id=' + encodeURIComponent(activePageId));
         const page = await res.json();
         
         document.getElementById('access-modal-page-sub').innerText = `${page.name} (Page ID: ${page.page_id})`;
@@ -2170,6 +2301,24 @@
         document.getElementById('access-modal-username').value = page.client_username || '';
         document.getElementById('access-modal-password').value = '';
         document.getElementById('access-modal-token-limit').value = page.monthly_token_limit || 100000;
+
+        // Reset password input type & icon
+        const passInput = document.getElementById('access-modal-password');
+        if (passInput) passInput.type = 'password';
+        const passIcon = document.getElementById('icon-toggle-modal-pass');
+        if (passIcon) {
+          passIcon.classList.remove('fa-eye-slash', 'text-cyan-400');
+          passIcon.classList.add('fa-eye');
+        }
+
+        const passStatusElem = document.getElementById('access-modal-pass-status');
+        if (passStatusElem) {
+          if (page.has_password) {
+            passStatusElem.innerHTML = `<span class="text-emerald-400 font-semibold"><i class="fa-solid fa-circle-check mr-1"></i> Нууц үг тохируулсан байна.</span> <span class="text-zinc-400 text-[10px]">(Солих бол шинэ нууц үг бичнэ үү)</span>`;
+          } else {
+            passStatusElem.innerHTML = `<span class="text-amber-400 font-semibold"><i class="fa-solid fa-triangle-exclamation mr-1"></i> Нууц үг хараахан тохируулаагүй байна!</span> <span class="text-zinc-400 text-[10px]">(Энд шинэ нууц үг бичиж хадгална уу)</span>`;
+          }
+        }
 
         const statusElem = document.getElementById('access-modal-gemini-status');
         if (page.has_custom_gemini_key) {
@@ -2192,11 +2341,35 @@
       document.getElementById('client-access-modal').classList.add('hidden');
     }
 
+    // ==================== EXCEL (.XLSX) & CSV EXPORT ====================
+    function downloadExcel() {
+      const pageId = (currentUser && currentUser.role === 'client') ? currentUser.page_id : activePageId;
+      let url = '/api/export/excel';
+      const params = [];
+      if (pageId) params.push('page_id=' + encodeURIComponent(pageId));
+      if (currentUser && currentUser.magic_token) params.push('token=' + encodeURIComponent(currentUser.magic_token));
+      if (params.length > 0) url += '?' + params.join('&');
+      
+      showToast('Excel (.xlsx) файл татаж байна...');
+      window.location.href = url;
+    }
+
+    function downloadCSV() {
+      const pageId = (currentUser && currentUser.role === 'client') ? currentUser.page_id : activePageId;
+      let url = '/api/export/csv';
+      const params = [];
+      if (pageId) params.push('page_id=' + encodeURIComponent(pageId));
+      if (currentUser && currentUser.magic_token) params.push('token=' + encodeURIComponent(currentUser.magic_token));
+      if (params.length > 0) url += '?' + params.join('&');
+      
+      window.location.href = url;
+    }
+
     // ==================== GOOGLE SHEETS LIVE SYNC MODAL ====================
     async function openGoogleSheetsModal() {
       try {
         const pageId = (currentUser && currentUser.role === 'client') ? currentUser.page_id : activePageId;
-        const res = await fetch('/api/pages/' + encodeURIComponent(pageId));
+        const res = await fetch('/api/pages/detail?page_id=' + encodeURIComponent(pageId));
         const page = await res.json();
         
         document.getElementById('sheets-modal-page-sub').innerText = `${page.name || 'Сонгосон хуудас'} (ID: ${pageId})`;
@@ -2323,31 +2496,44 @@
       const password = document.getElementById('access-modal-password').value.trim();
       const limit = document.getElementById('access-modal-token-limit').value.trim();
 
-      if (username) {
-        await fetch(`/api/pages/${encodeURIComponent(activePageId)}/credentials`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username, password: password || undefined })
-        });
+      if (!username) {
+        alert('Хэрэглэгчийн нэр оруулна уу');
+        return;
       }
 
-      if (limit) {
-        await fetch(`/api/pages/${encodeURIComponent(activePageId)}/gemini_key`, {
+      try {
+        const credRes = await fetch('/api/pages/credentials', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ monthly_token_limit: parseInt(limit) })
+          body: JSON.stringify({ page_id: activePageId, username, password: password || undefined })
         });
-      }
+        const credData = await credRes.json();
+        if (!credRes.ok || credData.error) {
+          alert('Алдаа: ' + (credData.error || 'Хадгалж чадсангүй'));
+          return;
+        }
 
-      showToast('Харилцагчийн хандалтын тохиргоо амжилттай хадгалагдлаа!');
-      closeClientAccessModal();
-      loadPages();
+        if (limit) {
+          await fetch('/api/pages/gemini_key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ page_id: activePageId, monthly_token_limit: parseInt(limit) })
+          });
+        }
+
+        showToast('Харилцагчийн хандалтын тохиргоо амжилттай хадгалагдлаа!');
+        closeClientAccessModal();
+        await loadPages();
+      } catch (err) {
+        console.error(err);
+        alert('Сервертэй холбогдоход алдаа гарлаа: ' + err.message);
+      }
     }
 
     // ==================== CLIENT DEDICATED AI KEY & QUOTA ====================
     async function loadClientApiQuota() {
       try {
-        const res = await fetch('/api/pages/' + encodeURIComponent(activePageId));
+        const res = await fetch('/api/pages/detail?page_id=' + encodeURIComponent(activePageId));
         const page = await res.json();
 
         const used = page.tokens_used || 0;
