@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  agency-hub:
+    build: .
+    container_name: ai_agency_hub
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./leads.db:/app/leads.db
+      - ./leads.csv:/app/leads.csv
+      - ./.env:/app/.env
+    environment:
+      - PORT=8000
