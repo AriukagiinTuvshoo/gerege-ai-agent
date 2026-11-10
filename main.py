@@ -367,6 +367,57 @@ async def web_chat_endpoint(payload: Dict[str, Any], request: Request, backgroun
         
     return JSONResponse(result)
 
+@app.post("/api/manychat")
+@app.get("/api/manychat")
+async def manychat_webhook_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """ManyChat / Instagram / Messenger External Request Webhook Bridge (Meta App Reviewгүйгээр шууд холбогдох)"""
+    try:
+        if request.method == "GET":
+            payload = dict(request.query_params)
+        else:
+            payload = await request.json()
+    except Exception:
+        payload = {}
+
+    target_page_id = str(payload.get("page_id") or request.query_params.get("page_id") or database.DEFAULT_PAGE_ID)
+    user_id = str(payload.get("user_id") or payload.get("id") or "manychat_user")
+    message = str(payload.get("message") or payload.get("last_input_text") or payload.get("text") or "").strip()
+
+    if not message:
+        return JSONResponse({
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": "Сайн байна уу! Танд хэрхэн туслах вэ?"}]
+            },
+            "reply": "Сайн байна уу! Танд хэрхэн туслах вэ?"
+        })
+
+    result = agent.process_message(
+        text=message,
+        sender_id=f"mc_{user_id}",
+        channel="manychat/instagram",
+        page_id=target_page_id
+    )
+
+    reply_text = result.get("reply", "Сайн байна уу? Танд хэрхэн туслах вэ?")
+
+    if result.get("registered") and result.get("reg_info"):
+        background_tasks.add_task(notify_manager_telegram, result["reg_info"])
+
+    return JSONResponse({
+        "version": "v2",
+        "content": {
+            "messages": [
+                {
+                    "type": "text",
+                    "text": reply_text
+                }
+            ]
+        },
+        "reply": reply_text,
+        "registered": result.get("registered", False)
+    })
+
 @app.post("/api/upload-receipt")
 async def upload_receipt_endpoint(
     request: Request,

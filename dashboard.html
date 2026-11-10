@@ -988,19 +988,35 @@
 
       <!-- Quick Preset Template Buttons -->
       <div class="space-y-1.5">
-        <label class="text-[11px] font-bold text-slate-300 uppercase tracking-wider">Бэлэн загвар сонгох (1 товшилтоор бөглөнө):</label>
+        <label class="text-[11px] font-bold text-slate-300 uppercase tracking-wider">Салбарын бэлэн загвар (1 товшилтоор бөглөх):</label>
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
           <button type="button" onclick="applyPreset('salon')" class="p-2 rounded-xl bg-white/[0.04] hover:bg-indigo-600/30 border border-white/[0.08] hover:border-indigo-500 text-left transition">
             <div class="text-base mb-0.5">💇‍♀️</div>
             <div class="font-bold text-white text-[11px]">Салон & Спа</div>
           </button>
+          <button type="button" onclick="applyPreset('cargo')" class="p-2 rounded-xl bg-white/[0.04] hover:bg-indigo-600/30 border border-white/[0.08] hover:border-indigo-500 text-left transition">
+            <div class="text-base mb-0.5">📦</div>
+            <div class="font-bold text-white text-[11px]">Карго тээвэр</div>
+          </button>
           <button type="button" onclick="applyPreset('shop')" class="p-2 rounded-xl bg-white/[0.04] hover:bg-indigo-600/30 border border-white/[0.08] hover:border-indigo-500 text-left transition">
             <div class="text-base mb-0.5">👗</div>
-            <div class="font-bold text-white text-[11px]">Дэлгүүр</div>
+            <div class="font-bold text-white text-[11px]">Хувцас, дэлгүүр</div>
+          </button>
+          <button type="button" onclick="applyPreset('restaurant')" class="p-2 rounded-xl bg-white/[0.04] hover:bg-indigo-600/30 border border-white/[0.08] hover:border-indigo-500 text-left transition">
+            <div class="text-base mb-0.5">🍔</div>
+            <div class="font-bold text-white text-[11px]">Ресторан, хоол</div>
+          </button>
+          <button type="button" onclick="applyPreset('clinic')" class="p-2 rounded-xl bg-white/[0.04] hover:bg-indigo-600/30 border border-white/[0.08] hover:border-indigo-500 text-left transition">
+            <div class="text-base mb-0.5">🏥</div>
+            <div class="font-bold text-white text-[11px]">Эмнэлэг, шүд</div>
+          </button>
+          <button type="button" onclick="applyPreset('realestate')" class="p-2 rounded-xl bg-white/[0.04] hover:bg-indigo-600/30 border border-white/[0.08] hover:border-indigo-500 text-left transition">
+            <div class="text-base mb-0.5">🏠</div>
+            <div class="font-bold text-white text-[11px]">Үл хөдлөх хөрөнгө</div>
           </button>
           <button type="button" onclick="applyPreset('course')" class="p-2 rounded-xl bg-white/[0.04] hover:bg-indigo-600/30 border border-white/[0.08] hover:border-indigo-500 text-left transition">
             <div class="text-base mb-0.5">📚</div>
-            <div class="font-bold text-white text-[11px]">Сургалт</div>
+            <div class="font-bold text-white text-[11px]">Сургалтын төв</div>
           </button>
           <button type="button" onclick="applyPreset('entertainment')" class="p-2 rounded-xl bg-white/[0.04] hover:bg-indigo-600/30 border border-white/[0.08] hover:border-indigo-500 text-left transition">
             <div class="text-base mb-0.5">🎬</div>
@@ -1118,6 +1134,46 @@
               <div id="access-modal-pass-status" class="text-[10px] text-zinc-500 mt-1"></div>
             </div>
           </div>
+        </div>
+
+        <!-- АРГА 3: ВЭБСАЙТ ДЭЭР СУУРИЛУУЛАХ 1-МӨР ВИДЖЕТ (META БАТАЛГААЖУУЛАЛТ ШААРДЛАГАГҮЙ) -->
+        <div class="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-2.5">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-zinc-200 flex items-center gap-2">
+              <i class="fa-solid fa-code text-cyan-400"></i>
+              <span>3. Вэбсайт дээр суурилуулах 1-мөр код:</span>
+            </span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 font-medium">100% Чөлөөтэй</span>
+          </div>
+          <div class="flex gap-2">
+            <input id="access-modal-widget-code" readonly type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-cyan-300 font-mono select-all focus:outline-none">
+            <button type="button" onclick="copyWidgetCode()" class="px-3.5 py-2 rounded-xl bg-zinc-100 hover:bg-white text-zinc-950 font-bold text-xs transition flex items-center gap-1.5 shrink-0">
+              <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
+            </button>
+          </div>
+          <p class="text-[11px] text-zinc-400 leading-relaxed">
+            Энэ 1 мөр кодыг өөрийн эсвэл харилцагчийн вэбсайт (WordPress, Shopify, Next.js, HTML)-ийн &lt;/body&gt; өмнө тавихад чат бот шууд ажиллана.
+          </p>
+        </div>
+
+        <!-- АРГА 4: MANYCHAT / INSTAGRAM / MESSENGER WEBHOOK (META АЛБАН ЁСНЫ ШАЛГАЛТГҮЙГЭЭР АЖИЛЛУУЛАХ) -->
+        <div class="p-4 rounded-xl bg-zinc-900 border border-zinc-800 space-y-2.5">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-zinc-200 flex items-center gap-2">
+              <i class="fa-solid fa-share-nodes text-purple-400"></i>
+              <span>4. ManyChat / Instagram Webhook URL:</span>
+            </span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20 font-medium">Шууд ажиллана</span>
+          </div>
+          <div class="flex gap-2">
+            <input id="access-modal-manychat-url" readonly type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-purple-300 font-mono select-all focus:outline-none">
+            <button type="button" onclick="copyManyChatUrl()" class="px-3.5 py-2 rounded-xl bg-zinc-100 hover:bg-white text-zinc-950 font-bold text-xs transition flex items-center gap-1.5 shrink-0">
+              <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
+            </button>
+          </div>
+          <p class="text-[11px] text-zinc-400 leading-relaxed">
+            ManyChat &gt; Automation &gt; External Request дээр POST хийж (Body: <code class="text-zinc-300 font-mono">{"message":"{{last_input_text}}", "user_id":"{{user_id}}"}</code>) холбоход Facebook & Instagram чат шууд ажиллана.
+          </p>
         </div>
 
         <!-- КВОТ & GEMINI ТҮЛХҮҮР -->
@@ -1458,21 +1514,41 @@
         document.getElementById('modal-bank-name').value = "ХААН БАНК";
         document.getElementById('modal-bank-acc').value = "5001234567";
         document.getElementById('modal-desc').value = "Гоо сайхан, арьс цэвэрлэгээ (60,000₮), гелин будалт (45,000₮), массаж. Цаг авах бол нэр утсаа чатаар үлдээнэ үү.";
+      } else if (type === 'cargo') {
+        document.getElementById('modal-page-name').value = "Монгол Экспресс Карго";
+        document.getElementById('modal-bank-name').value = "ХААН БАНК";
+        document.getElementById('modal-bank-acc').value = "5109876543";
+        document.getElementById('modal-desc').value = "БНХАУ-аас Улаанбаатар чиглэлийн карго тээвэр. Агаарын тээвэр 1кг 18,000₮ (3-5 хоног), авто тээвэр 1кг 3,500₮ (7-10 хоног). Хүлээн авах цэг: БЗД 13-р хороолол.";
       } else if (type === 'shop') {
         document.getElementById('modal-page-name').value = "Trendy Fashion Дэлгүүр";
         document.getElementById('modal-bank-name').value = "ГОЛОМТ БАНК";
         document.getElementById('modal-bank-acc').value = "9700112233";
-        document.getElementById('modal-desc').value = "Бэлэн хувцас, гутал, цүнх худалдаалж байна. Хот дотор хүргэлт 6,000₮, 100,000₮-с дээш үнэгүй.";
+        document.getElementById('modal-desc').value = "Бэлэн хувцас, гутал, цүнх худалдаалж байна. Хот дотор хүргэлт 6,000₮, 100,000₮-с дээш үнэгүй. Захиалга өгөх бол барааны зураг, хэмжээ, утасны дугаараа үлдээнэ үү.";
+      } else if (type === 'restaurant') {
+        document.getElementById('modal-page-name').value = "Urban Grill Ресторан";
+        document.getElementById('modal-bank-name').value = "ХААН БАНК";
+        document.getElementById('modal-bank-acc').value = "5087654321";
+        document.getElementById('modal-desc').value = "Европ & шарсан махан зоог. Бизнес сэт 28,000₮, Стейк 45,000₮. Ширээ захиалах эсвэл хүргэлтээр авах бол нэр, утас, хаягаа чатаар өгнө үү. Хүргэлтийн төлбөр 5,000₮.";
+      } else if (type === 'clinic') {
+        document.getElementById('modal-page-name').value = "Энх Сэтгэл Шүдний Эмнэлэг";
+        document.getElementById('modal-bank-name').value = "ХУДАЛДАА ХӨГЖЛИЙН БАНК";
+        document.getElementById('modal-bank-acc').value = "499123456";
+        document.getElementById('modal-desc').value = "Шүдний эмчилгээ, ломбо (40,000-80,000₮), цайруулалт, авахуулах, сувгийн эмчилгээ. Эмчид үзүүлэх цаг авахын тулд нэр, утасны дугаараа үлдээнэ үү.";
+      } else if (type === 'realestate') {
+        document.getElementById('modal-page-name').value = "Capital Property Үл Хөдлөх";
+        document.getElementById('modal-bank-name').value = "ГОЛОМТ БАНК";
+        document.getElementById('modal-bank-acc').value = "1105432190";
+        document.getElementById('modal-desc').value = "Шинэ орон сууц, оффис, хувийн сууц түрээс болон худалдаа. Зайсан болон ХУД-т 2-4 өрөө орон сууцнууд бэлэн байна. Байр үзэх цаг товлох бол нэр утсаа чатаар бичнэ үү.";
       } else if (type === 'course') {
         document.getElementById('modal-page-name').value = "English Master Академи";
         document.getElementById('modal-bank-name').value = "ХАС БАНК";
         document.getElementById('modal-bank-acc').value = "3004567890";
-        document.getElementById('modal-desc').value = "Ярианы англи хэл, IELTS бэлтгэл. Сарын сургалтын төлбөр 250,000₮. Бүртгүүлэх бол нэр утсаа үлдээнэ үү.";
+        document.getElementById('modal-desc').value = "Ярианы англи хэл, IELTS бэлтгэл. Сарын сургалтын төлбөр 250,000₮. Түвшин тогтоох шалгалт өгөх болон бүртгүүлэх бол нэр утсаа үлдээнэ үү.";
       } else if (type === 'entertainment') {
         document.getElementById('modal-page-name').value = "Шинэ Кино Суваг";
         document.getElementById('modal-bank-name').value = "ГОЛОМТ БАНК";
         document.getElementById('modal-bank-acc').value = "97001500 2815116628";
-        document.getElementById('modal-desc').value = "Шинэ солонгос кинонуудыг Telegram группт үзүүлнэ. Хандивын баримтаа чатаар илгээж линк авна уу.";
+        document.getElementById('modal-desc').value = "Шинэ кино, цувралуудыг VIP сувагт үзүүлнэ. Хандивын баримтаа чатаар илгээж линк авна уу.";
       }
     }
 
@@ -2331,6 +2407,15 @@
           statusElem.innerHTML = `🟡 Админы квот (${used} / ${limit})`;
         }
 
+        const widgetInput = document.getElementById('access-modal-widget-code');
+        if (widgetInput) {
+          widgetInput.value = `<script src="${window.location.origin}/widget.js" data-page-id="${page.page_id}" data-title="${page.name || 'AI Assistant'}"></script>`;
+        }
+        const manychatInput = document.getElementById('access-modal-manychat-url');
+        if (manychatInput) {
+          manychatInput.value = `${window.location.origin}/api/manychat?page_id=${encodeURIComponent(page.page_id)}`;
+        }
+
         document.getElementById('client-access-modal').classList.remove('hidden');
       } catch (err) {
         console.error(err);
@@ -2488,6 +2573,22 @@
       const linkInput = document.getElementById('access-modal-magic-link');
       navigator.clipboard.writeText(linkInput.value);
       showToast('1-товчлуурт шууд нэвтрэх Magic Link хуулагдлаа!');
+    }
+
+    function copyWidgetCode() {
+      const codeInput = document.getElementById('access-modal-widget-code');
+      if (codeInput) {
+        navigator.clipboard.writeText(codeInput.value);
+        showToast('Вэбсайтад суулгах 1-мөр код хуулагдлаа!');
+      }
+    }
+
+    function copyManyChatUrl() {
+      const urlInput = document.getElementById('access-modal-manychat-url');
+      if (urlInput) {
+        navigator.clipboard.writeText(urlInput.value);
+        showToast('ManyChat Webhook URL хуулагдлаа!');
+      }
     }
 
     async function handleSaveClientCredentials(e) {

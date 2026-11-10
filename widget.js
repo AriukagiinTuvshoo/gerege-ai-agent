@@ -8,6 +8,8 @@
     ? currentScript.getAttribute('data-title') 
     : 'AI Туслах';
 
+  const pageId = currentScript ? (currentScript.getAttribute('data-page-id') || currentScript.getAttribute('data-page')) : null;
+
   // Session ID
   let sessionId = localStorage.getItem('ai_widget_session_id');
   if (!sessionId) {
@@ -198,7 +200,11 @@
       const res = await fetch(serverUrl + '/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, sender_id: sessionId })
+        body: JSON.stringify({ 
+          message: text, 
+          sender_id: sessionId,
+          page_id: pageId || undefined
+        })
       });
       const data = await res.json();
       typingDiv.style.display = 'none';
