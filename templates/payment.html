@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="mn" class="h-full bg-slate-950 text-slate-100">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Төлбөр төлөх | Гэрэгэ Финтек</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.2/dist/confetti.browser.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+    @keyframes pulse-slow {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.85; transform: scale(0.98); }
+    }
+    .animate-pulse-slow { animation: pulse-slow 3s infinite ease-in-out; }
+    .glass-card {
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+  </style>
+</head>
+<body class="min-h-full flex flex-col justify-between p-4 sm:p-6 bg-radial from-slate-900 via-slate-950 to-black">
+
+  <!-- Header -->
+  <header class="w-full max-w-md mx-auto flex items-center justify-between py-2">
+    <div class="flex items-center space-x-2">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-500 to-teal-400 flex items-center justify-center font-extrabold text-slate-950 shadow-lg shadow-emerald-500/20 text-lg">
+        Г
+      </div>
+      <div>
+        <h1 class="text-sm font-bold tracking-tight text-white flex items-center gap-1.5">
+          <span>{{ company_name }}</span>
+          <span class="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+            ✓ Баталгаажсан
+          </span>
+        </h1>
+        <p class="text-[11px] text-slate-400">Гэрэгэ QPay v2 Төлбөрийн гарц</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-1 text-[11px] font-medium text-emerald-400 bg-emerald-500/10 px-2 py-1 rounded-lg border border-emerald-500/20">
+      <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+      256-bit SSL
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="w-full max-w-md mx-auto my-auto py-4">
+
+    <!-- ACTIVE PAYMENT VIEW -->
+    <div id="payment-view" class="glass-card rounded-3xl p-6 sm:p-7 shadow-2xl relative overflow-hidden transition-all duration-300">
+      <!-- Glow background -->
+      <div class="absolute -top-24 -right-24 w-48 h-48 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
+      <div class="absolute -bottom-24 -left-24 w-48 h-48 bg-blue-500/10 rounded-full blur-3xl pointer-events-none"></div>
+
+      <!-- Amount Badge -->
+      <div class="text-center pb-5 border-b border-slate-800/80">
+        <span class="inline-block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
+          {{ description }}
+        </span>
+        <div class="flex items-baseline justify-center gap-1">
+          <span class="text-4xl sm:text-5xl font-extrabold text-white tracking-tight">{{ "{:,}".format(amount) }}</span>
+          <span class="text-2xl font-bold text-emerald-400">₮</span>
+        </div>
+        <div class="mt-2 flex items-center justify-center gap-2 text-xs text-slate-400 mono">
+          <span>Нэхэмжлэх:</span>
+          <span class="text-slate-300 font-semibold select-all">{{ invoice_id }}</span>
+        </div>
+      </div>
+
+      <!-- Desktop / Tablet QR Code -->
+      <div class="py-5 flex flex-col items-center justify-center">
+        <div class="relative p-3.5 bg-white rounded-2xl shadow-xl shadow-black/40 border border-slate-200">
+          <img src="{{ qr_image_url }}" alt="QPay QR Code" class="w-48 h-48 sm:w-52 sm:h-52 object-contain rounded-lg">
+          <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div class="w-10 h-10 rounded-xl bg-white p-1 shadow-md flex items-center justify-center">
+              <span class="text-xs font-extrabold text-slate-900 tracking-tighter">QPAY</span>
+            </div>
+          </div>
+        </div>
+        <p class="text-xs text-slate-400 mt-3 text-center">
+          Банкны аппаараа QR кодыг уншуулж төлнө үү
+        </p>
+      </div>
+
+      <!-- Mobile Bank Deep Links -->
+      <div class="mt-1 space-y-2.5">
+        <div class="flex items-center justify-between text-xs font-semibold text-slate-300 px-1">
+          <span>Эсвэл банкны аппаа сонгох:</span>
+          <span class="text-[11px] text-emerald-400 flex items-center gap-1">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            1 товшилтоор нээгдэнэ
+          </span>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2">
+          {% for bank in deep_links %}
+          <a href="{{ bank.link }}" class="flex items-center gap-2.5 p-2.5 rounded-xl bg-slate-800/70 hover:bg-slate-700/80 border border-slate-700/60 active:scale-[0.98] transition-all group">
+            <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 text-white font-bold text-xs" style="background-color: {{ bank.color }};">
+              {{ bank.name[:2] }}
+            </div>
+            <div class="truncate text-left">
+              <div class="text-xs font-bold text-white group-hover:text-emerald-300 truncate">{{ bank.name }}</div>
+              <div class="text-[10px] text-slate-400 truncate">Апп нээх ↗</div>
+            </div>
+          </a>
+          {% endfor %}
+        </div>
+      </div>
+
+      <!-- Real-time Polling Status -->
+      <div class="mt-5 pt-4 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+        <div class="flex items-center gap-2">
+          <svg class="animate-spin h-3.5 w-3.5 text-emerald-400" viewBox="0 0 24 24" fill="none">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+          </svg>
+          <span id="poll-text">Төлбөрийг бодит цагт шалгаж байна...</span>
+        </div>
+        <span class="text-[11px] text-slate-400">1 сек авто</span>
+      </div>
+
+      <!-- Demo Simulator Button (Хэрэглэгчид шууд туршиж үзүүлэх товч) -->
+      <div class="mt-4 pt-3 border-t border-dashed border-slate-800 text-center">
+        <button onclick="simulatePayment()" id="btn-simulate" class="w-full py-2.5 px-4 rounded-xl text-xs font-semibold bg-gradient-to-r from-emerald-500/20 to-teal-500/20 hover:from-emerald-500/30 hover:to-teal-500/30 text-emerald-300 border border-emerald-500/30 active:scale-[0.99] transition flex items-center justify-center gap-2">
+          <span>⚡ Төлбөр шалгах (Demo Simulate)</span>
+        </button>
+        <p class="text-[10px] text-slate-400 mt-1">Туршилт: Банкны шилжүүлэг амжилттай болсныг 1 секундэд автоматаар баталгаажуулж үзэх</p>
+      </div>
+
+    </div>
+
+    <!-- SUCCESS & E-BARIMT VIEW (Hidden initially) -->
+    <div id="success-view" class="hidden glass-card rounded-3xl p-6 sm:p-7 shadow-2xl relative overflow-hidden transition-all duration-500 scale-95 opacity-0">
+      
+      <!-- Top Success Icon -->
+      <div class="text-center pt-2 pb-4">
+        <div class="w-16 h-16 rounded-full bg-emerald-500/20 border-2 border-emerald-500/40 text-emerald-400 mx-auto flex items-center justify-center text-3xl mb-3 shadow-lg shadow-emerald-500/30 animate-bounce">
+          ✓
+        </div>
+        <h2 class="text-xl font-extrabold text-white">Төлбөр Баталгаажлаа! 🎉</h2>
+        <p class="text-xs text-slate-300 mt-1">Хүний оролцоогүй 1 секундэд амжилттай баталгаажлаа.</p>
+      </div>
+
+      <!-- E-Barimt Digital Receipt Card -->
+      <div class="bg-slate-900/90 rounded-2xl p-4 sm:p-5 border border-slate-700/80 shadow-inner relative">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
+          <div class="flex items-center gap-2">
+            <span class="text-base font-extrabold text-red-500">И-БАРИМТ</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20 font-bold">POSAPI 3.0</span>
+          </div>
+          <span class="text-[11px] text-slate-400 mono" id="receipt-date">2026-11-11</span>
+        </div>
+
+        <div class="space-y-2 text-xs">
+          <div class="flex justify-between py-1 border-b border-slate-800/60">
+            <span class="text-slate-400">Байгууллага:</span>
+            <span class="font-semibold text-white text-right" id="receipt-company">{{ company_name }}</span>
+          </div>
+          <div class="flex justify-between py-1 border-b border-slate-800/60">
+            <span class="text-slate-400">Гүйлгээний утга:</span>
+            <span class="font-medium text-slate-200" id="receipt-desc">{{ description }}</span>
+          </div>
+          <div class="flex justify-between py-1 border-b border-slate-800/60 items-baseline">
+            <span class="text-slate-400 font-medium">Нийт төлсөн дүн:</span>
+            <span class="text-lg font-extrabold text-emerald-400 mono" id="receipt-amount">{{ "{:,}".format(amount) }} ₮</span>
+          </div>
+          <div class="flex justify-between py-1 border-b border-slate-800/60">
+            <span class="text-slate-400">НӨАТ (10%):</span>
+            <span class="text-slate-300 mono" id="receipt-vat">0 ₮</span>
+          </div>
+
+          <!-- Highlighted Lottery Box -->
+          <div class="mt-3 p-3 bg-gradient-to-r from-red-950/40 via-slate-900 to-red-950/40 rounded-xl border border-red-500/30 text-center">
+            <span class="text-[10px] text-red-400 font-bold tracking-wider uppercase block mb-1">Таны Сугалааны Дугаар</span>
+            <span class="text-2xl font-black text-white tracking-widest mono select-all" id="receipt-lottery">АБ00000000</span>
+          </div>
+
+          <!-- Fiscal Code -->
+          <div class="pt-2 text-center">
+            <span class="text-[10px] text-slate-500 block mb-0.5">ДДТД (33 оронтой бүртгэлийн код):</span>
+            <span class="text-[10px] text-slate-400 mono break-all select-all font-medium" id="receipt-qr-data">---------------------------------</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="mt-5 space-y-2">
+        <button onclick="window.print()" class="w-full py-3 px-4 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 flex items-center justify-center gap-2 active:scale-[0.99] transition">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/></svg>
+          Баримт хэвлэх / Хадгалах
+        </button>
+        <button onclick="closeOrBack()" class="w-full py-3 px-4 rounded-xl text-xs font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-lg shadow-emerald-500/20 active:scale-[0.99] transition flex items-center justify-center gap-2">
+          Чат руу буцах ↗
+        </button>
+      </div>
+
+    </div>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="w-full max-w-md mx-auto text-center py-2 text-[11px] text-slate-400">
+    Гэрэгэ AI Бизнес Үйлдлийн Систем &bull; QPay v2 Fintech
+  </footer>
+
+  <script>
+    const invoiceId = "{{ invoice_id }}";
+    let isPaid = false;
+
+    // Subtle audio chime on success (Web Audio API - no external mp3 needed)
+    function playSuccessChime() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(523.25, ctx.currentTime); // C5
+        osc.frequency.setValueAtTime(659.25, ctx.currentTime + 0.1); // E5
+        osc.frequency.setValueAtTime(783.99, ctx.currentTime + 0.2); // G5
+        osc.frequency.setValueAtTime(1046.50, ctx.currentTime + 0.3); // C6
+        gain.gain.setValueAtTime(0.15, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.8);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.8);
+      } catch (e) {}
+    }
+
+    function showPaidSuccess(data) {
+      if (isPaid) return;
+      isPaid = true;
+
+      playSuccessChime();
+
+      // Confetti burst
+      try {
+        confetti({
+          particleCount: 80,
+          spread: 70,
+          origin: { y: 0.6 }
+        });
+      } catch (e) {}
+
+      // Fill in receipt details
+      const inv = data.invoice || {};
+      const eb = data.ebarimt || {};
+
+      document.getElementById('receipt-lottery').textContent = eb.lottery || inv.ebarimt_lottery || 'АБ12345678';
+      document.getElementById('receipt-qr-data').textContent = eb.qr_data || inv.ebarimt_qr || '000000000000000000000000000000000';
+      if (inv.paid_at) {
+        document.getElementById('receipt-date').textContent = inv.paid_at;
+      }
+      if (eb.vat) {
+        document.getElementById('receipt-vat').textContent = (eb.vat).toLocaleString() + ' ₮';
+      }
+
+      // Transition views
+      const payView = document.getElementById('payment-view');
+      const succView = document.getElementById('success-view');
+
+      payView.style.opacity = '0';
+      payView.style.transform = 'scale(0.95)';
+      setTimeout(() => {
+        payView.classList.add('hidden');
+        succView.classList.remove('hidden');
+        setTimeout(() => {
+          succView.classList.remove('opacity-0', 'scale-95');
+          succView.classList.add('opacity-100', 'scale-100');
+        }, 50);
+      }, 300);
+    }
+
+    // Polling status
+    async function checkStatus() {
+      if (isPaid) return;
+      try {
+        const res = await fetch(`/api/fintech/invoices/${invoiceId}/status`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === 'PAID') {
+            showPaidSuccess(data);
+          }
+        }
+      } catch (e) {}
+    }
+
+    // Check every 1.5 seconds
+    const pollInterval = setInterval(() => {
+      if (!isPaid) checkStatus();
+      else clearInterval(pollInterval);
+    }, 1500);
+
+    // Initial check
+    checkStatus();
+
+    // Simulator function
+    async function simulatePayment() {
+      const btn = document.getElementById('btn-simulate');
+      btn.disabled = true;
+      btn.innerHTML = `<svg class="animate-spin h-4 w-4 text-emerald-400 mr-2" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg> Банкны webhook боловсруулж байна...`;
+
+      try {
+        const res = await fetch(`/api/fintech/invoices/${invoiceId}/simulate-pay`, {
+          method: 'POST'
+        });
+        const data = await res.json();
+        if (data.success) {
+          showPaidSuccess(data);
+        } else {
+          alert(data.message || 'Алдаа гарлаа');
+          btn.disabled = false;
+          btn.innerHTML = `<span>⚡ Төлбөр шалгах (Demo Simulate)</span>`;
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+        btn.disabled = false;
+        btn.innerHTML = `<span>⚡ Төлбөр шалгах (Demo Simulate)</span>`;
+      }
+    }
+
+    function closeOrBack() {
+      if (window.opener) {
+        window.close();
+      } else {
+        window.history.back();
+      }
+    }
+  </script>
+</body>
+</html>

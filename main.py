@@ -6,15 +6,17 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, Response, BackgroundTasks, Query, UploadFile, File, Form, Header, Cookie, HTTPException
+from fastapi import FastAPI, Request, Response, BackgroundTasks, Query, UploadFile, File, Form, Header, Cookie, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import httpx
 
 import database
 import agent
 import knowledge_base
 import sheets_service
+import fintech_service
 
 load_dotenv(override=True)
 
@@ -25,6 +27,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai_agent_app")
 
 app = FastAPI(title="Omnichannel AI Chatbot Agent & Multi-Tenant CRM Platform")
+
+os.makedirs("static/qrcodes", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1073,6 +1078,155 @@ async def update_keys(payload: Dict[str, str], request: Request):
 
     return {"status": "success", "message": "Тохиргоо амжилттай хадгалагдлаа!"}
 
+# -------------------------------------------------------------
+# 8. ФИНТЕК & ТӨЛБӨРИЙН АВТОМАТЖУУЛАЛТ (QPAY v2, DEEP LINKS, E-BARIMT)
+# -------------------------------------------------------------
+@app.get("/pay/{invoice_id}", response_class=HTMLResponse)
+async def serve_payment_page(invoice_id: str, request: Request):
+    """QPay төлбөрийн интерфэйс хуудас (QR код, банкны апп товчлуурууд, И-Баримт)"""
+    inv = database.get_invoice(invoice_id)
+    if not inv:
+        return HTMLResponse(
+            content="""<!DOCTYPE html><html lang="mn"><head><meta charset="UTF-8"><title>Нэхэмжлэх олдсонгүй</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 text-white min-h-screen flex items-center justify-center p-4"><div class="text-center p-8 bg-slate-900 rounded-2xl border border-slate-800"><h1 class="text-2xl font-bold mb-2">Нэхэмжлэх олдсонгүй</h1><p class="text-slate-400 text-sm">Төлбөрийн дугаар хүчингүй эсвэл цуцлагдсан байна.</p></div></body></html>""",
+            status_code=404
+        )
+
+    page = database.get_page(inv["page_id"]) or {}
+    company_name = page.get("name", "Гэрэгэ Системс")
+
+    import jinja2
+    template_loader = jinja2.FileSystemLoader(searchpath="templates")
+    template_env = jinja2.Environment(loader=template_loader)
+    template = template_env.get_template("payment.html")
+    rendered = template.render(
+        invoice_id=inv["invoice_id"],
+        amount=inv["amount"],
+        description=inv.get("description", "Үйлчилгээний төлбөр"),
+        company_name=company_name,
+        qr_image_url=inv.get("qr_image_url") or "",
+        deep_links=inv.get("deep_links") or []
+    )
+    return HTMLResponse(content=rendered)
+
+@app.get("/api/fintech/invoices/{invoice_id}/status")
+async def get_invoice_status_api(invoice_id: str):
+    """Төлбөрийн төлөвийг шалгах (Real-time Polling)"""
+    inv = database.get_invoice(invoice_id)
+    if not inv:
+        return JSONResponse(status_code=404, content={"error": "Invoice not found"})
+    return {
+        "status": inv.get("status", "PENDING"),
+        "invoice": inv,
+        "ebarimt": {
+            "lottery": inv.get("ebarimt_lottery"),
+            "qr_data": inv.get("ebarimt_qr")
+        }
+    }
+
+@app.post("/api/fintech/qpay/callback")
+async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Query(None)):
+    """Банк / QPay-ийн албан ёсны webhook хүлээн авагч"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    inv_id = invoice_id or body.get("sender_invoice_no") or body.get("invoice_id")
+    if not inv_id:
+        return JSONResponse(status_code=400, content={"error": "invoice_id missing"})
+    res = await fintech_service.process_successful_payment(inv_id, callback_data=body)
+    return res
+
+@app.post("/api/fintech/invoices/{invoice_id}/simulate-pay")
+async def simulate_invoice_payment_api(invoice_id: str):
+    """1 секундэд автоматаар баталгаажуулж турших (Simulator)"""
+    res = await fintech_service.process_successful_payment(invoice_id)
+    return res
+
+@app.get("/api/fintech/summary")
+async def get_fintech_summary_api(request: Request):
+    """Финтек хяналтын самбарын KPI тоон үзүүлэлтүүд"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    page_id = user.get("page_id")
+    return database.get_fintech_summary(page_id)
+
+@app.get("/api/fintech/invoices")
+async def get_fintech_invoices_api(
+    request: Request,
+    status: Optional[str] = Query(None),
+    limit: int = Query(50)
+):
+    """Нэхэмжлэхүүдийн жагсаалт"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    page_id = user.get("page_id")
+    return database.list_invoices(page_id=page_id, limit=limit, status=status)
+
+@app.post("/api/fintech/settings")
+async def save_fintech_settings_api(
+    payload: Dict[str, Any],
+    request: Request
+):
+    """QPay худалдаа эрхлэгчийн эрх болон И-Баримт тохиргоо хадгалах"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    page_id = payload.get("page_id") or user.get("page_id")
+    if not page_id:
+        raise HTTPException(status_code=400, detail="page_id required")
+    if user.get("role") == "client" and user.get("page_id") != page_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    success = database.update_page_qpay_settings(
+        page_id=page_id,
+        username=payload.get("qpay_username", ""),
+        password=payload.get("qpay_password", ""),
+        invoice_code=payload.get("qpay_invoice_code", ""),
+        ebarimt_enabled=payload.get("ebarimt_enabled", 1)
+    )
+    return {"success": success}
+
+@app.post("/api/fintech/create-invoice")
+async def create_invoice_manual_api(
+    payload: Dict[str, Any],
+    request: Request
+):
+    """Самбараас шууд төлбөрийн нэхэмжлэх үүсгэх"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    page_id = payload.get("page_id") or user.get("page_id") or database.DEFAULT_PAGE_ID
+    amount = int(payload.get("amount", 10000))
+    desc = payload.get("description", "Үйлчилгээний төлбөр")
+    base_url = str(request.base_url)
+    order = await fintech_service.create_payment_order(
+        page_id=page_id,
+        amount=amount,
+        description=desc,
+        sender_id=payload.get("sender_id", "admin_manual"),
+        channel="manual",
+        base_url=base_url
+    )
+    return order
+
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
 @app.get("/admin", response_class=HTMLResponse)
@@ -1145,7 +1299,7 @@ async def serve_branch_portal_or_page(branch_slug: str):
     Админы эрх задруулахгүйгээр зөвхөн тухайн салбарын эрхээр эсвэл нэвтрэх цонхоор нээнэ.
     """
     slug_clean = branch_slug.strip().lower()
-    if slug_clean in {"favicon.ico", "robots.txt", "widget.js", "api", "webhook", "admin", "dashboard", "privacy", "terms"}:
+    if slug_clean in {"favicon.ico", "robots.txt", "widget.js", "api", "webhook", "admin", "dashboard", "privacy", "terms", "pay", "static"}:
         raise HTTPException(status_code=404, detail="Not found")
 
     all_pages = database.get_all_pages()

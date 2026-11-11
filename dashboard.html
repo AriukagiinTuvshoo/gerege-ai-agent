@@ -304,6 +304,12 @@
           <span>Харилцагчийн сан</span>
         </button>
 
+        <button onclick="switchTab('fintech')" id="tab-btn-fintech" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-qrcode text-emerald-600 text-xs"></i>
+          <span>Финтек & QPay</span>
+          <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-emerald-100 text-emerald-700">v2</span>
+        </button>
+
         <button onclick="switchTab('social')" id="tab-btn-social" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
           <i class="fa-solid fa-pen-nib text-stone-400 text-xs"></i>
           <span>Нийтлэлийн бэлдэц</span>
@@ -698,6 +704,112 @@
             </thead>
             <tbody id="leads-table-body" class="divide-y divide-stone-100">
               <tr><td colspan="8" class="p-6 text-center text-stone-500">Уншиж байна...</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ==================== TAB: FINTECH & QPAY v2 (E-BARIMT) ==================== -->
+    <div id="tab-fintech" class="tab-content hidden space-y-6">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
+        
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 uppercase tracking-wider">
+                Fintech Engine v2
+              </span>
+              <span class="text-xs text-stone-400">• QPay, Deep Links, Webhook & И-Баримт POSAPI 3.0</span>
+            </div>
+            <h2 class="text-xl font-extrabold text-stone-900 tracking-tight flex items-center gap-2">
+              <i class="fa-solid fa-qrcode text-emerald-600"></i>
+              <span>Төлбөр & Финтек Автоматжуулалт</span>
+            </h2>
+            <p class="text-xs text-stone-500 mt-0.5">Банкны апп 1 товшилтоор нээгдэж, хүний оролцоогүй 1 секундэд автоматаар баталгаажна.</p>
+          </div>
+
+          <div class="flex items-center gap-2.5">
+            <button onclick="openCreateInvoiceModal()" class="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold transition flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-plus text-xs"></i>
+              <span>Шинэ QPay нэхэмжлэх</span>
+            </button>
+            <button onclick="openQPaySettingsModal()" class="px-3.5 py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-800 border border-stone-200 text-xs font-semibold transition flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-gear text-xs"></i>
+              <span>QPay & Татвар тохиргоо</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 4 KPI Metrics Cards -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div class="p-4 rounded-2xl bg-emerald-50/60 border border-emerald-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-700 flex items-center justify-center text-xl font-bold flex-shrink-0">
+              ₮
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-emerald-900 block">Нийт Төлөгдсөн Орлого</span>
+              <span id="fintech-total-rev" class="text-xl font-extrabold text-emerald-950 font-mono tracking-tight">0 ₮</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-blue-50/60 border border-blue-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-blue-500/20 text-blue-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-bolt"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-blue-900 block">Өнөөдрийн Орлого</span>
+              <span id="fintech-today-rev" class="text-xl font-extrabold text-blue-950 font-mono tracking-tight">0 ₮</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-amber-50/60 border border-amber-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-amber-500/20 text-amber-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-clock-rotate-left"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-amber-900 block">Хүлээгдэж буй нэхэмжлэх</span>
+              <span id="fintech-pending-count" class="text-xl font-extrabold text-amber-950 font-mono tracking-tight">0</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-red-50/60 border border-red-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-red-500/20 text-red-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-receipt"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-red-900 block">И-Баримт Олголт (POSAPI)</span>
+              <span id="fintech-ebarimt-count" class="text-xl font-extrabold text-red-950 font-mono tracking-tight">0 баримт</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Invoices Table -->
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-bold text-stone-900 flex items-center gap-2">
+            <span>Сүүлийн гүйлгээ & нэхэмжлэхүүд</span>
+            <span class="text-[11px] font-normal text-stone-400" id="invoices-count-label">(0 нэхэмжлэх)</span>
+          </h3>
+          <button onclick="loadFintechData()" class="text-xs text-stone-500 hover:text-stone-900 flex items-center gap-1">
+            <i class="fa-solid fa-rotate-right text-[10px]"></i>
+            <span>Шинэчлэх</span>
+          </button>
+        </div>
+
+        <div class="overflow-x-auto rounded-2xl border border-stone-200/60">
+          <table class="w-full text-left text-xs text-stone-800">
+            <thead class="bg-[#F8F6F0] text-stone-600 uppercase font-semibold border-b border-stone-200 text-[11px]">
+              <tr>
+                <th class="p-3.5">Огноо</th>
+                <th class="p-3.5">Нэхэмжлэхийн дугаар</th>
+                <th class="p-3.5">Утга</th>
+                <th class="p-3.5">Дүн</th>
+                <th class="p-3.5">Суваг</th>
+                <th class="p-3.5">Төлөв</th>
+                <th class="p-3.5">И-Баримт</th>
+                <th class="p-3.5 text-right">Үйлдэл</th>
+              </tr>
+            </thead>
+            <tbody id="invoices-table-body" class="divide-y divide-stone-100">
+              <tr><td colspan="8" class="p-6 text-center text-stone-400">Уншиж байна...</td></tr>
             </tbody>
           </table>
         </div>
@@ -1392,6 +1504,105 @@
     </div>
   </div>
 
+  <!-- ==================== MODAL: CREATE MANUAL QPAY INVOICE ==================== -->
+  <div id="create-invoice-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
+    <div class="glass-card max-w-md w-full rounded-3xl p-6 sm:p-7 border border-stone-200/80 shadow-2xl space-y-5 animate-in fade-in zoom-in-95 duration-200 bg-white">
+      <div class="flex items-center justify-between pb-3 border-b border-stone-100">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center font-bold text-sm">
+            QP
+          </div>
+          <div>
+            <h3 class="text-sm font-extrabold text-stone-900">Шинэ QPay нэхэмжлэх</h3>
+            <p class="text-[11px] text-stone-400">Харилцагчид илгээх төлбөрийн холбоос үүсгэх</p>
+          </div>
+        </div>
+        <button onclick="closeCreateInvoiceModal()" class="text-stone-400 hover:text-stone-600 text-lg">&times;</button>
+      </div>
+
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block font-semibold text-stone-700 mb-1">Төлөх дүн (Төгрөгөөр)</label>
+          <div class="relative">
+            <input type="number" id="manual-inv-amount" value="15000" step="500" class="w-full px-3.5 py-2.5 rounded-xl border border-stone-200 font-mono font-bold text-stone-900 text-base focus:outline-none focus:border-emerald-500 pl-8">
+            <span class="absolute left-3 top-1/2 -translate-y-1/2 font-bold text-stone-400">₮</span>
+          </div>
+        </div>
+
+        <div>
+          <label class="block font-semibold text-stone-700 mb-1">Гүйлгээний утга / Барааны нэр</label>
+          <input type="text" id="manual-inv-desc" value="Үйлчилгээний төлбөр" class="w-full px-3.5 py-2 rounded-xl border border-stone-200 text-stone-900 focus:outline-none focus:border-emerald-500">
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-stone-100">
+        <button onclick="closeCreateInvoiceModal()" class="px-4 py-2 rounded-xl text-stone-600 hover:bg-stone-100 text-xs font-semibold transition">
+          Цуцлах
+        </button>
+        <button onclick="submitManualInvoice()" id="btn-submit-manual-inv" class="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-sm">
+          <span>Нэхэмжлэх үүсгэх</span>
+          <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== MODAL: QPAY & E-BARIMT SETTINGS ==================== -->
+  <div id="qpay-settings-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
+    <div class="glass-card max-w-lg w-full rounded-3xl p-6 sm:p-7 border border-stone-200/80 shadow-2xl space-y-5 animate-in fade-in zoom-in-95 duration-200 bg-white">
+      <div class="flex items-center justify-between pb-3 border-b border-stone-100">
+        <div class="flex items-center gap-2.5">
+          <div class="w-9 h-9 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center font-bold text-base">
+            <i class="fa-solid fa-gear"></i>
+          </div>
+          <div>
+            <h3 class="text-sm font-extrabold text-stone-900">QPay v2 & И-Баримт тохиргоо</h3>
+            <p class="text-[11px] text-stone-400">Байгууллагын QPay худалдаа эрхлэгчийн эрх болон НӨАТ-ын холболт</p>
+          </div>
+        </div>
+        <button onclick="closeQPaySettingsModal()" class="text-stone-400 hover:text-stone-600 text-lg">&times;</button>
+      </div>
+
+      <div class="space-y-3.5 text-xs">
+        <div class="p-3 rounded-xl bg-amber-50/70 border border-amber-200/80 text-amber-800 text-[11px] leading-relaxed">
+          <i class="fa-solid fa-circle-info mr-1"></i>
+          Хэрэв танайд QPay-ийн албан ёсны мерчант эрх хараахан байхгүй бол хоосон үлдээж болно. Систем <b>Smart Sandbox / Simulator</b> горимоор QR код болон банкны апп холбоосыг автоматаар ажиллуулна.
+        </div>
+
+        <div>
+          <label class="block font-semibold text-stone-700 mb-1">QPay Хэрэглэгчийн нэр (Username)</label>
+          <input type="text" id="setting-qpay-username" placeholder="Жишээ: TUVSHOK_MERCHANT" class="w-full px-3.5 py-2 rounded-xl border border-stone-200 text-stone-900 font-mono focus:outline-none focus:border-emerald-500">
+        </div>
+
+        <div>
+          <label class="block font-semibold text-stone-700 mb-1">QPay Нууц үг (Password)</label>
+          <input type="password" id="setting-qpay-password" placeholder="••••••••••••" class="w-full px-3.5 py-2 rounded-xl border border-stone-200 text-stone-900 font-mono focus:outline-none focus:border-emerald-500">
+        </div>
+
+        <div>
+          <label class="block font-semibold text-stone-700 mb-1">QPay Invoice Code</label>
+          <input type="text" id="setting-qpay-code" placeholder="Жишээ: TUVSHOK_INVOICE" class="w-full px-3.5 py-2 rounded-xl border border-stone-200 text-stone-900 font-mono focus:outline-none focus:border-emerald-500">
+        </div>
+
+        <div class="pt-2">
+          <label class="flex items-center gap-2 cursor-pointer select-none">
+            <input type="checkbox" id="setting-ebarimt-enabled" checked class="rounded text-emerald-600 focus:ring-emerald-500 w-4 h-4">
+            <span class="font-semibold text-stone-800 text-xs">Төлбөр төлөгдмөгц 33 оронтой И-Баримт автоматаар олгох (POSAPI 3.0)</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-stone-100">
+        <button onclick="closeQPaySettingsModal()" class="px-4 py-2 rounded-xl text-stone-600 hover:bg-stone-100 text-xs font-semibold transition">
+          Цуцлах
+        </button>
+        <button onclick="saveQPaySettings()" id="btn-save-qpay-settings" class="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-sm">
+          <span>Хадгалах</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== MODAL: AUTHENTICATION LOGIN OVERLAY ==================== -->
   <div id="auth-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
     <div class="glass-card max-w-md w-full rounded-3xl p-8 border border-white/[0.1] space-y-6 shadow-2xl animate-in fade-in zoom-in-95 duration-200">
@@ -1500,6 +1711,7 @@
 
       if (tabId === 'inbox') loadSessions();
       if (tabId === 'leads') loadLeads();
+      if (tabId === 'fintech') loadFintechData();
       if (tabId === 'links') loadKnowledge();
     }
 
@@ -1884,6 +2096,194 @@
         el.select();
         navigator.clipboard.writeText(el.value);
         showToast('Verify Token хуулагдлаа!');
+      }
+    }
+
+    // ==================== FINTECH & QPAY v2 MODULE ====================
+    async function loadFintechData() {
+      try {
+        const sumRes = await fetch('/api/fintech/summary');
+        if (sumRes.ok) {
+          const sum = await sumRes.json();
+          document.getElementById('fintech-total-rev').textContent = (sum.total_revenue || 0).toLocaleString() + ' ₮';
+          document.getElementById('fintech-today-rev').textContent = (sum.today_revenue || 0).toLocaleString() + ' ₮';
+          document.getElementById('fintech-pending-count').textContent = (sum.pending_count || 0) + ' нэхэмжлэх';
+          document.getElementById('fintech-ebarimt-count').textContent = (sum.paid_count || 0) + ' баримт';
+        }
+
+        const invRes = await fetch('/api/fintech/invoices?limit=50');
+        if (invRes.ok) {
+          const invoices = await invRes.json();
+          renderInvoicesTable(invoices);
+        }
+      } catch (e) {
+        console.error('loadFintechData error:', e);
+      }
+    }
+
+    function renderInvoicesTable(invoices) {
+      const tbody = document.getElementById('invoices-table-body');
+      document.getElementById('invoices-count-label').textContent = `(${invoices.length} нэхэмжлэх)`;
+
+      if (!invoices || invoices.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="8" class="p-8 text-center text-stone-400">Одоогоор төлбөрийн нэхэмжлэх үүсээгүй байна.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = invoices.map(inv => {
+        const isPaid = inv.status === 'PAID';
+        const statusBadge = isPaid
+          ? `<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">✓ Төлөгдсөн</span>`
+          : `<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800">⏳ Хүлээгдэж буй</span>`;
+
+        const lotteryBadge = inv.ebarimt_lottery
+          ? `<span class="font-mono text-[11px] font-bold text-red-700 bg-red-50 border border-red-200 px-1.5 py-0.5 rounded">${escapeHtml(inv.ebarimt_lottery)}</span>`
+          : `<span class="text-stone-300">-</span>`;
+
+        const dateStr = (inv.created_at || '').substring(0, 16).replace('T', ' ');
+
+        return `
+          <tr class="hover:bg-stone-50/80 transition">
+            <td class="p-3.5 text-stone-500 font-mono text-[11px] whitespace-nowrap">${dateStr}</td>
+            <td class="p-3.5 font-mono font-semibold text-stone-900">
+              <a href="/pay/${inv.invoice_id}" target="_blank" class="hover:text-emerald-600 hover:underline flex items-center gap-1">
+                <span>${escapeHtml(inv.invoice_id)}</span>
+                <i class="fa-solid fa-arrow-up-right-from-square text-[9px] text-stone-400"></i>
+              </a>
+            </td>
+            <td class="p-3.5 text-stone-700 font-medium max-w-xs truncate">${escapeHtml(inv.description || '')}</td>
+            <td class="p-3.5 font-bold font-mono text-stone-950 text-sm whitespace-nowrap">${(inv.amount || 0).toLocaleString()} ₮</td>
+            <td class="p-3.5 text-stone-500 uppercase text-[10px] font-semibold">${escapeHtml(inv.channel || 'web')}</td>
+            <td class="p-3.5 whitespace-nowrap">${statusBadge}</td>
+            <td class="p-3.5 whitespace-nowrap">${lotteryBadge}</td>
+            <td class="p-3.5 text-right whitespace-nowrap space-x-1">
+              <a href="/pay/${inv.invoice_id}" target="_blank" class="px-2.5 py-1 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 text-[11px] font-semibold inline-flex items-center gap-1">
+                <span>Хуудас</span>
+              </a>
+              ${!isPaid ? `
+                <button onclick="simulateInvoicePayment('${inv.invoice_id}')" class="px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-[11px] font-bold inline-flex items-center gap-1" title="1 секундэд автоматаар баталгаажуулж турших">
+                  <span>⚡ Төлөх (Sim)</span>
+                </button>
+              ` : ''}
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function simulateInvoicePayment(invoiceId) {
+      if (!confirm(`'${invoiceId}' дугаартай нэхэмжлэхийг 1 секундэд автоматаар төлөгдсөн төлөвт оруулж, И-Баримт олгох уу?`)) return;
+      try {
+        const res = await fetch(`/api/fintech/invoices/${encodeURIComponent(invoiceId)}/simulate-pay`, {
+          method: 'POST'
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(`🎉 Төлбөр 1 секундэд амжилттай баталгаажлаа! И-Баримт: ${data.ebarimt?.lottery || ''}`);
+          loadFintechData();
+        } else {
+          alert(data.message || 'Алдаа гарлаа');
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      }
+    }
+
+    function openCreateInvoiceModal() {
+      document.getElementById('create-invoice-modal').classList.remove('hidden');
+    }
+    function closeCreateInvoiceModal() {
+      document.getElementById('create-invoice-modal').classList.add('hidden');
+    }
+
+    async function submitManualInvoice() {
+      const amountInput = document.getElementById('manual-inv-amount');
+      const descInput = document.getElementById('manual-inv-desc');
+      const btn = document.getElementById('btn-submit-manual-inv');
+
+      const amount = parseInt(amountInput.value) || 0;
+      const desc = descInput.value.trim() || 'Үйлчилгээний төлбөр';
+
+      if (amount <= 0) {
+        alert('Төлөх дүнгээ оруулна уу');
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerText = 'Үүсгэж байна...';
+
+      try {
+        const res = await fetch('/api/fintech/create-invoice', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            page_id: activePageId,
+            amount: amount,
+            description: desc
+          })
+        });
+        const inv = await res.json();
+        closeCreateInvoiceModal();
+        showToast('QPay нэхэмжлэх амжилттай үүслээ!');
+        loadFintechData();
+        if (inv.pay_url) {
+          window.open(inv.pay_url, '_blank');
+        }
+      } catch (e) {
+        alert('Алдаа гарлаа: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<span>Нэхэмжлэх үүсгэх</span> <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>`;
+      }
+    }
+
+    function openQPaySettingsModal() {
+      const currentPage = allPages.find(p => p.page_id === activePageId) || {};
+      document.getElementById('setting-qpay-username').value = currentPage.qpay_username || '';
+      document.getElementById('setting-qpay-password').value = currentPage.qpay_password || '';
+      document.getElementById('setting-qpay-code').value = currentPage.qpay_invoice_code || '';
+      document.getElementById('setting-ebarimt-enabled').checked = (currentPage.ebarimt_enabled !== 0);
+      document.getElementById('qpay-settings-modal').classList.remove('hidden');
+    }
+    function closeQPaySettingsModal() {
+      document.getElementById('qpay-settings-modal').classList.add('hidden');
+    }
+
+    async function saveQPaySettings() {
+      const u = document.getElementById('setting-qpay-username').value.trim();
+      const p = document.getElementById('setting-qpay-password').value.trim();
+      const c = document.getElementById('setting-qpay-code').value.trim();
+      const eb = document.getElementById('setting-ebarimt-enabled').checked ? 1 : 0;
+      const btn = document.getElementById('btn-save-qpay-settings');
+
+      btn.disabled = true;
+      btn.innerText = 'Хадгалж байна...';
+
+      try {
+        const res = await fetch('/api/fintech/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            page_id: activePageId,
+            qpay_username: u,
+            qpay_password: p,
+            qpay_invoice_code: c,
+            ebarimt_enabled: eb
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          closeQPaySettingsModal();
+          showToast('QPay & И-Баримт тохиргоо амжилттай хадгалагдлаа!');
+          loadPages();
+        } else {
+          alert('Хадгалахад алдаа гарлаа');
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerText = 'Хадгалах';
       }
     }
 

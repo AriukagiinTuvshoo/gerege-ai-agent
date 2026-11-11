@@ -10,6 +10,7 @@ from PIL import Image
 import database
 import knowledge_base
 import sheets_service
+import fintech_service
 
 load_dotenv(override=True)
 
@@ -115,8 +116,10 @@ def build_system_instruction_for_page(page_data: Optional[Dict[str, Any]] = None
 
 ТАНЫ ҮҮРЭГ БА ДҮРЭМ:
 1. Хэрэв хэрэглэгч нэр, утсаа өгвөл заавал 'register_customer' багажийг дуудаж баазад хадгална.
-2. Хэрэв хэрэглэгч гүйлгээний баримтын зураг явуулсан эсвэл гүйлгээ хийснээ баталгаажуулбал баярласнаа илэрхийлээд дээрх албан ёсны Telegram болон Facebook холбоосыг шууд илгээнэ.
-3. БОДИТ ЦАГИЙН GOOGLE SHEETS & БАРАА/КАРГО ШАЛГАЛТ:
+2. ТӨЛБӨР БА QPAY АВТОМАТЖУУЛАЛТ:
+   - Хэрэв хэрэглэгч "үйлчилгээ авъя", "төлбөрөө төлье", "данс өгөөч", "qpay линк" гэх мэтээр төлбөр төлөх хүсэлт гаргавал манай QPay автомат системээр Хаан, Голомт, М банкны апп шууд нээгдэж 1 секундэд автоматаар баталгааждаг болохыг тайлбарлаж 'create_payment_invoice' багажийг дуудна.
+3. Хэрэв хэрэглэгч гүйлгээний баримтын зураг явуулсан эсвэл гүйлгээ хийснээ баталгаажуулбал баярласнаа илэрхийлээд дээрх албан ёсны Telegram болон Facebook холбоосыг шууд илгээнэ.
+4. БОДИТ ЦАГИЙН GOOGLE SHEETS & БАРАА/КАРГО ШАЛГАЛТ:
    - Хэрэв хэрэглэгч барааны дугаар, карго код (жишээ нь: 1254, CRG...), утасны дугаараа бичиж бараа ирсэн эсэхийг асуувал, танд хавсаргасан [БОДИТ ЦАГИЙН ХОЛБОГДСОН GOOGLE SHEETS МЭДЭЭЛЭЛ]-ийг хатуу баримталж хариулна.
    - Хэрэв хүснэгтэд бараа нь ирсэн, олгоход бэлэн гэж байвал хаанаас авах салбар, төлөх төлбөрийг нь тодорхой хэлнэ.
    - Хэрэв тухайн код олдсонгүй гэсэн мэдээлэл ирвэл дугаараа зөв эсэхийг шалгах, эсвэл одоогоор салбар дээр хараахан бууж амжаагүй байгааг эелдэг тайлбарлаж өгнө үү.
@@ -362,6 +365,7 @@ class AIAgent:
         # 4. ЭНГИЙН ТЕКСТ МЕССЕЖ (GEMINI ЧАТ)
         registered = False
         reg_info = None
+        invoice_order = None
 
         # Олон хүснэгт (Google Sheets болон оруулсан Excel файлууд) дундаас хайлт хийх
         sheet_context = ""
@@ -409,6 +413,19 @@ class AIAgent:
                         res.append(f"[{sheet_name}] -> {pairs}")
                     return "\n---\n".join(res)
 
+                def create_payment_invoice(amount: int = 15000, description: str = "") -> str:
+                    """Хэрэглэгч төлбөр төлөх, үйлчилгээ худалдан авах, данс нэхэмжлэх үед QPay QR код болон банкны апп холбоос үүсгэх"""
+                    nonlocal invoice_order
+                    desc = description or f"{page_name} үйлчилгээний төлбөр"
+                    invoice_order = fintech_service.create_payment_order_sync(
+                        page_id=page_id,
+                        amount=int(amount),
+                        description=desc,
+                        sender_id=sender_id,
+                        channel=channel
+                    )
+                    return f"QPay нэхэмжлэх үүслээ. Дугаар: {invoice_order['invoice_id']}, Төлөх холбоос: {invoice_order['pay_url']}"
+
                 # Хэрэглэгчийн санах ойг татаж авах (Mem0 & Zep загвар)
                 user_memory = database.get_user_memory(page_id, sender_id)
 
@@ -416,7 +433,7 @@ class AIAgent:
                 if session_key not in self.chat_sessions:
                     config = types.GenerateContentConfig(
                         system_instruction=build_system_instruction_for_page(page_data, user_memory=user_memory),
-                        tools=[register_customer, check_sheet_cargo_status],
+                        tools=[register_customer, check_sheet_cargo_status, create_payment_invoice],
                         temperature=0.7,
                     )
                     self.chat_sessions[session_key] = client.chats.create(
@@ -437,7 +454,7 @@ class AIAgent:
                     self.chat_sessions.pop(session_key, None)
                     config = types.GenerateContentConfig(
                         system_instruction=build_system_instruction_for_page(page_data, user_memory=user_memory),
-                        tools=[register_customer, check_sheet_cargo_status],
+                        tools=[register_customer, check_sheet_cargo_status, create_payment_invoice],
                         temperature=0.7,
                     )
                     new_chat = client.chats.create(
@@ -455,6 +472,33 @@ class AIAgent:
                     clean_reply = re.sub(r'<thought>.*?</thought>', '', reply_text, flags=re.DOTALL).strip()
                     if clean_reply:
                         reply_text = clean_reply
+
+                # 5. ТӨЛБӨРИЙН ХҮСЭЛТ ШАЛГАХ (QPAY INTENT FALLBACK)
+                payment_keywords = ["авъя", "үйлчилгээ авъя", "төлбөр төлье", "төлбөрөө төлье", "данс өгөөч", "дансны дугаар", "данс", "qpay", "төлөх", "хандив өгье", "холбогдох эрх"]
+                is_payment_intent = any(pk in text.lower() for pk in payment_keywords)
+
+                if is_payment_intent and not invoice_order:
+                    default_amount = 15000
+                    if "хандив" in text.lower() or "кино" in text.lower():
+                        default_amount = 10000
+                    amount_match = re.search(r'(\d+)[kк]', text.lower())
+                    if amount_match:
+                        default_amount = int(amount_match.group(1)) * 1000
+
+                    invoice_order = fintech_service.create_payment_order_sync(
+                        page_id=page_id,
+                        amount=default_amount,
+                        description=f"{page_name} төлбөр",
+                        sender_id=sender_id,
+                        channel=channel
+                    )
+
+                if invoice_order and invoice_order.get("pay_url"):
+                    reply_text += (
+                        f"\n\n⚡ **QPay Төлбөрийн Шууд Холбоос:**\n"
+                        f"👉 **[ЭНД ДАРЖ ТӨЛӨХ]({invoice_order['pay_url']})**\n\n"
+                        f"*(Утсан дээрээ дээрх линк дээр дармагц Хаан, Голомт SocialPay, М банк гэх мэт банкны апп шууд нээгдэнэ. Төлбөр хийгдсэн секундын дотор 100% автоматаар баталгаажин И-Баримт очих болно! 🎉)*"
+                    )
 
                 # Токен тоолох ба хуудасны баазад нэмэх
                 tokens_spent = self.estimate_tokens(text, reply_text)
@@ -487,6 +531,7 @@ class AIAgent:
                     "reply": reply_text,
                     "registered": registered,
                     "reg_info": reg_info,
+                    "invoice_order": invoice_order,
                     "model": self.model_name,
                     "is_custom_key": is_custom_key,
                     "tokens_spent": tokens_spent

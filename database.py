@@ -150,6 +150,29 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_memories_page_user ON user_memories (page_id, user_id)")
 
+    # 6. Финтек & Төлбөрийн нэхэмжлэхүүд (QPay v2 & Bank Deep Links)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id TEXT UNIQUE NOT NULL,
+            page_id TEXT NOT NULL,
+            sender_id TEXT,
+            channel TEXT DEFAULT 'web',
+            amount INTEGER NOT NULL,
+            description TEXT,
+            status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PAID', 'EXPIRED', 'CANCELLED'
+            qr_text TEXT,
+            qr_image_url TEXT,
+            deep_links_json TEXT,
+            ebarimt_lottery TEXT,
+            ebarimt_qr TEXT,
+            paid_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_page_id ON invoices (page_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_invoice_id ON invoices (invoice_id)")
+
     # Багануудыг аюулгүй нэмэх (Migration check)
     tables_to_migrate = [
         ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
@@ -161,7 +184,11 @@ def init_db():
         ("pages", "client_salt", "TEXT"),
         ("pages", "client_magic_token", "TEXT"),
         ("pages", "monthly_token_limit", "INTEGER DEFAULT 100000"),
-        ("pages", "tokens_used", "INTEGER DEFAULT 0")
+        ("pages", "tokens_used", "INTEGER DEFAULT 0"),
+        ("pages", "qpay_username", "TEXT DEFAULT ''"),
+        ("pages", "qpay_password", "TEXT DEFAULT ''"),
+        ("pages", "qpay_invoice_code", "TEXT DEFAULT ''"),
+        ("pages", "ebarimt_enabled", "INTEGER DEFAULT 1")
     ]
     for table, col, col_def in tables_to_migrate:
         try:
@@ -854,6 +881,160 @@ def upsert_user_memory(
         
     conn.commit()
     conn.close()
+
+# -------------------------------------------------------------
+# 6. ФИНТЕК & ТӨЛБӨРИЙН УДИРДЛАГА (QPAY v2, DEEP LINKS, E-BARIMT)
+# -------------------------------------------------------------
+def create_invoice(
+    page_id: str,
+    amount: int,
+    description: str = "Үйлчилгээний төлбөр",
+    sender_id: Optional[str] = None,
+    channel: str = "web",
+    qr_text: str = "",
+    qr_image_url: str = "",
+    deep_links: Optional[List[Dict[str, Any]]] = None,
+    invoice_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Шинэ төлбөрийн нэхэмжлэх үүсгэх"""
+    if not invoice_id:
+        import uuid
+        invoice_id = f"INV-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+    
+    deep_links_json = json.dumps(deep_links or [], ensure_ascii=False)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO invoices (
+            invoice_id, page_id, sender_id, channel, amount, description,
+            status, qr_text, qr_image_url, deep_links_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+    """, (
+        invoice_id, str(page_id), sender_id, channel, int(amount), description,
+        qr_text, qr_image_url, deep_links_json
+    ))
+    conn.commit()
+    conn.close()
+    return get_invoice(invoice_id) or {}
+
+def get_invoice(invoice_id: str) -> Optional[Dict[str, Any]]:
+    """Нэхэмжлэхийн мэдээлэл авах"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM invoices WHERE invoice_id = ?", (invoice_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["deep_links"] = json.loads(d.get("deep_links_json") or "[]")
+    except Exception:
+        d["deep_links"] = []
+    return d
+
+def mark_invoice_paid(
+    invoice_id: str,
+    ebarimt_lottery: str = "",
+    ebarimt_qr: str = ""
+) -> Optional[Dict[str, Any]]:
+    """Нэхэмжлэхийг төлөгдсөн төлөвт оруулах ба И-Баримт олгох"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    paid_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+        UPDATE invoices
+        SET status = 'PAID', paid_at = ?, ebarimt_lottery = ?, ebarimt_qr = ?
+        WHERE invoice_id = ?
+    """, (paid_at, ebarimt_lottery, ebarimt_qr, invoice_id))
+    conn.commit()
+    conn.close()
+    return get_invoice(invoice_id)
+
+def list_invoices(page_id: Optional[str] = None, limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Нэхэмжлэхүүдийн жагсаалт авах"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    query = "SELECT * FROM invoices"
+    params = []
+    conditions = []
+    if page_id:
+        conditions.append("page_id = ?")
+        params.append(str(page_id))
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+        
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+        
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    res = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["deep_links"] = json.loads(d.get("deep_links_json") or "[]")
+        except Exception:
+            d["deep_links"] = []
+        res.append(d)
+    return res
+
+def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Финтек хяналтын самбарын тоон үзүүлэлтүүд (KPIs)"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    where_clause = " WHERE page_id = ?" if page_id else ""
+    params = (str(page_id),) if page_id else ()
+    
+    # Нийт төлөгдсөн дүн
+    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PAID'", params)
+    paid_sum, paid_count = cursor.fetchone()
+    
+    # Хүлээгдэж буй нэхэмжлэхүүд
+    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PENDING'", params)
+    pending_sum, pending_count = cursor.fetchone()
+    
+    # Өнөөдрийн орлого
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_params = (str(page_id), f"{today_str}%") if page_id else (f"{today_str}%",)
+    today_where = " WHERE page_id = ? AND status = 'PAID' AND paid_at LIKE ?" if page_id else " WHERE status = 'PAID' AND paid_at LIKE ?"
+    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{today_where}", today_params)
+    today_sum, today_count = cursor.fetchone()
+
+    conn.close()
+    return {
+        "total_revenue": int(paid_sum or 0),
+        "paid_count": int(paid_count or 0),
+        "pending_revenue": int(pending_sum or 0),
+        "pending_count": int(pending_count or 0),
+        "today_revenue": int(today_sum or 0),
+        "today_count": int(today_count or 0)
+    }
+
+def update_page_qpay_settings(page_id: str, username: str, password: str, invoice_code: str, ebarimt_enabled: int = 1) -> bool:
+    """Хуудасны QPay тохиргоог хадгалах"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE pages
+        SET qpay_username = ?, qpay_password = ?, qpay_invoice_code = ?, ebarimt_enabled = ?
+        WHERE page_id = ?
+    """, (username.strip(), password.strip(), invoice_code.strip(), int(ebarimt_enabled), str(page_id)))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
 
 if __name__ == "__main__":
     init_db()
