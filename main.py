@@ -2,6 +2,8 @@ import os
 import io
 import json
 import logging
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
@@ -18,6 +20,7 @@ import knowledge_base
 import sheets_service
 import fintech_service
 import cargo_service
+import executive_bot_service
 
 load_dotenv(override=True)
 
@@ -27,7 +30,48 @@ database.init_db()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai_agent_app")
 
-app = FastAPI(title="Omnichannel AI Chatbot Agent & Multi-Tenant CRM Platform")
+async def executive_scheduler_loop():
+    """Өглөө бүр товлосон цагт (анхдагчаар 08:30) бүх салбар хуудсын эздэд өдрийн тайлан автоматаар илгээх цикл"""
+    logger.info("Executive Daily Briefing scheduler loop started.")
+    last_sent_date = {}  # page_id -> date_str
+    while True:
+        try:
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            current_hm = now.strftime("%H:%M")
+
+            pages = database.get_all_pages()
+            for p in pages:
+                pid = p.get("page_id")
+                if not pid:
+                    continue
+                enabled = p.get("daily_report_enabled", 1)
+                target_time = p.get("daily_report_time", "08:30")
+
+                if enabled and current_hm == target_time:
+                    if last_sent_date.get(pid) != today_str:
+                        logger.info(f"Triggering scheduled daily executive report for page {pid} at {current_hm}")
+                        res = await executive_bot_service.send_executive_report(page_id=pid)
+                        logger.info(f"Scheduled report sent for {pid}: {res}")
+                        last_sent_date[pid] = today_str
+        except Exception as e:
+            logger.error(f"Executive scheduler error: {e}")
+        await asyncio.sleep(45)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler_task = asyncio.create_task(executive_scheduler_loop())
+    yield
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(
+    title="Omnichannel AI Chatbot Agent & Multi-Tenant CRM Platform",
+    lifespan=lifespan
+)
 
 os.makedirs("static/qrcodes", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -71,16 +115,20 @@ async def send_meta_message(recipient_id: str, text: str, page_token: Optional[s
     except Exception as e:
         logger.error(f"Meta илгээх алдаа: {e}")
 
-async def send_telegram_message(chat_id: Any, text: str):
-    """Telegram хэрэглэгч рүү хариу илгээх"""
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+async def send_telegram_message(chat_id: Any, text: str, page_id: Optional[str] = None):
+    """Telegram хэрэглэгч рүү хариу илгээх (Markdown дэмжлэгтэй)"""
+    page = database.get_page(page_id) if page_id else {}
+    bot_token = (page.get("telegram_bot_token") if page else None) or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not bot_token or not text:
         return
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(url, json=payload, timeout=10.0)
+            if res.status_code != 200:
+                payload.pop("parse_mode", None)
+                await client.post(url, json=payload, timeout=10.0)
             logger.info(f"Telegram status: {res.status_code}")
     except Exception as e:
         logger.error(f"Telegram илгээх алдаа: {e}")
@@ -309,7 +357,7 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
         return Response(content="Error", status_code=500)
 
 # -------------------------------------------------------------
-# 5. TELEGRAM WEBHOOK
+# 5. TELEGRAM WEBHOOK (Customer Chatbot & Owner Executive Commands)
 # -------------------------------------------------------------
 @app.post("/telegram/webhook")
 async def telegram_webhook_events(request: Request, background_tasks: BackgroundTasks):
@@ -320,6 +368,17 @@ async def telegram_webhook_events(request: Request, background_tasks: Background
         user_text = message.get("text", "")
         
         if chat_id and user_text:
+            # 1. Эхлээд эзний интерактив комманд мөн эсэхийг шалгах (/start, /today, /report, /qpay, /cargo, /help)
+            owner_reply = await executive_bot_service.handle_owner_command(
+                chat_id=str(chat_id),
+                text=user_text,
+                page_id=database.DEFAULT_PAGE_ID
+            )
+            if owner_reply:
+                background_tasks.add_task(send_telegram_message, chat_id, owner_reply)
+                return {"status": "ok", "mode": "owner_command"}
+
+            # 2. Энгийн харилцагчийн AI чатбот хариу
             result = agent.process_message(
                 text=user_text,
                 sender_id=f"tg_{chat_id}",
@@ -1310,6 +1369,86 @@ async def import_cargo_manifest_api(
     pid = user.get("page_id") or database.DEFAULT_PAGE_ID
     file_bytes = await file.read()
     return cargo_service.import_manifest_from_excel_bytes(pid, file_bytes, file.filename)
+
+# -------------------------------------------------------------
+# 11. ӨГЛӨӨНИЙ 08:30 ЭЗНИЙ ТАЙЛАН & TELEGRAM BOT API
+# -------------------------------------------------------------
+@app.get("/api/executive/preview")
+async def preview_executive_report_api(
+    request: Request,
+    date_str: Optional[str] = Query(None)
+):
+    """Өглөөний эзний тайлангийн шуурхай урьдчилсан харагдац"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
+    report_text = executive_bot_service.format_executive_report(page_id=pid, target_date=date_str)
+    metrics = database.get_daily_executive_metrics(page_id=pid, date_str=date_str)
+    return {"report_text": report_text, "metrics": metrics}
+
+@app.post("/api/executive/send-report")
+async def send_executive_report_api(payload: Dict[str, Any], request: Request):
+    """Тайланг яг одоо Telegram-аар илгээх"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
+    chat_id = payload.get("chat_id")
+    date_str = payload.get("date_str")
+    res = await executive_bot_service.send_executive_report(chat_id=chat_id, page_id=pid, target_date=date_str)
+    return res
+
+@app.get("/api/executive/settings")
+async def get_executive_settings_api(request: Request):
+    """Telegram бот болон өглөөний тайлангийн тохиргоог авах"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
+    page = database.get_page(pid) or {}
+    bot_token = page.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    masked_token = f"{bot_token[:6]}...{bot_token[-4:]}" if len(bot_token) > 10 else ("Тохируулаагүй" if not bot_token else "***")
+    return {
+        "telegram_bot_token_masked": masked_token,
+        "has_bot_token": bool(bot_token),
+        "telegram_manager_chat_id": page.get("telegram_manager_chat_id") or os.getenv("TELEGRAM_MANAGER_CHAT_ID", ""),
+        "daily_report_time": page.get("daily_report_time", "08:30"),
+        "daily_report_enabled": bool(page.get("daily_report_enabled", 1))
+    }
+
+@app.post("/api/executive/settings")
+async def update_executive_settings_api(payload: Dict[str, Any], request: Request):
+    """Telegram бот болон өглөөний тайлангийн тохиргоог хадгалах"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
+    bot_token = payload.get("telegram_bot_token", "")
+    manager_chat_id = payload.get("telegram_manager_chat_id", "")
+    daily_report_time = payload.get("daily_report_time", "08:30")
+    daily_report_enabled = 1 if payload.get("daily_report_enabled", True) else 0
+
+    if bot_token and "..." in bot_token:
+        page = database.get_page(pid) or {}
+        bot_token = page.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+    database.update_page_telegram_settings(
+        page_id=pid,
+        bot_token=bot_token,
+        manager_chat_id=manager_chat_id,
+        report_time=daily_report_time,
+        report_enabled=daily_report_enabled
+    )
+    return {"success": True, "message": "Telegram болон өглөөний тайлангийн тохиргоо амжилттай хадгалагдлаа"}
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)

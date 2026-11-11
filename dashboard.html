@@ -316,6 +316,12 @@
           <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-amber-100 text-amber-800">Баркод</span>
         </button>
 
+        <button onclick="switchTab('executive')" id="tab-btn-executive" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-chart-line text-indigo-600 text-xs"></i>
+          <span>08:30 Эзний Тайлан</span>
+          <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-indigo-100 text-indigo-800">Telegram</span>
+        </button>
+
         <button onclick="switchTab('social')" id="tab-btn-social" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
           <i class="fa-solid fa-pen-nib text-stone-400 text-xs"></i>
           <span>Нийтлэлийн бэлдэц</span>
@@ -924,6 +930,181 @@
               <tr><td colspan="8" class="p-6 text-center text-stone-400">Уншиж байна...</td></tr>
             </tbody>
           </table>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ==================== TAB: EXECUTIVE DAILY BRIEFING & OWNER TELEGRAM BOT ==================== -->
+    <div id="tab-executive" class="tab-content hidden space-y-6">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
+        
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-800 border border-indigo-200 uppercase tracking-wider">
+                Autonomous Executive AI
+              </span>
+              <span class="text-xs text-stone-400">• Өглөөний 08:30 тайлан, QPay орлого & Telegram эзний удирдлага</span>
+            </div>
+            <h2 class="text-xl font-extrabold text-stone-900 tracking-tight flex items-center gap-2">
+              <i class="fa-solid fa-chart-line text-indigo-600"></i>
+              <span>Өглөөний 08:30 Эзний Тайлан & Telegram Туслах</span>
+            </h2>
+            <p class="text-xs text-stone-500 mt-0.5">Бизнес эрхлэгчийн Telegram руу өглөө бүрийн 08:30-д өчигдрийн борлуулалт, орлого, сэжим болон ачааны нэгдсэн тайлан автоматаар очно.</p>
+          </div>
+
+          <div class="flex items-center gap-2.5">
+            <button onclick="sendExecutiveReportNow()" id="btn-send-report-now" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition flex items-center gap-2 shadow-sm">
+              <i class="fa-solid fa-paper-plane text-xs"></i>
+              <span>Яг одоо тайлан илгээх</span>
+            </button>
+            <button onclick="openExecutiveSettingsModal()" class="px-3.5 py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-800 border border-stone-200 text-xs font-semibold transition flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-gear text-indigo-600 text-xs"></i>
+              <span>Telegram тохиргоо</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Connection Status Banner -->
+        <div class="p-4 rounded-2xl bg-indigo-50/50 border border-indigo-100 mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div class="flex items-center gap-3">
+            <div id="exec-status-dot" class="w-3 h-3 rounded-full bg-emerald-500 animate-pulse flex-shrink-0"></div>
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="text-xs font-bold text-stone-900" id="exec-status-text">Telegram Бот холбогдсон</span>
+                <span id="exec-bot-token-badge" class="px-2 py-0.5 rounded-full text-[10px] font-mono bg-white border border-indigo-200 text-indigo-700">Token тохируулагдсан</span>
+              </div>
+              <p class="text-[11px] text-stone-500 mt-0.5">
+                Хүлээн авагч Chat ID: <span id="exec-manager-chat-id" class="font-mono font-bold text-stone-800">-</span> |
+                Товлосон цаг: <span id="exec-report-time" class="font-bold text-stone-800">08:30</span> |
+                Автомат илгээлт: <span id="exec-enabled-status" class="font-bold text-emerald-600">Идэвхтэй</span>
+              </p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <button onclick="switchReportPeriod('yesterday')" id="btn-period-yesterday" class="px-3 py-1.5 rounded-xl bg-indigo-600 text-white text-xs font-semibold shadow-sm transition">
+              Өчигдрийн тайлан (08:30)
+            </button>
+            <button onclick="switchReportPeriod('today')" id="btn-period-today" class="px-3 py-1.5 rounded-xl bg-white text-stone-700 border border-stone-200 hover:bg-stone-50 text-xs font-semibold shadow-sm transition">
+              Өнөөдрийн шуурхай
+            </button>
+          </div>
+        </div>
+
+        <!-- 4 KPI Metrics Cards -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div class="p-4 rounded-2xl bg-indigo-50/60 border border-indigo-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-indigo-500/20 text-indigo-700 flex items-center justify-center text-xl font-bold flex-shrink-0">
+              <i class="fa-solid fa-comments"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-indigo-900 block">Шинэ Чат Харилцаа</span>
+              <span id="exec-kpi-chats" class="text-xl font-extrabold text-indigo-950 font-mono tracking-tight">0 хүн</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-blue-50/60 border border-blue-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-blue-500/20 text-blue-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-user-plus"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-blue-900 block">Бүртгэгдсэн Сэжим (Leads)</span>
+              <span id="exec-kpi-leads" class="text-xl font-extrabold text-blue-950 font-mono tracking-tight">0 хүн</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-emerald-50/60 border border-emerald-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-qrcode"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-emerald-900 block">Баталгаажсан QPay Орлого</span>
+              <span id="exec-kpi-revenue" class="text-xl font-extrabold text-emerald-950 font-mono tracking-tight">0 ₮</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-amber-50/60 border border-amber-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-amber-500/20 text-amber-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-box-open"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-amber-900 block">Агуулахад Ирсэн Ачаа</span>
+              <span id="exec-kpi-cargo" class="text-xl font-extrabold text-amber-950 font-mono tracking-tight">0 хайрцаг</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2 Column Layout: Report Preview & Interactive Commands -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          
+          <!-- Column 1: Live Telegram Message Preview -->
+          <div class="rounded-2xl border border-stone-200/80 p-5 bg-[#FAF8F5]">
+            <div class="flex items-center justify-between pb-3 border-b border-stone-200/60 mb-3">
+              <div class="flex items-center gap-2">
+                <i class="fa-brands fa-telegram text-sky-500 text-lg"></i>
+                <h3 class="text-xs font-bold text-stone-900 uppercase tracking-wider">Telegram Мэдэгдлийн Бодит Харагдац</h3>
+              </div>
+              <span class="text-[11px] font-mono text-stone-400" id="exec-preview-date">-</span>
+            </div>
+            <div class="bg-white rounded-xl p-4 border border-stone-200/60 shadow-sm font-sans text-xs text-stone-800 leading-relaxed whitespace-pre-wrap font-mono min-h-[220px]" id="exec-report-preview-text">
+              Тайлан уншиж байна...
+            </div>
+          </div>
+
+          <!-- Column 2: Owner Interactive Commands Guide -->
+          <div class="rounded-2xl border border-stone-200/80 p-5 bg-white space-y-4">
+            <div class="flex items-center gap-2 pb-3 border-b border-stone-100">
+              <div class="w-8 h-8 rounded-xl bg-sky-50 text-sky-600 flex items-center justify-center font-bold text-sm">
+                <i class="fa-solid fa-robot"></i>
+              </div>
+              <div>
+                <h3 class="text-sm font-extrabold text-stone-900">Эзний Хувийн Удирдлагын Командууд</h3>
+                <p class="text-[11px] text-stone-400">Telegram бот руугаа хүссэн үедээ бичиж хариу авах</p>
+              </div>
+            </div>
+
+            <div class="space-y-2.5 text-xs text-stone-700">
+              <div class="p-3 rounded-xl bg-stone-50 border border-stone-200/70 flex items-start gap-3">
+                <span class="px-2 py-0.5 rounded-lg bg-indigo-100 text-indigo-800 font-mono font-bold text-[11px]">/today</span>
+                <div>
+                  <div class="font-bold text-stone-900">Өнөөдрийн шуурхай үзүүлэлт</div>
+                  <div class="text-[11px] text-stone-500">Яг одоогийн байдлаар ирсэн чат, бүртгэл, QPay төлбөрийн дүнг шууд авна.</div>
+                </div>
+              </div>
+
+              <div class="p-3 rounded-xl bg-stone-50 border border-stone-200/70 flex items-start gap-3">
+                <span class="px-2 py-0.5 rounded-lg bg-indigo-100 text-indigo-800 font-mono font-bold text-[11px]">/report</span>
+                <div>
+                  <div class="font-bold text-stone-900">Өчигдрийн дэлгэрэнгүй тайлан</div>
+                  <div class="text-[11px] text-stone-500">Өглөөний 08:30-д очдог өдрийн эцсийн бүтэн тайланг дахин дуудна.</div>
+                </div>
+              </div>
+
+              <div class="p-3 rounded-xl bg-stone-50 border border-stone-200/70 flex items-start gap-3">
+                <span class="px-2 py-0.5 rounded-lg bg-emerald-100 text-emerald-800 font-mono font-bold text-[11px]">/qpay</span>
+                <div>
+                  <div class="font-bold text-stone-900">Сүүлийн баталгаажсан төлбөрүүд</div>
+                  <div class="text-[11px] text-stone-500">Сүүлийн 5 QPay гүйлгээ, сугалааны дугаар, нийт дүнг харуулна.</div>
+                </div>
+              </div>
+
+              <div class="p-3 rounded-xl bg-stone-50 border border-stone-200/70 flex items-start gap-3">
+                <span class="px-2 py-0.5 rounded-lg bg-amber-100 text-amber-800 font-mono font-bold text-[11px]">/cargo</span>
+                <div>
+                  <div class="font-bold text-stone-900">Карго агуулахын төлөв байдал</div>
+                  <div class="text-[11px] text-stone-500">УБ-т ирсэн, олгосон болон төлбөр хүлээгдэж буй ачааны тоо, мөнгөн дүн.</div>
+                </div>
+              </div>
+
+              <div class="p-3 rounded-xl bg-stone-50 border border-stone-200/70 flex items-start gap-3">
+                <span class="px-2 py-0.5 rounded-lg bg-sky-100 text-sky-800 font-mono font-bold text-[11px]">/start</span>
+                <div>
+                  <div class="font-bold text-stone-900">Эзнийг автоматаар таних</div>
+                  <div class="text-[11px] text-stone-500">Бот руугаа /start бичихэд таны Chat ID автоматаар хадгалагдаж холбогдоно.</div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
         </div>
 
       </div>
@@ -1753,6 +1934,61 @@
     </div>
   </div>
 
+  <!-- ==================== MODAL: EXECUTIVE TELEGRAM SETTINGS ==================== -->
+  <div id="modal-executive-settings" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
+    <div class="glass-card max-w-md w-full rounded-3xl p-6 sm:p-7 border border-stone-200/80 shadow-2xl space-y-5 bg-white">
+      <div class="flex items-center justify-between pb-3 border-b border-stone-100">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-xl bg-indigo-50 text-indigo-700 flex items-center justify-center font-bold text-sm">
+            <i class="fa-brands fa-telegram"></i>
+          </div>
+          <div>
+            <h3 class="text-sm font-extrabold text-stone-900">Telegram Эзний Тайлангийн Тохиргоо</h3>
+            <p class="text-[11px] text-stone-400">Өглөө бүр автомат тайлан хүлээн авах тохиргоо</p>
+          </div>
+        </div>
+        <button onclick="closeExecutiveSettingsModal()" class="text-stone-400 hover:text-stone-600 text-lg">&times;</button>
+      </div>
+
+      <div class="space-y-3.5 text-xs">
+        <div>
+          <label class="block font-semibold text-stone-700 mb-1">Telegram Bot Token (@BotFather)</label>
+          <input type="password" id="input-exec-bot-token" placeholder="Жишээ: 7123456789:AAH..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono focus:outline-none focus:border-indigo-500">
+          <p class="text-[10px] text-stone-400 mt-1">@BotFather-аас шинэ бот үүсгэж авсан API Token.</p>
+        </div>
+
+        <div>
+          <label class="block font-semibold text-stone-700 mb-1">Менежерийн Telegram Chat ID</label>
+          <input type="text" id="input-exec-chat-id" placeholder="Жишээ: 123456789" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono focus:outline-none focus:border-indigo-500">
+          <p class="text-[10px] text-stone-400 mt-1">Та өөрийн бот руугаа <b>/start</b> бичвэл энэ дугаар автоматаар холбогдоно.</p>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block font-semibold text-stone-700 mb-1">Тайлан илгээх цаг</label>
+            <input type="time" id="input-exec-report-time" value="08:30" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono focus:outline-none focus:border-indigo-500">
+          </div>
+          <div>
+            <label class="block font-semibold text-stone-700 mb-1">Автомат илгээлт</label>
+            <select id="select-exec-enabled" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-medium focus:outline-none focus:border-indigo-500">
+              <option value="1">Идэвхтэй (Өдөр бүр)</option>
+              <option value="0">Идэвхгүй (Түр зогсоох)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-stone-100">
+        <button onclick="closeExecutiveSettingsModal()" class="px-4 py-2 rounded-xl text-stone-600 hover:bg-stone-100 text-xs font-semibold transition">
+          Цуцлах
+        </button>
+        <button onclick="saveExecutiveSettings()" id="btn-save-exec-settings" class="px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-sm">
+          <span>Хадгалах</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== MODAL: AUTHENTICATION LOGIN OVERLAY ==================== -->
   <div id="auth-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
     <div class="glass-card max-w-md w-full rounded-3xl p-8 border border-white/[0.1] space-y-6 shadow-2xl animate-in fade-in zoom-in-95 duration-200">
@@ -1863,6 +2099,7 @@
       if (tabId === 'leads') loadLeads();
       if (tabId === 'fintech') loadFintechData();
       if (tabId === 'cargo') loadCargoData();
+      if (tabId === 'executive') loadExecutiveData();
       if (tabId === 'links') loadKnowledge();
     }
 
@@ -2563,6 +2800,175 @@
       } finally {
         btn.disabled = false;
         btn.innerText = 'Импортлох';
+      }
+    }
+
+    // ==================== EXECUTIVE DAILY BRIEFING MODULE ====================
+    let currentReportPeriod = 'yesterday';
+
+    async function loadExecutiveData() {
+      try {
+        // 1. Settings
+        const setRes = await fetch('/api/executive/settings');
+        if (setRes.ok) {
+          const cfg = await setRes.json();
+          document.getElementById('exec-manager-chat-id').textContent = cfg.telegram_manager_chat_id || 'Тохируулаагүй (Хүлээгдэж байна)';
+          document.getElementById('exec-report-time').textContent = (cfg.daily_report_time || '08:30') + ' цагт';
+          
+          const dot = document.getElementById('exec-status-dot');
+          const statusText = document.getElementById('exec-status-text');
+          const tokenBadge = document.getElementById('exec-bot-token-badge');
+          const enabledStatus = document.getElementById('exec-enabled-status');
+
+          if (cfg.has_bot_token) {
+            dot.className = 'w-3 h-3 rounded-full bg-emerald-500 animate-pulse flex-shrink-0';
+            statusText.textContent = 'Telegram Бот холбогдсон';
+            tokenBadge.textContent = cfg.telegram_bot_token_masked || 'Token байна';
+            tokenBadge.className = 'px-2 py-0.5 rounded-full text-[10px] font-mono bg-white border border-emerald-200 text-emerald-700';
+          } else {
+            dot.className = 'w-3 h-3 rounded-full bg-amber-500 flex-shrink-0';
+            statusText.textContent = 'Telegram Token оруулаагүй';
+            tokenBadge.textContent = 'Тохируулаагүй';
+            tokenBadge.className = 'px-2 py-0.5 rounded-full text-[10px] font-mono bg-white border border-amber-200 text-amber-700';
+          }
+
+          if (cfg.daily_report_enabled) {
+            enabledStatus.textContent = 'Идэвхтэй';
+            enabledStatus.className = 'font-bold text-emerald-600';
+          } else {
+            enabledStatus.textContent = 'Түр зогссон';
+            enabledStatus.className = 'font-bold text-stone-400';
+          }
+
+          document.getElementById('input-exec-chat-id').value = cfg.telegram_manager_chat_id || '';
+          document.getElementById('input-exec-report-time').value = cfg.daily_report_time || '08:30';
+          document.getElementById('select-exec-enabled').value = cfg.daily_report_enabled ? '1' : '0';
+          if (cfg.has_bot_token) {
+            document.getElementById('input-exec-bot-token').placeholder = cfg.telegram_bot_token_masked;
+          }
+        }
+
+        // 2. Report Preview
+        await fetchExecutiveReportPreview();
+      } catch (e) {
+        console.error('loadExecutiveData error:', e);
+      }
+    }
+
+    async function fetchExecutiveReportPreview() {
+      try {
+        let dateQuery = '';
+        if (currentReportPeriod === 'today') {
+          const d = new Date();
+          dateQuery = `?date_str=${d.toISOString().slice(0, 10)}`;
+        } else {
+          const y = new Date(Date.now() - 86400000);
+          dateQuery = `?date_str=${y.toISOString().slice(0, 10)}`;
+        }
+
+        const res = await fetch(`/api/executive/preview${dateQuery}`);
+        if (res.ok) {
+          const data = await res.json();
+          document.getElementById('exec-report-preview-text').textContent = data.report_text || '';
+          
+          const m = data.metrics || {};
+          document.getElementById('exec-preview-date').textContent = m.date || '';
+          document.getElementById('exec-kpi-chats').textContent = (m.chats_count || 0) + ' хүн';
+          document.getElementById('exec-kpi-leads').textContent = (m.leads_count || 0) + ' хүн';
+          document.getElementById('exec-kpi-revenue').textContent = (m.paid_amount || 0).toLocaleString() + ' ₮';
+          document.getElementById('exec-kpi-cargo').textContent = (m.cargo_arrived || 0) + ' хайрцаг';
+        }
+      } catch (e) {
+        console.error('fetchExecutiveReportPreview error:', e);
+      }
+    }
+
+    function switchReportPeriod(period) {
+      currentReportPeriod = period;
+      const btnYest = document.getElementById('btn-period-yesterday');
+      const btnToday = document.getElementById('btn-period-today');
+      if (period === 'today') {
+        btnToday.className = 'px-3 py-1.5 rounded-xl bg-indigo-600 text-white text-xs font-semibold shadow-sm transition';
+        btnYest.className = 'px-3 py-1.5 rounded-xl bg-white text-stone-700 border border-stone-200 hover:bg-stone-50 text-xs font-semibold shadow-sm transition';
+      } else {
+        btnYest.className = 'px-3 py-1.5 rounded-xl bg-indigo-600 text-white text-xs font-semibold shadow-sm transition';
+        btnToday.className = 'px-3 py-1.5 rounded-xl bg-white text-stone-700 border border-stone-200 hover:bg-stone-50 text-xs font-semibold shadow-sm transition';
+      }
+      fetchExecutiveReportPreview();
+    }
+
+    async function sendExecutiveReportNow() {
+      const btn = document.getElementById('btn-send-report-now');
+      btn.disabled = true;
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-xs"></i> <span>Илгээж байна...</span>`;
+      try {
+        let dateStr = null;
+        if (currentReportPeriod === 'today') {
+          dateStr = new Date().toISOString().slice(0, 10);
+        } else {
+          dateStr = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+        }
+
+        const res = await fetch('/api/executive/send-report', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({date_str: dateStr})
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('✅ ' + (data.message || 'Тайлан Telegram руу амжилттай илгээгдлээ!'));
+        } else {
+          alert('⚠️ Илгээх боломжгүй: ' + (data.message || 'Telegram тохиргоогоо шалгана уу'));
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="fa-solid fa-paper-plane text-xs"></i> <span>Яг одоо тайлан илгээх</span>`;
+      }
+    }
+
+    function openExecutiveSettingsModal() {
+      document.getElementById('modal-executive-settings').classList.remove('hidden');
+    }
+    function closeExecutiveSettingsModal() {
+      document.getElementById('modal-executive-settings').classList.add('hidden');
+    }
+
+    async function saveExecutiveSettings() {
+      const botToken = document.getElementById('input-exec-bot-token').value.trim();
+      const chatId = document.getElementById('input-exec-chat-id').value.trim();
+      const reportTime = document.getElementById('input-exec-report-time').value.trim() || '08:30';
+      const enabled = document.getElementById('select-exec-enabled').value === '1';
+
+      const btn = document.getElementById('btn-save-exec-settings');
+      btn.disabled = true;
+      btn.innerText = 'Хадгалж байна...';
+
+      try {
+        const res = await fetch('/api/executive/settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            telegram_bot_token: botToken,
+            telegram_manager_chat_id: chatId,
+            daily_report_time: reportTime,
+            daily_report_enabled: enabled
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          closeExecutiveSettingsModal();
+          showToast(data.message || 'Тохиргоо амжилттай хадгалагдлаа!');
+          loadExecutiveData();
+        } else {
+          alert('Алдаа: ' + (data.message || 'Тохиргоо хадгалагдсангүй'));
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerText = 'Хадгалах';
       }
     }
 

@@ -215,7 +215,11 @@ def init_db():
         ("pages", "qpay_username", "TEXT DEFAULT ''"),
         ("pages", "qpay_password", "TEXT DEFAULT ''"),
         ("pages", "qpay_invoice_code", "TEXT DEFAULT ''"),
-        ("pages", "ebarimt_enabled", "INTEGER DEFAULT 1")
+        ("pages", "ebarimt_enabled", "INTEGER DEFAULT 1"),
+        ("pages", "telegram_bot_token", "TEXT DEFAULT ''"),
+        ("pages", "telegram_manager_chat_id", "TEXT DEFAULT ''"),
+        ("pages", "daily_report_time", "TEXT DEFAULT '08:30'"),
+        ("pages", "daily_report_enabled", "INTEGER DEFAULT 1")
     ]
     for table, col, col_def in tables_to_migrate:
         try:
@@ -1248,6 +1252,81 @@ def get_cargo_summary(page_id: str) -> Dict[str, Any]:
         "delivered_packages": int(delivered_count),
         "pending_payment_count": int(pending_pay_count or 0),
         "pending_payment_amount": int(pending_pay_sum or 0)
+    }
+
+# -------------------------------------------------------------
+# 8. ӨГЛӨӨНИЙ ЭЗНИЙ ТАЙЛАН & TELEGRAM ТОХИРГОО
+# -------------------------------------------------------------
+def update_page_telegram_settings(
+    page_id: str,
+    bot_token: str,
+    manager_chat_id: str,
+    report_time: str = "08:30",
+    report_enabled: int = 1
+) -> bool:
+    """Хуудасны Telegram эзний тохиргоог хадгалах"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE pages
+        SET telegram_bot_token = ?, telegram_manager_chat_id = ?,
+            daily_report_time = ?, daily_report_enabled = ?
+        WHERE page_id = ?
+    """, (bot_token.strip(), manager_chat_id.strip(), report_time.strip(), int(report_enabled), str(page_id)))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
+def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optional[str] = None) -> Dict[str, Any]:
+    """Өчигдрийн эсвэл өнөөдрийн гүйцэтгэлийн нэгдсэн тайлангийн тоонууд"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    if not date_str:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        
+    date_pattern = f"{date_str}%"
+    p_cond = " AND page_id = ?" if page_id else ""
+    p_params = [date_pattern, str(page_id)] if page_id else [date_pattern]
+    
+    # 1. Шинэ харилцагч / Leads
+    cursor.execute(f"SELECT COUNT(id) FROM registrations WHERE created_at LIKE ?{p_cond}", tuple(p_params))
+    leads_count = cursor.fetchone()[0] or 0
+    
+    # 2. Чат харилцан ярианууд
+    cursor.execute(f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at LIKE ?{p_cond}", tuple(p_params))
+    chats_count = cursor.fetchone()[0] or 0
+    
+    # 3. Карго ачаанууд (ирсэн)
+    cursor.execute(f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at LIKE ?{p_cond}", tuple(p_params))
+    cargo_arrived = cursor.fetchone()[0] or 0
+    
+    # 4. QPay төлбөрүүд
+    cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices WHERE status = 'PAID' AND paid_at LIKE ?{p_cond}", tuple(p_params))
+    paid_count, paid_amount = cursor.fetchone()
+    
+    # 5. Хүлээгдэж буй карго ачаа (төлөгдөөгүй)
+    pending_p_cond = " WHERE page_id = ?" if page_id else ""
+    pending_params = (str(page_id),) if page_id else ()
+    cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(price_amount), 0) FROM cargo_packages{pending_p_cond} {'AND' if page_id else 'WHERE'} status = 'ARRIVED_UB' AND price_amount > 0", pending_params)
+    pending_cargo_count, pending_cargo_amount = cursor.fetchone()
+    
+    # 6. Эскалаци / Хүнтэй ярих хүсэлт гаргасан
+    cursor.execute("SELECT COUNT(sender_id) FROM session_states WHERE is_human_takeover = 1" + (" AND page_id = ?" if page_id else ""), ((str(page_id),) if page_id else ()))
+    escalated_count = cursor.fetchone()[0] or 0
+    
+    conn.close()
+    return {
+        "date": date_str,
+        "leads_count": int(leads_count),
+        "chats_count": int(chats_count),
+        "cargo_arrived": int(cargo_arrived),
+        "paid_count": int(paid_count or 0),
+        "paid_amount": int(paid_amount or 0),
+        "pending_cargo_count": int(pending_cargo_count or 0),
+        "pending_cargo_amount": int(pending_cargo_amount or 0),
+        "escalated_count": int(escalated_count or 0)
     }
 
 if __name__ == "__main__":
