@@ -17,6 +17,7 @@ import agent
 import knowledge_base
 import sheets_service
 import fintech_service
+import cargo_service
 
 load_dotenv(override=True)
 
@@ -1227,6 +1228,89 @@ async def create_invoice_manual_api(
     )
     return order
 
+# -------------------------------------------------------------
+# 9. КАРГО АГУУЛАХЫН БАРКОД СКАННЕР БА АВТО МЭДЭГДЭЛ (CARGO MODULE)
+# -------------------------------------------------------------
+@app.get("/scanner", response_class=HTMLResponse)
+async def serve_warehouse_scanner(request: Request, page_id: Optional[str] = Query(None)):
+    """Гар утасны агуулахын камертай баркод сканнер"""
+    pid = page_id or database.DEFAULT_PAGE_ID
+    import jinja2
+    template_loader = jinja2.FileSystemLoader(searchpath="templates")
+    template_env = jinja2.Environment(loader=template_loader)
+    template = template_env.get_template("scanner.html")
+    rendered = template.render(page_id=pid)
+    return HTMLResponse(content=rendered)
+
+@app.post("/api/cargo/scan")
+async def scan_cargo_package_api(payload: Dict[str, Any], request: Request):
+    """Агуулахын ажилтан баркод уншуулах үед ачааг бүртгэж авто мэдэгдэл илгээх"""
+    pid = payload.get("page_id") or database.DEFAULT_PAGE_ID
+    code = payload.get("tracking_code", "").strip()
+    if not code:
+        return JSONResponse(status_code=400, content={"error": "tracking_code is required"})
+    loc = payload.get("location", "УБ Төв Агуулах")
+    base_url = str(request.base_url)
+    res = await cargo_service.scan_and_notify_package(
+        page_id=pid,
+        tracking_code=code,
+        location=loc,
+        weight_kg=payload.get("weight_kg"),
+        price_amount=payload.get("price_amount"),
+        base_url=base_url
+    )
+    return res
+
+@app.post("/api/cargo/{tracking_code}/deliver")
+async def deliver_cargo_api(tracking_code: str, page_id: Optional[str] = Query(None)):
+    """Ачааг олгосон гэж тэмдэглэх"""
+    pid = page_id or database.DEFAULT_PAGE_ID
+    pkg = database.mark_cargo_delivered(pid, tracking_code)
+    return {"success": bool(pkg), "package": pkg}
+
+@app.get("/api/cargo/packages")
+async def list_cargo_packages_api(
+    request: Request,
+    status: Optional[str] = Query(None),
+    limit: int = Query(50)
+):
+    """Карго ачаануудын жагсаалт"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
+    return database.list_cargo_packages(pid, status=status, limit=limit)
+
+@app.get("/api/cargo/summary")
+async def get_cargo_summary_api(request: Request):
+    """Карго самбарын хураангуй KPI үзүүлэлтүүд"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
+    return database.get_cargo_summary(pid)
+
+@app.post("/api/cargo/import-manifest")
+async def import_cargo_manifest_api(
+    request: Request,
+    file: UploadFile = File(...)
+):
+    """Excel файлаас карго ачаануудыг олноор нь импортлох"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    pid = user.get("page_id") or database.DEFAULT_PAGE_ID
+    file_bytes = await file.read()
+    return cargo_service.import_manifest_from_excel_bytes(pid, file_bytes, file.filename)
+
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
 @app.get("/admin", response_class=HTMLResponse)
@@ -1299,7 +1383,7 @@ async def serve_branch_portal_or_page(branch_slug: str):
     Админы эрх задруулахгүйгээр зөвхөн тухайн салбарын эрхээр эсвэл нэвтрэх цонхоор нээнэ.
     """
     slug_clean = branch_slug.strip().lower()
-    if slug_clean in {"favicon.ico", "robots.txt", "widget.js", "api", "webhook", "admin", "dashboard", "privacy", "terms", "pay", "static"}:
+    if slug_clean in {"favicon.ico", "robots.txt", "widget.js", "api", "webhook", "admin", "dashboard", "privacy", "terms", "pay", "static", "scanner"}:
         raise HTTPException(status_code=404, detail="Not found")
 
     all_pages = database.get_all_pages()

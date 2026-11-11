@@ -173,6 +173,33 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_page_id ON invoices (page_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_invoice_id ON invoices (invoice_id)")
 
+    # 7. Карго тээвэр ба агуулахын ачаанууд (Warehouse Barcode & Tracking)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cargo_packages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT NOT NULL,
+            tracking_code TEXT NOT NULL,
+            customer_name TEXT,
+            customer_phone TEXT,
+            sender_id TEXT,
+            channel TEXT DEFAULT 'web',
+            weight_kg REAL DEFAULT 0.0,
+            price_amount INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'REGISTERED', -- REGISTERED, IN_TRANSIT, ARRIVED_UB, PAID, DELIVERED
+            warehouse_location TEXT DEFAULT 'УБ Агуулах',
+            invoice_id TEXT,
+            notified_at TIMESTAMP,
+            arrived_at TIMESTAMP,
+            delivered_at TIMESTAMP,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(page_id, tracking_code)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_page_tracking ON cargo_packages (page_id, tracking_code)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_phone ON cargo_packages (customer_phone)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_status ON cargo_packages (status)")
+
     # Багануудыг аюулгүй нэмэх (Migration check)
     tables_to_migrate = [
         ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
@@ -1035,6 +1062,193 @@ def update_page_qpay_settings(page_id: str, username: str, password: str, invoic
     conn.commit()
     conn.close()
     return success
+
+# -------------------------------------------------------------
+# 7. КАРГО ТЭЭВЭР БА АГУУЛАХЫН БҮРТГЭЛ (CARGO MANAGEMENT)
+# -------------------------------------------------------------
+def upsert_cargo_package(
+    page_id: str,
+    tracking_code: str,
+    customer_name: Optional[str] = None,
+    customer_phone: Optional[str] = None,
+    weight_kg: float = 0.0,
+    price_amount: int = 0,
+    status: str = "REGISTERED",
+    warehouse_location: str = "УБ Агуулах",
+    notes: Optional[str] = None,
+    sender_id: Optional[str] = None,
+    channel: str = "web"
+) -> Dict[str, Any]:
+    """Карго ачааны бүртгэл үүсгэх эсвэл шинэчлэх (Idempotent Upsert)"""
+    tracking_clean = tracking_code.strip().upper()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO cargo_packages (
+            page_id, tracking_code, customer_name, customer_phone,
+            weight_kg, price_amount, status, warehouse_location, notes,
+            sender_id, channel
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(page_id, tracking_code) DO UPDATE SET
+            customer_name = COALESCE(excluded.customer_name, cargo_packages.customer_name),
+            customer_phone = COALESCE(excluded.customer_phone, cargo_packages.customer_phone),
+            weight_kg = CASE WHEN excluded.weight_kg > 0 THEN excluded.weight_kg ELSE cargo_packages.weight_kg END,
+            price_amount = CASE WHEN excluded.price_amount > 0 THEN excluded.price_amount ELSE cargo_packages.price_amount END,
+            warehouse_location = excluded.warehouse_location,
+            notes = COALESCE(excluded.notes, cargo_packages.notes)
+    """, (
+        str(page_id), tracking_clean, customer_name, customer_phone,
+        float(weight_kg or 0.0), int(price_amount or 0), status,
+        warehouse_location, notes, sender_id, channel
+    ))
+    conn.commit()
+    conn.close()
+    return get_cargo_package(page_id, tracking_clean) or {}
+
+def get_cargo_package(page_id: str, tracking_code: str) -> Optional[Dict[str, Any]]:
+    """Нэг карго ачааг кодоор хайх"""
+    tracking_clean = tracking_code.strip().upper()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM cargo_packages WHERE page_id = ? AND tracking_code = ?", (str(page_id), tracking_clean))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def find_cargo_by_phone_or_code(page_id: str, query: str) -> List[Dict[str, Any]]:
+    """Утасны дугаар эсвэл карго кодоор ачаа хайх"""
+    q_clean = query.strip().upper()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM cargo_packages
+        WHERE page_id = ? AND (
+            tracking_code LIKE ? OR
+            customer_phone LIKE ? OR
+            customer_name LIKE ?
+        )
+        ORDER BY id DESC LIMIT 10
+    """, (str(page_id), f"%{q_clean}%", f"%{q_clean}%", f"%{q_clean}%"))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def scan_arrive_package(
+    page_id: str,
+    tracking_code: str,
+    location: str = "УБ Агуулах",
+    weight_kg: Optional[float] = None,
+    price_amount: Optional[int] = None,
+    invoice_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Агуулахын ажилтан баркод уншуулахад:
+    1. Төлөвийг 'ARRIVED_UB' болгох
+    2. Байршил болон ирсэн огноог бүртгэх
+    """
+    tracking_clean = tracking_code.strip().upper()
+    arrived_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Хэрэв өмнө нь бүртгэлгүй байсан ч баркод уншуулсан бол шууд шинээр үүсгэнэ
+    cursor.execute("SELECT id FROM cargo_packages WHERE page_id = ? AND tracking_code = ?", (str(page_id), tracking_clean))
+    existing = cursor.fetchone()
+    if not existing:
+        cursor.execute("""
+            INSERT INTO cargo_packages (
+                page_id, tracking_code, status, warehouse_location,
+                weight_kg, price_amount, arrived_at, invoice_id
+            )
+            VALUES (?, ?, 'ARRIVED_UB', ?, ?, ?, ?, ?)
+        """, (
+            str(page_id), tracking_clean, location,
+            float(weight_kg or 0.0), int(price_amount or 0), arrived_at, invoice_id
+        ))
+    else:
+        cursor.execute("""
+            UPDATE cargo_packages
+            SET status = 'ARRIVED_UB',
+                warehouse_location = ?,
+                arrived_at = ?,
+                weight_kg = COALESCE(?, weight_kg),
+                price_amount = COALESCE(?, price_amount),
+                invoice_id = COALESCE(?, invoice_id)
+            WHERE page_id = ? AND tracking_code = ?
+        """, (
+            location, arrived_at, weight_kg, price_amount, invoice_id,
+            str(page_id), tracking_clean
+        ))
+        
+    conn.commit()
+    conn.close()
+    return get_cargo_package(page_id, tracking_clean) or {}
+
+def mark_cargo_delivered(page_id: str, tracking_code: str) -> Optional[Dict[str, Any]]:
+    """Ачааг олгосон төлөвт оруулах"""
+    tracking_clean = tracking_code.strip().upper()
+    delivered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE cargo_packages
+        SET status = 'DELIVERED', delivered_at = ?
+        WHERE page_id = ? AND tracking_code = ?
+    """, (delivered_at, str(page_id), tracking_clean))
+    conn.commit()
+    conn.close()
+    return get_cargo_package(page_id, tracking_clean)
+
+def list_cargo_packages(page_id: str, status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    """Карго ачаануудын жагсаалт"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    query = "SELECT * FROM cargo_packages WHERE page_id = ?"
+    params = [str(page_id)]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_cargo_summary(page_id: str) -> Dict[str, Any]:
+    """Карго хяналтын самбарын үзүүлэлтүүд"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Нийт ачаа
+    cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ?", (str(page_id),))
+    total_count = cursor.fetchone()[0] or 0
+    
+    # УБ-т ирсэн
+    cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ? AND status = 'ARRIVED_UB'", (str(page_id),))
+    arrived_count = cursor.fetchone()[0] or 0
+    
+    # Олгогдсон
+    cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ? AND status = 'DELIVERED'", (str(page_id),))
+    delivered_count = cursor.fetchone()[0] or 0
+    
+    # Төлбөр хүлээгдэж буй
+    cursor.execute("SELECT COUNT(id), COALESCE(SUM(price_amount), 0) FROM cargo_packages WHERE page_id = ? AND status = 'ARRIVED_UB' AND price_amount > 0", (str(page_id),))
+    pending_pay_count, pending_pay_sum = cursor.fetchone()
+
+    conn.close()
+    return {
+        "total_packages": int(total_count),
+        "arrived_packages": int(arrived_count),
+        "delivered_packages": int(delivered_count),
+        "pending_payment_count": int(pending_pay_count or 0),
+        "pending_payment_amount": int(pending_pay_sum or 0)
+    }
 
 if __name__ == "__main__":
     init_db()

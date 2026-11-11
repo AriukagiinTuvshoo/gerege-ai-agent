@@ -310,6 +310,12 @@
           <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-emerald-100 text-emerald-700">v2</span>
         </button>
 
+        <button onclick="switchTab('cargo')" id="tab-btn-cargo" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-box-open text-amber-600 text-xs"></i>
+          <span>Карго & Агуулах</span>
+          <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-amber-100 text-amber-800">Баркод</span>
+        </button>
+
         <button onclick="switchTab('social')" id="tab-btn-social" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
           <i class="fa-solid fa-pen-nib text-stone-400 text-xs"></i>
           <span>Нийтлэлийн бэлдэц</span>
@@ -809,6 +815,112 @@
               </tr>
             </thead>
             <tbody id="invoices-table-body" class="divide-y divide-stone-100">
+              <tr><td colspan="8" class="p-6 text-center text-stone-400">Уншиж байна...</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ==================== TAB: CARGO & WAREHOUSE BARCODE ==================== -->
+    <div id="tab-cargo" class="tab-content hidden space-y-6">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
+        
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200 uppercase tracking-wider">
+                Industry Superpower
+              </span>
+              <span class="text-xs text-stone-400">• Баркод сканнер, Агуулахын төлөв, QPay & Авто мэдэгдэл</span>
+            </div>
+            <h2 class="text-xl font-extrabold text-stone-900 tracking-tight flex items-center gap-2">
+              <i class="fa-solid fa-box-open text-amber-600"></i>
+              <span>Карго Тээвэр & Агуулахын Удирдлага</span>
+            </h2>
+            <p class="text-xs text-stone-500 mt-0.5">Гар утсаараа баркод сканнердахад харилцагчийн FB/Telegram руу ачаа ирсэн мэдэгдэл QPay төлбөртэйгээ секундэд очно.</p>
+          </div>
+
+          <div class="flex items-center gap-2.5">
+            <a href="/scanner" target="_blank" class="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold transition flex items-center gap-2 shadow-sm">
+              <i class="fa-solid fa-barcode text-xs"></i>
+              <span>Гар утасны Сканнер нээх ↗</span>
+            </a>
+            <button onclick="openImportCargoModal()" class="px-3.5 py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-800 border border-stone-200 text-xs font-semibold transition flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-file-excel text-emerald-600 text-xs"></i>
+              <span>Excel манифест оруулах</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 4 KPI Metrics Cards -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div class="p-4 rounded-2xl bg-amber-50/60 border border-amber-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-amber-500/20 text-amber-700 flex items-center justify-center text-xl font-bold flex-shrink-0">
+              <i class="fa-solid fa-boxes-stacked"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-amber-900 block">Нийт Карго Ачаа</span>
+              <span id="cargo-total-count" class="text-xl font-extrabold text-amber-950 font-mono tracking-tight">0 ачаа</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-blue-50/60 border border-blue-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-blue-500/20 text-blue-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-warehouse"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-blue-900 block">УБ-т Ирсэн (Олгоход бэлэн)</span>
+              <span id="cargo-arrived-count" class="text-xl font-extrabold text-blue-950 font-mono tracking-tight">0 ачаа</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-emerald-50/60 border border-emerald-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-circle-check"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-emerald-900 block">Хүлээлгэн өгсөн (Олгосон)</span>
+              <span id="cargo-delivered-count" class="text-xl font-extrabold text-emerald-950 font-mono tracking-tight">0</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-red-50/60 border border-red-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-red-500/20 text-red-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-hand-holding-dollar"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-red-900 block">Төлбөр хүлээгдэж буй</span>
+              <span id="cargo-pending-pay" class="text-xl font-extrabold text-red-950 font-mono tracking-tight">0 ₮</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Cargo Packages Table -->
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-bold text-stone-900 flex items-center gap-2">
+            <span>Ачаануудын жагсаалт</span>
+            <span class="text-[11px] font-normal text-stone-400" id="cargo-count-label">(0 ачаа)</span>
+          </h3>
+          <button onclick="loadCargoData()" class="text-xs text-stone-500 hover:text-stone-900 flex items-center gap-1">
+            <i class="fa-solid fa-rotate-right text-[10px]"></i>
+            <span>Шинэчлэх</span>
+          </button>
+        </div>
+
+        <div class="overflow-x-auto rounded-2xl border border-stone-200/60">
+          <table class="w-full text-left text-xs text-stone-800">
+            <thead class="bg-[#F8F6F0] text-stone-600 uppercase font-semibold border-b border-stone-200 text-[11px]">
+              <tr>
+                <th class="p-3.5">Карго код</th>
+                <th class="p-3.5">Харилцагч</th>
+                <th class="p-3.5">Утас</th>
+                <th class="p-3.5">Жин</th>
+                <th class="p-3.5">Тээврийн хөлс</th>
+                <th class="p-3.5">Агуулахын байршил</th>
+                <th class="p-3.5">Төлөв</th>
+                <th class="p-3.5 text-right">Үйлдэл</th>
+              </tr>
+            </thead>
+            <tbody id="cargo-table-body" class="divide-y divide-stone-100">
               <tr><td colspan="8" class="p-6 text-center text-stone-400">Уншиж байна...</td></tr>
             </tbody>
           </table>
@@ -1603,6 +1715,44 @@
     </div>
   </div>
 
+  <!-- ==================== MODAL: IMPORT CARGO MANIFEST ==================== -->
+  <div id="import-cargo-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
+    <div class="glass-card max-w-md w-full rounded-3xl p-6 sm:p-7 border border-stone-200/80 shadow-2xl space-y-5 bg-white">
+      <div class="flex items-center justify-between pb-3 border-b border-stone-100">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-xl bg-amber-50 text-amber-700 flex items-center justify-center font-bold text-sm">
+            <i class="fa-solid fa-file-excel"></i>
+          </div>
+          <div>
+            <h3 class="text-sm font-extrabold text-stone-900">Excel манифест оруулах</h3>
+            <p class="text-[11px] text-stone-400">Карго ачаануудын жагсаалтыг олноор нь бүртгэх</p>
+          </div>
+        </div>
+        <button onclick="closeImportCargoModal()" class="text-stone-400 hover:text-stone-600 text-lg">&times;</button>
+      </div>
+
+      <div class="space-y-3 text-xs">
+        <div class="p-3 rounded-xl bg-stone-50 border border-stone-200 text-stone-600 text-[11px] leading-relaxed">
+          <b>Баганын нэрс:</b> Код (Tracking), Утас (Phone), Нэр (Name), Жин (Weight kg), Үнэ (Price).
+        </div>
+
+        <div>
+          <label class="block font-semibold text-stone-700 mb-1">Excel файл сонгох (.xlsx / .csv)</label>
+          <input type="file" id="cargo-manifest-file" accept=".xlsx, .xls, .csv" class="w-full text-xs file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-amber-50 file:text-amber-700 hover:file:bg-amber-100">
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-stone-100">
+        <button onclick="closeImportCargoModal()" class="px-4 py-2 rounded-xl text-stone-600 hover:bg-stone-100 text-xs font-semibold transition">
+          Цуцлах
+        </button>
+        <button onclick="submitCargoManifest()" id="btn-submit-manifest" class="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold transition flex items-center gap-1.5 shadow-sm">
+          <span>Импортлох</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== MODAL: AUTHENTICATION LOGIN OVERLAY ==================== -->
   <div id="auth-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
     <div class="glass-card max-w-md w-full rounded-3xl p-8 border border-white/[0.1] space-y-6 shadow-2xl animate-in fade-in zoom-in-95 duration-200">
@@ -1712,6 +1862,7 @@
       if (tabId === 'inbox') loadSessions();
       if (tabId === 'leads') loadLeads();
       if (tabId === 'fintech') loadFintechData();
+      if (tabId === 'cargo') loadCargoData();
       if (tabId === 'links') loadKnowledge();
     }
 
@@ -2284,6 +2435,134 @@
       } finally {
         btn.disabled = false;
         btn.innerText = 'Хадгалах';
+      }
+    }
+
+    // ==================== CARGO & WAREHOUSE MODULE ====================
+    async function loadCargoData() {
+      try {
+        const sumRes = await fetch('/api/cargo/summary');
+        if (sumRes.ok) {
+          const sum = await sumRes.json();
+          document.getElementById('cargo-total-count').textContent = (sum.total_packages || 0) + ' ачаа';
+          document.getElementById('cargo-arrived-count').textContent = (sum.arrived_packages || 0) + ' ачаа';
+          document.getElementById('cargo-delivered-count').textContent = (sum.delivered_packages || 0) + ' ачаа';
+          document.getElementById('cargo-pending-pay').textContent = (sum.pending_payment_amount || 0).toLocaleString() + ' ₮';
+        }
+
+        const pkgRes = await fetch('/api/cargo/packages?limit=50');
+        if (pkgRes.ok) {
+          const packages = await pkgRes.json();
+          renderCargoTable(packages);
+        }
+      } catch (e) {
+        console.error('loadCargoData error:', e);
+      }
+    }
+
+    function renderCargoTable(packages) {
+      const tbody = document.getElementById('cargo-table-body');
+      document.getElementById('cargo-count-label').textContent = `(${packages.length} ачаа)`;
+
+      if (!packages || packages.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="8" class="p-8 text-center text-stone-400">Одоогоор карго ачаа бүртгэгдээгүй байна. Дээрх 'Гар утасны Сканнер' эсвэл 'Excel оруулах' товчоор бүртгэнэ үү.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = packages.map(p => {
+        let statusBadge = '';
+        if (p.status === 'ARRIVED_UB') {
+          statusBadge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800">🟢 УБ-т ирсэн</span>`;
+        } else if (p.status === 'PAID') {
+          statusBadge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">✓ Төлөгдсөн</span>`;
+        } else if (p.status === 'DELIVERED') {
+          statusBadge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-stone-100 text-stone-600">📦 Олгогдсон</span>`;
+        } else {
+          statusBadge = `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800">✈️ Замдаа</span>`;
+        }
+
+        return `
+          <tr class="hover:bg-stone-50/80 transition">
+            <td class="p-3.5 font-mono font-bold text-stone-900">${escapeHtml(p.tracking_code)}</td>
+            <td class="p-3.5 font-medium text-stone-800">${escapeHtml(p.customer_name || 'Харилцагч')}</td>
+            <td class="p-3.5 font-mono text-stone-600">${escapeHtml(p.customer_phone || '-')}</td>
+            <td class="p-3.5 font-mono font-semibold text-stone-900">${p.weight_kg || 0} кг</td>
+            <td class="p-3.5 font-bold font-mono text-amber-700">${(p.price_amount || 0).toLocaleString()} ₮</td>
+            <td class="p-3.5 text-stone-600 text-xs">${escapeHtml(p.warehouse_location || 'УБ Агуулах')}</td>
+            <td class="p-3.5 whitespace-nowrap">${statusBadge}</td>
+            <td class="p-3.5 text-right whitespace-nowrap space-x-1">
+              ${p.status !== 'DELIVERED' ? `
+                <button onclick="markCargoDelivered('${p.tracking_code}')" class="px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-[11px] font-bold inline-flex items-center gap-1" title="Хэрэглэгчид гардуулж өгөх">
+                  <i class="fa-solid fa-box-open text-[10px]"></i>
+                  <span>Олгох</span>
+                </button>
+              ` : `
+                <span class="text-stone-400 text-[11px] font-medium">Олгогдсон</span>
+              `}
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function markCargoDelivered(trackingCode) {
+      if (!confirm(`'${trackingCode}' карго кодыг олгосон гэж тэмдэглэх үү?`)) return;
+      try {
+        const res = await fetch(`/api/cargo/${encodeURIComponent(trackingCode)}/deliver?page_id=${encodeURIComponent(activePageId)}`, {
+          method: 'POST'
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(`Ачаа ${trackingCode} амжилттай олгогдлоо!`);
+          loadCargoData();
+        } else {
+          alert('Алдаа гарлаа');
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      }
+    }
+
+    function openImportCargoModal() {
+      document.getElementById('import-cargo-modal').classList.remove('hidden');
+    }
+    function closeImportCargoModal() {
+      document.getElementById('import-cargo-modal').classList.add('hidden');
+    }
+
+    async function submitCargoManifest() {
+      const fileInput = document.getElementById('cargo-manifest-file');
+      if (!fileInput.files || fileInput.files.length === 0) {
+        alert('Excel файл сонгоно уу');
+        return;
+      }
+
+      const file = fileInput.files[0];
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const btn = document.getElementById('btn-submit-manifest');
+      btn.disabled = true;
+      btn.innerText = 'Импортлож байна...';
+
+      try {
+        const res = await fetch('/api/cargo/import-manifest', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        if (data.success) {
+          closeImportCargoModal();
+          showToast(data.message || 'Ачаанууд амжилттай импортлогдлоо!');
+          loadCargoData();
+        } else {
+          alert(data.message || 'Импортлоход алдаа гарлаа');
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerText = 'Импортлох';
       }
     }
 

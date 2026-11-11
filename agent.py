@@ -11,6 +11,7 @@ import database
 import knowledge_base
 import sheets_service
 import fintech_service
+import cargo_service
 
 load_dotenv(override=True)
 
@@ -400,12 +401,18 @@ class AIAgent:
                     return f"Амжилттай бүртгэгдлээ. Дугаар: #{r_id}"
 
                 def check_sheet_cargo_status(tracking_or_phone: str) -> str:
-                    """Бүх холбогдсон Google Sheets болон Excel хүснэгтүүдээс бараа, үнэ, захиалга эсвэл утасны дугаараар шүүж хайх"""
+                    """Бүх холбогдсон Карго агуулахын бааз, Google Sheets болон Excel хүснэгтүүдээс бараа, карго код, үнэ, захиалга эсвэл утасны дугаараар шүүж хайх"""
+                    # 1. Албан ёсны карго агуулахын бодит цагийн сангаас хайх
+                    cargo_direct = cargo_service.lookup_customer_cargo(page_id, tracking_or_phone)
+                    if cargo_direct:
+                        return f"[АГУУЛАХЫН БОДИТ ЦАГИЙН СТАТУС]:\n{cargo_direct}"
+
+                    # 2. Холбогдсон Google Sheets болон Excel хүснэгтүүдээс хайх
                     if not page_data:
                         return "Хүснэгтийн мэдээлэл олдсонгүй."
                     matched = sheets_service.search_all_page_sheets(page_data, tracking_or_phone)
                     if not matched:
-                        return f"'{tracking_or_phone}' утгаар хайхад хүснэгтүүдээс тохирох мөр олдсонгүй."
+                        return f"'{tracking_or_phone}' утгаар хайхад тохирох ачаа олдсонгүй."
                     res = []
                     for r in matched[:8]:
                         sheet_name = r.get("Хүснэгт", "Хүснэгт")
