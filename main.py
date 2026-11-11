@@ -752,7 +752,178 @@ async def update_page_google_sheets_endpoint(page_id: str, payload: Dict[str, An
     
     url = payload.get("google_sheets_url", "").strip()
     database.update_page_google_sheets(page_id, url)
+    agent.reset_sessions()
     return {"success": True, "page_id": page_id, "google_sheets_url": url}
+
+def _save_page_sheets_list(page_id: str, sheets_list: List[Dict[str, Any]]):
+    page_obj = database.get_page(page_id)
+    if not page_obj:
+        raise HTTPException(status_code=404, detail="Салбар олдсонгүй")
+    raw_kj = page_obj.get("knowledge_json") or "{}"
+    try:
+        kj = json.loads(raw_kj) if isinstance(raw_kj, str) else dict(raw_kj)
+    except Exception:
+        kj = {}
+    kj["sheets"] = sheets_list
+
+    # Keep first google sheet url in google_sheets_url for backward compatibility
+    first_gs_url = next((s.get("url", "") for s in sheets_list if s.get("type") == "google" and s.get("url")), "")
+    database.update_page_google_sheets(page_id, first_gs_url)
+    database.save_page(
+        page_id=page_id,
+        name=page_obj.get("name", "Салбар"),
+        category=page_obj.get("category", "general"),
+        page_access_token=page_obj.get("page_access_token", ""),
+        verify_token=page_obj.get("verify_token", "agent_verify_secret_token_123"),
+        knowledge_json=json.dumps(kj, ensure_ascii=False, indent=2),
+        gemini_api_key=page_obj.get("gemini_api_key", ""),
+        monthly_token_limit=page_obj.get("monthly_token_limit", 100000)
+    )
+    agent.reset_sessions()
+
+@app.get("/api/pages/{page_id}/sheets")
+async def list_page_sheets_endpoint(page_id: str, request: Request):
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
+    if user["role"] == "client" and user["page_id"] != page_id:
+        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
+
+    page_obj = database.get_page(page_id)
+    if not page_obj:
+        raise HTTPException(status_code=404, detail="Салбар олдсонгүй")
+
+    sheets = sheets_service.get_page_sheets_list(page_obj)
+    summary = []
+    for s in sheets:
+        s_type = s.get("type", "google")
+        cols = s.get("columns") or []
+        row_count = s.get("row_count")
+        if s_type == "excel":
+            rows = s.get("rows") or []
+            row_count = len(rows)
+            if not cols and rows:
+                cols = list(rows[0].keys())
+        summary.append({
+            "id": s.get("id"),
+            "title": s.get("title") or "Хүснэгт",
+            "type": s_type,
+            "url": s.get("url", ""),
+            "filename": s.get("filename", ""),
+            "columns": cols,
+            "row_count": row_count if row_count is not None else "Шалгаагүй",
+            "updated_at": s.get("updated_at", "")
+        })
+    return {"success": True, "sheets": summary}
+
+@app.post("/api/pages/{page_id}/sheets/add")
+async def add_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any], request: Request):
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
+    if user["role"] == "client" and user["page_id"] != page_id:
+        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
+
+    url = (payload.get("url") or payload.get("google_sheets_url") or "").strip()
+    title = (payload.get("title") or "").strip()
+    if not url:
+        return JSONResponse({"success": False, "error": "Google Sheet холбоос оруулна уу."}, status_code=400)
+
+    try:
+        rows = sheets_service.fetch_sheet_rows(url, force_refresh=True)
+    except Exception as e:
+        return JSONResponse({
+            "success": False,
+            "error": f"Хүснэгтийг уншихад алдаа гарлаа ({e}). 'Anyone with the link can view' эрхтэй эсэхийг шалгана уу."
+        }, status_code=400)
+
+    cols = list(rows[0].keys()) if rows else []
+    page_obj = database.get_page(page_id)
+    sheets = sheets_service.get_page_sheets_list(page_obj)
+    import uuid, time
+    new_sheet = {
+        "id": f"gs_{uuid.uuid4().hex[:8]}",
+        "title": title or f"Google Хүснэгт #{len(sheets) + 1}",
+        "type": "google",
+        "url": url,
+        "columns": cols,
+        "row_count": len(rows),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M")
+    }
+    sheets.append(new_sheet)
+    _save_page_sheets_list(page_id, sheets)
+    return {
+        "success": True,
+        "sheet": new_sheet,
+        "count": len(rows),
+        "columns": cols,
+        "sample": rows[:3]
+    }
+
+@app.post("/api/pages/{page_id}/sheets/upload")
+async def upload_page_excel_sheets_endpoint(page_id: str, request: Request, file: UploadFile = File(...)):
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
+    if user["role"] == "client" and user["page_id"] != page_id:
+        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        return JSONResponse({"success": False, "error": "Хоосон файл байна."}, status_code=400)
+
+    try:
+        extracted_sheets = sheets_service.parse_uploaded_excel_bytes(file_bytes, file.filename or "excel.xlsx")
+    except Exception as e:
+        return JSONResponse({"success": False, "error": f"Excel файл уншихад алдаа гарлаа: {e}"}, status_code=400)
+
+    if not extracted_sheets:
+        return JSONResponse({"success": False, "error": "Хүснэгтэд өгөгдөл олдсонгүй."}, status_code=400)
+
+    page_obj = database.get_page(page_id)
+    sheets = sheets_service.get_page_sheets_list(page_obj)
+    sheets.extend(extracted_sheets)
+    _save_page_sheets_list(page_id, sheets)
+
+    return {
+        "success": True,
+        "added_count": len(extracted_sheets),
+        "added_sheets": [
+            {
+                "id": s["id"],
+                "title": s["title"],
+                "row_count": s["row_count"],
+                "columns": s["columns"]
+            }
+            for s in extracted_sheets
+        ]
+    }
+
+@app.delete("/api/pages/{page_id}/sheets/{sheet_id}")
+async def delete_page_sheet_endpoint(page_id: str, sheet_id: str, request: Request):
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token")
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
+    if user["role"] == "client" and user["page_id"] != page_id:
+        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
+
+    page_obj = database.get_page(page_id)
+    sheets = sheets_service.get_page_sheets_list(page_obj)
+    filtered = [s for s in sheets if s.get("id") != sheet_id]
+    _save_page_sheets_list(page_id, filtered)
+    return {"success": True, "remaining": len(filtered)}
 
 @app.post("/api/pages/{page_id}/test_sheet")
 async def test_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any], request: Request):
@@ -767,13 +938,19 @@ async def test_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any],
     
     url = payload.get("google_sheets_url", "").strip()
     if not url:
-        return JSONResponse({"success": False, "error": "Google Sheets URL оруулаагүй байна."}, status_code=400)
+        return JSONResponse({"success": False, "error": "Google Sheets холбоос оруулаагүй байна."}, status_code=400)
     
-    rows = sheets_service.fetch_google_sheet_data(url)
+    try:
+        rows = sheets_service.fetch_sheet_rows(url, force_refresh=True)
+    except Exception as e:
+        return JSONResponse({
+            "success": False, 
+            "error": f"Хүснэгтийг уншиж чадсангүй ({e}). Та Google Sheet-ийнхээ 'Share' эрхийг 'Anyone with the link can view' болгосон эсэхээ шалгана уу."
+        }, status_code=400)
     if not rows:
         return JSONResponse({
             "success": False, 
-            "error": "Хүснэгтийг уншиж чадсангүй. Та Google Sheet-ийнхээ 'Share' эрхийг 'Anyone with the link can view' (Холбоостой хүн бүр үзэж болно) болгосон эсэхээ шалгана уу."
+            "error": "Хүснэгт хоосон эсвэл уншиж чадсангүй. 'Share' эрхийг 'Anyone with the link can view' болгосон эсэхээ шалгана уу."
         }, status_code=400)
         
     cols = list(rows[0].keys()) if rows else []
@@ -887,9 +1064,12 @@ async def update_keys(payload: Dict[str, str], request: Request):
         "ADMIN_PASSWORD": os.getenv("ADMIN_PASSWORD", database.DEFAULT_ADMIN_PASSWORD),
         "PORT": os.getenv("PORT", "8000")
     }
-    with open(".env", "w", encoding="utf-8") as f:
-        for k, v in keys_map.items():
-            f.write(f"{k}={v}\n")
+    try:
+        with open(".env", "w", encoding="utf-8") as f:
+            for k, v in keys_map.items():
+                f.write(f"{k}={v}\n")
+    except Exception as env_err:
+        logger.warning(f"Could not write .env file (read-only fs): {env_err}")
 
     return {"status": "success", "message": "Тохиргоо амжилттай хадгалагдлаа!"}
 
@@ -906,30 +1086,30 @@ async def serve_privacy_policy():
 <html lang="mn">
 <head>
   <meta charset="UTF-8">
-  <title>Privacy Policy - AI Agent Hub</title>
+  <title>Нууцлалын Бодлого — Гэрэгэ</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen p-6 md:p-12 font-sans">
-  <div class="max-w-3xl mx-auto space-y-6 bg-slate-900/80 p-8 rounded-2xl border border-slate-800">
+<body class="bg-[#0a0a0c] text-[#ece8e1] min-h-screen p-6 md:p-12 font-sans">
+  <div class="max-w-3xl mx-auto space-y-6 bg-[#121316] p-8 rounded-2xl border border-white/10">
     <h1 class="text-3xl font-bold text-white">Нууцлалын Бодлого (Privacy Policy)</h1>
-    <p class="text-xs text-slate-400">Сүүлд шинэчлэгдсэн: 2026-11-11</p>
+    <p class="text-xs text-stone-400">Сүүлд шинэчлэгдсэн: 2026-11-11</p>
     
-    <div class="space-y-4 text-sm text-slate-300 leading-relaxed">
+    <div class="space-y-4 text-sm text-stone-300 leading-relaxed">
       <h2 class="text-lg font-semibold text-white">1. Ерөнхий зүйл</h2>
-      <p>Энэхүү систем нь Facebook Messenger, Instagram болон бусад сувгаар ирсэн харилцагчийн асуулт, хүсэлтэд хиймэл оюун ухааны тусламжтайгаар шуурхай хариулах зориулалттай харилцагчийн үйлчилгээний автоматжуулсан платформ юм.</p>
+      <p>Энэхүү систем нь Facebook Messenger, Instagram болон вэб сувгаар ирсэн харилцагчийн асуулт, хүсэлтэд хиймэл оюун ухааны тусламжтайгаар шуурхай хариулах зориулалттай харилцагчийн үйлчилгээний платформ юм.</p>
 
       <h2 class="text-lg font-semibold text-white">2. Бид ямар мэдээлэл цуглуулдаг вэ?</h2>
-      <p>Бид зөвхөн хэрэглэгчийн бичсэн чат мессеж, лавлагаа, холбоо барих утас болон нэр, гүйлгээний баримтын мэдээллийг хэрэглэгчийн хүсэлтээр үйлчилгээ үзүүлэх зорилгоор түр бүртгэнэ.</p>
+      <p>Бид зөвхөн хэрэглэгчийн бичсэн чат мессеж, лавлагаа, холбоо барих утас болон нэр, гүйлгээний баримтын мэдээллийг хэрэглэгчийн хүсэлтээр үйлчилгээ үзүүлэх зорилгоор бүртгэнэ.</p>
 
       <h2 class="text-lg font-semibold text-white">3. Мэдээллийн ашиглалт</h2>
-      <p>Цуглуулсан мэдээллийг зөвхөн тухайн байгууллага, хуудасны үйлчилгээ үзүүлэх, захиалга/бүртгэлийг баталгаажуулахад ашиглах бөгөөд гуравдагч этгээдэд зарж борлуулахгүй.</p>
+      <p>Цуглуулсан мэдээллийг зөвхөн тухайн байгууллага, салбарын үйлчилгээ үзүүлэх, захиалга болон бүртгэлийг баталгаажуулахад ашиглах бөгөөд гуравдагч этгээдэд дамжуулахгүй.</p>
 
       <h2 class="text-lg font-semibold text-white">4. Мэдээлэл устгах (User Data Deletion)</h2>
-      <p>Хэрэглэгч өөрийн бүртгэгдсэн мэдээллийг устгуулахыг хүсвэл тухайн хуудасны чатаар "Бүртгэл устгах" эсвэл админд мэдэгдэн шууд устгуулах бүрэн эрхтэй.</p>
+      <p>Хэрэглэгч өөрийн бүртгэгдсэн мэдээллийг устгуулахыг хүсвэл тухайн салбарын чатаар "Бүртгэл устгах" гэж бичих эсвэл удирдлагад мэдэгдэн устгуулах бүрэн эрхтэй.</p>
 
       <h2 class="text-lg font-semibold text-white">5. Холбоо барих</h2>
-      <p>Асуулт, санал байвал хуудасны чатаар болон системийн удирдлагад хандана уу.</p>
+      <p>Асуулт, санал байвал салбарын чатаар болон системийн удирдлагад хандана уу.</p>
     </div>
   </div>
 </body>
@@ -941,24 +1121,60 @@ async def serve_terms_of_service():
 <html lang="mn">
 <head>
   <meta charset="UTF-8">
-  <title>Terms of Service - AI Agent Hub</title>
+  <title>Үйлчилгээний Нөхцөл — Гэрэгэ</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen p-6 md:p-12 font-sans">
-  <div class="max-w-3xl mx-auto space-y-6 bg-slate-900/80 p-8 rounded-2xl border border-slate-800">
+<body class="bg-[#0a0a0c] text-[#ece8e1] min-h-screen p-6 md:p-12 font-sans">
+  <div class="max-w-3xl mx-auto space-y-6 bg-[#121316] p-8 rounded-2xl border border-white/10">
     <h1 class="text-3xl font-bold text-white">Үйлчилгээний Нөхцөл (Terms of Service)</h1>
-    <p class="text-xs text-slate-400">Сүүлд шинэчлэгдсэн: 2026-11-11</p>
-    <div class="space-y-4 text-sm text-slate-300 leading-relaxed">
-      <p>Манай автоматжуулсан харилцагчийн үйлчилгээний AI туслахыг ашигласнаар та энэхүү нөхцөлийг зөвшөөрсөнд тооцогдоно.</p>
-      <p>AI систем нь мэдээлэл олгох зорилготой бөгөөд албан ёсны шийдвэрийг байгууллагын хүний менежер эцэслэн баталгаажуулна.</p>
+    <p class="text-xs text-stone-400">Сүүлд шинэчлэгдсэн: 2026-11-11</p>
+    <div class="space-y-4 text-sm text-stone-300 leading-relaxed">
+      <p>Манай харилцагчийн ухаалаг туслахыг ашигласнаар та энэхүү үйлчилгээний нөхцөлийг зөвшөөрсөнд тооцогдоно.</p>
+      <p>Систем нь мэдээлэл олгох, бүртгэл хийх зорилготой бөгөөд албан ёсны шийдвэрийг байгууллагын менежер эцэслэн баталгаажуулна.</p>
     </div>
   </div>
 </body>
 </html>"""
 
+@app.get("/b/{branch_slug}", response_class=HTMLResponse)
+@app.get("/{branch_slug}", response_class=HTMLResponse)
+async def serve_branch_portal_or_page(branch_slug: str):
+    """
+    Салбар бүрийн тусгай цэвэр холбоос (жишээ нь: /cargo, /salon, /turshilt).
+    Админы эрх задруулахгүйгээр зөвхөн тухайн салбарын эрхээр эсвэл нэвтрэх цонхоор нээнэ.
+    """
+    slug_clean = branch_slug.strip().lower()
+    if slug_clean in {"favicon.ico", "robots.txt", "widget.js", "api", "webhook", "admin", "dashboard", "privacy", "terms"}:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    all_pages = database.get_all_pages()
+    matched_page = None
+    for p in all_pages:
+        pid = str(p.get("page_id") or "").lower()
+        uname = str(p.get("client_username") or "").lower()
+        pname = str(p.get("name") or "").lower()
+        if slug_clean in {pid, uname, pname} or slug_clean == pname.replace(" ", "-"):
+            matched_page = p
+            break
+
+    with open("dashboard.html", "r", encoding="utf-8") as f:
+        html_str = f.read()
+
+    if matched_page:
+        # Inject safe branch hint (never exposes admin token, only pre-selects branch for client login)
+        branch_hint = json.dumps({
+            "page_id": matched_page.get("page_id"),
+            "name": matched_page.get("name"),
+            "client_username": matched_page.get("client_username") or ""
+        }, ensure_ascii=False)
+        inject_script = f"<script>window.__INITIAL_BRANCH_HINT__ = {branch_hint};</script></head>"
+        html_str = html_str.replace("</head>", inject_script, 1)
+
+    return html_str
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    print(f"🚀 AI Chatbot Multi-Tenant Agency Suite: http://localhost:{port}")
+    print(f"Гэрэгэ — Харилцааны Ухаалаг Систем: http://localhost:{port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

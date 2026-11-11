@@ -363,11 +363,10 @@ class AIAgent:
         registered = False
         reg_info = None
 
-        # Google Sheets холболт шалгах ба бараа/карго хайлт хийх
-        sheets_url = page_data.get("google_sheets_url") if page_data else None
+        # Олон хүснэгт (Google Sheets болон оруулсан Excel файлууд) дундаас хайлт хийх
         sheet_context = ""
-        if sheets_url and text:
-            sheet_context = sheets_service.get_sheet_lookup_context(sheets_url, text) or ""
+        if page_data and text:
+            sheet_context = sheets_service.get_page_sheets_lookup_context(page_data, text) or ""
 
         if client:
             try:
@@ -397,15 +396,17 @@ class AIAgent:
                     return f"Амжилттай бүртгэгдлээ. Дугаар: #{r_id}"
 
                 def check_sheet_cargo_status(tracking_or_phone: str) -> str:
-                    """Google Sheets-ээс барааны төлөв хайх"""
-                    if not sheets_url:
-                        return "Google Sheets холбогдоогүй байна."
-                    matched = sheets_service.search_sheet_records(sheets_url, tracking_or_phone)
+                    """Бүх холбогдсон Google Sheets болон Excel хүснэгтүүдээс бараа, үнэ, захиалга эсвэл утасны дугаараар шүүж хайх"""
+                    if not page_data:
+                        return "Хүснэгтийн мэдээлэл олдсонгүй."
+                    matched = sheets_service.search_all_page_sheets(page_data, tracking_or_phone)
                     if not matched:
-                        return f"'{tracking_or_phone}' дугаартай барааны мэдээлэл олдсонгүй."
+                        return f"'{tracking_or_phone}' утгаар хайхад хүснэгтүүдээс тохирох мөр олдсонгүй."
                     res = []
-                    for r in matched[:3]:
-                        res.append("; ".join([f"{k}: {v}" for k, v in r.items() if v]))
+                    for r in matched[:8]:
+                        sheet_name = r.get("Хүснэгт", "Хүснэгт")
+                        pairs = "; ".join([f"{k}: {v}" for k, v in r.items() if v and k != "Хүснэгт"])
+                        res.append(f"[{sheet_name}] -> {pairs}")
                     return "\n---\n".join(res)
 
                 # Хэрэглэгчийн санах ойг татаж авах (Mem0 & Zep загвар)
