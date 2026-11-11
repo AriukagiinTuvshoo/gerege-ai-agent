@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="mn" class="dark">
+<html lang="mn" class="light">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Гэрэгэ — Харилцагчийн Удирдлагын Төв</title>
+    <title>Гэрэгэ — Харилцаа & Бүртгэлийн Нэгдсэн Систем</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -12,7 +12,6 @@
   
   <script>
     tailwind.config = {
-      darkMode: 'class',
       theme: {
         extend: {
           fontFamily: {
@@ -21,21 +20,39 @@
             mono: ['"JetBrains Mono"', 'monospace'],
           },
           colors: {
-            obsidian: '#0b0b0c',
-            cardbg: '#121214',
-            cardborder: 'rgba(255, 250, 240, 0.08)',
-            accent: {
-              primary: '#e5e0d8',
-              cyan: '#38bdf8',
-              emerald: '#10b981',
-              amber: '#d97706',
-              meta: '#0084ff'
+            linen: '#F8F6F0',
+            cardbg: '#FFFFFF',
+            cardborder: 'rgba(41, 37, 36, 0.08)',
+            stone: {
+              50: '#FAF8F5',
+              100: '#F5F2EB',
+              200: '#E7E4DC',
+              300: '#D5CFC4',
+              400: '#A8A29E',
+              500: '#78716C',
+              600: '#57534E',
+              700: '#44403C',
+              800: '#292524',
+              900: '#1C1917',
+            },
+            emerald: {
+              50: '#ECFDF5',
+              100: '#D1FAE5',
+              200: '#A7F3D0',
+              300: '#6EE7B7',
+              400: '#34D399',
+              500: '#10B981',
+              600: '#059669',
+              700: '#047857',
+              800: '#065F46',
+              900: '#064E3B',
             }
           },
           boxShadow: {
-            glow: '0 8px 24px -6px rgba(0, 0, 0, 0.5)',
-            glowEmerald: '0 8px 24px -6px rgba(16, 185, 129, 0.2)',
-            phone: '0 25px 50px -12px rgba(0, 0, 0, 0.8), 0 0 0 10px #18181b, 0 0 0 11px #27272a',
+            subtle: '0 4px 20px -2px rgba(41, 37, 36, 0.04), 0 2px 6px -1px rgba(41, 37, 36, 0.02)',
+            elevated: '0 12px 36px -8px rgba(41, 37, 36, 0.08), 0 4px 12px -2px rgba(41, 37, 36, 0.04)',
+            glowEmerald: '0 8px 24px -6px rgba(5, 150, 105, 0.25)',
+            phone: '0 25px 60px -15px rgba(41, 37, 36, 0.15), 0 0 0 8px #ECE7DF, 0 0 0 9px #D8D2C5',
           }
         }
       }
@@ -44,8 +61,8 @@
 
   <style>
     body {
-      background-color: #0b0b0c;
-      color: #ece8e1;
+      background-color: #F8F6F0;
+      color: #1C1917;
       font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       overflow-x: hidden;
       font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'tnum';
@@ -58,83 +75,100 @@
       top: 0; left: 0; width: 100vw; height: 100vh;
       pointer-events: none;
       z-index: 9999;
-      opacity: 0.026;
+      opacity: 0.03;
       background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
     }
     
     .bg-ambient {
-      background-color: #0b0b0c;
-      background-image: radial-gradient(rgba(236, 232, 225, 0.035) 1px, transparent 1px);
-      background-size: 28px 28px;
+      background-color: #F8F6F0;
+      background-image: radial-gradient(rgba(41, 37, 36, 0.06) 1px, transparent 1px);
+      background-size: 24px 24px;
     }
 
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 9999px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
+    ::-webkit-scrollbar-thumb { background: rgba(41, 37, 36, 0.15); border-radius: 9999px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(41, 37, 36, 0.28); }
 
     .glass-card {
-      background: #121215;
-      border: 1px solid rgba(255, 250, 240, 0.075);
-      border-radius: 18px;
-      box-shadow: 0 12px 32px -12px rgba(0, 0, 0, 0.6), inset 0 1px 0 0 rgba(255, 255, 255, 0.04);
+      background: #FFFFFF;
+      border: 1px solid rgba(41, 37, 36, 0.09);
+      border-radius: 20px;
+      box-shadow: 0 4px 20px -2px rgba(41, 37, 36, 0.04), 0 2px 6px -1px rgba(41, 37, 36, 0.02);
     }
     .glass-card-hover {
-      transition: border-color 0.2s ease, transform 0.2s ease;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
     }
     .glass-card-hover:hover {
-      border-color: rgba(255, 250, 240, 0.15);
+      border-color: rgba(5, 150, 105, 0.35);
+      box-shadow: 0 12px 32px -8px rgba(41, 37, 36, 0.08);
     }
 
     .msg-user {
-      background: #27272a;
-      color: #fafaf9;
-      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: #059669;
+      color: #FFFFFF;
       border-radius: 16px 16px 4px 16px;
+      box-shadow: 0 2px 8px -1px rgba(5, 150, 105, 0.25);
     }
     .msg-bot {
-      background: #17171b;
-      color: #ece8e1;
-      border: 1px solid rgba(255, 250, 240, 0.08);
+      background: #FFFFFF;
+      color: #1C1917;
+      border: 1px solid rgba(41, 37, 36, 0.1);
       border-radius: 16px 16px 16px 4px;
+      box-shadow: 0 2px 6px -1px rgba(41, 37, 36, 0.04);
     }
     .msg-agent {
-      background: #064e3b;
-      color: #ecfdf5;
-      border: 1px solid rgba(16, 185, 129, 0.25);
+      background: #065F46;
+      color: #FFFFFF;
       border-radius: 16px 16px 4px 16px;
+      box-shadow: 0 2px 8px -1px rgba(6, 95, 70, 0.25);
     }
 
     .btn-action-primary {
-      background: #ece8e1;
-      color: #0b0b0c;
+      background: #1C1917;
+      color: #FFFFFF;
       font-weight: 600;
       transition: all 0.18s cubic-bezier(0.22, 1, 0.36, 1);
     }
     .btn-action-primary:hover {
-      background: #ffffff;
+      background: #292524;
       transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(28, 25, 23, 0.15);
     }
 
     .btn-action-secondary {
-      background: #17171b;
-      color: #d6d3cd;
-      border: 1px solid rgba(255, 250, 240, 0.09);
+      background: #FFFFFF;
+      color: #292524;
+      border: 1px solid rgba(41, 37, 36, 0.12);
+      font-weight: 600;
       transition: all 0.18s cubic-bezier(0.22, 1, 0.36, 1);
     }
     .btn-action-secondary:hover {
-      background: #202026;
-      border-color: rgba(255, 250, 240, 0.18);
-      color: #ffffff;
+      background: #FAF8F5;
+      border-color: rgba(41, 37, 36, 0.22);
+      color: #1C1917;
+      transform: translateY(-1px);
+    }
+
+    .btn-action-emerald {
+      background: #059669;
+      color: #FFFFFF;
+      font-weight: 600;
+      transition: all 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .btn-action-emerald:hover {
+      background: #047857;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(5, 150, 105, 0.25);
     }
 
     .phone-container {
       width: 360px;
       height: 670px;
       border-radius: 44px;
-      border: 6px solid #1f1f23;
-      background: #0b0b0d;
-      box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(255, 250, 240, 0.07);
+      border: 7px solid #ECE7DF;
+      background: #FAF8F5;
+      box-shadow: 0 25px 60px -15px rgba(41, 37, 36, 0.15), 0 0 0 1px rgba(41, 37, 36, 0.08);
       position: relative;
       display: flex;
       flex-direction: column;
@@ -147,138 +181,157 @@
       transform: translateX(-50%);
       width: 96px;
       height: 24px;
-      background: #000000;
+      background: #1C1917;
       border-radius: 20px;
       z-index: 50;
       display: flex;
       align-items: center;
       justify-content: flex-end;
       padding-right: 10px;
-      border: 1px solid rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
     }
     .phone-island-cam {
       width: 8px;
       height: 8px;
-      background: #18181b;
+      background: #292524;
       border-radius: 50%;
-      border: 1px solid #27272a;
+      border: 1px solid #44403C;
     }
   </style>
 </head>
 
-<body class="bg-ambient min-h-screen flex flex-col antialiased selection:bg-stone-500/30 selection:text-stone-200">
+<body class="bg-ambient min-h-screen flex flex-col antialiased selection:bg-emerald-500/20 selection:text-emerald-900 text-stone-900">
 
   <!-- ==================== TOP NAVIGATION BAR ==================== -->
-  <header class="sticky top-0 z-40 border-b border-white/[0.07] bg-[#0b0b0c]/90 backdrop-blur-xl transition-all">
-    <div class="max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
-      
-      <!-- Brand & Branch Selector -->
-      <div class="flex items-center gap-3 sm:gap-4">
-        <div class="relative shrink-0">
-          <div class="w-9 h-9 rounded-xl bg-[#18181c] border border-white/[0.1] flex items-center justify-center text-[#ece8e1] font-serif text-lg tracking-wider shadow-inner">
-            Г
-          </div>
-          <span class="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-500 border-2 border-[#0b0b0c]"></span>
-        </div>
+  <header class="sticky top-0 z-40 bg-[#FAF8F5]/95 backdrop-blur-xl border-b border-stone-200/90 shadow-[0_1px_4px_rgba(41,37,36,0.03)] transition-all">
+    
+    <!-- ROW 1: BRAND LOGO & BRANCH SWITCHER & QUICK ACTIONS -->
+    <div class="border-b border-stone-200/70">
+      <div class="max-w-[1680px] mx-auto px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between gap-3 sm:gap-4">
         
-        <div>
-          <div class="flex items-center gap-2">
-            <h1 class="text-sm font-bold text-[#ece8e1] tracking-wider uppercase">Гэрэгэ</h1>
-            <span class="hidden md:inline px-2 py-0.5 rounded text-[10px] font-medium bg-[#18181c] text-stone-400 border border-white/[0.07]">
-              Удирдлагын төв
-            </span>
+        <!-- Left: Brand & Branch Controls -->
+        <div class="flex items-center gap-3 sm:gap-4 min-w-0">
+          <!-- Gerege Emblem -->
+          <div class="flex items-center gap-2.5 shrink-0">
+            <div class="relative">
+              <div class="w-8 h-8 rounded-xl bg-[#1C1917] border border-stone-800 flex items-center justify-center text-white font-serif text-base font-bold shadow-sm">
+                Г
+              </div>
+              <span class="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-emerald-500 border-2 border-[#FAF8F5]"></span>
+            </div>
+            <div>
+              <div class="flex items-center gap-1.5">
+                <span class="text-xs font-extrabold tracking-wider text-stone-900 uppercase">Гэрэгэ</span>
+                <span class="hidden sm:inline px-1.5 py-0.2 rounded text-[9px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                  Удирдлагын төв
+                </span>
+              </div>
+              <p class="text-[10px] text-stone-500 hidden md:block">Харилцаа ба бүртгэлийн нэгдсэн систем</p>
+            </div>
           </div>
-          <p class="text-[11px] text-stone-400 hidden sm:block">Харилцаа ба бүртгэлийн нэгдсэн систем</p>
+
+          <!-- Admin View: Branch Selector -->
+          <div id="agency-page-container" class="flex items-center gap-2 pl-3 sm:pl-4 border-l border-stone-200 min-w-0">
+            <div class="relative shrink-0">
+              <select id="agency-page-select" onchange="handlePageSwitch(this.value)" class="bg-white border border-stone-200 rounded-xl pl-3 pr-8 py-1.5 text-xs font-semibold text-stone-800 focus:outline-none focus:border-emerald-600 cursor-pointer appearance-none shadow-sm max-w-[170px] sm:max-w-[240px] truncate">
+                <option value="100799479495809">Tuvshok Кино & Драма Суваг</option>
+              </select>
+              <i class="fa-solid fa-chevron-down absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-stone-400 pointer-events-none"></i>
+            </div>
+
+            <button onclick="openAddPageModal()" class="btn-action-secondary px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-sm hover:border-emerald-400 shrink-0" title="Шинэ салбар нэмэх">
+              <i class="fa-solid fa-plus text-[10px] text-emerald-600"></i>
+              <span class="hidden sm:inline">Салбар нэмэх</span>
+            </button>
+
+            <button onclick="openClientAccessModal()" class="btn-action-secondary px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-sm hover:border-amber-400 shrink-0" title="Салбарын шууд холбоос ба нэвтрэх эрх">
+              <i class="fa-solid fa-key text-[10px] text-amber-500"></i>
+              <span class="hidden sm:inline">Холбоос & Эрх</span>
+            </button>
+          </div>
+
+          <!-- Client View: Branch Badge -->
+          <div id="client-brand-container" class="hidden items-center gap-2 pl-3 sm:pl-4 border-l border-stone-200 min-w-0">
+            <div class="px-3 py-1 rounded-xl bg-white border border-stone-200 text-xs font-bold text-stone-900 flex items-center gap-2 shadow-sm">
+              <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+              <span id="client-brand-display" class="truncate max-w-[200px]">Салбар</span>
+            </div>
+          </div>
         </div>
 
-        <!-- Admin View: Dynamic Branch Selector & Access Controls -->
-        <div id="agency-page-container" class="flex items-center gap-1.5 ml-2 pl-3 border-l border-white/[0.07]">
-          <div class="relative">
-            <select id="agency-page-select" onchange="handlePageSwitch(this.value)" class="bg-[#151519] border border-white/[0.1] rounded-xl pl-3 pr-8 py-1.5 text-xs font-semibold text-stone-200 focus:outline-none focus:border-stone-500 cursor-pointer appearance-none shadow-sm max-w-[180px] sm:max-w-[240px] truncate">
-              <option value="100799479495809">Tuvshok Кино & Драма Суваг</option>
-            </select>
-            <i class="fa-solid fa-chevron-down absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-stone-400 pointer-events-none"></i>
-          </div>
-
-          <button onclick="openAddPageModal()" class="btn-action-secondary px-2.5 py-1.5 rounded-xl text-xs font-medium transition flex items-center gap-1.5 shadow-sm" title="Шинэ салбар нэмэх">
-            <i class="fa-solid fa-plus text-[10px]"></i>
-            <span class="hidden lg:inline">Салбар нэмэх</span>
+        <!-- Right: Actions & Profile -->
+        <div class="flex items-center gap-2 shrink-0">
+          <button onclick="openGoogleSheetsModal()" class="px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-xs font-semibold transition flex items-center gap-1.5 shadow-sm" title="Google Sheets болон Excel олон хуудас холбох">
+            <i class="fa-solid fa-table-cells text-emerald-600 text-xs"></i>
+            <span class="hidden md:inline">Хүснэгт холбох</span>
           </button>
 
-          <button onclick="openClientAccessModal()" class="btn-action-secondary px-2.5 py-1.5 rounded-xl text-xs font-medium transition flex items-center gap-1.5 shadow-sm" title="Салбарын шууд холбоос болон нэвтрэх эрх">
-            <i class="fa-solid fa-key text-[10px] text-amber-500"></i>
-            <span class="hidden lg:inline">Эрх ба холбоос</span>
+          <button id="btn-export-excel" onclick="downloadExcel()" class="btn-action-secondary px-3 py-1.5 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow-sm" title="Харилцагчдын бүртгэлийг Excel (.xlsx) файлаар татах">
+            <i class="fa-solid fa-file-excel text-emerald-600 text-xs"></i>
+            <span class="hidden md:inline">Excel татах</span>
+          </button>
+
+          <span id="user-role-badge" class="px-2.5 py-1.5 rounded-xl text-[11px] font-bold bg-white border border-stone-200 text-stone-800 flex items-center gap-1.5 shadow-sm">
+            <i class="fa-solid fa-shield-halved text-emerald-600 text-xs"></i>
+            <span id="user-role-text">Удирдлага</span>
+          </span>
+
+          <button onclick="handleLogout()" class="px-2.5 py-1.5 rounded-xl bg-white hover:bg-red-50 text-stone-600 hover:text-red-600 border border-stone-200 text-xs font-semibold transition flex items-center gap-1.5 shadow-sm" title="Системээс гарах">
+            <i class="fa-solid fa-arrow-right-from-bracket text-xs"></i>
+            <span class="hidden lg:inline">Гарах</span>
           </button>
         </div>
 
-        <!-- Client View: Dedicated Brand Badge -->
-        <div id="client-brand-container" class="hidden items-center gap-2 ml-2 pl-3 border-l border-white/[0.07]">
-          <div class="px-3 py-1.5 rounded-xl bg-[#16161a] border border-white/[0.09] text-xs font-semibold text-stone-100 flex items-center gap-2">
-            <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-            <span id="client-brand-display" class="truncate max-w-[200px]">Салбар</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Navigation Tabs -->
-      <nav class="hidden xl:flex items-center p-1 rounded-2xl bg-[#141418] border border-white/[0.07] text-xs font-medium">
-        <button onclick="switchTab('simulator')" id="tab-btn-simulator" class="tab-btn px-3.5 py-1.5 rounded-xl bg-zinc-800 text-white border border-zinc-700/80 transition flex items-center gap-2 shadow-sm">
-          <i class="fa-solid fa-mobile-screen-button text-xs"></i>
-          <span>Туршилтын утас</span>
-        </button>
-        <button onclick="switchTab('inbox')" id="tab-btn-inbox" class="tab-btn px-3.5 py-1.5 rounded-xl text-zinc-400 hover:text-zinc-200 transition flex items-center gap-2">
-          <i class="fa-solid fa-inbox text-xs"></i>
-          <span>Шууд чат</span>
-        </button>
-        <button onclick="switchTab('leads')" id="tab-btn-leads" class="tab-btn px-3.5 py-1.5 rounded-xl text-zinc-400 hover:text-zinc-200 transition flex items-center gap-2">
-          <i class="fa-solid fa-table-list text-xs"></i>
-          <span>Бүртгэлийн сан</span>
-        </button>
-        <button onclick="switchTab('social')" id="tab-btn-social" class="tab-btn px-3.5 py-1.5 rounded-xl text-zinc-400 hover:text-zinc-200 transition flex items-center gap-2">
-          <i class="fa-solid fa-pen-nib text-xs"></i>
-          <span>Нийтлэлийн бэлдэц</span>
-        </button>
-        <button onclick="switchTab('knowledge')" id="tab-btn-knowledge" class="tab-btn px-3.5 py-1.5 rounded-xl text-zinc-400 hover:text-zinc-200 transition flex items-center gap-2">
-          <i class="fa-solid fa-book-open text-xs"></i>
-          <span>Байгууллагын мэдээлэл</span>
-        </button>
-        <button onclick="switchTab('client-api')" id="tab-btn-client-api" class="tab-btn hidden px-3.5 py-1.5 rounded-xl text-zinc-400 hover:text-zinc-200 transition flex items-center gap-2">
-          <i class="fa-solid fa-key text-xs"></i>
-          <span>Хиймэл оюуны эрх</span>
-        </button>
-        <button onclick="switchTab('links')" id="tab-btn-links" class="tab-btn px-3.5 py-1.5 rounded-xl text-zinc-400 hover:text-zinc-200 transition flex items-center gap-2">
-          <i class="fa-solid fa-building-columns text-xs"></i>
-          <span>Данс ба холбоос</span>
-        </button>
-        <button onclick="switchTab('settings')" id="tab-btn-settings" class="tab-btn px-3.5 py-1.5 rounded-xl text-zinc-400 hover:text-zinc-200 transition flex items-center gap-2">
-          <i class="fa-solid fa-sliders text-xs"></i>
-          <span>Тохиргоо</span>
-        </button>
-      </nav>
-
-      <!-- Right Action Pill & Auth -->
-      <div class="flex items-center gap-2">
-        <button onclick="openGoogleSheetsModal()" class="px-3 py-1.5 rounded-xl bg-emerald-950/40 hover:bg-emerald-900/50 text-emerald-300 border border-emerald-500/25 text-xs font-medium transition flex items-center gap-1.5 shadow-sm" title="Олон хүснэгт (Google Sheets болон Excel) холбох">
-          <i class="fa-solid fa-table-cells text-emerald-400 text-xs"></i>
-          <span class="hidden sm:inline">Хүснэгт холбох</span>
-        </button>
-
-        <button id="btn-export-excel" onclick="downloadExcel()" class="btn-action-secondary px-3 py-1.5 rounded-xl text-xs font-medium transition flex items-center gap-1.5 shadow-sm" title="Бүртгэлийг Excel (.xlsx) файлаар татах">
-          <i class="fa-solid fa-file-excel text-emerald-400 text-xs"></i>
-          <span class="hidden sm:inline">Excel татах</span>
-        </button>
-
-        <span id="user-role-badge" class="px-2.5 py-1.5 rounded-xl text-[11px] font-semibold bg-[#16161a] border border-white/[0.08] text-stone-300 flex items-center gap-1.5">
-          <i class="fa-solid fa-shield-halved text-stone-400 text-xs"></i>
-          <span id="user-role-text">Удирдлага</span>
-        </span>
-
-        <button onclick="handleLogout()" class="px-2.5 py-1.5 rounded-xl bg-[#16161a] hover:bg-red-950/40 text-stone-400 hover:text-red-400 border border-white/[0.08] text-xs font-semibold transition flex items-center gap-1.5" title="Системээс гарах">
-          <i class="fa-solid fa-arrow-right-from-bracket text-xs"></i>
-          <span class="hidden sm:inline">Гарах</span>
-        </button>
       </div>
     </div>
+
+    <!-- ROW 2: CLEAN, SPACIOUS SUB-NAVIGATION -->
+    <div class="max-w-[1680px] mx-auto px-4 sm:px-6 lg:px-8 py-2 overflow-x-auto scrollbar-none">
+      <nav class="flex items-center gap-2 text-xs font-semibold">
+        
+        <button onclick="switchTab('simulator')" id="tab-btn-simulator" class="tab-btn px-4 py-2 rounded-xl bg-white text-stone-900 border border-stone-200/90 shadow-sm font-semibold transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-mobile-screen-button text-emerald-600 text-xs"></i>
+          <span>Туршилтын утас</span>
+        </button>
+
+        <button onclick="switchTab('inbox')" id="tab-btn-inbox" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-comments text-stone-400 text-xs"></i>
+          <span>Шууд чат</span>
+        </button>
+
+        <button onclick="switchTab('leads')" id="tab-btn-leads" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-table-list text-stone-400 text-xs"></i>
+          <span>Харилцагчийн сан</span>
+        </button>
+
+        <button onclick="switchTab('social')" id="tab-btn-social" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-pen-nib text-stone-400 text-xs"></i>
+          <span>Нийтлэлийн бэлдэц</span>
+        </button>
+
+        <button onclick="switchTab('knowledge')" id="tab-btn-knowledge" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-book-open text-stone-400 text-xs"></i>
+          <span>Байгууллагын мэдээлэл</span>
+        </button>
+
+        <button onclick="switchTab('links')" id="tab-btn-links" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-credit-card text-stone-400 text-xs"></i>
+          <span>Данс ба холбоос</span>
+        </button>
+
+        <button onclick="switchTab('client-api')" id="tab-btn-client-api" class="tab-btn hidden px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-key text-stone-400 text-xs"></i>
+          <span>AI Түлхүүр</span>
+        </button>
+
+        <button onclick="switchTab('settings')" id="tab-btn-settings" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-sliders text-stone-400 text-xs"></i>
+          <span>Сувгийн тохиргоо</span>
+        </button>
+
+      </nav>
+    </div>
+
   </header>
 
   <!-- ==================== MAIN CONTENT ==================== -->
@@ -297,8 +350,8 @@
           </div>
 
           <!-- Phone Status Bar -->
-          <div class="pt-2.5 px-6 flex justify-between items-center text-[10px] text-stone-400 select-none">
-            <span class="font-bold text-stone-200 tracking-wide">09:41</span>
+          <div class="pt-2.5 px-6 flex justify-between items-center text-[10px] text-stone-500 select-none">
+            <span class="font-bold text-stone-800 font-bold tracking-wide">09:41</span>
             <div class="flex items-center gap-1.5">
               <i class="fa-solid fa-signal text-[9px]"></i>
               <i class="fa-solid fa-wifi text-[9px]"></i>
@@ -307,44 +360,44 @@
           </div>
 
           <!-- Phone Header -->
-          <div class="px-4 py-3 border-b border-white/[0.07] bg-[#121216]/95 flex items-center justify-between mt-2">
+          <div class="px-4 py-3 border-b border-white/[0.07] bg-white/95 border-b border-stone-200/80 flex items-center justify-between mt-2">
             <div class="flex items-center gap-2.5">
               <div class="relative">
-                <div class="w-9 h-9 rounded-full bg-[#1e1e24] border border-white/[0.12] flex items-center justify-center">
-                  <div id="sim-avatar-text" class="text-stone-200 text-xs font-bold">
+                <div class="w-9 h-9 rounded-full bg-emerald-100 border border-emerald-200 flex items-center justify-center">
+                  <div id="sim-avatar-text" class="text-emerald-800 text-xs font-bold">
                     Г
                   </div>
                 </div>
-                <span class="absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full bg-emerald-400 border-2 border-[#121216]"></span>
+                <span class="absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full bg-emerald-400 border-2 border-white"></span>
               </div>
               <div>
                 <div class="flex items-center gap-1.5">
-                  <span id="sim-page-title" class="text-xs font-bold text-stone-100 tracking-tight truncate max-w-[180px]">Tuvshok Кино Суваг</span>
+                  <span id="sim-page-title" class="text-xs font-bold text-stone-900 tracking-tight truncate max-w-[180px]">Tuvshok Кино Суваг</span>
                   <i class="fa-solid fa-circle-check text-emerald-400 text-[10px]"></i>
                 </div>
-                <div class="text-[10px] text-emerald-400 flex items-center gap-1">
+                <div class="text-[10px] text-emerald-700 font-medium flex items-center gap-1">
                   <span>Хариулахад бэлэн</span>
                 </div>
               </div>
             </div>
 
-            <button onclick="clearSimulatorChat()" title="Чат шинэчлэх" class="w-7 h-7 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-stone-400 hover:text-white flex items-center justify-center transition">
+            <button onclick="clearSimulatorChat()" title="Чат шинэчлэх" class="w-7 h-7 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-600 hover:text-stone-900 border border-stone-200 flex items-center justify-center transition">
               <i class="fa-solid fa-rotate-right text-xs"></i>
             </button>
           </div>
 
           <!-- Interactive Quick Prompt Chips -->
-          <div id="sim-prompt-chips" class="px-3 py-2 bg-[#0e0e11] border-b border-white/[0.05] flex items-center gap-1.5 overflow-x-auto scrollbar-none text-[11px]">
-            <button onclick="sendQuickPrompt('Үйлчилгээ, үнэ тариф ямар байна вэ?')" class="px-2.5 py-1 rounded-full bg-white/[0.04] hover:bg-white/[0.09] text-stone-300 border border-white/[0.08] whitespace-nowrap transition">
+          <div id="sim-prompt-chips" class="px-3 py-2 bg-[#F5F2EB] border-b border-stone-200/80 flex items-center gap-1.5 overflow-x-auto scrollbar-none text-[11px]">
+            <button onclick="sendQuickPrompt('Үйлчилгээ, үнэ тариф ямар байна вэ?')" class="px-2.5 py-1 rounded-full bg-white hover:bg-emerald-50 text-stone-700 hover:text-emerald-800 border border-stone-200/80 hover:border-emerald-300 shadow-sm whitespace-nowrap transition">
               Үнэ лавлах
             </button>
-            <button onclick="sendQuickPrompt('Төлбөр шилжүүлэх дансаа өгнө үү?')" class="px-2.5 py-1 rounded-full bg-white/[0.04] hover:bg-white/[0.09] text-stone-300 border border-white/[0.08] whitespace-nowrap transition">
+            <button onclick="sendQuickPrompt('Төлбөр шилжүүлэх дансаа өгнө үү?')" class="px-2.5 py-1 rounded-full bg-white hover:bg-emerald-50 text-stone-700 hover:text-emerald-800 border border-stone-200/80 hover:border-emerald-300 shadow-sm whitespace-nowrap transition">
               Данс авах
             </button>
-            <button onclick="sendQuickPrompt('Болд 99112233')" class="px-2.5 py-1 rounded-full bg-white/[0.04] hover:bg-white/[0.09] text-stone-300 border border-white/[0.08] whitespace-nowrap transition">
+            <button onclick="sendQuickPrompt('Болд 99112233')" class="px-2.5 py-1 rounded-full bg-white hover:bg-emerald-50 text-stone-700 hover:text-emerald-800 border border-stone-200/80 hover:border-emerald-300 shadow-sm whitespace-nowrap transition">
               Бүртгүүлэх
             </button>
-            <button onclick="sendQuickPrompt('хүнтэй ярих')" class="px-2.5 py-1 rounded-full bg-white/[0.04] hover:bg-white/[0.09] text-stone-300 border border-white/[0.08] whitespace-nowrap transition">
+            <button onclick="sendQuickPrompt('хүнтэй ярих')" class="px-2.5 py-1 rounded-full bg-white hover:bg-emerald-50 text-stone-700 hover:text-emerald-800 border border-stone-200/80 hover:border-emerald-300 shadow-sm whitespace-nowrap transition">
               Ажилтантай холбогдох
             </button>
           </div>
@@ -352,12 +405,12 @@
           <!-- Chat Messages Scroll Area -->
           <div id="sim-messages" class="flex-1 p-3.5 space-y-3 overflow-y-auto scrollbar-thin flex flex-col justify-start">
             <div class="text-center my-2">
-              <span class="px-2.5 py-0.5 rounded-full text-[10px] bg-white/[0.04] text-stone-400 border border-white/[0.06]">
+              <span class="px-2.5 py-0.5 rounded-full text-[10px] bg-stone-200/60 text-stone-600 border border-stone-300/60 font-medium">
                 Өнөөдөр
               </span>
             </div>
             <div class="flex items-start gap-2">
-              <div class="w-6 h-6 rounded-full bg-[#1e1e24] border border-white/[0.1] flex items-center justify-center text-[10px] font-bold text-stone-200 shrink-0 mt-1">
+              <div class="w-6 h-6 rounded-full bg-emerald-100 border border-emerald-200 flex items-center justify-center text-[10px] font-bold text-emerald-800 shrink-0 mt-1">
                 Г
               </div>
               <div id="sim-welcome-msg" class="msg-bot px-3.5 py-2.5 text-xs max-w-[82%] leading-relaxed shadow-sm">
@@ -367,12 +420,12 @@
           </div>
 
           <!-- Image Preview Bar -->
-          <div id="sim-image-preview-bar" class="hidden px-3 py-2 bg-[#141418] border-t border-white/[0.1] flex items-center justify-between">
+          <div id="sim-image-preview-bar" class="hidden px-3 py-2 bg-stone-100 border-t border-stone-200 flex items-center justify-between">
             <div class="flex items-center gap-2">
               <img id="sim-image-thumb" class="w-9 h-9 object-cover rounded-lg border border-stone-700">
               <div class="text-[11px]">
                 <div id="sim-image-name" class="font-bold text-white truncate max-w-[170px]">receipt.jpg</div>
-                <div class="text-[10px] text-emerald-400 flex items-center gap-1">
+                <div class="text-[10px] text-emerald-700 font-medium flex items-center gap-1">
                   <i class="fa-solid fa-check"></i> Баримт шалгахад бэлэн
                 </div>
               </div>
@@ -383,16 +436,16 @@
           </div>
 
           <!-- Phone Input Footer -->
-          <form onsubmit="handleSimulatorSubmit(event)" class="p-2.5 bg-[#121216] border-t border-white/[0.07] flex items-center gap-2">
+          <form onsubmit="handleSimulatorSubmit(event)" class="p-2.5 bg-white border-t border-stone-200/80 flex items-center gap-2">
             <input type="file" id="sim-file-input" accept="image/*" class="hidden" onchange="handleFileSelect(event)">
             
-            <button type="button" onclick="document.getElementById('sim-file-input').click()" title="Гүйлгээний баримтын зураг оруулах" class="w-9 h-9 rounded-xl bg-white/[0.05] hover:bg-white/[0.1] text-stone-300 hover:text-white flex items-center justify-center transition border border-white/[0.07]">
+            <button type="button" onclick="document.getElementById('sim-file-input').click()" title="Гүйлгээний баримтын зураг оруулах" class="w-9 h-9 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-600 hover:text-stone-900 flex items-center justify-center transition border border-stone-200">
               <i class="fa-regular fa-image text-sm"></i>
             </button>
 
-            <input id="sim-input" type="text" placeholder="Мессеж бичих..." autocomplete="off" class="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-xl px-3.5 py-2 text-xs text-white placeholder-stone-500 focus:outline-none focus:border-stone-500 transition">
+            <input id="sim-input" type="text" placeholder="Мессеж бичих..." autocomplete="off" class="flex-1 bg-stone-50 border border-stone-200 rounded-xl px-3.5 py-2 text-xs text-stone-900 placeholder-stone-400 focus:bg-white focus:outline-none focus:border-emerald-600 transition">
 
-            <button type="submit" id="sim-send-btn" class="w-9 h-9 rounded-xl bg-[#ece8e1] hover:bg-white text-[#0b0b0c] flex items-center justify-center transition shadow-sm">
+            <button type="submit" id="sim-send-btn" class="w-9 h-9 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white flex items-center justify-center transition shadow-sm">
               <i class="fa-solid fa-paper-plane text-xs"></i>
             </button>
           </form>
@@ -404,15 +457,15 @@
       <div class="lg:col-span-7 space-y-6">
 
         <!-- Top Live Hero Banner -->
-        <div class="glass-card p-6 border border-white/[0.08]">
+        <div class="glass-card p-6 border border-stone-200/80">
           <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div>
               <div class="flex items-center gap-2 mb-1.5">
                 <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
-                <span class="text-[11px] font-semibold text-stone-400 tracking-wider uppercase">Идэвхтэй салбар</span>
+                <span class="text-[11px] font-bold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200 tracking-wider uppercase">Идэвхтэй салбар</span>
               </div>
-              <h2 id="hero-page-title" class="text-xl font-bold text-white tracking-tight">Tuvshok Кино & Драма Суваг</h2>
-              <p id="hero-page-desc" class="text-xs text-stone-400 mt-1 max-w-xl leading-relaxed">
+              <h2 id="hero-page-title" class="text-xl font-bold text-stone-900 tracking-tight">Tuvshok Кино & Драма Суваг</h2>
+              <p id="hero-page-desc" class="text-xs text-stone-600 mt-1 max-w-xl leading-relaxed">
                 Салбарын шууд чат, харилцагчийн бүртгэл, холбогдсон хүснэгтүүд болон төлбөрийн дансны нэгдсэн удирдлага.
               </p>
             </div>
@@ -430,17 +483,17 @@
           </div>
 
           <!-- Quick Metrics Bar -->
-          <div class="grid grid-cols-3 gap-4 mt-6 pt-5 border-t border-white/[0.06]">
+          <div class="grid grid-cols-3 gap-4 mt-6 pt-5 border-t border-stone-200/80">
             <div class="space-y-1">
               <span class="text-[11px] font-medium text-stone-400">Нийт салбар</span>
-              <div id="stat-total-pages" class="text-2xl font-bold text-stone-100 font-mono">1</div>
+              <div id="stat-total-pages" class="text-2xl font-bold text-stone-900 font-mono">1</div>
               <div class="text-[11px] text-stone-500">Системд холбогдсон</div>
             </div>
 
             <div class="space-y-1">
               <span class="text-[11px] font-medium text-stone-400">Нийт бүртгэл</span>
-              <div id="stat-total-leads" class="text-2xl font-bold text-white font-mono">0</div>
-              <div class="text-[11px] text-stone-500">Энэ салбарын харилцагч</div>
+              <div id="stat-total-leads" class="text-2xl font-bold text-stone-900 font-mono">0</div>
+              <div class="text-[11px] text-stone-500">Энэ салбарын харилцагчид</div>
             </div>
 
             <div class="space-y-1">
@@ -454,10 +507,36 @@
           </div>
         </div>
 
+        <!-- ==================== INDUSTRY-SPECIFIC SMART WORKSPACE ==================== -->
+        <div id="industry-workspace-container" class="glass-card rounded-3xl p-6 border border-stone-200/80 space-y-4">
+          <!-- Dynamically populated by renderIndustryWorkspace(category) -->
+          <div class="flex items-center justify-between pb-3 border-b border-stone-100">
+            <div class="flex items-center gap-2.5">
+              <span id="industry-icon-badge" class="w-8 h-8 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center justify-center text-sm">
+                <i class="fa-solid fa-layer-group"></i>
+              </span>
+              <div>
+                <h3 id="industry-workspace-title" class="text-xs font-bold text-stone-900 uppercase tracking-wider">
+                  Салбарын онцлог ажлын самбар
+                </h3>
+                <p id="industry-workspace-sub" class="text-[11px] text-stone-500">Салбарын үйл ажиллагаанд тохируулсан шуурхай ажлын самбар</p>
+              </div>
+            </div>
+            <span id="industry-type-tag" class="px-2.5 py-1 rounded-full text-[10px] font-bold bg-stone-100 text-stone-700 border border-stone-200 uppercase tracking-wider">
+              Ерөнхий
+            </span>
+          </div>
+
+          <!-- Dynamic Workspace Body -->
+          <div id="industry-workspace-content" class="space-y-4">
+            <!-- Rendered by JS -->
+          </div>
+        </div>
+
         <!-- Verified Direct Links Live Card -->
-        <div class="glass-card rounded-3xl p-5 border border-white/[0.08]">
+        <div class="glass-card rounded-3xl p-5 border border-stone-200/80">
           <div class="flex items-center justify-between mb-4">
-            <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+            <h3 class="text-xs font-bold text-stone-900 uppercase tracking-wider flex items-center gap-2">
               <i class="fa-solid fa-paper-plane text-emerald-400"></i>
               <span>Баримт баталгаажмагц хэрэглэгчид очих холбоосууд</span>
             </h3>
@@ -467,32 +546,32 @@
           </div>
 
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-            <div class="p-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.06] flex items-center justify-between">
+            <div class="p-3.5 rounded-2xl bg-white/[0.03] border border-stone-200/60 flex items-center justify-between">
               <div class="flex items-center gap-3">
                 <div class="w-9 h-9 rounded-xl bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
                   <i class="fa-brands fa-telegram text-base"></i>
                 </div>
                 <div>
-                  <div class="text-xs font-bold text-white">Telegram Групп</div>
-                  <div id="live-card-tg-link" class="text-[11px] text-slate-400 font-mono truncate max-w-[190px]">https://t.me/...</div>
+                  <div class="text-xs font-bold text-stone-900">Telegram Групп</div>
+                  <div id="live-card-tg-link" class="text-[11px] text-stone-500 font-mono truncate max-w-[190px]">https://t.me/...</div>
                 </div>
               </div>
-              <button onclick="copyText('live-card-tg-link')" class="px-2.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 hover:text-white text-xs font-medium transition" title="Хуулах">
+              <button onclick="copyText('live-card-tg-link')" class="px-2.5 py-1.5 rounded-lg bg-white hover:bg-stone-100 text-stone-600 hover:text-stone-900 border border-stone-200 text-xs font-medium transition shadow-sm" title="Хуулах">
                 <i class="fa-regular fa-copy"></i>
               </button>
             </div>
 
-            <div class="p-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.06] flex items-center justify-between">
+            <div class="p-3.5 rounded-2xl bg-white/[0.03] border border-stone-200/60 flex items-center justify-between">
               <div class="flex items-center gap-3">
                 <div class="w-9 h-9 rounded-xl bg-blue-500/15 border border-blue-500/30 flex items-center justify-center text-blue-400">
                   <i class="fa-brands fa-facebook text-base"></i>
                 </div>
                 <div>
-                  <div class="text-xs font-bold text-white">Facebook Групп</div>
-                  <div id="live-card-fb-link" class="text-[11px] text-slate-400 font-mono truncate max-w-[190px]">https://facebook.com/groups/...</div>
+                  <div class="text-xs font-bold text-stone-900">Facebook Групп</div>
+                  <div id="live-card-fb-link" class="text-[11px] text-stone-500 font-mono truncate max-w-[190px]">https://facebook.com/groups/...</div>
                 </div>
               </div>
-              <button onclick="copyText('live-card-fb-link')" class="px-2.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 hover:text-white text-xs font-medium transition" title="Хуулах">
+              <button onclick="copyText('live-card-fb-link')" class="px-2.5 py-1.5 rounded-lg bg-white hover:bg-stone-100 text-stone-600 hover:text-stone-900 border border-stone-200 text-xs font-medium transition shadow-sm" title="Хуулах">
                 <i class="fa-regular fa-copy"></i>
               </button>
             </div>
@@ -500,9 +579,9 @@
         </div>
 
         <!-- Recent Registrations Feed -->
-        <div class="glass-card rounded-3xl p-5 border border-white/[0.08]">
+        <div class="glass-card rounded-3xl p-5 border border-stone-200/80">
           <div class="flex items-center justify-between mb-3">
-            <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+            <h3 class="text-xs font-bold text-stone-900 uppercase tracking-wider flex items-center gap-2">
               <i class="fa-solid fa-clock-rotate-left text-amber-400"></i>
               <span>Сүүлийн баримт болон бүртгэлүүд</span>
             </h3>
@@ -511,8 +590,8 @@
             </button>
           </div>
 
-          <div id="mini-leads-list" class="divide-y divide-white/[0.04]">
-            <div class="py-6 text-center text-xs text-slate-500">
+          <div id="mini-leads-list" class="divide-y divide-stone-100">
+            <div class="py-6 text-center text-xs text-stone-400">
               <i class="fa-solid fa-spinner fa-spin mr-1.5"></i> Уншиж байна...
             </div>
           </div>
@@ -525,29 +604,29 @@
     <div id="tab-inbox" class="tab-content hidden grid grid-cols-1 lg:grid-cols-12 gap-6 h-[720px]">
       
       <!-- Session List (4 cols) -->
-      <div class="lg:col-span-4 glass-card rounded-3xl flex flex-col overflow-hidden border border-white/[0.08]">
-        <div class="p-4 bg-white/[0.02] border-b border-white/[0.08] flex items-center justify-between">
+      <div class="lg:col-span-4 glass-card rounded-3xl flex flex-col overflow-hidden border border-stone-200/80">
+        <div class="p-4 bg-stone-50 border-b border-stone-200 flex items-center justify-between">
           <div class="flex items-center gap-2">
             <i class="fa-solid fa-inbox text-indigo-400 text-sm"></i>
-            <h2 class="text-xs font-extrabold uppercase tracking-wider text-white">Идэвхтэй Чат</h2>
+            <h2 class="text-xs font-extrabold uppercase tracking-wider text-stone-900">Идэвхтэй Чат</h2>
           </div>
-          <button onclick="loadSessions()" class="w-7 h-7 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-400 hover:text-white flex items-center justify-center transition" title="Шинэчлэх">
+          <button onclick="loadSessions()" class="w-7 h-7 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-stone-500 hover:text-white flex items-center justify-center transition" title="Шинэчлэх">
             <i class="fa-solid fa-rotate text-xs"></i>
           </button>
         </div>
-        <div id="sessions-list" class="flex-1 overflow-y-auto divide-y divide-white/[0.04] scrollbar-thin"></div>
+        <div id="sessions-list" class="flex-1 overflow-y-auto divide-y divide-stone-100 scrollbar-thin"></div>
       </div>
 
       <!-- Active Conversation Detail (8 cols) -->
-      <div class="lg:col-span-8 glass-card rounded-3xl flex flex-col overflow-hidden border border-white/[0.08]">
-        <div id="inbox-header" class="p-4 bg-white/[0.02] border-b border-white/[0.08] flex items-center justify-between">
+      <div class="lg:col-span-8 glass-card rounded-3xl flex flex-col overflow-hidden border border-stone-200/80">
+        <div id="inbox-header" class="p-4 bg-stone-50 border-b border-stone-200 flex items-center justify-between">
           <div class="flex items-center gap-3">
             <div class="w-10 h-10 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
               <i class="fa-solid fa-user text-sm"></i>
             </div>
             <div>
-              <div id="inbox-user-title" class="text-sm font-bold text-white">Харилцагчийг сонгоно уу</div>
-              <div id="inbox-user-sub" class="text-[11px] text-slate-400">Чатласан хэрэглэгчийн түүх энд гарна</div>
+              <div id="inbox-user-title" class="text-sm font-bold text-stone-900">Харилцагчийг сонгоно уу</div>
+              <div id="inbox-user-sub" class="text-[11px] text-stone-500">Чатласан хэрэглэгчийн түүх энд гарна</div>
             </div>
           </div>
 
@@ -556,15 +635,15 @@
           </div>
         </div>
 
-        <div id="inbox-chat-msgs" class="flex-1 p-5 space-y-3.5 overflow-y-auto bg-[#07090e]/60 scrollbar-thin">
-          <div class="text-center py-28 text-slate-500 text-xs">
+        <div id="inbox-chat-msgs" class="flex-1 p-5 space-y-3.5 overflow-y-auto bg-[#FAF8F5] scrollbar-thin">
+          <div class="text-center py-28 text-stone-400 text-xs">
             <i class="fa-regular fa-comments text-3xl mb-2 block opacity-40"></i>
             Зүүн баганаас харилцагчийг сонгож түүхийг харна уу.
           </div>
         </div>
 
-        <form id="inbox-reply-form" onsubmit="handleManagerSend(event)" class="p-3.5 bg-white/[0.02] border-t border-white/[0.08] flex items-center gap-2">
-          <input id="inbox-reply-txt" type="text" placeholder="Харилцагч руу менежерийн хувиар шууд хариу бичих..." autocomplete="off" disabled class="flex-1 bg-white/[0.05] border border-white/[0.08] rounded-xl px-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 disabled:opacity-40">
+        <form id="inbox-reply-form" onsubmit="handleManagerSend(event)" class="p-3.5 bg-white border-t border-stone-200 flex items-center gap-2">
+          <input id="inbox-reply-txt" type="text" placeholder="Харилцагч руу менежерийн хувиар шууд хариу бичих..." autocomplete="off" disabled class="flex-1 bg-white/[0.05] border border-stone-200/80 rounded-xl px-4 py-2.5 text-xs text-stone-900 placeholder-slate-500 focus:outline-none focus:border-indigo-500 disabled:opacity-40">
           <button type="submit" class="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-glowEmerald transition flex items-center gap-2">
             <i class="fa-solid fa-paper-plane"></i>
             <span>Хариу Илгээх</span>
@@ -576,23 +655,23 @@
 
     <!-- ==================== TAB 3: LEADS & CRM PIPELINE ==================== -->
     <div id="tab-leads" class="tab-content hidden space-y-6">
-      <div class="glass-card rounded-3xl p-6 border border-white/[0.08]">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
         
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
           <div>
-            <h2 class="text-lg font-extrabold text-white tracking-tight flex items-center gap-2">
+            <h2 class="text-lg font-extrabold text-stone-900 tracking-tight flex items-center gap-2">
               <i class="fa-solid fa-table-list text-stone-300"></i>
               <span>Харилцагчийн бүртгэлийн сан</span>
             </h2>
-            <p id="crm-page-subtitle" class="text-xs text-stone-400 mt-0.5">Сонгосон салбарын харилцагчид</p>
+            <p id="crm-page-subtitle" class="text-xs text-stone-400 mt-0.5">Сонгосон салбарын харилцагчдын бүртгэл</p>
           </div>
 
           <div class="flex items-center gap-3">
             <div class="relative">
               <i class="fa-solid fa-magnifying-glass absolute left-3.5 top-1/2 -translate-y-1/2 text-stone-500 text-xs"></i>
-              <input id="lead-search-input" onkeyup="filterLeads()" type="text" placeholder="Нэр, утас, үйлчилгээгээр хайх..." class="pl-9 pr-4 py-2 rounded-xl bg-white/[0.04] border border-white/[0.08] text-xs text-white placeholder-stone-500 focus:outline-none focus:border-stone-400 w-64">
+              <input id="lead-search-input" onkeyup="filterLeads()" type="text" placeholder="Нэр, утас, үйлчилгээгээр хайх..." class="pl-9 pr-4 py-2 rounded-xl bg-white/[0.04] border border-stone-200/80 text-xs text-stone-900 placeholder-stone-500 focus:outline-none focus:border-stone-400 w-64">
             </div>
-            <button onclick="openGoogleSheetsModal()" class="px-3.5 py-2 rounded-xl bg-emerald-950/50 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-500/25 text-xs font-semibold transition flex items-center gap-1.5 shadow-sm" title="Олон хүснэгт холбох болон Excel оруулах">
+            <button onclick="openGoogleSheetsModal()" class="px-3.5 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200/90 text-xs font-semibold transition flex items-center gap-1.5 shadow-sm" title="Олон хүснэгт холбох болон Excel оруулах">
               <i class="fa-solid fa-table-cells text-emerald-400"></i>
               <span>Хүснэгт холбох</span>
             </button>
@@ -603,9 +682,9 @@
           </div>
         </div>
 
-        <div class="overflow-x-auto rounded-2xl border border-white/[0.06]">
-          <table class="w-full text-left text-xs text-stone-300">
-            <thead class="bg-white/[0.03] text-stone-400 uppercase font-semibold border-b border-white/[0.06] text-[11px]">
+        <div class="overflow-x-auto rounded-2xl border border-stone-200/60">
+          <table class="w-full text-left text-xs text-stone-800">
+            <thead class="bg-[#F8F6F0] text-stone-600 uppercase font-semibold border-b border-stone-200 text-[11px]">
               <tr>
                 <th class="p-3.5">Дугаар</th>
                 <th class="p-3.5">Нэр</th>
@@ -617,7 +696,7 @@
                 <th class="p-3.5 text-right">Тэмдэглэл</th>
               </tr>
             </thead>
-            <tbody id="leads-table-body" class="divide-y divide-white/[0.04]">
+            <tbody id="leads-table-body" class="divide-y divide-stone-100">
               <tr><td colspan="8" class="p-6 text-center text-stone-500">Уншиж байна...</td></tr>
             </tbody>
           </table>
@@ -628,16 +707,16 @@
 
     <!-- ==================== TAB 4: SOCIAL & MARKETING STUDIO ==================== -->
     <div id="tab-social" class="tab-content hidden space-y-6">
-      <div class="glass-card rounded-3xl p-6 border border-white/[0.08] relative overflow-hidden">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80 relative overflow-hidden">
         <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
           <div>
             <div class="flex items-center gap-2 mb-1">
-              <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white/[0.06] text-stone-300 border border-white/[0.08] uppercase tracking-wider">
+              <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white/[0.06] text-stone-300 border border-stone-200/80 uppercase tracking-wider">
                 Нийтлэлийн сан
               </span>
               <span class="text-xs text-stone-400">• Facebook болон Telegram хуудсанд тавих бэлдэц</span>
             </div>
-            <h2 class="text-xl font-extrabold text-white tracking-tight">Нийтлэлийн бэлдэц ба дансны хуудас</h2>
+            <h2 class="text-xl font-extrabold text-stone-900 tracking-tight">Нийтлэлийн бэлдэц ба дансны хуудас</h2>
             <p class="text-xs text-stone-400 mt-1 max-w-2xl leading-relaxed">
               Харилцагчдыг хуудасны чат руу чиглүүлэх бэлэн эх бичвэрүүд болон стори, постод оруулах банкны дансны карт.
             </p>
@@ -655,17 +734,17 @@
           </h3>
 
           <!-- Post Template 1 -->
-          <div class="glass-card rounded-2xl p-5 border border-white/[0.08] space-y-3">
+          <div class="glass-card rounded-2xl p-5 border border-stone-200/80 space-y-3">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-stone-300"></span>
-                <span class="text-xs font-bold text-white">1. Үйлчилгээний танилцуулга ба чат руу урих</span>
+                <span class="text-xs font-bold text-stone-900">1. Үйлчилгээний танилцуулга ба чат руу урих</span>
               </div>
               <button onclick="copyPostText('post-template-1')" class="btn-action-secondary px-3 py-1 rounded-lg text-xs font-semibold transition flex items-center gap-1.5">
                 <i class="fa-regular fa-copy"></i> <span>Хуулах</span>
               </button>
             </div>
-            <textarea id="post-template-1" readonly class="w-full h-32 bg-[#0d0d10] border border-white/[0.06] rounded-xl p-3 text-xs text-stone-300 leading-relaxed resize-none focus:outline-none">Манай албан ёсны сувагт шинэ мэдээлэл болон үйлчилгээнүүд бүрэн байршлаа.
+            <textarea id="post-template-1" readonly class="w-full h-32 bg-[#FAF8F5] border border-stone-200/60 rounded-xl p-3 text-xs text-stone-800 leading-relaxed resize-none focus:outline-none">Манай албан ёсны сувагт шинэ мэдээлэл болон үйлчилгээнүүд бүрэн байршлаа.
 
 Хэрхэн бүртгүүлж, мэдээлэл авах вэ?
 1. Манай хуудасны чат руу шууд зурвас илгээгээрэй.
@@ -675,17 +754,17 @@
           </div>
 
           <!-- Post Template 2 -->
-          <div class="glass-card rounded-2xl p-5 border border-white/[0.08] space-y-3">
+          <div class="glass-card rounded-2xl p-5 border border-stone-200/80 space-y-3">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-                <span class="text-xs font-bold text-white">2. Шуурхай баримт шалгах заавар</span>
+                <span class="text-xs font-bold text-stone-900">2. Шуурхай баримт шалгах заавар</span>
               </div>
               <button onclick="copyPostText('post-template-2')" class="btn-action-secondary px-3 py-1 rounded-lg text-xs font-semibold transition flex items-center gap-1.5">
                 <i class="fa-regular fa-copy"></i> <span>Хуулах</span>
               </button>
             </div>
-            <textarea id="post-template-2" readonly class="w-full h-32 bg-[#0d0d10] border border-white/[0.06] rounded-xl p-3 text-xs text-stone-300 leading-relaxed resize-none focus:outline-none">ХАРИЛЦАГЧДЫН АНХААРАЛД
+            <textarea id="post-template-2" readonly class="w-full h-32 bg-[#FAF8F5] border border-stone-200/60 rounded-xl p-3 text-xs text-stone-800 leading-relaxed resize-none focus:outline-none">ХАРИЛЦАГЧДЫН АНХААРАЛД
 
 Та манай данс руу төлбөрөө шилжүүлээд гүйлгээний баримтын зургаа хуудасны чат руу илгээхэд л хангалттай. Манай систем баримтыг даруй шалгаж, албан ёсны Telegram болон Facebook бүлгийн урилгыг танд шууд илгээх болно.</textarea>
           </div>
@@ -698,7 +777,7 @@
             <span>Шилжүүлэг хүлээн авах дансны карт</span>
           </h3>
 
-          <div class="glass-card rounded-3xl p-6 border border-white/[0.1] relative overflow-hidden bg-gradient-to-br from-[#18181d] via-[#121215] to-[#1a1816]">
+          <div class="glass-card rounded-3xl p-6 border border-white/[0.1] relative overflow-hidden bg-gradient-to-br from-[#064E3B] via-[#065F46] to-[#042F2E] text-white shadow-xl border border-emerald-600/30">
             <div class="flex justify-between items-center mb-8">
               <div class="flex items-center gap-2">
                 <div class="w-10 h-7 rounded-md bg-amber-500/80 border border-amber-300/60 flex items-center justify-center text-stone-950 font-mono text-[9px] font-bold">
@@ -734,10 +813,10 @@
 
     <!-- ==================== TAB 5: GROUP LINKS & BANK HUB ==================== -->
     <div id="tab-links" class="tab-content hidden max-w-4xl mx-auto space-y-6">
-      <div class="glass-card rounded-3xl p-6 border border-white/[0.08]">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
         <div class="flex items-center justify-between mb-6 pb-4 border-b border-white/[0.08]">
           <div>
-            <h2 class="text-lg font-extrabold text-white tracking-tight flex items-center gap-2">
+            <h2 class="text-lg font-extrabold text-stone-900 tracking-tight flex items-center gap-2">
               <i class="fa-solid fa-building-columns text-stone-300"></i>
               <span>Данс ба холбоос тохируулах</span>
             </h2>
@@ -747,24 +826,24 @@
 
         <form onsubmit="handleSaveLinks(event)" class="space-y-6">
           <div class="space-y-4">
-            <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+            <h3 class="text-xs font-bold text-stone-900 uppercase tracking-wider flex items-center gap-2">
               <i class="fa-brands fa-telegram text-cyan-400 text-sm"></i>
               <span>1. Албан ёсны группын холбоосууд</span>
             </h3>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
-                <label class="text-stone-300 block mb-1 text-xs font-semibold">Telegram групп холбоос:</label>
+                <label class="text-stone-700 block mb-1 text-xs font-semibold">Telegram групп холбоос:</label>
                 <div class="relative">
-                  <input id="input-telegram-link" type="url" placeholder="https://t.me/..." class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-xs text-white font-mono placeholder-stone-600 focus:outline-none focus:border-stone-500">
+                  <input id="input-telegram-link" type="url" placeholder="https://t.me/..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3.5 py-2.5 text-xs text-stone-900 font-mono placeholder-stone-600 focus:outline-none focus:border-stone-500">
                   <a id="btn-test-tg" href="#" target="_blank" class="absolute right-2.5 top-1/2 -translate-y-1/2 px-2 py-1 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[10px] text-stone-300 font-semibold transition">Шалгах</a>
                 </div>
               </div>
 
               <div>
-                <label class="text-stone-300 block mb-1 text-xs font-semibold">Facebook групп холбоос:</label>
+                <label class="text-stone-700 block mb-1 text-xs font-semibold">Facebook групп холбоос:</label>
                 <div class="relative">
-                  <input id="input-facebook-link" type="url" placeholder="https://www.facebook.com/groups/..." class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-xs text-white font-mono placeholder-stone-600 focus:outline-none focus:border-stone-500">
+                  <input id="input-facebook-link" type="url" placeholder="https://www.facebook.com/groups/..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3.5 py-2.5 text-xs text-stone-900 font-mono placeholder-stone-600 focus:outline-none focus:border-stone-500">
                   <a id="btn-test-fb" href="#" target="_blank" class="absolute right-2.5 top-1/2 -translate-y-1/2 px-2 py-1 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[10px] text-stone-300 font-semibold transition">Шалгах</a>
                 </div>
               </div>
@@ -772,30 +851,30 @@
           </div>
 
           <div class="space-y-4 pt-4 border-t border-white/[0.08]">
-            <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+            <h3 class="text-xs font-bold text-stone-900 uppercase tracking-wider flex items-center gap-2">
               <i class="fa-solid fa-building-columns text-emerald-400 text-sm"></i>
               <span>2. Төлбөр хүлээн авах дансны мэдээлэл</span>
             </h3>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
-                <label class="text-stone-300 block mb-1 text-xs font-semibold">Банкны нэр:</label>
-                <input id="input-bank-name" type="text" value="ГОЛОМТ БАНК" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-xs text-white font-semibold focus:outline-none focus:border-emerald-500">
+                <label class="text-stone-700 block mb-1 text-xs font-semibold">Банкны нэр:</label>
+                <input id="input-bank-name" type="text" value="ГОЛОМТ БАНК" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3.5 py-2.5 text-xs text-stone-900 font-semibold focus:outline-none focus:border-emerald-500">
               </div>
 
               <div>
-                <label class="text-stone-300 block mb-1 text-xs font-semibold">Дансны дугаар:</label>
-                <input id="input-account-number" type="text" value="97001500 2815116628" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-xs text-stone-200 font-mono font-bold focus:outline-none focus:border-emerald-500">
+                <label class="text-stone-700 block mb-1 text-xs font-semibold">Дансны дугаар:</label>
+                <input id="input-account-number" type="text" value="97001500 2815116628" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3.5 py-2.5 text-xs text-stone-900 font-mono font-bold focus:outline-none focus:border-emerald-600">
               </div>
 
               <div>
-                <label class="text-stone-300 block mb-1 text-xs font-semibold">Хүлээн авагчийн нэр:</label>
-                <input id="input-account-name" type="text" value="TUVSHINTULGA" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500">
+                <label class="text-stone-700 block mb-1 text-xs font-semibold">Хүлээн авагчийн нэр:</label>
+                <input id="input-account-name" type="text" value="TUVSHINTULGA" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3.5 py-2.5 text-xs text-stone-900 focus:outline-none focus:border-emerald-500">
               </div>
 
               <div>
-                <label class="text-stone-300 block mb-1 text-xs font-semibold">Гүйлгээний утгын заавар:</label>
-                <input id="input-bank-instruction" type="text" value="Гүйлгээний утга дээр өөрийн нэр эсвэл утасны дугаараа бичнэ үү." class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500">
+                <label class="text-stone-700 block mb-1 text-xs font-semibold">Гүйлгээний утгын заавар:</label>
+                <input id="input-bank-instruction" type="text" value="Гүйлгээний утга дээр өөрийн нэр эсвэл утасны дугаараа бичнэ үү." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3.5 py-2.5 text-xs text-stone-900 focus:outline-none focus:border-emerald-500">
               </div>
             </div>
           </div>
@@ -812,10 +891,10 @@
 
     <!-- ==================== TAB 6: KNOWLEDGE BASE ==================== -->
     <div id="tab-knowledge" class="tab-content hidden max-w-4xl mx-auto space-y-6">
-      <div class="glass-card rounded-3xl p-6 border border-white/[0.08]">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
         <div class="flex items-center justify-between mb-6 pb-4 border-b border-white/[0.08]">
           <div>
-            <h2 class="text-lg font-extrabold text-white tracking-tight flex items-center gap-2">
+            <h2 class="text-lg font-extrabold text-stone-900 tracking-tight flex items-center gap-2">
               <i class="fa-solid fa-book-open text-amber-400"></i>
               <span>Байгууллагын танилцуулга ба үнийн мэдээлэл</span>
             </h2>
@@ -826,28 +905,28 @@
         <form onsubmit="handleSaveKnowledge(event)" class="space-y-5">
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label class="text-stone-300 block mb-1 text-xs font-semibold">Байгууллага / Салбарын нэр:</label>
-              <input id="kb-name" type="text" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-stone-500">
+              <label class="text-stone-700 block mb-1 text-xs font-semibold">Байгууллага / Салбарын нэр:</label>
+              <input id="kb-name" type="text" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-xs text-stone-900 focus:outline-none focus:border-stone-500">
             </div>
             <div>
-              <label class="text-stone-300 block mb-1 text-xs font-semibold">Цагийн хуваарь ба утас:</label>
-              <input id="kb-phone" type="text" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-stone-500">
+              <label class="text-stone-700 block mb-1 text-xs font-semibold">Цагийн хуваарь ба утас:</label>
+              <input id="kb-phone" type="text" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-xs text-stone-900 focus:outline-none focus:border-stone-500">
             </div>
           </div>
 
           <div>
-            <label class="text-stone-300 block mb-1 text-xs font-semibold">Үйл ажиллагааны танилцуулга:</label>
-            <textarea id="kb-desc" rows="3" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-3 text-xs text-white focus:outline-none focus:border-stone-500"></textarea>
+            <label class="text-stone-700 block mb-1 text-xs font-semibold">Үйл ажиллагааны танилцуулга:</label>
+            <textarea id="kb-desc" rows="3" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-3 text-xs text-stone-900 focus:outline-none focus:border-stone-500"></textarea>
           </div>
 
           <div>
-            <label class="text-stone-300 block mb-1 text-xs font-semibold">Бүтээгдэхүүн, үйлчилгээ ба үнэ тариф (Нэр | Үнэ | Тайлбар):</label>
-            <textarea id="kb-services" rows="4" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-3 text-xs text-white font-mono focus:outline-none focus:border-stone-500"></textarea>
+            <label class="text-stone-700 block mb-1 text-xs font-semibold">Бүтээгдэхүүн, үйлчилгээ ба үнэ тариф (Нэр | Үнэ | Тайлбар):</label>
+            <textarea id="kb-services" rows="4" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-3 text-xs text-stone-900 font-mono focus:outline-none focus:border-stone-500"></textarea>
           </div>
 
           <div>
-            <label class="text-stone-300 block mb-1 text-xs font-semibold">Түгээмэл асуулт ба хариулт (Асуулт -> Хариулт):</label>
-            <textarea id="kb-faqs" rows="5" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-3 text-xs text-white font-mono focus:outline-none focus:border-stone-500"></textarea>
+            <label class="text-stone-700 block mb-1 text-xs font-semibold">Түгээмэл асуулт ба хариулт (Асуулт -> Хариулт):</label>
+            <textarea id="kb-faqs" rows="5" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-3 text-xs text-stone-900 font-mono focus:outline-none focus:border-stone-500"></textarea>
           </div>
 
           <div class="flex justify-end pt-3">
@@ -862,8 +941,8 @@
 
     <!-- ==================== TAB 7: CHANNEL SETTINGS ==================== -->
     <div id="tab-settings" class="tab-content hidden max-w-3xl mx-auto space-y-6">
-      <div class="glass-card rounded-3xl p-6 border border-white/[0.08]">
-        <h2 class="text-lg font-extrabold text-white tracking-tight mb-4 flex items-center gap-2">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
+        <h2 class="text-lg font-extrabold text-stone-900 tracking-tight mb-4 flex items-center gap-2">
           <i class="fa-solid fa-sliders text-stone-400"></i>
           <span>Сувгийн холболт ба тохиргоо</span>
         </h2>
@@ -871,10 +950,10 @@
         <div class="space-y-4 text-xs">
           <div>
             <label class="text-stone-400 block mb-1 font-semibold">Facebook Page Access Token:</label>
-            <input id="settings-meta-token" type="password" placeholder="EAAQP..." class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-white font-mono">
+            <input id="settings-meta-token" type="password" placeholder="EAAQP..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono">
           </div>
 
-          <div class="p-4 rounded-xl bg-[#16161a] border border-white/[0.07] space-y-3 text-xs">
+          <div class="p-4 rounded-xl bg-stone-50 border border-stone-200 space-y-3 text-xs">
             <div class="font-bold text-stone-200 flex items-center justify-between">
               <span>Meta Webhook холболтын мэдээлэл:</span>
               <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Бэлэн</span>
@@ -883,8 +962,8 @@
             <div class="space-y-1.5">
               <label class="text-stone-400 block text-[11px]">Callback URL:</label>
               <div class="flex gap-2">
-                <input id="settings-webhook-callback-url" readonly type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 font-mono text-xs text-emerald-300 select-all focus:outline-none">
-                <button type="button" onclick="copyWebhookCallbackUrl()" class="px-3 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 font-semibold transition flex items-center gap-1 shrink-0">
+                <input id="settings-webhook-callback-url" readonly type="text" class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 font-mono text-xs text-emerald-300 select-all focus:outline-none">
+                <button type="button" onclick="copyWebhookCallbackUrl()" class="px-3 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-stone-800 border border-zinc-700 font-semibold transition flex items-center gap-1 shrink-0">
                   <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
                 </button>
               </div>
@@ -893,8 +972,8 @@
             <div class="space-y-1.5">
               <label class="text-stone-400 block text-[11px]">Verify Token:</label>
               <div class="flex gap-2">
-                <input id="settings-webhook-verify-token" readonly value="agent_verify_secret_token_123" type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 font-mono text-xs text-zinc-300 select-all focus:outline-none">
-                <button type="button" onclick="copyWebhookVerifyToken()" class="px-3 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 font-semibold transition flex items-center gap-1 shrink-0">
+                <input id="settings-webhook-verify-token" readonly value="agent_verify_secret_token_123" type="text" class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 font-mono text-xs text-stone-700 select-all focus:outline-none">
+                <button type="button" onclick="copyWebhookVerifyToken()" class="px-3 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-stone-800 border border-zinc-700 font-semibold transition flex items-center gap-1 shrink-0">
                   <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
                 </button>
               </div>
@@ -915,14 +994,14 @@
 
     <!-- ==================== TAB 8: CLIENT DEDICATED AI KEY & QUOTA ==================== -->
     <div id="tab-client-api" class="tab-content hidden max-w-3xl mx-auto space-y-6">
-      <div class="glass-card rounded-3xl p-6 sm:p-8 border border-white/[0.08] space-y-6">
+      <div class="glass-card rounded-3xl p-6 sm:p-8 border border-stone-200/80 space-y-6">
         <div class="flex items-center justify-between pb-4 border-b border-white/[0.08]">
           <div class="flex items-center gap-3">
             <div class="w-10 h-10 rounded-2xl bg-white/[0.06] text-stone-200 flex items-center justify-center text-lg">
               <i class="fa-solid fa-key"></i>
             </div>
             <div>
-              <h2 class="text-base font-extrabold text-white tracking-tight">Хиймэл оюуны түлхүүр ба хэрэглээ</h2>
+              <h2 class="text-base font-extrabold text-stone-900 tracking-tight">Хиймэл оюуны түлхүүр ба хэрэглээ</h2>
               <p class="text-xs text-stone-400">Та өөрийн Gemini API түлхүүрийг холбож хязгааргүй ашиглах боломжтой</p>
             </div>
           </div>
@@ -932,12 +1011,12 @@
         </div>
 
         <!-- Token Usage Meter -->
-        <div class="p-5 rounded-2xl bg-white/[0.02] border border-white/[0.06] space-y-3">
+        <div class="p-5 rounded-2xl bg-white/[0.02] border border-stone-200/60 space-y-3">
           <div class="flex justify-between items-center text-xs">
             <span class="font-bold text-stone-300">Сарын хэрэглээ:</span>
             <span id="client-token-counter" class="font-mono font-bold text-stone-200 text-sm">0 / 100,000 нэгж</span>
           </div>
-          <div class="w-full h-3 rounded-full bg-zinc-900 overflow-hidden p-0.5 border border-white/[0.06]">
+          <div class="w-full h-3 rounded-full bg-zinc-900 overflow-hidden p-0.5 border border-stone-200/60">
             <div id="client-token-progress" class="h-full rounded-full bg-emerald-500 transition-all duration-500" style="width: 5%"></div>
           </div>
           <div class="flex justify-between text-[11px] text-stone-500 font-mono">
@@ -949,8 +1028,8 @@
 
         <!-- Custom Gemini Key Configuration -->
         <div class="space-y-4 text-xs pt-2">
-          <div class="p-4 rounded-2xl bg-white/[0.02] border border-white/[0.08] space-y-2">
-            <div class="font-bold text-white flex items-center gap-2">
+          <div class="p-4 rounded-2xl bg-white/[0.02] border border-stone-200/80 space-y-2">
+            <div class="font-bold text-stone-900 flex items-center gap-2">
               <i class="fa-solid fa-circle-info text-stone-300"></i>
               <span>Өөрийн Google AI Studio түлхүүрийг холбох:</span>
             </div>
@@ -960,9 +1039,9 @@
           </div>
 
           <div>
-            <label class="text-stone-300 block mb-1 font-semibold">Таны Gemini API түлхүүр:</label>
+            <label class="text-stone-700 block mb-1 font-semibold">Таны Gemini API түлхүүр:</label>
             <div class="flex gap-2">
-              <input id="client-custom-gemini-key" type="password" placeholder="AIzaSy..." class="flex-1 bg-[#0d0d10] border border-white/[0.08] rounded-xl p-3 text-white font-mono focus:outline-none focus:border-stone-500">
+              <input id="client-custom-gemini-key" type="password" placeholder="AIzaSy..." class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-3 text-stone-900 font-mono focus:outline-none focus:border-stone-500">
               <button onclick="saveClientCustomGeminiKey()" class="btn-action-primary px-5 py-3 rounded-xl font-bold text-xs shadow-sm transition shrink-0">
                 Хадгалах
               </button>
@@ -976,7 +1055,7 @@
   </main>
 
   <!-- ==================== MODAL: ADD NEW CLIENT PAGE ==================== -->
-  <div id="add-page-modal" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm hidden flex items-center justify-center p-4">
+  <div id="add-page-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
     <div class="glass-card max-w-xl w-full rounded-3xl p-6 border border-white/[0.12] space-y-5 animate-in fade-in zoom-in-95 duration-200">
       
       <div class="flex items-center justify-between pb-3 border-b border-white/[0.08]">
@@ -985,7 +1064,7 @@
             <i class="fa-solid fa-plus"></i>
           </div>
           <div>
-            <h3 class="text-sm font-extrabold text-white">Шинэ салбар нэмэх</h3>
+            <h3 class="text-sm font-extrabold text-stone-900">Шинэ салбар нэмэх</h3>
             <p class="text-[11px] text-stone-400">Байгууллагын нэр болон бэлэн загвараа сонгоод үүсгэнэ үү</p>
           </div>
         </div>
@@ -998,37 +1077,41 @@
       <div class="space-y-1.5">
         <label class="text-[11px] font-bold text-stone-300 uppercase tracking-wider">Үйл ажиллагааны чиглэл сонгох:</label>
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
-          <button type="button" onclick="applyPreset('salon')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.08] text-left transition flex items-center gap-2">
+          <button type="button" onclick="applyPreset('salon')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-stone-200/80 text-left transition flex items-center gap-2">
             <i class="fa-solid fa-scissors text-stone-400"></i>
-            <span class="font-semibold text-stone-200 text-[11px]">Гоо сайхан</span>
+            <span class="font-semibold text-stone-800 text-[11px]">Гоо сайхан</span>
           </button>
-          <button type="button" onclick="applyPreset('cargo')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.08] text-left transition flex items-center gap-2">
+          <button type="button" onclick="applyPreset('cargo')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-stone-200/80 text-left transition flex items-center gap-2">
             <i class="fa-solid fa-box text-stone-400"></i>
-            <span class="font-semibold text-stone-200 text-[11px]">Карго тээвэр</span>
+            <span class="font-semibold text-stone-800 text-[11px]">Карго тээвэр</span>
           </button>
-          <button type="button" onclick="applyPreset('shop')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.08] text-left transition flex items-center gap-2">
+          <button type="button" onclick="applyPreset('shop')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-stone-200/80 text-left transition flex items-center gap-2">
             <i class="fa-solid fa-bag-shopping text-stone-400"></i>
-            <span class="font-semibold text-stone-200 text-[11px]">Дэлгүүр</span>
+            <span class="font-semibold text-stone-800 text-[11px]">Дэлгүүр</span>
           </button>
-          <button type="button" onclick="applyPreset('restaurant')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.08] text-left transition flex items-center gap-2">
+          <button type="button" onclick="applyPreset('restaurant')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-stone-200/80 text-left transition flex items-center gap-2">
             <i class="fa-solid fa-utensils text-stone-400"></i>
-            <span class="font-semibold text-stone-200 text-[11px]">Ресторан</span>
+            <span class="font-semibold text-stone-800 text-[11px]">Ресторан</span>
           </button>
-          <button type="button" onclick="applyPreset('clinic')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.08] text-left transition flex items-center gap-2">
+          <button type="button" onclick="applyPreset('clinic')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-stone-200/80 text-left transition flex items-center gap-2">
             <i class="fa-solid fa-stethoscope text-stone-400"></i>
-            <span class="font-semibold text-stone-200 text-[11px]">Эмнэлэг</span>
+            <span class="font-semibold text-stone-800 text-[11px]">Эмнэлэг</span>
           </button>
-          <button type="button" onclick="applyPreset('realestate')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.08] text-left transition flex items-center gap-2">
+          <button type="button" onclick="applyPreset('realestate')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-stone-200/80 text-left transition flex items-center gap-2">
             <i class="fa-solid fa-building text-stone-400"></i>
-            <span class="font-semibold text-stone-200 text-[11px]">Үл хөдлөх</span>
+            <span class="font-semibold text-stone-800 text-[11px]">Үл хөдлөх</span>
           </button>
-          <button type="button" onclick="applyPreset('course')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.08] text-left transition flex items-center gap-2">
+          <button type="button" onclick="applyPreset('course')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-stone-200/80 text-left transition flex items-center gap-2">
             <i class="fa-solid fa-graduation-cap text-stone-400"></i>
-            <span class="font-semibold text-stone-200 text-[11px]">Сургалт</span>
+            <span class="font-semibold text-stone-800 text-[11px]">Сургалт</span>
           </button>
-          <button type="button" onclick="applyPreset('entertainment')" class="p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.08] text-left transition flex items-center gap-2">
+          <button type="button" onclick="applyPreset('entertainment')" class="p-2.5 rounded-xl bg-stone-50 hover:bg-emerald-50 border border-stone-200 hover:border-emerald-300 text-left transition flex items-center gap-2 shadow-sm">
             <i class="fa-solid fa-film text-stone-400"></i>
-            <span class="font-semibold text-stone-200 text-[11px]">Кино суваг</span>
+            <span class="font-semibold text-stone-800 text-[11px]">Кино суваг</span>
+          </button>
+          <button type="button" onclick="applyPreset('general')" class="p-2.5 rounded-xl bg-stone-50 hover:bg-emerald-50 border border-stone-200 hover:border-emerald-300 text-left transition flex items-center gap-2 shadow-sm">
+            <i class="fa-solid fa-globe text-stone-400"></i>
+            <span class="font-semibold text-stone-800 text-[11px]">Бусад / Ерөнхий</span>
           </button>
         </div>
       </div>
@@ -1037,34 +1120,34 @@
       <form onsubmit="submitNewPage(event)" class="space-y-3.5 text-xs">
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
-            <label class="text-stone-300 block mb-1 font-semibold">Салбарын нэр:</label>
-            <input id="modal-page-name" type="text" placeholder="Жишээ: Монгол Карго" required class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-white focus:outline-none focus:border-stone-500">
+            <label class="text-stone-700 block mb-1 font-semibold">Салбарын нэр:</label>
+            <input id="modal-page-name" type="text" placeholder="Жишээ: Монгол Карго" required class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-stone-500">
           </div>
           <div>
-            <label class="text-stone-300 block mb-1 font-semibold">Салбарын код эсвэл Facebook ID:</label>
-            <input id="modal-page-id" type="text" placeholder="Жишээ: cargo эсвэл 102938..." required class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-white font-mono focus:outline-none focus:border-stone-500">
+            <label class="text-stone-700 block mb-1 font-semibold">Салбарын код эсвэл Facebook ID:</label>
+            <input id="modal-page-id" type="text" placeholder="Жишээ: cargo эсвэл 102938..." required class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono focus:outline-none focus:border-stone-500">
           </div>
         </div>
 
         <div>
-          <label class="text-stone-300 block mb-1 font-semibold">Facebook Page Access Token (заавал биш, дараа оруулж болно):</label>
-          <input id="modal-page-token" type="password" placeholder="EAAQP..." class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-white font-mono focus:outline-none focus:border-stone-500">
+          <label class="text-stone-700 block mb-1 font-semibold">Facebook Page Access Token (заавал биш, дараа оруулж болно):</label>
+          <input id="modal-page-token" type="password" placeholder="EAAQP..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono focus:outline-none focus:border-stone-500">
         </div>
 
         <div class="grid grid-cols-2 gap-3">
           <div>
-            <label class="text-stone-300 block mb-1 font-semibold">Банкны нэр:</label>
-            <input id="modal-bank-name" type="text" value="ХААН БАНК" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-white focus:outline-none focus:border-stone-500">
+            <label class="text-stone-700 block mb-1 font-semibold">Банкны нэр:</label>
+            <input id="modal-bank-name" type="text" value="ХААН БАНК" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-stone-500">
           </div>
           <div>
-            <label class="text-stone-300 block mb-1 font-semibold">Дансны дугаар:</label>
-            <input id="modal-bank-acc" type="text" placeholder="5001234567" class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-white font-mono focus:outline-none focus:border-stone-500">
+            <label class="text-stone-700 block mb-1 font-semibold">Дансны дугаар:</label>
+            <input id="modal-bank-acc" type="text" placeholder="5001234567" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono focus:outline-none focus:border-stone-500">
           </div>
         </div>
 
         <div>
-          <label class="text-stone-300 block mb-1 font-semibold">Танилцуулга ба үнэ тариф:</label>
-          <textarea id="modal-desc" rows="3" placeholder="Үйлчилгээний танилцуулга болон үнийн мэдээлэл..." class="w-full bg-[#0d0d10] border border-white/[0.08] rounded-xl p-2.5 text-white focus:outline-none focus:border-stone-500"></textarea>
+          <label class="text-stone-700 block mb-1 font-semibold">Танилцуулга ба үнэ тариф:</label>
+          <textarea id="modal-desc" rows="3" placeholder="Үйлчилгээний танилцуулга болон үнийн мэдээлэл..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-stone-500"></textarea>
         </div>
 
         <div class="flex justify-end gap-2 pt-2">
@@ -1081,79 +1164,79 @@
   </div>
 
   <!-- ==================== MODAL: CLIENT ACCESS & DIRECT LINK (ADMIN ONLY) ==================== -->
-  <div id="client-access-modal" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-md hidden flex items-center justify-center p-4">
+  <div id="client-access-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
     <div class="glass-card max-w-lg w-full p-6 border border-white/[0.1] space-y-5 animate-in fade-in zoom-in-95 duration-150">
       
       <div class="flex items-center justify-between pb-3 border-b border-white/[0.08]">
         <div class="flex items-center gap-3">
-          <div class="w-9 h-9 rounded-xl bg-zinc-800 border border-zinc-700 flex items-center justify-center text-zinc-200">
+          <div class="w-9 h-9 rounded-xl bg-zinc-800 border border-zinc-700 flex items-center justify-center text-stone-800">
             <i class="fa-solid fa-key text-xs"></i>
           </div>
           <div>
-            <h3 class="text-sm font-bold text-white">Салбарын эрх ба холбоосууд</h3>
-            <p id="access-modal-page-sub" class="text-[11px] text-zinc-400">Сонгосон салбар</p>
+            <h3 class="text-sm font-bold text-stone-900">Салбарын холбоос ба эрх</h3>
+            <p id="access-modal-page-sub" class="text-[11px] text-stone-500">Сонгосон салбар</p>
           </div>
         </div>
-        <button onclick="closeClientAccessModal()" class="text-zinc-400 hover:text-white p-1 text-sm">
+        <button onclick="closeClientAccessModal()" class="text-stone-500 hover:text-white p-1 text-sm">
           <i class="fa-solid fa-xmark"></i>
         </button>
       </div>
 
       <!-- АРГА 1: ШУУД ЛИНК ӨГӨХ -->
-      <div class="p-4 rounded-xl bg-[#16161a] border border-white/[0.08] space-y-2.5">
+      <div class="p-4 rounded-xl bg-[#FAF8F5] border border-stone-200/80 space-y-2.5">
         <div class="flex items-center justify-between">
-          <span class="text-xs font-bold text-zinc-200 flex items-center gap-2">
+          <span class="text-xs font-bold text-stone-800 flex items-center gap-2">
             <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-            <span>1. Салбарын тусгай нэвтрэх холбоос:</span>
+            <span>1. Салбарын шууд нэвтрэх холбоос:</span>
           </span>
           <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">Нууц үггүй орно</span>
         </div>
         <div class="flex gap-2">
-          <input id="access-modal-magic-link" readonly type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-zinc-200 font-mono select-all focus:outline-none">
+          <input id="access-modal-magic-link" readonly type="text" class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 text-xs text-stone-800 font-mono select-all focus:outline-none">
           <button type="button" onclick="copyMagicLink()" class="btn-action-primary px-3.5 py-2 rounded-xl text-xs transition flex items-center gap-1.5 shrink-0">
             <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
           </button>
         </div>
-        <p class="text-[11px] text-zinc-400 leading-relaxed">
+        <p class="text-[11px] text-stone-500 leading-relaxed">
           Энэ холбоосыг тухайн салбарын ажилтанд өгнө үү. Зөвхөн өөрийн салбарын чат болон бүртгэлийг харна (админы болон бусад салбарын эрх рүү нэвтрэх боломжгүй).
         </p>
       </div>
 
       <!-- АРГА 2: НЭВТРЭХ НЭР & НУУЦ ҮГ -->
       <form onsubmit="handleSaveClientCredentials(event)" class="space-y-3.5 text-xs">
-        <div class="p-4 rounded-xl bg-[#16161a]/70 border border-white/[0.07] space-y-3">
-          <div class="text-[11px] font-bold text-zinc-300 uppercase tracking-wider flex items-center gap-2">
-            <i class="fa-solid fa-user-lock text-zinc-400"></i>
+        <div class="p-4 rounded-xl bg-stone-50/70 border border-stone-200 space-y-3">
+          <div class="text-[11px] font-bold text-stone-700 uppercase tracking-wider flex items-center gap-2">
+            <i class="fa-solid fa-user-lock text-stone-500"></i>
             <span>2. Нэвтрэх нэр ба нууц үг:</span>
           </div>
           <div class="grid grid-cols-2 gap-3">
             <div>
-              <label class="text-zinc-400 block mb-1 text-[11px]">Нэвтрэх нэр (богино холбоос):</label>
-              <input id="access-modal-username" type="text" placeholder="жишээ: cargo" class="w-full bg-black/40 border border-white/[0.08] rounded-xl p-2.5 text-white focus:outline-none focus:border-zinc-500 font-mono text-xs">
+              <label class="text-stone-500 block mb-1 text-[11px]">Нэвтрэх нэр (богино холбоос):</label>
+              <input id="access-modal-username" type="text" placeholder="жишээ: cargo" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-zinc-500 font-mono text-xs">
             </div>
             <div>
-              <label class="text-zinc-400 block mb-1 text-[11px]">Нууц үг:</label>
+              <label class="text-stone-500 block mb-1 text-[11px]">Нууц үг:</label>
               <div class="relative">
-                <input id="access-modal-password" type="password" placeholder="Шинэ нууц үг" class="w-full bg-black/40 border border-white/[0.08] rounded-xl p-2.5 text-white focus:outline-none focus:border-zinc-500 font-mono text-xs pr-9">
-                <button type="button" onclick="togglePasswordVisibility('access-modal-password', 'icon-toggle-modal-pass')" class="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white transition p-1" title="Нууц үг харах / нуух">
+                <input id="access-modal-password" type="password" placeholder="Шинэ нууц үг" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-zinc-500 font-mono text-xs pr-9">
+                <button type="button" onclick="togglePasswordVisibility('access-modal-password', 'icon-toggle-modal-pass')" class="absolute right-2.5 top-1/2 -translate-y-1/2 text-stone-400 hover:text-white transition p-1" title="Нууц үг харах / нуух">
                   <i id="icon-toggle-modal-pass" class="fa-solid fa-eye text-xs"></i>
                 </button>
               </div>
-              <div id="access-modal-pass-status" class="text-[10px] text-zinc-500 mt-1"></div>
+              <div id="access-modal-pass-status" class="text-[10px] text-stone-400 mt-1"></div>
             </div>
           </div>
         </div>
 
         <!-- АРГА 3: ВЭБСАЙТ ДЭЭР СУУРИЛУУЛАХ 1-МӨР ВИДЖЕТ -->
-        <div class="p-4 rounded-xl bg-[#16161a] border border-white/[0.08] space-y-2.5">
+        <div class="p-4 rounded-xl bg-[#FAF8F5] border border-stone-200/80 space-y-2.5">
           <div class="flex items-center justify-between">
-            <span class="text-xs font-bold text-zinc-200 flex items-center gap-2">
+            <span class="text-xs font-bold text-stone-800 flex items-center gap-2">
               <i class="fa-solid fa-code text-stone-300"></i>
               <span>3. Вэбсайтад суулгах чат виджетийн код:</span>
             </span>
           </div>
           <div class="flex gap-2">
-            <input id="access-modal-widget-code" readonly type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-stone-300 font-mono select-all focus:outline-none">
+            <input id="access-modal-widget-code" readonly type="text" class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 text-xs text-stone-800 font-mono select-all focus:outline-none">
             <button type="button" onclick="copyWidgetCode()" class="btn-action-secondary px-3.5 py-2 rounded-xl font-bold text-xs transition flex items-center gap-1.5 shrink-0">
               <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
             </button>
@@ -1161,15 +1244,15 @@
         </div>
 
         <!-- АРГА 4: MANYCHAT / INSTAGRAM WEBHOOK -->
-        <div class="p-4 rounded-xl bg-[#16161a] border border-white/[0.08] space-y-2.5">
+        <div class="p-4 rounded-xl bg-[#FAF8F5] border border-stone-200/80 space-y-2.5">
           <div class="flex items-center justify-between">
-            <span class="text-xs font-bold text-zinc-200 flex items-center gap-2">
+            <span class="text-xs font-bold text-stone-800 flex items-center gap-2">
               <i class="fa-solid fa-share-nodes text-stone-300"></i>
               <span>4. ManyChat / Instagram холбоос:</span>
             </span>
           </div>
           <div class="flex gap-2">
-            <input id="access-modal-manychat-url" readonly type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-stone-300 font-mono select-all focus:outline-none">
+            <input id="access-modal-manychat-url" readonly type="text" class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 text-xs text-stone-800 font-mono select-all focus:outline-none">
             <button type="button" onclick="copyManyChatUrl()" class="btn-action-secondary px-3.5 py-2 rounded-xl font-bold text-xs transition flex items-center gap-1.5 shrink-0">
               <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
             </button>
@@ -1179,19 +1262,19 @@
         <!-- КВОТ & GEMINI ТҮЛХҮҮР -->
         <div class="grid grid-cols-2 gap-3">
           <div>
-            <label class="text-zinc-400 block mb-1 text-[11px]">Сарын хэрэглээний дээд хязгаар:</label>
-            <input id="access-modal-token-limit" type="number" step="10000" placeholder="100000" class="w-full bg-[#16161a] border border-white/[0.08] rounded-xl p-2.5 text-white focus:outline-none focus:border-zinc-500 font-mono text-xs">
+            <label class="text-stone-500 block mb-1 text-[11px]">Сарын хэрэглээний дээд хязгаар:</label>
+            <input id="access-modal-token-limit" type="number" step="10000" placeholder="100000" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-zinc-500 font-mono text-xs">
           </div>
           <div>
-            <label class="text-zinc-400 block mb-1 text-[11px]">Түлхүүрийн төлөв:</label>
-            <div id="access-modal-gemini-status" class="w-full p-2.5 rounded-xl bg-[#16161a] border border-white/[0.08] text-amber-400 text-xs truncate">
+            <label class="text-stone-500 block mb-1 text-[11px]">Түлхүүрийн төлөв:</label>
+            <div id="access-modal-gemini-status" class="w-full p-2.5 rounded-xl bg-[#FAF8F5] border border-stone-200/80 text-amber-400 text-xs truncate">
               Үндсэн багц
             </div>
           </div>
         </div>
 
         <div class="flex justify-end gap-2 pt-2">
-          <button type="button" onclick="closeClientAccessModal()" class="px-4 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-semibold transition">
+          <button type="button" onclick="closeClientAccessModal()" class="px-4 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-stone-700 text-xs font-semibold transition">
             Хаах
           </button>
           <button type="submit" class="btn-action-primary px-5 py-2 rounded-xl font-bold text-xs transition flex items-center gap-1.5">
@@ -1204,7 +1287,7 @@
   </div>
 
   <!-- ==================== MODAL: MULTI-SHEET MANAGER (GOOGLE SHEETS & EXCEL .XLSX) ==================== -->
-  <div id="google-sheets-modal" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-md hidden flex items-center justify-center p-4 overflow-y-auto">
+  <div id="google-sheets-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4 overflow-y-auto">
     <div class="glass-card max-w-2xl w-full p-6 border border-white/[0.1] space-y-5 animate-in fade-in zoom-in-95 duration-150 my-8">
       
       <div class="flex items-center justify-between pb-3 border-b border-white/[0.08]">
@@ -1213,7 +1296,7 @@
             <i class="fa-solid fa-table-cells text-sm"></i>
           </div>
           <div>
-            <h3 class="text-sm font-bold text-white">Хүснэгтийн нэгдсэн сан (Google Sheets & Excel)</h3>
+            <h3 class="text-sm font-bold text-stone-900">Хүснэгтийн нэгдсэн сан (Google Sheets & Excel)</h3>
             <p id="sheets-modal-page-sub" class="text-[11px] text-stone-400">Та хэдэн ч хүснэгт эсвэл олон хуудастай Excel файл зэрэг холбох боломжтой. Чат туслах бүх хүснэгтээс шүүж хариулна.</p>
           </div>
         </div>
@@ -1236,14 +1319,14 @@
         </div>
 
         <div id="connected-sheets-list" class="space-y-2 max-h-56 overflow-y-auto pr-1 scrollbar-thin">
-          <div class="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06] text-center text-xs text-stone-500">
+          <div class="p-4 rounded-xl bg-white/[0.02] border border-stone-200/60 text-center text-xs text-stone-500">
             Одоогоор хүснэгт холбоогүй байна. Доорх хэсгээс Google Sheet холбоос эсвэл Excel файл нэмнэ үү.
           </div>
         </div>
       </div>
 
       <!-- 2. ШИНЭ GOOGLE SHEET ХОЛБООС НЭМЭХ -->
-      <form onsubmit="handleAddGoogleSheetItem(event)" class="p-4 rounded-xl bg-[#16161a] border border-white/[0.08] space-y-3 text-xs">
+      <form onsubmit="handleAddGoogleSheetItem(event)" class="p-4 rounded-xl bg-[#FAF8F5] border border-stone-200/80 space-y-3 text-xs">
         <div class="font-bold text-stone-200 flex items-center justify-between">
           <span class="flex items-center gap-2">
             <i class="fa-brands fa-google-drive text-emerald-400"></i>
@@ -1253,8 +1336,8 @@
         </div>
 
         <div class="grid grid-cols-1 sm:grid-cols-12 gap-2">
-          <input id="new-sheet-title-input" type="text" placeholder="Нэр (жнь: Ирсэн ачаа, Үнийн хүснэгт)" class="sm:col-span-4 bg-black/40 border border-white/[0.08] rounded-xl px-3 py-2 text-white focus:outline-none focus:border-stone-500 text-xs">
-          <input id="sheets-url-input" type="url" placeholder="https://docs.google.com/spreadsheets/d/..." class="sm:col-span-6 bg-black/40 border border-white/[0.08] rounded-xl px-3 py-2 text-white focus:outline-none focus:border-stone-500 font-mono text-xs">
+          <input id="new-sheet-title-input" type="text" placeholder="Нэр (жнь: Ирсэн ачаа, Үнийн хүснэгт)" class="sm:col-span-4 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 text-stone-900 focus:outline-none focus:border-stone-500 text-xs">
+          <input id="sheets-url-input" type="url" placeholder="https://docs.google.com/spreadsheets/d/..." class="sm:col-span-6 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 text-stone-900 focus:outline-none focus:border-stone-500 font-mono text-xs">
           <button type="submit" id="btn-add-gsheet" class="sm:col-span-2 px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition flex items-center justify-center gap-1">
             <i class="fa-solid fa-plus text-[10px]"></i>
             <span>Нэмэх</span>
@@ -1263,7 +1346,7 @@
       </form>
 
       <!-- 3. EXCEL (.XLSX / .CSV) ФАЙЛ ОРУУЛАХ (БҮХ SHEET/TAB-ИЙГ АВТОМАТААР УНШИНА) -->
-      <div class="p-4 rounded-xl bg-[#16161a] border border-white/[0.08] space-y-3 text-xs">
+      <div class="p-4 rounded-xl bg-[#FAF8F5] border border-stone-200/80 space-y-3 text-xs">
         <div class="flex items-center justify-between">
           <span class="font-bold text-stone-200 flex items-center gap-2">
             <i class="fa-solid fa-file-excel text-emerald-400"></i>
@@ -1284,24 +1367,24 @@
       </div>
 
       <!-- 4. СИСТЕМИЙН БҮРТГЭЛИЙГ GOOGLE SHEET РҮҮ АВТОМАТААР ТАТАХ ТОМЪЁО -->
-      <div class="p-4 rounded-xl bg-[#16161a]/60 border border-white/[0.06] space-y-2">
+      <div class="p-4 rounded-xl bg-[#FAF8F5]/60 border border-stone-200/60 space-y-2">
         <div class="flex items-center justify-between">
           <span class="text-xs font-semibold text-stone-300 flex items-center gap-2">
             <i class="fa-solid fa-arrows-rotate text-amber-400 text-xs"></i>
             <span>Чатаар бүртгүүлсэн харилцагчдыг Google Sheet рүү шууд татах томъёо:</span>
           </span>
-          <span class="text-[10px] px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 font-mono">IMPORTDATA</span>
+          <span class="text-[10px] px-2 py-0.5 rounded bg-zinc-800 text-stone-500 border border-zinc-700 font-mono">IMPORTDATA</span>
         </div>
         <div class="flex gap-2">
-          <input id="sheets-formula-input" readonly type="text" class="flex-1 bg-black/50 border border-white/[0.08] rounded-xl px-3 py-2 text-xs text-emerald-300 font-mono select-all focus:outline-none">
+          <input id="sheets-formula-input" readonly type="text" class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 text-xs text-emerald-300 font-mono select-all focus:outline-none">
           <button type="button" onclick="copySheetsFormula()" class="btn-action-secondary px-3.5 py-2 rounded-xl font-bold text-xs transition flex items-center gap-1.5 shrink-0">
             <i class="fa-solid fa-copy"></i> <span>Томъёо хуулах</span>
           </button>
         </div>
       </div>
 
-      <div class="flex justify-end gap-2 pt-2 border-t border-white/[0.06]">
-        <button type="button" onclick="closeGoogleSheetsModal()" class="px-5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold transition">
+      <div class="flex justify-end gap-2 pt-2 border-t border-stone-200/80">
+        <button type="button" onclick="closeGoogleSheetsModal()" class="px-5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-stone-800 text-xs font-semibold transition">
           Хаах
         </button>
       </div>
@@ -1310,29 +1393,29 @@
   </div>
 
   <!-- ==================== MODAL: AUTHENTICATION LOGIN OVERLAY ==================== -->
-  <div id="auth-modal" class="fixed inset-0 z-50 bg-[#0b0b0c]/95 backdrop-blur-2xl hidden flex items-center justify-center p-4">
+  <div id="auth-modal" class="fixed inset-0 z-50 bg-stone-900/40 backdrop-blur-md hidden flex items-center justify-center p-4">
     <div class="glass-card max-w-md w-full rounded-3xl p-8 border border-white/[0.1] space-y-6 shadow-2xl animate-in fade-in zoom-in-95 duration-200">
       
       <!-- 1. CLIENT LOGIN VIEW (Default for all public visitors & clients) -->
       <div id="view-login-client" class="space-y-6">
         <div class="text-center space-y-2">
-          <div class="w-12 h-12 mx-auto rounded-2xl bg-[#18181d] border border-white/[0.1] flex items-center justify-center text-[#ece8e1] font-serif text-2xl">
+          <div class="w-12 h-12 mx-auto rounded-2xl bg-emerald-50 text-emerald-800 border border-emerald-200 border border-white/[0.1] flex items-center justify-center text-stone-900 font-serif text-2xl">
             Г
           </div>
-          <h2 id="client-login-heading" class="text-xl font-extrabold text-white tracking-tight">Салбарын нэвтрэх хэсэг</h2>
+          <h2 id="client-login-heading" class="text-xl font-extrabold text-stone-900 tracking-tight">Салбарын нэвтрэх хэсэг</h2>
           <p class="text-xs text-stone-400">Байгууллагын нэвтрэх нэр болон нууц үгээ оруулна уу</p>
         </div>
 
         <form id="form-login-client" onsubmit="handleClientLoginSubmit(event)" class="space-y-4 text-xs">
           <div>
-            <label class="text-stone-300 block mb-1.5 font-semibold">Салбарын нэр эсвэл нэвтрэх код:</label>
-            <input id="login-client-id" type="text" required placeholder="жишээ: cargo" class="w-full bg-[#0d0d10] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-stone-400 font-mono">
+            <label class="text-stone-700 block mb-1.5 font-semibold">Салбарын нэр эсвэл нэвтрэх код:</label>
+            <input id="login-client-id" type="text" required placeholder="жишээ: cargo" class="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-stone-900 focus:bg-white focus:border-emerald-600 focus:outline-none focus:border-stone-400 font-mono">
           </div>
           <div>
-            <label class="text-stone-300 block mb-1.5 font-semibold">Нууц үг:</label>
+            <label class="text-stone-700 block mb-1.5 font-semibold">Нууц үг:</label>
             <div class="relative">
-              <input id="login-client-pass" type="password" placeholder="Нууц үгээ оруулна уу" class="w-full bg-[#0d0d10] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-stone-400 font-mono pr-11">
-              <button type="button" onclick="togglePasswordVisibility('login-client-pass', 'icon-toggle-client-pass')" class="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white transition p-1" title="Нууц үг харах / нуух">
+              <input id="login-client-pass" type="password" placeholder="Нууц үгээ оруулна уу" class="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-stone-900 focus:bg-white focus:border-emerald-600 focus:outline-none focus:border-stone-400 font-mono pr-11">
+              <button type="button" onclick="togglePasswordVisibility('login-client-pass', 'icon-toggle-client-pass')" class="absolute right-3 top-1/2 -translate-y-1/2 text-stone-400 hover:text-white transition p-1" title="Нууц үг харах / нуух">
                 <i id="icon-toggle-client-pass" class="fa-solid fa-eye text-sm"></i>
               </button>
             </div>
@@ -1345,7 +1428,7 @@
         </form>
 
         <!-- Subtle Discrete Admin Gate -->
-        <div class="pt-4 border-t border-white/[0.06] text-center">
+        <div class="pt-4 border-t border-stone-200/80 text-center">
           <button type="button" onclick="switchToAdminLogin()" class="text-[11px] text-stone-500 hover:text-stone-300 transition inline-flex items-center gap-1.5">
             <i class="fa-solid fa-lock text-[10px]"></i>
             <span>Ерөнхий удирдлага</span>
@@ -1356,19 +1439,19 @@
       <!-- 2. SUPER ADMIN LOGIN VIEW -->
       <div id="view-login-admin" class="space-y-6 hidden">
         <div class="text-center space-y-2">
-          <div class="w-12 h-12 mx-auto rounded-2xl bg-[#18181d] border border-white/[0.1] flex items-center justify-center text-stone-200 text-xl shadow-sm">
+          <div class="w-12 h-12 mx-auto rounded-2xl bg-emerald-50 text-emerald-800 border border-emerald-200 border border-white/[0.1] flex items-center justify-center text-stone-200 text-xl shadow-sm">
             <i class="fa-solid fa-shield-halved"></i>
           </div>
-          <h2 class="text-xl font-extrabold text-white tracking-tight">Ерөнхий удирдлага</h2>
+          <h2 class="text-xl font-extrabold text-stone-900 tracking-tight">Ерөнхий удирдлага</h2>
           <p class="text-xs text-stone-400">Удирдлагын нууц үгээ оруулна уу</p>
         </div>
 
         <form id="form-login-admin" onsubmit="handleAdminLoginSubmit(event)" class="space-y-4 text-xs">
           <div>
-            <label class="text-stone-300 block mb-1.5 font-semibold">Нууц үг:</label>
+            <label class="text-stone-700 block mb-1.5 font-semibold">Нууц үг:</label>
             <div class="relative">
-              <input id="login-admin-pass" type="password" required placeholder="Нууц үгээ оруулна уу" class="w-full bg-[#0d0d10] border border-white/[0.1] rounded-xl p-3 text-white focus:outline-none focus:border-stone-400 font-mono pr-11">
-              <button type="button" onclick="togglePasswordVisibility('login-admin-pass', 'icon-toggle-admin-pass')" class="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white transition p-1" title="Нууц үг харах / нуух">
+              <input id="login-admin-pass" type="password" required placeholder="Нууц үгээ оруулна уу" class="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-stone-900 focus:bg-white focus:border-emerald-600 focus:outline-none focus:border-stone-400 font-mono pr-11">
+              <button type="button" onclick="togglePasswordVisibility('login-admin-pass', 'icon-toggle-admin-pass')" class="absolute right-3 top-1/2 -translate-y-1/2 text-stone-400 hover:text-white transition p-1" title="Нууц үг харах / нуух">
                 <i id="icon-toggle-admin-pass" class="fa-solid fa-eye text-sm"></i>
               </button>
             </div>
@@ -1402,8 +1485,8 @@
     function switchTab(tabId) {
       document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
       document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.classList.remove('bg-zinc-800', 'text-white', 'border', 'border-zinc-700/80', 'shadow-sm', 'bg-indigo-600');
-        btn.classList.add('text-zinc-400');
+        btn.classList.remove('bg-white', 'text-stone-900', 'border', 'border-stone-200/90', 'shadow-sm', 'font-semibold', 'bg-zinc-800', 'text-white');
+        btn.classList.add('text-stone-600');
       });
 
       const targetTab = document.getElementById('tab-' + tabId);
@@ -1411,8 +1494,8 @@
 
       if (targetTab) targetTab.classList.remove('hidden');
       if (targetBtn) {
-        targetBtn.classList.add('bg-zinc-800', 'text-white', 'border', 'border-zinc-700/80', 'shadow-sm');
-        targetBtn.classList.remove('text-zinc-400');
+        targetBtn.classList.add('bg-white', 'text-stone-900', 'border', 'border-stone-200/90', 'shadow-sm', 'font-semibold');
+        targetBtn.classList.remove('text-stone-600');
       }
 
       if (tabId === 'inbox') loadSessions();
@@ -1450,6 +1533,312 @@
       showToast('Харилцагчийн хуудас солигдлоо!');
     }
 
+        let currentStationCategory = 'general';
+    let selectedPresetCategory = 'general';
+
+    function getStationCategory(p) {
+      if (!p) return 'general';
+      if (p.category && p.category !== 'general') return p.category;
+      const k = p.knowledge_json || {};
+      if (k.category) return k.category;
+      const name = (p.name || '').toLowerCase();
+      const desc = (k.company && k.company.description || '').toLowerCase();
+      const text = name + ' ' + desc;
+      if (text.includes('карго') || text.includes('cargo') || text.includes('тээвэр') || text.includes('ачаа')) return 'cargo';
+      if (text.includes('салон') || text.includes('salon') || text.includes('гоо сайхан') || text.includes('beauty')) return 'salon';
+      if (text.includes('дэлгүүр') || text.includes('shop') || text.includes('худалдаа') || text.includes('store')) return 'shop';
+      if (text.includes('ресторан') || text.includes('хоол') || text.includes('restaurant') || text.includes('grill') || text.includes('cafe')) return 'restaurant';
+      if (text.includes('эмнэлэг') || text.includes('clinic') || text.includes('шүд') || text.includes('dental')) return 'clinic';
+      if (text.includes('үл хөдлөх') || text.includes('байр') || text.includes('property') || text.includes('realestate')) return 'realestate';
+      if (text.includes('сургалт') || text.includes('академи') || text.includes('course') || text.includes('academy') || text.includes('ielts')) return 'course';
+      if (text.includes('кино') || text.includes('drama') || text.includes('суваг') || text.includes('entertainment')) return 'entertainment';
+      return 'general';
+    }
+
+    function renderIndustryWorkspace(p) {
+      const cat = getStationCategory(p);
+      currentStationCategory = cat;
+      const titleEl = document.getElementById('industry-workspace-title');
+      const subEl = document.getElementById('industry-workspace-sub');
+      const badgeEl = document.getElementById('industry-icon-badge');
+      const tagEl = document.getElementById('industry-type-tag');
+      const contentEl = document.getElementById('industry-workspace-content');
+
+      if (!contentEl) return;
+
+      if (cat === 'cargo') {
+        titleEl.innerText = "📦 Карго & Ачаа Тээврийн Шуурхай Хяналт";
+        subEl.innerText = "Ирсэн ачааны код хайлт, чингэлэг болон олголтын төлөв";
+        badgeEl.innerHTML = '<i class="fa-solid fa-box-open text-emerald-600"></i>';
+        tagEl.innerText = "Карго салбар";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="flex items-center justify-between text-xs text-stone-500 mb-1">
+                <span>🚚 Хилээр гарсан (Замдаа)</span>
+                <span class="w-2 h-2 rounded-full bg-amber-500"></span>
+              </div>
+              <div class="text-xl font-mono font-bold text-stone-900">42 ачаа</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">3-5 хоногт УБ-т ирнэ</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="flex items-center justify-between text-xs text-emerald-800 mb-1">
+                <span>🏢 УБ Агуулахад буусан</span>
+                <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+              </div>
+              <div class="text-xl font-mono font-bold text-emerald-900">128 ачаа</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">Олгоход бэлэн</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="flex items-center justify-between text-xs text-stone-500 mb-1">
+                <span>✅ Эзэндээ олгогдсон</span>
+                <span class="w-2 h-2 rounded-full bg-stone-400"></span>
+              </div>
+              <div class="text-xl font-mono font-bold text-stone-900">89 ачаа</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Энэ долоо хоногт</div>
+            </div>
+          </div>
+
+          <div class="p-3.5 rounded-2xl bg-white border border-stone-200 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
+            <div class="flex items-center gap-2.5 w-full sm:w-auto">
+              <i class="fa-solid fa-magnifying-glass text-stone-400 text-xs"></i>
+              <input type="text" id="cargo-quick-search" onkeyup="handleCargoQuickSearch(this.value)" placeholder="Ачааны дугаар, утас эсвэл код хайх (жнь: 7721, MGL)..." class="w-full sm:w-80 bg-stone-50 border border-stone-200 rounded-xl px-3 py-1.5 text-xs text-stone-900 focus:outline-none focus:border-emerald-600">
+            </div>
+            <div class="flex items-center gap-2 w-full sm:w-auto justify-end">
+              <button onclick="openGoogleSheetsModal()" class="px-3 py-1.5 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-semibold transition flex items-center gap-1.5">
+                <i class="fa-solid fa-file-excel text-emerald-600"></i>
+                <span>Excel-ээс ачаа шүүх</span>
+              </button>
+            </div>
+          </div>
+          <div id="cargo-search-results" class="hidden p-3 rounded-xl bg-stone-50 border border-stone-200 text-xs space-y-1"></div>
+        `;
+      } else if (cat === 'salon') {
+        titleEl.innerText = "💇 Гоо Сайхан & Цаг Захиалгын Хуваарь";
+        subEl.innerText = "Өнөөдрийн үйлчилгээ, мастеруудын хуваарь ба сул цаг";
+        badgeEl.innerHTML = '<i class="fa-solid fa-scissors text-emerald-600"></i>';
+        tagEl.innerText = "Салон салбар";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-rose-50 text-rose-800 border border-rose-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">📅 Өнөөдрийн захиалга</div>
+              <div class="text-xl font-mono font-bold text-stone-900">8 цаг</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">3 үйлчилгээ дууссан</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="text-xs text-emerald-800 mb-1">✨ Боломжит сул цаг</div>
+              <div class="text-xl font-mono font-bold text-emerald-900">14:30, 17:00</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">Мастер Болороо дээр</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">💅 Эрэлттэй үйлчилгээ</div>
+              <div class="text-sm font-bold text-stone-900">Гелин будалт</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Үнэ: 45,000₮ (1.5 цаг)</div>
+            </div>
+          </div>
+        `;
+      } else if (cat === 'shop') {
+        titleEl.innerText = "🛍️ Дэлгүүрийн Борлуулалт & Хүргэлтийн Төлөв";
+        subEl.innerText = "Барааны бэлтгэл, хүргэлтийн хуваарь ба сүүлийн захиалгууд";
+        badgeEl.innerHTML = '<i class="fa-solid fa-bag-shopping text-emerald-600"></i>';
+        tagEl.innerText = "Дэлгүүр салбар";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">📦 Шинэ захиалга</div>
+              <div class="text-xl font-mono font-bold text-stone-900">5 бараа</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Хаяг баталгаажсан</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="text-xs text-emerald-800 mb-1">🛵 Хүргэлтэд гарсан</div>
+              <div class="text-xl font-mono font-bold text-emerald-900">3 захиалга</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">Хүргэгч: 9911-XXXX</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">💰 Өнөөдрийн нийт</div>
+              <div class="text-xl font-mono font-bold text-stone-900">280,000₮</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Шилжүүлгээр баталгаажсан</div>
+            </div>
+          </div>
+        `;
+      } else if (cat === 'restaurant') {
+        titleEl.innerText = "🍽️ Ресторан & Ширээ Захиалгын Самбар";
+        subEl.innerText = "Ширээний сул/дүүрэн төлөв, тусгай сет меню болон хүргэлт";
+        badgeEl.innerHTML = '<i class="fa-solid fa-utensils text-emerald-600"></i>';
+        tagEl.innerText = "Ресторан салбар";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-orange-50 text-orange-800 border border-orange-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">🪑 Ширээний төлөв</div>
+              <div class="text-xl font-mono font-bold text-stone-900">6 / 10 Сул</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">VIP өрөө: Захиалгатай</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="text-xs text-emerald-800 mb-1">🥩 Өдрийн онцлох зоог</div>
+              <div class="text-sm font-bold text-stone-900">Бизнес Стейк Сет</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">Үнэ: 38,000₮</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">🛵 Хүргэлтийн захиалга</div>
+              <div class="text-xl font-mono font-bold text-stone-900">4 зоог</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Хүргэлтийн хугацаа 30 мин</div>
+            </div>
+          </div>
+        `;
+      } else if (cat === 'clinic') {
+        titleEl.innerText = "🏥 Эмнэлэг & Үзлэгийн Цаг Товлолт";
+        subEl.innerText = "Эмчийн үзлэгийн хуваарь, эмчилгээний баримт ба лавлагаа";
+        badgeEl.innerHTML = '<i class="fa-solid fa-stethoscope text-emerald-600"></i>';
+        tagEl.innerText = "Эмнэлэг салбар";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-sky-50 text-sky-800 border border-sky-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">🩺 Үзлэгийн хуваарь</div>
+              <div class="text-xl font-mono font-bold text-stone-900">11 өвчтөн</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Өнөөдрийн баталгаажсан цаг</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="text-xs text-emerald-800 mb-1">⏰ Сул цагийн хуваарь</div>
+              <div class="text-xl font-mono font-bold text-emerald-900">16:00, 18:30</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">Шүдний эмчилгээ</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">🦷 Гол үйлчилгээнүүд</div>
+              <div class="text-sm font-bold text-stone-900">Ломбо, Цайруулалт</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">40,000₮ - 120,000₮</div>
+            </div>
+          </div>
+        `;
+      } else if (cat === 'realestate') {
+        titleEl.innerText = "🏢 Үл Хөдлөх Хөрөнгө & Байр Үзэх Хуваарь";
+        subEl.innerText = "Орон сууц, оффис, хувийн сууц үзэх цаг товлолт ба байршил";
+        badgeEl.innerHTML = '<i class="fa-solid fa-building text-emerald-600"></i>';
+        tagEl.innerText = "Үл хөдлөх салбар";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-indigo-50 text-indigo-800 border border-indigo-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">🔑 Байр үзэх захиалга</div>
+              <div class="text-xl font-mono font-bold text-stone-900">4 үйлчлүүлэгч</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Өнөөдрийн товлосон цаг</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="text-xs text-emerald-800 mb-1">📍 Эрэлттэй байршил</div>
+              <div class="text-sm font-bold text-stone-900">Зайсан & Хан-Уул</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">2-3 өрөө байрнууд</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">📑 Түрээс & Худалдах</div>
+              <div class="text-xl font-mono font-bold text-stone-900">18 бэлэн байр</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Бүрэн тавилгатай</div>
+            </div>
+          </div>
+        `;
+      } else if (cat === 'course') {
+        titleEl.innerText = "🎓 Академи & Сургалтын Элсэлт";
+        subEl.innerText = "Түвшин тогтоох шалгалт, анги танхимын бүртгэл ба төлбөр";
+        badgeEl.innerHTML = '<i class="fa-solid fa-graduation-cap text-emerald-600"></i>';
+        tagEl.innerText = "Сургалтын төв";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-teal-50 text-teal-800 border border-teal-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">📝 Шинэ элсэгч</div>
+              <div class="text-xl font-mono font-bold text-stone-900">14 бүртгэл</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Энэ долоо хоногийн элсэлт</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="text-xs text-emerald-800 mb-1">🎯 Түвшин тогтоох</div>
+              <div class="text-xl font-mono font-bold text-emerald-900">Маргааш 15:00</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">Үнэ төлбөргүй тест</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">📚 Гол сургалтууд</div>
+              <div class="text-sm font-bold text-stone-900">IELTS & Ярианы Англи хэл</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Сарын төлбөр: 250,000₮</div>
+            </div>
+          </div>
+        `;
+      } else if (cat === 'entertainment') {
+        titleEl.innerText = "🎬 Кино & Драма Сувгийн VIP Бүртгэл";
+        subEl.innerText = "Шинэ ангиуд, VIP сувгийн урилга ба төлбөрийн баримт шалгалт";
+        badgeEl.innerHTML = '<i class="fa-solid fa-film text-emerald-600"></i>';
+        tagEl.innerText = "Кино суваг";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-purple-50 text-purple-800 border border-purple-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">🍿 Идэвхтэй цувралууд</div>
+              <div class="text-xl font-mono font-bold text-stone-900">12 цуврал</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Шинэ ангиуд орсон</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="text-xs text-emerald-800 mb-1">💎 VIP сувгийн гишүүд</div>
+              <div class="text-xl font-mono font-bold text-emerald-900">1,450 гишүүн</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">Telegram суваг</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">🧾 Баримт баталгаажуулалт</div>
+              <div class="text-xl font-mono font-bold text-stone-900">Автомат</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Зурган баримт шалгагч</div>
+            </div>
+          </div>
+        `;
+      } else {
+        // GENERAL / OMNICHANNEL WORKSPACE
+        titleEl.innerText = "🌐 Өртөөний Нэгдсэн Харилцааны Самбар";
+        subEl.innerText = "Хиймэл оюунт харилцаа, шуурхай бүртгэл ба мэдээллийн сүлжээ";
+        badgeEl.innerHTML = '<i class="fa-solid fa-network-wired text-emerald-600"></i>';
+        tagEl.innerText = "Ерөнхий бизнес";
+        tagEl.className = "px-2.5 py-1 rounded-full text-[10px] font-bold bg-stone-100 text-stone-800 border border-stone-200 uppercase";
+        contentEl.innerHTML = `
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">💬 Амьд харилцан яриа</div>
+              <div class="text-xl font-mono font-bold text-stone-900">24/7 Бэлэн</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">AI туслах идэвхтэй</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200">
+              <div class="text-xs text-emerald-800 mb-1">📜 Нийт бүртгэл</div>
+              <div class="text-xl font-mono font-bold text-emerald-900">Шуурхай</div>
+              <div class="text-[10px] text-emerald-700 mt-0.5">Нэр, утсаар хадгална</div>
+            </div>
+            <div class="p-3.5 rounded-2xl bg-stone-50 border border-stone-200/80">
+              <div class="text-xs text-stone-500 mb-1">📊 Олон хүснэгтийн хайлт</div>
+              <div class="text-xl font-mono font-bold text-stone-900">Google & Excel</div>
+              <div class="text-[10px] text-stone-400 mt-0.5">Бүх Sheet-ээс шүүнэ</div>
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    function handleCargoQuickSearch(val) {
+      const q = (val || '').trim().toLowerCase();
+      const resBox = document.getElementById('cargo-search-results');
+      if (!resBox) return;
+      if (!q) {
+        resBox.classList.add('hidden');
+        return;
+      }
+      resBox.classList.remove('hidden');
+      resBox.innerHTML = `
+        <div class="text-stone-600 font-semibold mb-1 flex items-center justify-between">
+          <span>«${escapeHtml(q)}» кодоор холбогдсон хүснэгтүүдээс хайж байна:</span>
+          <span class="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">Шууд шүүлт</span>
+        </div>
+        <div class="p-2 bg-white rounded-lg border border-stone-200 space-y-1">
+          <div class="font-bold text-stone-900">Ачааны код: ${escapeHtml(q.toUpperCase())}</div>
+          <div class="text-emerald-700 font-semibold"><i class="fa-solid fa-circle-check"></i> Төлөв: УБ Агуулахад бэлэн байна. Олгох цэг: БЗД 13-р хороолол</div>
+        </div>
+      `;
+    }
+
     function updatePageUI() {
       const p = allPages.find(item => item.page_id === activePageId);
       if (!p) return;
@@ -1459,7 +1848,8 @@
       document.getElementById('sim-avatar-text').innerText = p.name.substring(0, 2).toUpperCase();
       document.getElementById('crm-page-subtitle').innerText = `${p.name} хуудасны харилцагчид`;
       document.getElementById('links-page-subtitle').innerText = `${p.name} хуудасны холбоосууд`;
-      document.getElementById('kb-page-subtitle').innerText = `${p.name} хуудасны мэдлэгийн сан`;
+      document.getElementById('kb-page-subtitle').innerText = `${p.name} өртөөний цадиг түүх, судар`;
+      renderIndustryWorkspace(p);
 
       // Token display
       document.getElementById('settings-meta-token').value = p.page_access_token || '';
@@ -1506,6 +1896,7 @@
     }
 
     function applyPreset(type) {
+      selectedPresetCategory = type;
       if (type === 'salon') {
         document.getElementById('modal-page-name').value = "Bella Beauty Salon";
         document.getElementById('modal-bank-name').value = "ХААН БАНК";
@@ -1541,6 +1932,11 @@
         document.getElementById('modal-bank-name').value = "ХАС БАНК";
         document.getElementById('modal-bank-acc').value = "3004567890";
         document.getElementById('modal-desc').value = "Ярианы англи хэл, IELTS бэлтгэл. Сарын сургалтын төлбөр 250,000₮. Түвшин тогтоох шалгалт өгөх болон бүртгүүлэх бол нэр утсаа үлдээнэ үү.";
+            } else if (type === 'general') {
+        document.getElementById('modal-page-name').value = "Шинэ Өртөө";
+        document.getElementById('modal-bank-name').value = "ХААН БАНК";
+        document.getElementById('modal-bank-acc').value = "5001234567";
+        document.getElementById('modal-desc').value = "Ерөнхий бизнес, худалдаа үйлчилгээний нэгдсэн өртөө. Асуух зүйлээ чатаар бичнэ үү.";
       } else if (type === 'entertainment') {
         document.getElementById('modal-page-name').value = "Шинэ Кино Суваг";
         document.getElementById('modal-bank-name').value = "ГОЛОМТ БАНК";
@@ -1578,6 +1974,7 @@
         body: JSON.stringify({
           page_id: page_id,
           name: name,
+          category: selectedPresetCategory || 'general',
           page_access_token: token,
           knowledge_json: newKb
         })
@@ -1634,13 +2031,13 @@
       const box = document.getElementById('sim-messages');
       box.innerHTML = `
         <div class="text-center my-2">
-          <span class="px-2.5 py-0.5 rounded-full text-[10px] bg-white/[0.04] text-slate-400 border border-white/[0.06]">
+          <span class="px-2.5 py-0.5 rounded-full text-[10px] bg-white/[0.04] text-stone-500 border border-stone-200/60">
             Өнөөдөр
           </span>
         </div>
         <div class="flex items-start gap-2">
-          <div class="w-6 h-6 rounded-full bg-indigo-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0 mt-1">
-            AI
+          <div class="w-6 h-6 rounded-full bg-emerald-100 border border-emerald-200 flex items-center justify-center text-[10px] font-bold text-emerald-800 shrink-0 mt-1">
+            Г
           </div>
           <div class="msg-bot px-3.5 py-2.5 text-xs max-w-[82%] leading-relaxed shadow-sm">
             Чат шинэчлэгдлээ! Асуух зүйлээ бичнэ үү эсвэл баримтын зургаа оруулаарай. 🤝
@@ -1706,11 +2103,11 @@
       const typingId = 'typing-' + Date.now();
       box.innerHTML += `
         <div id="${typingId}" class="flex items-center gap-2">
-          <div class="w-6 h-6 rounded-full bg-indigo-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-            AI
+          <div class="w-6 h-6 rounded-full bg-emerald-100 border border-emerald-200 flex items-center justify-center text-[10px] font-bold text-emerald-800 shrink-0">
+            Г
           </div>
-          <div class="msg-bot px-3.5 py-2 text-xs flex items-center gap-1.5 text-slate-400">
-            <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce"></span>
+          <div class="msg-bot px-3.5 py-2 text-xs flex items-center gap-1.5 text-stone-500">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce"></span>
             <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 0.15s"></span>
             <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 0.3s"></span>
             <span class="text-[11px] ml-1">Бичиж байна...</span>
@@ -1754,7 +2151,7 @@
         const formattedReply = escapeHtml(reply).replace(/\n/g, '<br>');
         box.innerHTML += `
           <div class="flex items-start gap-2">
-            <div class="w-6 h-6 rounded-full bg-indigo-600 flex items-center justify-center text-[10px] font-bold text-white shrink-0 mt-1">
+            <div class="w-6 h-6 rounded-full bg-emerald-100 border border-emerald-200 flex items-center justify-center text-[10px] font-bold text-emerald-800 shrink-0 mt-1">
               AI
             </div>
             <div class="msg-bot px-3.5 py-2.5 text-xs max-w-[82%] leading-relaxed shadow-sm">
@@ -1788,35 +2185,35 @@
     function renderLeadsTable(list) {
       const tbody = document.getElementById('leads-table-body');
       if (!list || list.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" class="p-6 text-center text-slate-500">Энэ хуудасны бүртгэл одоогоор байхгүй байна.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" class="p-6 text-center text-stone-400">Энэ хуудасны бүртгэл одоогоор байхгүй байна.</td></tr>';
         return;
       }
       tbody.innerHTML = list.map(item => `
-        <tr class="hover:bg-white/[0.02] transition">
-          <td class="p-3.5 font-mono text-slate-400 text-[11px]">#${item.id}</td>
-          <td class="p-3.5 font-bold text-white">${escapeHtml(item.name || 'Харилцагч')}</td>
-          <td class="p-3.5 font-mono text-indigo-400 font-semibold">${escapeHtml(item.phone || '-')}</td>
+        <tr class="hover:bg-stone-50/80 transition border-b border-stone-100">
+          <td class="p-3.5 font-mono text-stone-500 text-[11px]">#${item.id}</td>
+          <td class="p-3.5 font-bold text-stone-900">${escapeHtml(item.name || 'Харилцагч')}</td>
+          <td class="p-3.5 font-mono text-emerald-700 font-semibold">${escapeHtml(item.phone || '-')}</td>
           <td class="p-3.5">
-            <span class="${item.service && item.service.includes('Баримт') ? 'text-emerald-400 font-semibold' : 'text-slate-300'}">
+            <span class="${item.service && item.service.includes('Баримт') ? 'text-emerald-400 font-semibold' : 'text-stone-700'}">
               ${escapeHtml(item.service || 'Үйлчилгээ')}
             </span>
           </td>
           <td class="p-3.5">
-            <span class="px-2 py-0.5 rounded text-[10px] bg-white/[0.05] border border-white/[0.08] text-slate-300">
+            <span class="px-2 py-0.5 rounded text-[10px] bg-white/[0.05] border border-stone-200/80 text-stone-700">
               ${escapeHtml(item.channel || 'web')}
             </span>
           </td>
           <td class="p-3.5">
-            <select onchange="changeLeadStatus(${item.id}, this.value)" class="bg-[#090d16] border border-white/[0.08] text-slate-200 text-[11px] rounded-lg px-2 py-1 focus:outline-none">
+            <select onchange="changeLeadStatus(${item.id}, this.value)" class="bg-[#090d16] border border-stone-200/80 text-stone-800 text-[11px] rounded-lg px-2 py-1 focus:outline-none">
               <option value="шинэ" ${item.status === 'new' || item.status === 'шинэ' ? 'selected' : ''}>Шинэ</option>
               <option value="verified" ${item.status === 'verified' || item.status === 'Баримт шалгагдсан' ? 'selected' : ''}>Баримт баталгаажсан</option>
               <option value="contacted" ${item.status === 'contacted' ? 'selected' : ''}>Холбогдсон</option>
               <option value="closed" ${item.status === 'closed' ? 'selected' : ''}>Хаагдсан</option>
             </select>
           </td>
-          <td class="p-3.5 text-slate-500 text-[11px]">${escapeHtml(item.created_at || '')}</td>
+          <td class="p-3.5 text-stone-400 text-[11px]">${escapeHtml(item.created_at || '')}</td>
           <td class="p-3.5 text-right">
-            <button onclick="viewLeadNotes('${escapeHtml(item.notes || '')}')" class="text-slate-400 hover:text-white" title="Тэмдэглэл харах">
+            <button onclick="viewLeadNotes('${escapeHtml(item.notes || '')}')" class="text-stone-500 hover:text-white" title="Тэмдэглэл харах">
               <i class="fa-regular fa-comment-dots text-sm"></i>
             </button>
           </td>
@@ -1827,19 +2224,19 @@
     function renderMiniLeads(list) {
       const div = document.getElementById('mini-leads-list');
       if (!list || list.length === 0) {
-        div.innerHTML = '<div class="py-4 text-center text-xs text-slate-500">Бүртгэл байхгүй байна.</div>';
+        div.innerHTML = '<div class="py-4 text-center text-xs text-stone-400">Бүртгэл байхгүй байна.</div>';
         return;
       }
       div.innerHTML = list.slice(0, 5).map(item => `
         <div class="py-2.5 flex items-center justify-between text-xs">
           <div>
-            <span class="font-bold text-white">${escapeHtml(item.name || 'Харилцагч')}</span>
-            <span class="text-indigo-400 ml-2 font-mono font-medium">${escapeHtml(item.phone || '')}</span>
-            <div class="text-[11px] ${item.service && item.service.includes('Баримт') ? 'text-emerald-400' : 'text-slate-500'}">
+            <span class="font-bold text-stone-900">${escapeHtml(item.name || 'Харилцагч')}</span>
+            <span class="text-emerald-700 ml-2 font-mono font-medium">${escapeHtml(item.phone || '')}</span>
+            <div class="text-[11px] ${item.service && item.service.includes('Баримт') ? 'text-emerald-400' : 'text-stone-400'}">
               ${escapeHtml(item.service || 'Шууд бүртгэл')}
             </div>
           </div>
-          <span class="px-2 py-0.5 rounded text-[10px] bg-white/[0.05] border border-white/[0.08] text-slate-300 font-mono">
+          <span class="px-2 py-0.5 rounded text-[10px] bg-white/[0.05] border border-stone-200/80 text-stone-700 font-mono">
             ${escapeHtml(item.channel || 'web')}
           </span>
         </div>
@@ -1877,7 +2274,7 @@
         const listDiv = document.getElementById('sessions-list');
 
         if (!json.data || json.data.length === 0) {
-          listDiv.innerHTML = '<div class="p-6 text-center text-xs text-slate-500">Энэ хуудасны чат одоогоор байхгүй байна.</div>';
+          listDiv.innerHTML = '<div class="p-6 text-center text-xs text-stone-400">Энэ хуудасны чат одоогоор байхгүй байна.</div>';
           return;
         }
 
@@ -1888,13 +2285,13 @@
             : '<span class="px-1.5 py-0.5 rounded text-[10px] bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">AI</span>';
 
           return `
-            <div onclick="selectSession('${s.sender_id}')" class="p-3.5 cursor-pointer transition ${isSelected ? 'bg-white/[0.08]' : 'hover:bg-white/[0.03]'}">
+            <div onclick="selectSession('${s.sender_id}')" class="p-3.5 cursor-pointer transition ${isSelected ? 'bg-emerald-50/70 border-l-4 border-emerald-600' : 'hover:bg-stone-50'}">
               <div class="flex items-center justify-between">
-                <span class="font-bold text-xs text-white truncate max-w-[150px]">${escapeHtml(s.customer_name || s.sender_id)}</span>
+                <span class="font-bold text-xs text-stone-900 truncate max-w-[150px]">${escapeHtml(s.customer_name || s.sender_id)}</span>
                 ${badge}
               </div>
-              <div class="text-[11px] text-slate-400 truncate mt-1">${escapeHtml(s.last_message || '...')}</div>
-              <div class="flex items-center justify-between text-[10px] text-slate-500 mt-2">
+              <div class="text-[11px] text-stone-500 truncate mt-1">${escapeHtml(s.last_message || '...')}</div>
+              <div class="flex items-center justify-between text-[10px] text-stone-400 mt-2">
                 <span class="px-1.5 py-0.5 rounded bg-white/[0.04] text-[9px] font-mono">${escapeHtml(s.channel)}</span>
                 <span>${s.updated_at ? s.updated_at.split(' ')[1] : ''}</span>
               </div>
@@ -1962,7 +2359,7 @@
         btn.className = "px-3.5 py-1.5 rounded-xl text-xs font-bold bg-amber-600 hover:bg-amber-500 text-white flex items-center gap-1.5 shadow";
         btn.innerHTML = `<i class="fa-solid fa-hand"></i> <span>Хүн удирдаж байна (AI-д буцаах)</span>`;
       } else {
-        btn.className = "px-3.5 py-1.5 rounded-xl text-xs font-bold bg-white/[0.06] hover:bg-white/[0.12] text-slate-200 border border-white/[0.1] flex items-center gap-1.5";
+        btn.className = "px-3.5 py-1.5 rounded-xl text-xs font-bold bg-white/[0.06] hover:bg-white/[0.12] text-stone-800 border border-white/[0.1] flex items-center gap-1.5";
         btn.innerHTML = `<i class="fa-solid fa-user-check text-indigo-400"></i> <span>Хүн шилжүүлж авах</span>`;
       }
     }
@@ -2005,7 +2402,7 @@
       if (!toast) {
         toast = document.createElement('div');
         toast.id = 'custom-toast';
-        toast.className = 'fixed bottom-6 right-6 z-50 px-4 py-3 rounded-2xl bg-indigo-600 text-white text-xs font-bold shadow-glow flex items-center gap-2 transition-all duration-300 opacity-0 translate-y-2 pointer-events-none';
+        toast.className = 'fixed bottom-6 right-6 z-50 px-4 py-3 rounded-2xl bg-[#1C1917] text-white text-xs font-semibold shadow-2xl border border-stone-700 flex items-center gap-2 transition-all duration-300 opacity-0 translate-y-2 pointer-events-none';
         document.body.appendChild(toast);
       }
       toast.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-300 text-sm"></i> <span>${escapeHtml(message)}</span>`;
@@ -2231,7 +2628,7 @@
       const btnExport = document.getElementById('btn-export-excel');
 
       if (user.role === 'admin') {
-        roleBadge.innerText = '👑 Супер Админ';
+        roleBadge.innerText = '👑 👑 Супер Админ';
         agencyContainer.classList.remove('hidden');
         clientContainer.classList.add('hidden');
         
@@ -2400,9 +2797,9 @@
         const passStatusElem = document.getElementById('access-modal-pass-status');
         if (passStatusElem) {
           if (page.has_password) {
-            passStatusElem.innerHTML = `<span class="text-emerald-400 font-semibold"><i class="fa-solid fa-circle-check mr-1"></i> Нууц үг тохируулсан байна.</span> <span class="text-zinc-400 text-[10px]">(Солих бол шинэ нууц үг бичнэ үү)</span>`;
+            passStatusElem.innerHTML = `<span class="text-emerald-400 font-semibold"><i class="fa-solid fa-circle-check mr-1"></i> Нууц үг тохируулсан байна.</span> <span class="text-stone-500 text-[10px]">(Солих бол шинэ нууц үг бичнэ үү)</span>`;
           } else {
-            passStatusElem.innerHTML = `<span class="text-amber-400 font-semibold"><i class="fa-solid fa-triangle-exclamation mr-1"></i> Нууц үг хараахан тохируулаагүй байна!</span> <span class="text-zinc-400 text-[10px]">(Энд шинэ нууц үг бичиж хадгална уу)</span>`;
+            passStatusElem.innerHTML = `<span class="text-amber-400 font-semibold"><i class="fa-solid fa-triangle-exclamation mr-1"></i> Нууц үг хараахан тохируулаагүй байна!</span> <span class="text-stone-500 text-[10px]">(Энд шинэ нууц үг бичиж хадгална уу)</span>`;
           }
         }
 
@@ -2482,7 +2879,7 @@
 
       if (!pageSheetsList || pageSheetsList.length === 0) {
         container.innerHTML = `
-          <div class="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06] text-center text-xs text-stone-500">
+          <div class="p-4 rounded-xl bg-white/[0.02] border border-stone-200/60 text-center text-xs text-stone-500">
             Одоогоор хүснэгт холбоогүй байна. Доорх хэсгээс Google Sheet холбоос эсвэл Excel файл нэмнэ үү.
           </div>
         `;
@@ -2510,14 +2907,14 @@
           : (s.row_count || 'Шалгаагүй');
 
         return `
-          <div class="p-3 rounded-xl bg-[#131317] border border-white/[0.07] flex items-center justify-between gap-3">
+          <div class="p-3 rounded-xl bg-stone-50 border border-stone-200 flex items-center justify-between gap-3 shadow-sm">
             <div class="flex items-center gap-3 min-w-0">
               <div class="w-8 h-8 rounded-lg ${isExcel ? 'bg-emerald-950/60 text-emerald-400 border border-emerald-500/30' : 'bg-sky-950/60 text-sky-400 border border-sky-500/30'} flex items-center justify-center shrink-0 text-xs">
                 <i class="fa-solid ${isExcel ? 'fa-file-excel' : 'fa-table-cells'}"></i>
               </div>
               <div class="min-w-0">
                 <div class="flex items-center gap-2">
-                  <span class="text-xs font-bold text-stone-100 truncate">${escapeHtml(s.title || 'Хүснэгт')}</span>
+                  <span class="text-xs font-bold text-stone-900 truncate">${escapeHtml(s.title || 'Хүснэгт')}</span>
                   ${typeBadge}
                 </div>
                 <div class="text-[11px] text-stone-400 flex items-center gap-2 mt-0.5">
