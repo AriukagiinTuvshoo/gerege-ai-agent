@@ -200,6 +200,51 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_phone ON cargo_packages (customer_phone)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_status ON cargo_packages (status)")
 
+    # 8. Автомат борлуулалт, сэргээх дүрмүүд (Smart Retention & Follow-up Rules)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS automated_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT NOT NULL,
+            rule_type TEXT NOT NULL, -- 'abandoned_chat', 'cargo_pickup', 'retention_followup'
+            delay_hours INTEGER DEFAULT 2,
+            message_template TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(page_id, rule_type)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rules_page ON automated_rules (page_id)")
+
+    # 9. Маркетингийн кампэйн ба 1-Click Broadcast
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS marketing_campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            target_segment TEXT DEFAULT 'all', -- 'all', 'leads_only', 'unregistered'
+            channel TEXT DEFAULT 'all', -- 'all', 'facebook', 'telegram'
+            status TEXT DEFAULT 'COMPLETED',
+            sent_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_page ON marketing_campaigns (page_id)")
+
+    # 10. Илгээгдсэн сэргээх зурвасуудын түүх (Давхардахаас сэргийлэх)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sent_followups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT NOT NULL,
+            rule_type TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            channel TEXT DEFAULT 'web',
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(page_id, rule_type, sender_id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_followups ON sent_followups (page_id, rule_type, sender_id)")
+
     # Багануудыг аюулгүй нэмэх (Migration check)
     tables_to_migrate = [
         ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
@@ -790,6 +835,9 @@ def log_message(sender_id: str, channel: str, sender_type: str, content: str, pa
     conn.commit()
     conn.close()
 
+def save_chat_message(page_id: str, sender_id: str, channel: str, sender_type: str, content: str):
+    return log_message(sender_id=sender_id, channel=channel, sender_type=sender_type, content=content, page_id=page_id)
+
 def get_conversation_history(sender_id: str, limit: int = 50) -> List[Dict]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -1327,6 +1375,274 @@ def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optiona
         "pending_cargo_count": int(pending_cargo_count or 0),
         "pending_cargo_amount": int(pending_cargo_amount or 0),
         "escalated_count": int(escalated_count or 0)
+    }
+
+# -------------------------------------------------------------
+# 9. АВТОМАТ МАРКЕТИНГ & ХАРИЛЦАГЧИЙГ СЭРГЭЭХ САН (RETENTION & BROADCAST)
+# -------------------------------------------------------------
+def get_automated_rules(page_id: str) -> List[Dict[str, Any]]:
+    """Хуудасны автомат сэргээлтийн дүрмүүд (байхгүй бол анхны утгуудыг үүсгэнэ)"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    default_rules = [
+        (
+            page_id,
+            "abandoned_chat",
+            2,
+            "Сайн байна уу? Танд үйлчилгээ болон үнийн мэдээлэл сонгоход тусламж хэрэгтэй юу? Та манай чатаар хүссэн асуултаа лавлаарай 😊",
+            1
+        ),
+        (
+            page_id,
+            "cargo_pickup",
+            48,
+            "Сайн байна уу? Таны ачаа агуулахад бэлэн ирсэн байгаа шүү. Та ирж авахдаа чатаар олголтын кодоо хэлээрэй 📦",
+            1
+        ),
+        (
+            page_id,
+            "retention_followup",
+            600,
+            "Сайн байна уу? Манайхаар үйлчлүүлснээс хойш сар орчим болжээ. Танд давтан үйлчилгээ эсвэл шинэ урамшууллын мэдээлэл хэрэгтэй бол бидэнд мэдэгдээрэй ✨",
+            1
+        )
+    ]
+
+    for p, r_type, delay, msg, active in default_rules:
+        cursor.execute("""
+            INSERT OR IGNORE INTO automated_rules (page_id, rule_type, delay_hours, message_template, is_active)
+            VALUES (?, ?, ?, ?, ?)
+        """, (str(p), r_type, delay, msg, active))
+    conn.commit()
+
+    cursor.execute("SELECT * FROM automated_rules WHERE page_id = ? ORDER BY id ASC", (str(page_id),))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def update_automated_rule(page_id: str, rule_type: str, delay_hours: int, message_template: str, is_active: bool) -> bool:
+    """Сэргээх дүрмийг шинэчлэх"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO automated_rules (page_id, rule_type, delay_hours, message_template, is_active)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(page_id, rule_type) DO UPDATE SET
+            delay_hours = excluded.delay_hours,
+            message_template = excluded.message_template,
+            is_active = excluded.is_active
+    """, (str(page_id), rule_type, int(delay_hours), message_template.strip(), 1 if is_active else 0))
+    conn.commit()
+    conn.close()
+    return True
+
+def record_sent_followup(page_id: str, rule_type: str, sender_id: str, channel: str = "web") -> bool:
+    """Илгээсэн сэргээх зурвасыг бүртгэх (давхардахаас сэргийлэх)"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT OR IGNORE INTO sent_followups (page_id, rule_type, sender_id, channel)
+            VALUES (?, ?, ?, ?)
+        """, (str(page_id), rule_type, str(sender_id), channel))
+        conn.commit()
+        success = cursor.rowcount > 0
+    except Exception:
+        success = False
+    finally:
+        conn.close()
+    return success
+
+def is_followup_sent(page_id: str, rule_type: str, sender_id: str) -> bool:
+    """Өмнө нь энэ харилцагч руу энэ дүрмээр зурвас очсон эсэх"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id FROM sent_followups
+        WHERE page_id = ? AND rule_type = ? AND sender_id = ?
+    """, (str(page_id), rule_type, str(sender_id)))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row)
+
+def get_abandoned_chat_candidates(page_id: str, delay_hours: int = 2) -> List[Dict[str, Any]]:
+    """Хаягдсан чат илрүүлэгч"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    threshold_iso = (datetime.now() - timedelta(hours=delay_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    max_threshold_iso = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        SELECT m.sender_id, m.channel, m.content, m.created_at
+        FROM messages m
+        WHERE m.page_id = ?
+          AND m.sender_type = 'user'
+          AND m.created_at <= ?
+          AND m.created_at >= ?
+          AND m.sender_id NOT IN (
+              SELECT DISTINCT sender_id FROM registrations WHERE page_id = ? AND sender_id IS NOT NULL
+          )
+          AND m.sender_id NOT IN (
+              SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'abandoned_chat'
+          )
+        GROUP BY m.sender_id
+        ORDER BY m.created_at DESC
+        LIMIT 50
+    """, (str(page_id), threshold_iso, max_threshold_iso, str(page_id), str(page_id)))
+
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_cargo_pickup_candidates(page_id: str, delay_hours: int = 48) -> List[Dict[str, Any]]:
+    """Ачаагаа аваагүй байгаа хэрэглэгчид (ARRIVED_UB төлөвтэй, delay_hours өнгөрсөн)"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    threshold_iso = (datetime.now() - timedelta(hours=delay_hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        SELECT c.*
+        FROM cargo_packages c
+        WHERE c.page_id = ?
+          AND c.status = 'ARRIVED_UB'
+          AND c.arrived_at <= ?
+          AND c.sender_id IS NOT NULL
+          AND c.sender_id != ''
+          AND c.sender_id NOT IN (
+              SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'cargo_pickup'
+          )
+        LIMIT 50
+    """, (str(page_id), threshold_iso, str(page_id)))
+
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_retention_candidates(page_id: str, delay_days: int = 25) -> List[Dict[str, Any]]:
+    """25+ хоногийн өмнө бүртгэл үүссэн харилцагчид (хумс будалт, давтан үйлчилгээ)"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    threshold_iso = (datetime.now() - timedelta(days=delay_days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        SELECT r.*
+        FROM registrations r
+        WHERE r.page_id = ?
+          AND r.created_at <= ?
+          AND r.sender_id IS NOT NULL
+          AND r.sender_id != ''
+          AND r.sender_id NOT IN (
+              SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'retention_followup'
+          )
+        LIMIT 50
+    """, (str(page_id), threshold_iso, str(page_id)))
+
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_broadcast_audience(page_id: str, segment: str = "all") -> List[Dict[str, Any]]:
+    """1-Click Broadcast илгээх зорилтот харилцагчид"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if segment == "leads_only":
+        cursor.execute("""
+            SELECT DISTINCT sender_id, channel, name, phone
+            FROM registrations
+            WHERE page_id = ? AND sender_id IS NOT NULL AND sender_id != ''
+        """, (str(page_id),))
+    elif segment == "unregistered":
+        cursor.execute("""
+            SELECT DISTINCT sender_id, channel, '' as name, '' as phone
+            FROM messages
+            WHERE page_id = ? AND sender_type = 'user' AND sender_id NOT IN (
+                SELECT DISTINCT sender_id FROM registrations WHERE page_id = ? AND sender_id IS NOT NULL
+            )
+        """, (str(page_id), str(page_id)))
+    else:  # all
+        cursor.execute("""
+            SELECT DISTINCT sender_id, channel, '' as name, '' as phone
+            FROM messages
+            WHERE page_id = ? AND sender_type = 'user'
+        """, (str(page_id),))
+
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def create_marketing_campaign(
+    page_id: str,
+    title: str,
+    message: str,
+    target_segment: str = "all",
+    channel: str = "all",
+    sent_count: int = 0
+) -> Dict[str, Any]:
+    """1-Click Broadcast кампэйн үүсгэж хадгалах"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO marketing_campaigns (page_id, title, message, target_segment, channel, status, sent_count)
+        VALUES (?, ?, ?, ?, ?, 'COMPLETED', ?)
+    """, (str(page_id), title.strip(), message.strip(), target_segment, channel, sent_count))
+    c_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return {
+        "id": c_id,
+        "page_id": page_id,
+        "title": title,
+        "sent_count": sent_count,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+
+def list_marketing_campaigns(page_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Өмнөх маркетинг кампэйнуудын жагсаалт"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM marketing_campaigns
+        WHERE page_id = ?
+        ORDER BY id DESC LIMIT ?
+    """, (str(page_id), limit))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_marketing_summary(page_id: str) -> Dict[str, Any]:
+    """Маркетингийн хураангуй тооцоолол"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(id) FROM marketing_campaigns WHERE page_id = ?", (str(page_id),))
+    total_campaigns = cursor.fetchone()[0] or 0
+
+    cursor.execute("SELECT COALESCE(SUM(sent_count), 0) FROM marketing_campaigns WHERE page_id = ?", (str(page_id),))
+    total_broadcast_sent = cursor.fetchone()[0] or 0
+
+    cursor.execute("SELECT COUNT(id) FROM sent_followups WHERE page_id = ?", (str(page_id),))
+    total_followups_sent = cursor.fetchone()[0] or 0
+
+    cursor.execute("SELECT COUNT(DISTINCT sender_id) FROM messages WHERE page_id = ? AND sender_type = 'user'", (str(page_id),))
+    total_audience = cursor.fetchone()[0] or 0
+
+    conn.close()
+    return {
+        "total_campaigns": int(total_campaigns),
+        "total_broadcast_sent": int(total_broadcast_sent),
+        "total_followups_sent": int(total_followups_sent),
+        "total_audience": int(total_audience)
     }
 
 if __name__ == "__main__":

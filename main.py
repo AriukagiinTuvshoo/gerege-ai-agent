@@ -21,6 +21,7 @@ import sheets_service
 import fintech_service
 import cargo_service
 import executive_bot_service
+import retention_service
 
 load_dotenv(override=True)
 
@@ -31,9 +32,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai_agent_app")
 
 async def executive_scheduler_loop():
-    """Өглөө бүр товлосон цагт (анхдагчаар 08:30) бүх салбар хуудсын эздэд өдрийн тайлан автоматаар илгээх цикл"""
-    logger.info("Executive Daily Briefing scheduler loop started.")
+    """Өглөө бүр товлосон цагт өдрийн тайлан илгээх болон 15 минут тутамд автомат сэргээгч шалгах цикл"""
+    logger.info("Executive Daily Briefing & Retention scheduler loop started.")
     last_sent_date = {}  # page_id -> date_str
+    loop_count = 0
     while True:
         try:
             now = datetime.now()
@@ -54,8 +56,14 @@ async def executive_scheduler_loop():
                         res = await executive_bot_service.send_executive_report(page_id=pid)
                         logger.info(f"Scheduled report sent for {pid}: {res}")
                         last_sent_date[pid] = today_str
+
+            # 15 минут тутамд автомат хаягдсан чат болон retention сэргээгчийг шалгах (loop_count % 20 == 0)
+            loop_count += 1
+            if loop_count % 20 == 0:
+                await retention_service.run_automated_retention_checks()
+
         except Exception as e:
-            logger.error(f"Executive scheduler error: {e}")
+            logger.error(f"Executive & Retention scheduler error: {e}")
         await asyncio.sleep(45)
 
 @asynccontextmanager
@@ -1449,6 +1457,102 @@ async def update_executive_settings_api(payload: Dict[str, Any], request: Reques
         report_enabled=daily_report_enabled
     )
     return {"success": True, "message": "Telegram болон өглөөний тайлангийн тохиргоо амжилттай хадгалагдлаа"}
+
+# -------------------------------------------------------------
+# 12. АВТОМАТ МАРКЕТИНГ & ХАРИЛЦАГЧИЙГ СЭРГЭЭХ API (RETENTION & BROADCAST)
+# -------------------------------------------------------------
+@app.get("/api/retention/rules")
+async def get_retention_rules_api(request: Request):
+    """Салбарын автомат сэргээлтийн дүрмүүдийн жагсаалт"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
+    rules = database.get_automated_rules(pid)
+    return {"rules": rules}
+
+@app.post("/api/retention/rules")
+async def update_retention_rule_api(payload: Dict[str, Any], request: Request):
+    """Сэргээх дүрмийг шинэчлэх"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
+    rule_type = payload.get("rule_type")
+    delay_hours = payload.get("delay_hours", 2)
+    message_template = payload.get("message_template", "")
+    is_active = payload.get("is_active", True)
+    
+    if not rule_type or not message_template:
+        raise HTTPException(status_code=400, detail="rule_type and message_template are required")
+        
+    database.update_automated_rule(
+        page_id=pid,
+        rule_type=rule_type,
+        delay_hours=int(delay_hours),
+        message_template=message_template,
+        is_active=bool(is_active)
+    )
+    return {"success": True, "message": "Дүрэм амжилттай хадгалагдлаа"}
+
+@app.post("/api/retention/broadcast")
+async def send_broadcast_api(payload: Dict[str, Any], request: Request):
+    """1-Click Broadcast илгээх"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
+    title = payload.get("title", "").strip()
+    message = payload.get("message", "").strip()
+    target_segment = payload.get("target_segment", "all")
+    channel = payload.get("channel", "all")
+    
+    if not title or not message:
+        raise HTTPException(status_code=400, detail="Гарчиг болон зурвасын эх бичвэр шаардлагатай")
+        
+    res = await retention_service.send_broadcast(
+        page_id=pid,
+        title=title,
+        message=message,
+        target_segment=target_segment,
+        channel=channel
+    )
+    return res
+
+@app.get("/api/retention/campaigns")
+async def list_campaigns_api(request: Request, limit: int = Query(20)):
+    """Маркетингийн өмнөх кампэйнуудын түүх"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
+    return database.list_marketing_campaigns(pid, limit=limit)
+
+@app.get("/api/retention/summary")
+async def get_retention_summary_api(request: Request):
+    """Маркетингийн нэгдсэн үзүүлэлтүүд"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
+    return database.get_marketing_summary(pid)
+
+@app.post("/api/retention/trigger-checks")
+async def trigger_retention_checks_api(request: Request):
+    """Автомат сэргээлтийн шалгалтыг гараар яг одоо ажиллуулах"""
+    base_url = str(request.base_url).rstrip("/")
+    stats = await retention_service.run_automated_retention_checks(base_url=base_url)
+    return {"success": True, "stats": stats}
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)

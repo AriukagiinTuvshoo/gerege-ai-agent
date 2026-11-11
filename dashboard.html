@@ -322,6 +322,12 @@
           <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-indigo-100 text-indigo-800">Telegram</span>
         </button>
 
+        <button onclick="switchTab('marketing')" id="tab-btn-marketing" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-bullhorn text-rose-600 text-xs"></i>
+          <span>Маркетинг & Сэргээгч</span>
+          <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-rose-100 text-rose-800">1-Click</span>
+        </button>
+
         <button onclick="switchTab('social')" id="tab-btn-social" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
           <i class="fa-solid fa-pen-nib text-stone-400 text-xs"></i>
           <span>Нийтлэлийн бэлдэц</span>
@@ -1100,6 +1106,249 @@
                   <div class="font-bold text-stone-900">Эзнийг автоматаар таних</div>
                   <div class="text-[11px] text-stone-500">Бот руугаа /start бичихэд таны Chat ID автоматаар хадгалагдаж холбогдоно.</div>
                 </div>
+              </div>
+            </div>
+
+          </div>
+
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ==================== TAB: SMART RETENTION & 1-CLICK BROADCAST ==================== -->
+    <div id="tab-marketing" class="tab-content hidden space-y-6">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
+        
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-200 uppercase tracking-wider">
+                Smart Retention & Growth Engine
+              </span>
+              <span class="text-xs text-stone-400">• Хаягдсан чатыг сэргээх, 1-Click Broadcast & Давтан борлуулалт</span>
+            </div>
+            <h2 class="text-xl font-extrabold text-stone-900 tracking-tight flex items-center gap-2">
+              <i class="fa-solid fa-bullhorn text-rose-600"></i>
+              <span>Маркетинг & Авто-Сэргээгч (Smart AI Retention)</span>
+            </h2>
+            <p class="text-xs text-stone-500 mt-0.5">Үнэ асуугаад гарсан харилцагчийг 2 цагийн дараа эелдэгээр татаж, бүх чаталсан хүмүүс рүү 1 товшилтоор хямдралын мэдээгээ илгээх систем.</p>
+          </div>
+
+          <div class="flex items-center gap-2.5">
+            <button onclick="triggerRetentionChecksNow()" id="btn-trigger-retention" class="px-3.5 py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-800 border border-stone-200 text-xs font-semibold transition flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-rotate text-rose-600 text-xs"></i>
+              <span>Сэргээлт шалгах</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 4 KPI Metrics Cards -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div class="p-4 rounded-2xl bg-rose-50/60 border border-rose-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-rose-500/20 text-rose-700 flex items-center justify-center text-xl font-bold flex-shrink-0">
+              <i class="fa-solid fa-bullhorn"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-rose-900 block">Нийт Кампэйн</span>
+              <span id="mkt-kpi-campaigns" class="text-xl font-extrabold text-rose-950 font-mono tracking-tight">0</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-indigo-50/60 border border-indigo-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-indigo-500/20 text-indigo-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-paper-plane"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-indigo-900 block">Broadcast Илгээлт</span>
+              <span id="mkt-kpi-broadcasts" class="text-xl font-extrabold text-indigo-950 font-mono tracking-tight">0 удаа</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-emerald-50/60 border border-emerald-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-robot"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-emerald-900 block">Авто-Сэргээсэн Чат</span>
+              <span id="mkt-kpi-followups" class="text-xl font-extrabold text-emerald-950 font-mono tracking-tight">0 харилцагч</span>
+            </div>
+          </div>
+          <div class="p-4 rounded-2xl bg-amber-50/60 border border-amber-100 flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl bg-amber-500/20 text-amber-700 flex items-center justify-center text-lg flex-shrink-0">
+              <i class="fa-solid fa-users"></i>
+            </div>
+            <div>
+              <span class="text-[11px] font-semibold text-amber-900 block">Боломжит Зорилтот Сан</span>
+              <span id="mkt-kpi-audience" class="text-xl font-extrabold text-amber-950 font-mono tracking-tight">0 хүн</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2 Column Layout: 1-Click Broadcast & 3 Auto Retention Rules -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+          <!-- Left Column: 1-Click Broadcast Form & History -->
+          <div class="space-y-6">
+            <div class="rounded-2xl border border-stone-200/80 p-5 bg-white space-y-4">
+              <div class="flex items-center gap-2 pb-3 border-b border-stone-100">
+                <div class="w-8 h-8 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center font-bold text-sm">
+                  <i class="fa-solid fa-tower-broadcast"></i>
+                </div>
+                <div>
+                  <h3 class="text-sm font-extrabold text-stone-900">1-Click Broadcast (Олноор нь илгээх)</h3>
+                  <p class="text-[11px] text-stone-400">Шинэ хямдрал, урамшуулал, чухал зарлал илгээх</p>
+                </div>
+              </div>
+
+              <div class="space-y-3 text-xs">
+                <div>
+                  <label class="block font-semibold text-stone-700 mb-1">Кампэйны нэр</label>
+                  <input type="text" id="broadcast-title" placeholder="Жишээ: 11.11 Сар бүрийн онцгой 30% хямдрал" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-rose-500 font-medium">
+                </div>
+
+                <div>
+                  <label class="block font-semibold text-stone-700 mb-1">Зурвасын эх бичвэр</label>
+                  <textarea id="broadcast-message" rows="4" placeholder="Сайн байна уу? Манай үнэнч хэрэглэгч танд энэ долоо хоногийн сүүлийн өдөр хүртэл 30%-ийн онцгой купон бэлэглэж байна..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-rose-500 leading-relaxed"></textarea>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <label class="block font-semibold text-stone-700 mb-1">Зорилтот харилцагчид</label>
+                    <select id="broadcast-segment" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-rose-500 font-medium">
+                      <option value="all">Бүх чаталсан хүмүүс</option>
+                      <option value="leads_only">Зөвхөн бүртгэлтэй үйлчлүүлэгчид</option>
+                      <option value="unregistered">Үнэ асуугаад захиалаагүй хүмүүс</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="block font-semibold text-stone-700 mb-1">Илгээх суваг</label>
+                    <select id="broadcast-channel" class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 focus:outline-none focus:border-rose-500 font-medium">
+                      <option value="all">Бүх боломжит суваг</option>
+                      <option value="facebook">Зөвхөн Facebook / Instagram</option>
+                      <option value="telegram">Зөвхөн Telegram</option>
+                      <option value="web">Вэб чат симулятор</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="pt-2">
+                  <button onclick="sendBroadcastNow()" id="btn-send-broadcast" class="w-full py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold transition flex items-center justify-center gap-2 shadow-sm">
+                    <i class="fa-solid fa-paper-plane text-xs"></i>
+                    <span>Broadcast Зурвасыг Илгээх</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Past Broadcasts Table -->
+            <div class="rounded-2xl border border-stone-200/80 p-5 bg-white space-y-3">
+              <h4 class="text-xs font-bold text-stone-900 uppercase tracking-wider">Өмнөх Кампэйнуудын Түүх</h4>
+              <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs text-stone-800">
+                  <thead class="bg-[#FAF8F5] text-stone-600 uppercase text-[10px] font-semibold border-b border-stone-200">
+                    <tr>
+                      <th class="p-2.5">Гарчиг</th>
+                      <th class="p-2.5">Сегмент</th>
+                      <th class="p-2.5">Хүрсэн</th>
+                      <th class="p-2.5">Огноо</th>
+                    </tr>
+                  </thead>
+                  <tbody id="mkt-campaigns-body" class="divide-y divide-stone-100">
+                    <tr><td colspan="4" class="p-4 text-center text-stone-400">Уншиж байна...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right Column: 3 Automated Rules -->
+          <div class="rounded-2xl border border-stone-200/80 p-5 bg-white space-y-5">
+            <div class="flex items-center justify-between pb-3 border-b border-stone-100">
+              <div class="flex items-center gap-2">
+                <div class="w-8 h-8 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold text-sm">
+                  <i class="fa-solid fa-robot"></i>
+                </div>
+                <div>
+                  <h3 class="text-sm font-extrabold text-stone-900">Ухаалаг Авто-Сэргээлтийн 3 Дүрэм</h3>
+                  <p class="text-[11px] text-stone-400">Хүний оролцоогүй автоматаар харилцагчийг татах дүрмүүд</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- Rule 1: Abandoned Chat -->
+            <div class="p-4 rounded-2xl bg-amber-50/40 border border-amber-100 space-y-3">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+                  <span class="font-bold text-stone-900 text-xs">1. Хаягдсан Чатыг Сэргээх (Abandoned Chat)</span>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" id="rule-active-abandoned" class="sr-only peer">
+                  <div class="w-8 h-4 bg-stone-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-stone-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-amber-500"></div>
+                </label>
+              </div>
+              <p class="text-[11px] text-stone-500">Чатаар асуугаад бүртгэл үүсгэлгүй орхисон хүмүүст автоматаар тусламж санал болгох.</p>
+              <div class="flex items-center gap-2 text-xs">
+                <span class="text-stone-600 text-[11px]">Сануулах хугацаа:</span>
+                <input type="number" id="rule-delay-abandoned" value="2" min="1" max="72" class="w-16 bg-white border border-stone-200 rounded-lg p-1.5 text-center text-xs font-bold font-mono">
+                <span class="text-stone-600 text-[11px]">цагийн дараа</span>
+              </div>
+              <textarea id="rule-template-abandoned" rows="2" class="w-full bg-white border border-stone-200 rounded-xl p-2.5 text-xs text-stone-800 focus:outline-none focus:border-amber-500 leading-relaxed"></textarea>
+              <div class="flex justify-end">
+                <button onclick="saveRetentionRule('abandoned_chat')" class="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold transition shadow-sm">
+                  Хадгалах
+                </button>
+              </div>
+            </div>
+
+            <!-- Rule 2: Cargo Pickup Reminder -->
+            <div class="p-4 rounded-2xl bg-blue-50/40 border border-blue-100 space-y-3">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="w-2.5 h-2.5 rounded-full bg-blue-500"></span>
+                  <span class="font-bold text-stone-900 text-xs">2. Карго Ачаа Авах Сануулга (Cargo Pickup)</span>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" id="rule-active-cargo" class="sr-only peer">
+                  <div class="w-8 h-4 bg-stone-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-stone-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blue-500"></div>
+                </label>
+              </div>
+              <p class="text-[11px] text-stone-500">Ачаа нь буугаад тодорхой цаг өнгөрсөн хүнд QPay төлбөрийн холбоостой сануулга илгээх.</p>
+              <div class="flex items-center gap-2 text-xs">
+                <span class="text-stone-600 text-[11px]">Сануулах хугацаа:</span>
+                <input type="number" id="rule-delay-cargo" value="48" min="1" max="168" class="w-16 bg-white border border-stone-200 rounded-lg p-1.5 text-center text-xs font-bold font-mono">
+                <span class="text-stone-600 text-[11px]">цагийн дараа</span>
+              </div>
+              <textarea id="rule-template-cargo" rows="2" class="w-full bg-white border border-stone-200 rounded-xl p-2.5 text-xs text-stone-800 focus:outline-none focus:border-blue-500 leading-relaxed"></textarea>
+              <div class="flex justify-end">
+                <button onclick="saveRetentionRule('cargo_pickup')" class="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition shadow-sm">
+                  Хадгалах
+                </button>
+              </div>
+            </div>
+
+            <!-- Rule 3: 25-Day Retention Follow-up -->
+            <div class="p-4 rounded-2xl bg-emerald-50/40 border border-emerald-100 space-y-3">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+                  <span class="font-bold text-stone-900 text-xs">3. Давтан Үйлчилгээний Сэрээгч (Re-engagement)</span>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" id="rule-active-retention" class="sr-only peer">
+                  <div class="w-8 h-4 bg-stone-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-stone-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-emerald-500"></div>
+                </label>
+              </div>
+              <p class="text-[11px] text-stone-500">Салонд үйлчлүүлсэн эсвэл захиалга хийснээс хойш сар орчим болсон хүнд сэргээх санал илгээх.</p>
+              <div class="flex items-center gap-2 text-xs">
+                <span class="text-stone-600 text-[11px]">Сануулах хугацаа:</span>
+                <input type="number" id="rule-delay-retention" value="600" min="24" max="2160" class="w-20 bg-white border border-stone-200 rounded-lg p-1.5 text-center text-xs font-bold font-mono">
+                <span class="text-stone-600 text-[11px]">цаг (~25 хоног)</span>
+              </div>
+              <textarea id="rule-template-retention" rows="2" class="w-full bg-white border border-stone-200 rounded-xl p-2.5 text-xs text-stone-800 focus:outline-none focus:border-emerald-500 leading-relaxed"></textarea>
+              <div class="flex justify-end">
+                <button onclick="saveRetentionRule('retention_followup')" class="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow-sm">
+                  Хадгалах
+                </button>
               </div>
             </div>
 
@@ -2100,6 +2349,7 @@
       if (tabId === 'fintech') loadFintechData();
       if (tabId === 'cargo') loadCargoData();
       if (tabId === 'executive') loadExecutiveData();
+      if (tabId === 'marketing') loadMarketingData();
       if (tabId === 'links') loadKnowledge();
     }
 
@@ -4352,6 +4602,180 @@
     function escapeHtml(text) {
       if (!text) return '';
       return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    // ==================== SMART RETENTION & BROADCAST MODULE ====================
+    async function loadMarketingData() {
+      try {
+        // 1. Summary
+        const sumRes = await fetch('/api/retention/summary');
+        if (sumRes.ok) {
+          const s = await sumRes.json();
+          document.getElementById('mkt-kpi-campaigns').textContent = s.total_campaigns || 0;
+          document.getElementById('mkt-kpi-broadcasts').textContent = (s.total_broadcast_sent || 0) + ' удаа';
+          document.getElementById('mkt-kpi-followups').textContent = (s.total_followups_sent || 0) + ' харилцагч';
+          document.getElementById('mkt-kpi-audience').textContent = (s.total_audience || 0) + ' хүн';
+        }
+
+        // 2. Rules
+        const rulesRes = await fetch('/api/retention/rules');
+        if (rulesRes.ok) {
+          const rData = await rulesRes.json();
+          const rules = rData.rules || [];
+          rules.forEach(r => {
+            if (r.rule_type === 'abandoned_chat') {
+              document.getElementById('rule-active-abandoned').checked = Boolean(r.is_active);
+              document.getElementById('rule-delay-abandoned').value = r.delay_hours || 2;
+              document.getElementById('rule-template-abandoned').value = r.message_template || '';
+            } else if (r.rule_type === 'cargo_pickup') {
+              document.getElementById('rule-active-cargo').checked = Boolean(r.is_active);
+              document.getElementById('rule-delay-cargo').value = r.delay_hours || 48;
+              document.getElementById('rule-template-cargo').value = r.message_template || '';
+            } else if (r.rule_type === 'retention_followup') {
+              document.getElementById('rule-active-retention').checked = Boolean(r.is_active);
+              document.getElementById('rule-delay-retention').value = r.delay_hours || 600;
+              document.getElementById('rule-template-retention').value = r.message_template || '';
+            }
+          });
+        }
+
+        // 3. Campaigns History
+        const campRes = await fetch('/api/retention/campaigns?limit=15');
+        if (campRes.ok) {
+          const camps = await campRes.json();
+          renderCampaignsTable(camps);
+        }
+      } catch (e) {
+        console.error('loadMarketingData error:', e);
+      }
+    }
+
+    function renderCampaignsTable(campaigns) {
+      const tbody = document.getElementById('mkt-campaigns-body');
+      if (!campaigns || campaigns.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="4" class="p-4 text-center text-stone-400">Одоогоор кампэйн илгээгдээгүй байна. Дээрх форм ашиглан анхны Broadcast-аа илгээнэ үү.</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = campaigns.map(c => `
+        <tr class="hover:bg-stone-50/80 transition">
+          <td class="p-2.5 font-medium text-stone-900">${escapeHtml(c.title)}</td>
+          <td class="p-2.5 font-mono text-[11px] text-stone-600">${escapeHtml(c.target_segment)}</td>
+          <td class="p-2.5 font-mono font-bold text-rose-700">${c.sent_count || 0} хүн</td>
+          <td class="p-2.5 font-mono text-[11px] text-stone-400">${(c.created_at || '').substring(0, 16)}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function sendBroadcastNow() {
+      const title = document.getElementById('broadcast-title').value.trim();
+      const message = document.getElementById('broadcast-message').value.trim();
+      const segment = document.getElementById('broadcast-segment').value;
+      const channel = document.getElementById('broadcast-channel').value;
+
+      if (!title || !message) {
+        alert('Кампэйны гарчиг болон зурвасын эх бичвэрийг заавал бөглөнө үү!');
+        return;
+      }
+
+      if (!confirm(`'${title}' нэртэй Broadcast зурвасыг сонгосон ${segment} харилцагчид руу яг одоо илгээх үү?`)) return;
+
+      const btn = document.getElementById('btn-send-broadcast');
+      btn.disabled = true;
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-xs"></i> <span>Илгээж байна...</span>`;
+
+      try {
+        const res = await fetch('/api/retention/broadcast', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            title: title,
+            message: message,
+            target_segment: segment,
+            channel: channel
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('✅ ' + (data.message || 'Broadcast амжилттай илгээгдлээ!'));
+          document.getElementById('broadcast-title').value = '';
+          document.getElementById('broadcast-message').value = '';
+          loadMarketingData();
+        } else {
+          alert('Алдаа: ' + (data.message || 'Илгээхэд алдаа гарлаа'));
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="fa-solid fa-paper-plane text-xs"></i> <span>Broadcast Зурвасыг Илгээх</span>`;
+      }
+    }
+
+    async function saveRetentionRule(ruleType) {
+      let active = false;
+      let delay = 2;
+      let template = '';
+
+      if (ruleType === 'abandoned_chat') {
+        active = document.getElementById('rule-active-abandoned').checked;
+        delay = parseInt(document.getElementById('rule-delay-abandoned').value) || 2;
+        template = document.getElementById('rule-template-abandoned').value.trim();
+      } else if (ruleType === 'cargo_pickup') {
+        active = document.getElementById('rule-active-cargo').checked;
+        delay = parseInt(document.getElementById('rule-delay-cargo').value) || 48;
+        template = document.getElementById('rule-template-cargo').value.trim();
+      } else if (ruleType === 'retention_followup') {
+        active = document.getElementById('rule-active-retention').checked;
+        delay = parseInt(document.getElementById('rule-delay-retention').value) || 600;
+        template = document.getElementById('rule-template-retention').value.trim();
+      }
+
+      if (!template) {
+        alert('Зурвасын загвар хоосон байж болохгүй!');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/retention/rules', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            rule_type: ruleType,
+            delay_hours: delay,
+            message_template: template,
+            is_active: active
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast('✅ Дүрэм амжилттай шинэчлэгдлээ!');
+          loadMarketingData();
+        } else {
+          alert('Алдаа: ' + (data.message || 'Хадгалж чадсангүй'));
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      }
+    }
+
+    async function triggerRetentionChecksNow() {
+      const btn = document.getElementById('btn-trigger-retention');
+      btn.disabled = true;
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-xs"></i> <span>Шалгаж байна...</span>`;
+      try {
+        const res = await fetch('/api/retention/trigger-checks', {method: 'POST'});
+        const data = await res.json();
+        if (data.success) {
+          const s = data.stats || {};
+          showToast(`Шалгалт дууслаа: Хаягдсан чат: ${s.abandoned_sent}, Карго сануулга: ${s.cargo_pickup_sent}, Retention: ${s.retention_sent}`);
+          loadMarketingData();
+        }
+      } catch (e) {
+        alert('Холболтын алдаа: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="fa-solid fa-rotate text-rose-600 text-xs"></i> <span>Сэргээлт шалгах</span>`;
+      }
     }
 
     // Initialize with Auth Check
