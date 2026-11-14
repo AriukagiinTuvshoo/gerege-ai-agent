@@ -247,6 +247,41 @@ async def create_qpay_invoice_live(
         logger.error(f"QPay Create Invoice Exception: {e}")
     return None
 
+
+async def check_qpay_payment_live(
+    token: str,
+    object_id: str,
+    expected_amount: int = 0,
+) -> bool:
+    """
+    QPay v2 API (/v2/payment/check) дуудаж тухайн нэхэмжлэх бодитоор төлөгдсөн эсэхийг баталгаажуулах (Phase 1 P0).
+    """
+    if not token or not object_id:
+        return False
+    url = f"{QPAY_BASE_URL}/payment/check"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "object_type": "INVOICE",
+        "object_id": object_id,
+        "offset": {"page_number": 1, "page_limit": 10},
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(url, headers=headers, json=payload, timeout=10.0)
+            if res.status_code == 200:
+                data = res.json()
+                rows = data.get("rows") or []
+                paid_amt = int(data.get("paid_amount") or 0)
+                for r in rows:
+                    if str(r.get("payment_status", "")).upper() == "PAID":
+                        if expected_amount <= 0 or paid_amt >= expected_amount or int(r.get("payment_amount") or 0) >= expected_amount:
+                            return True
+                if paid_amt > 0 and (expected_amount <= 0 or paid_amt >= expected_amount):
+                    return True
+    except Exception as e:
+        logger.error(f"QPay Payment Check Exception: {e}")
+    return False
+
 # -------------------------------------------------------------
 # 4. НЭГДСЭН ТӨЛБӨРИЙН НЭХЭМЖЛЭХ ҮҮСГЭХ (UNIFIED FACTORY)
 # -------------------------------------------------------------

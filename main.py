@@ -26,6 +26,9 @@ import cargo_service
 import executive_bot_service
 import retention_service
 import appointment_service
+from core import security as core_security
+from core.monitoring import telemetry
+from routers import system_router
 
 load_dotenv(override=True)
 
@@ -75,18 +78,36 @@ async def executive_scheduler_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler_task = asyncio.create_task(executive_scheduler_loop())
+    scheduler_task = None
+    if os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1":
+        scheduler_task = asyncio.create_task(executive_scheduler_loop())
     yield
-    scheduler_task.cancel()
-    try:
-        await scheduler_task
-    except asyncio.CancelledError:
-        pass
+    if scheduler_task:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(
     title="Omnichannel AI Chatbot Agent & Multi-Tenant CRM Platform",
     lifespan=lifespan
 )
+
+app.include_router(system_router.router)
+
+@app.middleware("http")
+async def telemetry_and_error_tracking_middleware(request: Request, call_next):
+    t0 = time.perf_counter()
+    try:
+        resp = await call_next(request)
+        dur = (time.perf_counter() - t0) * 1000.0
+        telemetry.record_request(request.url.path, request.method, resp.status_code, dur)
+        return resp
+    except Exception as exc:
+        dur = (time.perf_counter() - t0) * 1000.0
+        telemetry.record_request(request.url.path, request.method, 500, dur, error_detail=str(exc))
+        raise
 
 os.makedirs("static/qrcodes", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -340,13 +361,10 @@ async def verify_meta_webhook(
 async def meta_webhook_events(request: Request, background_tasks: BackgroundTasks):
     try:
         raw_body = await request.body()
-        app_secret = os.getenv("META_APP_SECRET", "").strip()
-        if app_secret:
-            sig_header = request.headers.get("X-Hub-Signature-256", "")
-            expected_sig = "sha256=" + hmac.new(app_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-            if not sig_header or not hmac.compare_digest(sig_header, expected_sig):
-                logger.warning("Meta webhook rejected: invalid X-Hub-Signature-256")
-                return Response(content="Invalid signature", status_code=403)
+        sig_header = request.headers.get("X-Hub-Signature-256", "")
+        if not core_security.verify_meta_webhook_signature(raw_body, sig_header):
+            logger.warning("Meta webhook rejected by fail-closed signature check")
+            return Response(content="Invalid or missing signature", status_code=403)
 
         data = json.loads(raw_body.decode("utf-8") or "{}")
         for entry in data.get("entry", []):
@@ -416,11 +434,10 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
 @app.post("/telegram/webhook")
 async def telegram_webhook_events(request: Request, background_tasks: BackgroundTasks):
     try:
-        tg_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-        if tg_secret:
-            header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if not header_secret or not hmac.compare_digest(header_secret, tg_secret):
-                return Response(content="Forbidden", status_code=403)
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not core_security.verify_telegram_webhook_secret(header_secret):
+            logger.warning("Telegram webhook rejected by fail-closed secret check")
+            return Response(content="Forbidden", status_code=403)
 
         data = await request.json()
         message = data.get("message", {})
@@ -792,7 +809,13 @@ async def get_session_messages(sender_id: str, request: Request):
     return JSONResponse({"sender_id": sender_id, "is_human_takeover": is_takeover, "messages": msgs})
 
 @app.post("/api/sessions/{sender_id}/takeover")
-async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool]):
+async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool], request: Request):
+    user = await core_security.resolve_current_user(request)
+    msgs = database.get_conversation_history(sender_id, limit=5)
+    if msgs:
+        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"))
+    elif core_security.is_production_mode() and not user:
+        raise HTTPException(status_code=401, detail="Нэвтрэх шаардлагатай!")
     takeover = payload.get("takeover", False)
     database.set_human_takeover(sender_id, takeover)
     return {"status": "success", "is_human_takeover": takeover}
@@ -800,10 +823,12 @@ async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool]):
 @app.post("/api/sessions/{sender_id}/send")
 async def manager_send_message(sender_id: str, payload: Dict[str, str], request: Request, background_tasks: BackgroundTasks):
     text = payload.get("message", "").strip()
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
+    user = await core_security.resolve_current_user(request)
+    msgs = database.get_conversation_history(sender_id, limit=5)
+    if msgs:
+        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"))
+    elif core_security.is_production_mode() and not user:
+        raise HTTPException(status_code=401, detail="Нэвтрэх шаардлагатай!")
     target_page_id = user["page_id"] if (user and user.get("role") == "client") else payload.get("page_id", database.DEFAULT_PAGE_ID)
 
     if not text:
@@ -842,7 +867,13 @@ async def get_registrations(request: Request, page_id: Optional[str] = Query(Non
     return JSONResponse({"total": len(rows), "data": rows})
 
 @app.post("/api/leads/{lead_id}/status")
-async def update_lead(lead_id: int, payload: Dict[str, Any]):
+async def update_lead(lead_id: int, payload: Dict[str, Any], request: Request):
+    user = await core_security.resolve_current_user(request)
+    lead = database.get_lead_by_id(lead_id)
+    if lead:
+        core_security.verify_resource_tenant_ownership(user, lead.get("page_id"))
+    elif core_security.is_production_mode() and not user:
+        raise HTTPException(status_code=401, detail="Нэвтрэх шаардлагатай!")
     status = payload.get("status", "шинэ")
     notes = payload.get("notes")
     database.update_lead_status(lead_id, status, notes)
@@ -1306,19 +1337,26 @@ async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Qu
     if not inv_id:
         return JSONResponse(status_code=400, content={"error": "invoice_id missing"})
 
-    # Бодит QPay тохиргоотой үед QPay v2 payment/check дуудаж баталгаажуулах (P0-4)
+    # Бодит QPay тохиргоотой эсвэл Production/Strict горимд QPay v2 payment/check заавал дуудаж баталгаажуулах (Phase 1 P0)
     inv = database.get_invoice(inv_id)
-    if inv:
-        page = database.get_page(inv.get("page_id", database.DEFAULT_PAGE_ID)) or {}
-        qpay_user = page.get("qpay_username") or os.getenv("QPAY_USERNAME", "").strip()
-        qpay_pass = page.get("qpay_password") or os.getenv("QPAY_PASSWORD", "").strip()
-        qpay_obj_id = body.get("object_id") or request.query_params.get("object_id")
-        if qpay_user and qpay_pass and qpay_obj_id:
-            token = await fintech_service.get_qpay_token(qpay_user, qpay_pass)
-            if token:
-                is_verified = await fintech_service.check_qpay_payment_live(token, str(qpay_obj_id))
-                if not is_verified:
-                    return Response(content="FAILED_VERIFICATION", media_type="text/plain", status_code=400)
+    if not inv:
+        return JSONResponse(status_code=404, content={"error": "invoice not found"})
+
+    page = database.get_page(inv.get("page_id", database.DEFAULT_PAGE_ID)) or {}
+    qpay_user = page.get("qpay_username") or os.getenv("QPAY_USERNAME", "").strip()
+    qpay_pass = page.get("qpay_password") or os.getenv("QPAY_PASSWORD", "").strip()
+    qpay_obj_id = body.get("object_id") or request.query_params.get("object_id") or request.query_params.get("qpay_payment_id")
+    strict_qpay = core_security.is_production_mode() or os.getenv("STRICT_QPAY_VERIFICATION", "").strip() in ("1", "true")
+
+    if strict_qpay or (qpay_user and qpay_pass):
+        if not (qpay_user and qpay_pass and qpay_obj_id):
+            return Response(content="PROVIDER_VERIFICATION_REQUIRED", media_type="text/plain", status_code=400)
+        token = await fintech_service.get_qpay_token(qpay_user, qpay_pass)
+        if not token:
+            return Response(content="PROVIDER_AUTH_FAILED", media_type="text/plain", status_code=400)
+        is_verified = await fintech_service.check_qpay_payment_live(token, str(qpay_obj_id))
+        if not is_verified:
+            return Response(content="FAILED_VERIFICATION", media_type="text/plain", status_code=400)
 
     await fintech_service.process_successful_payment(inv_id, callback_data=body)
     return Response(content="SUCCESS", media_type="text/plain", status_code=200)
@@ -1437,15 +1475,15 @@ async def serve_warehouse_scanner(request: Request, page_id: Optional[str] = Que
 
 @app.post("/api/cargo/scan")
 async def scan_cargo_package_api(payload: Dict[str, Any], request: Request):
-    """Агуулахын ажилтан баркод уншуулах үед ачааг бүртгэж авто мэдэгдэл илгээх"""
-    pid = payload.get("page_id") or database.DEFAULT_PAGE_ID
+    """Агуулахын ажилтан баркод уншуулах үед ачааг бүртгэж авто мэдэгдэл илгээх (Tenant Scoped)"""
+    pid = await core_security.enforce_tenant_scope(request, requested_page_id=payload.get("page_id"))
     code = payload.get("tracking_code", "").strip()
     if not code:
         return JSONResponse(status_code=400, content={"error": "tracking_code is required"})
     loc = payload.get("location", "УБ Төв Агуулах")
     base_url = str(request.base_url)
     res = await cargo_service.scan_and_notify_package(
-        page_id=pid,
+        page_id=pid or database.DEFAULT_PAGE_ID,
         tracking_code=code,
         location=loc,
         weight_kg=payload.get("weight_kg"),
@@ -1455,10 +1493,10 @@ async def scan_cargo_package_api(payload: Dict[str, Any], request: Request):
     return res
 
 @app.post("/api/cargo/{tracking_code}/deliver")
-async def deliver_cargo_api(tracking_code: str, page_id: Optional[str] = Query(None)):
-    """Ачааг олгосон гэж тэмдэглэх"""
-    pid = page_id or database.DEFAULT_PAGE_ID
-    pkg = database.mark_cargo_delivered(pid, tracking_code)
+async def deliver_cargo_api(tracking_code: str, request: Request, page_id: Optional[str] = Query(None)):
+    """Ачааг олгосон гэж тэмдэглэх (Tenant Scoped)"""
+    pid = await core_security.enforce_tenant_scope(request, requested_page_id=page_id)
+    pkg = database.mark_cargo_delivered(pid or database.DEFAULT_PAGE_ID, tracking_code)
     return {"success": bool(pkg), "package": pkg}
 
 @app.get("/api/cargo/packages")
@@ -1734,8 +1772,14 @@ async def create_appointment_manual_api(payload: Dict[str, Any], request: Reques
     return {"success": True, "appointment": appt}
 
 @app.post("/api/appointments/{appointment_id}/status")
-async def update_appointment_status_api(appointment_id: int, payload: Dict[str, Any]):
-    """Цаг захиалгын төлөв өөрчлөх ('CONFIRMED', 'COMPLETED', 'CANCELLED')"""
+async def update_appointment_status_api(appointment_id: int, payload: Dict[str, Any], request: Request):
+    """Цаг захиалгын төлөв өөрчлөх ('CONFIRMED', 'COMPLETED', 'CANCELLED') — Tenant Scoped"""
+    user = await core_security.resolve_current_user(request)
+    appt = database.get_appointment_by_id(appointment_id)
+    if appt:
+        core_security.verify_resource_tenant_ownership(user, appt.get("page_id"))
+    elif core_security.is_production_mode() and not user:
+        raise HTTPException(status_code=401, detail="Нэвтрэх шаардлагатай!")
     new_status = payload.get("status", "CONFIRMED")
     success = database.update_appointment_status(appointment_id, new_status)
     return {"success": success, "status": new_status}

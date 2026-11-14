@@ -11,8 +11,13 @@ __pycache__/
 # Local Databases & Logs
 leads.db
 leads.db-journal
+leads.db-wal
+leads.db-shm
 leads.csv
 *.log
+backups/
+.pytest_cache/
+.last_working_commit
 
 # Static Generated Files (QRCodes)
 static/qrcodes/*.png

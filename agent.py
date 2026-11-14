@@ -12,6 +12,7 @@ import knowledge_base
 import sheets_service
 import fintech_service
 import cargo_service
+import core.ai_router as ai_router
 
 load_dotenv(override=True)
 
@@ -304,6 +305,18 @@ class AIAgent:
             database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=reply, page_id=page_id)
             return {"reply": reply, "human_takeover": True, "registered": False, "model": "escalated"}
 
+        # 1.5. Prompt Injection / Jailbreak хамгаалалт (Phase 3)
+        is_injected, inj_reason = ai_router.detect_prompt_injection(text)
+        if is_injected:
+            safe_reply = f"Сайн байна уу? Би зөвхөн {page_name}-ийн бүтээгдэхүүн, үйлчилгээний талаар мэдээлэл өгөх зориулалттай туслах байна. Танд ямар үйлчилгээ сонирхолтой байна вэ?"
+            database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=safe_reply, page_id=page_id)
+            return {
+                "reply": safe_reply,
+                "registered": False,
+                "prompt_injection_blocked": True,
+                "model": "security_guard",
+            }
+
         # 2. Тухайн хуудасны Gemini Client болон Лимит шалгах
         client, is_custom_key = self.get_client_for_page(page_data)
         
@@ -336,42 +349,67 @@ class AIAgent:
             tg_link = links.get("telegram_group", "")
             fb_link = links.get("facebook_group", "")
 
-        # 3. ЗУРАГ / БАНКНЫ ХУУЛГА ИРСЭН ЭСЭХИЙГ ШАЛГАХ (VISION)
+        # 3. ЗУРАГ / БАНКНЫ ХУУЛГА ИРСЭН ЭСЭХИЙГ ШАЛГАХ (VISION + PROVIDER VERIFICATION GUARD — Phase 1)
         if image_bytes:
             receipt_check = self.analyze_receipt_image(image_bytes, client=client)
-            # Зураг уншихад ойролцоогоор 250 токен зарцуулна
             database.increment_page_tokens(page_id, 250)
-            
+
             if receipt_check.get("is_receipt"):
-                reply_text = (
-                    "Гүйлгээний баримтыг амжилттай шалгаж баталгаажууллаа! 🎉\n\n"
-                    f"{page_name}-д хандсанд маш их баярлалаа. Албан ёсны нэвтрэх урилгын холбоосууд:\n\n"
-                    f"👉 **Telegram групп линк:** {tg_link}\n"
-                    f"👉 **Facebook групп линк:** {fb_link}\n\n"
-                    "Холбоосоор орж тухлан үзээрэй! 🎬 Асуух зүйл гарвал хэзээд бичээрэй."
-                )
+                # AI receipt шалгалтыг дангаар нь төлбөр баталгаажуулахад ашиглахгүй:
+                # Бодит төлөгдсөн QPay нэхэмжлэх байгаа эсэхийг баазаас давхар тулгана
+                paid_invoices = [
+                    inv for inv in database.list_invoices(page_id=page_id, status="PAID", limit=20)
+                    if inv.get("sender_id") == sender_id
+                ]
+                has_provider_verified_payment = len(paid_invoices) > 0
+                parsed_amt = receipt_check.get("amount", 0)
+
+                if has_provider_verified_payment:
+                    reply_text = (
+                        "Гүйлгээний баримт болон QPay төлбөр амжилттай баталгаажлаа! 🎉\n\n"
+                        f"{page_name}-д хандсанд маш их баярлалаа."
+                    )
+                    if tg_link or fb_link:
+                        reply_text += "\n\nАлбан ёсны нэвтрэх урилгын холбоосууд:\n"
+                        if tg_link:
+                            reply_text += f"👉 **Telegram групп линк:** {tg_link}\n"
+                        if fb_link:
+                            reply_text += f"👉 **Facebook групп линк:** {fb_link}\n"
+                    reg_status = "verified"
+                    is_verified_final = True
+                else:
+                    amt_note = f" ({parsed_amt:,}₮)" if parsed_amt else ""
+                    reply_text = (
+                        f"Таны илгээсэн гүйлгээний баримтын зургийг хүлээн авч бүртгэлээ{amt_note}. 🧾\n\n"
+                        "Аюулгүй байдлын үүднээс банкны дансны хуулгатай менежер тулган шалгаж баталгаажуулмагц танд эрх болон холбоос очих болно. "
+                        "(Хэрэв 1 секундэд шууд автоматаар баталгаажуулах бол 'QPay төлбөр төлье' гэж бичээд QPay-ээр төлнө үү) 🤝"
+                    )
+                    reg_status = "pending_verification"
+                    is_verified_final = False
+
                 database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=reply_text, page_id=page_id)
                 reg_id = database.save_registration(
-                    name="Баримт баталгаажсан",
+                    name="Баримт баталгаажсан" if is_verified_final else "Баримт хүлээгдэж буй (Менежер шалгана)",
                     phone=sender_id.replace("meta_", "").replace("tg_", ""),
-                    service=f"{page_name} Хандив/Төлбөр (Баталгаажсан)",
+                    service=f"{page_name} Төлбөрийн баримт ({'Баталгаажсан' if is_verified_final else 'Шалгагдаж буй'})",
                     channel=channel,
                     sender_id=sender_id,
-                    notes=receipt_check.get("analysis", "Гүйлгээний баримт амжилттай"),
-                    status="verified",
+                    notes=receipt_check.get("analysis", "Гүйлгээний баримт хүлээн авсан"),
+                    status=reg_status,
                     page_id=page_id
                 )
                 return {
                     "reply": reply_text,
                     "registered": True,
-                    "verified_receipt": True,
+                    "verified_receipt": is_verified_final,
+                    "pending_verification": not is_verified_final,
                     "model": self.model_name,
                     "is_custom_key": is_custom_key,
                     "reg_info": {
                         "id": reg_id,
-                        "name": "Баримт баталгаажсан",
+                        "name": "Баримт баталгаажсан" if is_verified_final else "Баримт шалгагдаж буй",
                         "phone": sender_id.replace("meta_", "").replace("tg_", ""),
-                        "service": f"{page_name} Төлбөр (Баталгаажсан)",
+                        "service": f"{page_name} Төлбөр ({reg_status})",
                         "channel": channel,
                         "created_at": "Яг одоо"
                     }
@@ -379,10 +417,10 @@ class AIAgent:
             else:
                 reply_text = (
                     "Таны илгээсэн зургийг хүлээн авлаа. Банкны гүйлгээний дүн болон 'Амжилттай' төлөв бүхий баримтын зургийг тодорхой харуулан дахин илгээнэ үү. "
-                    "Баримт шалгагдмагц холбоос автоматаар очно шүү! 🤝"
+                    "Баримт шалгагдмагц мэдэгдэх болно! 🤝"
                 )
                 database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=reply_text, page_id=page_id)
-                return {"reply": reply_text, "registered": False, "model": self.model_name, "is_custom_key": is_custom_key}
+                return {"reply": reply_text, "registered": False, "verified_receipt": False, "model": self.model_name, "is_custom_key": is_custom_key}
 
         # 4. ЭНГИЙН ТЕКСТ МЕССЕЖ (GEMINI ЧАТ)
         registered = False
@@ -398,8 +436,13 @@ class AIAgent:
             try:
                 from google.genai import types
 
+                tool_guard = ai_router.ToolExecutionGuard(page_id=page_id, sender_id=sender_id)
+
                 def register_customer(name: str, phone: str, service: str = "", notes: str = "") -> str:
                     nonlocal registered, reg_info
+                    allowed, reason = tool_guard.check_and_record("register_customer")
+                    if not allowed:
+                        return reason
                     r_id = database.save_registration(
                         name=name,
                         phone=phone,
@@ -423,6 +466,9 @@ class AIAgent:
 
                 def check_sheet_cargo_status(tracking_or_phone: str) -> str:
                     """Бүх холбогдсон Карго агуулахын бааз, Google Sheets болон Excel хүснэгтүүдээс бараа, карго код, үнэ, захиалга эсвэл утасны дугаараар шүүж хайх"""
+                    allowed, reason = tool_guard.check_and_record("check_sheet_cargo_status")
+                    if not allowed:
+                        return reason
                     # 1. Албан ёсны карго агуулахын бодит цагийн сангаас хайх
                     cargo_direct = cargo_service.lookup_customer_cargo(page_id, tracking_or_phone)
                     if cargo_direct:
@@ -444,10 +490,14 @@ class AIAgent:
                 def create_payment_invoice(amount: int = 15000, description: str = "") -> str:
                     """Хэрэглэгч төлбөр төлөх, үйлчилгээ худалдан авах, данс нэхэмжлэх үед QPay QR код болон банкны апп холбоос үүсгэх"""
                     nonlocal invoice_order
+                    allowed, reason = tool_guard.check_and_record("create_payment_invoice")
+                    if not allowed:
+                        return reason
+                    safe_amount = tool_guard.validate_invoice_amount(amount, default_amount=15000)
                     desc = description or f"{page_name} үйлчилгээний төлбөр"
                     invoice_order = fintech_service.create_payment_order_sync(
                         page_id=page_id,
-                        amount=int(amount),
+                        amount=safe_amount,
                         description=desc,
                         sender_id=sender_id,
                         channel=channel
@@ -462,16 +512,11 @@ class AIAgent:
                     time: str,
                     notes: str = ""
                 ) -> str:
-                    """Салон, эмнэлэг, үйлчилгээний цаг товлох, цагийн хуваарийн давхцал шалгаж захиалга баталгаажуулах хэрэгсэл.
-                    Args:
-                        name: Үйлчлүүлэгчийн нэр
-                        phone: 8 оронтой утасны дугаар
-                        service: Захиалах үйлчилгээний нэр (жишээ: Гелин будалт, Массаж, Үзлэг)
-                        date: Захиалгын огноо (YYYY-MM-DD эсвэл өнөөдөр, маргааш)
-                        time: Захиалгын цаг (HH:MM формат, жишээ: 14:00)
-                        notes: Нэмэлт тайлбар
-                    """
+                    """Салон, эмнэлэг, үйлчилгээний цаг товлох, цагийн хуваарийн давхцал шалгаж захиалга баталгаажуулах хэрэгсэл."""
                     nonlocal registered, reg_info
+                    allowed, reason = tool_guard.check_and_record("book_service_appointment")
+                    if not allowed:
+                        return reason
                     import appointment_service
                     res = appointment_service.book_appointment_from_ai(
                         page_id=page_id,
@@ -489,15 +534,17 @@ class AIAgent:
                         reg_info = {"id": res["appointment"]["id"], "name": name, "phone": phone, "service": service}
                     return res.get("message", "Цаг захиалгын мэдээлэл шалгагдлаа.")
 
-                # Хэрэглэгчийн санах ойг татаж авах (Mem0 & Zep загвар)
+                # Хэрэглэгчийн санах ой ба Persistent Conversation History татах (Phase 3)
                 user_memory = database.get_user_memory(page_id, sender_id)
+                persistent_history = ai_router.format_persistent_conversation_context(sender_id, limit=8)
+                sys_instruction = build_system_instruction_for_page(page_data, user_memory=user_memory) + persistent_history
 
                 agent_tools = [register_customer, check_sheet_cargo_status, create_payment_invoice, book_service_appointment]
 
                 session_key = f"{page_id}_{sender_id}"
                 if session_key not in self.chat_sessions:
                     config = types.GenerateContentConfig(
-                        system_instruction=build_system_instruction_for_page(page_data, user_memory=user_memory),
+                        system_instruction=sys_instruction,
                         tools=agent_tools,
                         temperature=0.7,
                     )
@@ -515,18 +562,19 @@ class AIAgent:
                         prompt_txt += f"\n\n{sheet_context}"
                     message_payload = [prompt_txt, audio_part]
                 else:
-                    message_payload = text
+                    wrapped_text = ai_router.wrap_untrusted_user_input(text)
+                    message_payload = wrapped_text
                     if sheet_context:
-                        message_payload = f"{text}\n\n{sheet_context}"
+                        message_payload = f"{wrapped_text}\n\n{sheet_context}"
 
                 try:
-                    response = chat.send_message(message_payload)
+                    response = ai_router.execute_with_retry(lambda: chat.send_message(message_payload), max_retries=1)
                     reply_text = response.text or ""
                 except Exception as send_err:
                     logger.warning(f"Chat session send_message error, refreshing session: {send_err}")
                     self.chat_sessions.pop(session_key, None)
                     config = types.GenerateContentConfig(
-                        system_instruction=build_system_instruction_for_page(page_data, user_memory=user_memory),
+                        system_instruction=sys_instruction,
                         tools=agent_tools,
                         temperature=0.7,
                     )
@@ -535,16 +583,14 @@ class AIAgent:
                         config=config
                     )
                     self.chat_sessions[session_key] = new_chat
-                    response = new_chat.send_message(message_payload)
+                    response = ai_router.execute_with_retry(lambda: new_chat.send_message(message_payload), max_retries=1)
                     reply_text = response.text or ""
 
+                # AI Response Evaluation (Phase 3)
+                eval_res = ai_router.evaluate_ai_response(reply_text, page_id=page_id)
+                reply_text = eval_res["cleaned_reply"]
                 if not reply_text:
                     reply_text = f"Сайн байна уу? {page_name}-д тавтай морилно уу! Танд ямар мэдээлэл хэрэгтэй байна вэ?"
-                else:
-                    # <thought>...</thought> дотоод дүгнэлтийг хэрэглэгчийн хариултаас салгаж цэвэрлэх
-                    clean_reply = re.sub(r'<thought>.*?</thought>', '', reply_text, flags=re.DOTALL).strip()
-                    if clean_reply:
-                        reply_text = clean_reply
 
                 # 5. ТӨЛБӨРИЙН ХҮСЭЛТ ШАЛГАХ (QPAY EXPLICIT INTENT FALLBACK)
                 payment_keywords = ["төлбөр төлье", "төлбөрөө төлье", "qpay линк", "qpay-ээр төлье", "нэхэмжлэх авъя", "хандив өгье"]
@@ -613,6 +659,28 @@ class AIAgent:
                 }
             except Exception as e:
                 logger.error(f"Gemini API алдаа: {e}")
+
+        # 4.5. Олон төрлийн AI Provider Fallback (OpenAI / DeepSeek / Anthropic — Phase 3)
+        if text:
+            try:
+                user_memory = database.get_user_memory(page_id, sender_id)
+                sys_inst = build_system_instruction_for_page(page_data, user_memory=user_memory)
+                hist = database.get_conversation_history(sender_id=sender_id, limit=8)
+                alt_reply = ai_router.call_openai_compatible_fallback(sys_inst, text, hist) or ai_router.call_anthropic_fallback(sys_inst, text, hist)
+                if alt_reply:
+                    eval_alt = ai_router.evaluate_ai_response(alt_reply, page_id=page_id)
+                    clean_alt = eval_alt["cleaned_reply"]
+                    if clean_alt:
+                        database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=clean_alt, page_id=page_id)
+                        return {
+                            "reply": clean_alt,
+                            "registered": registered,
+                            "reg_info": reg_info,
+                            "model": os.getenv("AI_PROVIDER", "multi_provider_fallback"),
+                            "is_custom_key": False,
+                        }
+            except Exception as alt_err:
+                logger.warning(f"Alternative AI provider fallback error: {alt_err}")
 
         # 5. Нөөц хариу
         detected = extract_phone_and_name_fallback(text)

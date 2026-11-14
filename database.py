@@ -273,12 +273,39 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_appointments_page_date ON appointments (page_id, appointment_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments (customer_phone)")
 
+    # 12. Давхар мэдэгдлээс хамгаалах түгжээ (Idempotent Notification Lock)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS notification_locks (
+            idempotency_key TEXT PRIMARY KEY,
+            channel TEXT DEFAULT 'any',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 13. Асинхрон фоновые даалгаврын дараалал (Task Queue Jobs)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS task_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT UNIQUE,
+            task_name TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'
+            attempts INTEGER DEFAULT 0,
+            max_retries INTEGER DEFAULT 3,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_jobs_status ON task_jobs (status, created_at)")
+
     # Багануудыг аюулгүй нэмэх (Migration check)
     tables_to_migrate = [
         ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
         ("messages", "page_id", "TEXT DEFAULT '100799479495809'"),
         ("session_states", "page_id", "TEXT DEFAULT '100799479495809'"),
         ("pages", "gemini_api_key", "TEXT DEFAULT ''"),
+        ("pages", "ai_provider", "TEXT DEFAULT 'gemini'"),
         ("pages", "client_username", "TEXT"),
         ("pages", "client_password_hash", "TEXT"),
         ("pages", "client_salt", "TEXT"),
@@ -394,12 +421,62 @@ def delete_session(token: str):
     conn.close()
 
 def authenticate_admin(password: str) -> bool:
-    """Супер Админы нууц үгийг шалгах (ENV дээр ADMIN_PASSWORD тохируулсан бол зөвхөн түүнийг шалгана)"""
+    """Супер Админы нууц үгийг шалгах (Production болон ADMIN_PASSWORD тохируулсан үед анхдагч нууц үгийг бүрэн хаана)"""
     env_pw = os.getenv("ADMIN_PASSWORD", "").strip()
     p = (password or "").strip()
+    if not p:
+        return False
     if env_pw:
         return secrets.compare_digest(p, env_pw)
+    # Production эсвэл STRICT_SECURITY горимд ADMIN_PASSWORD тохируулаагүй бол fail-closed (False) буцаана
+    if (
+        os.getenv("ENV", "").strip().lower() in ("production", "prod")
+        or os.getenv("STRICT_SECURITY", "").strip().lower() in ("1", "true", "yes")
+        or os.getenv("DISABLE_DEFAULT_ADMIN_PASSWORD", "").strip().lower() in ("1", "true", "yes")
+    ):
+        return False
     return secrets.compare_digest(p, DEFAULT_ADMIN_PASSWORD) or secrets.compare_digest(p.lower(), DEFAULT_ADMIN_PASSWORD.lower())
+
+
+def claim_notification_lock(idempotency_key: str, channel: str = "any") -> bool:
+    """Давхар мэдэгдэл илгээхээс сэргийлэх атомик түгжээ. Амжилттай түгжвэл True, аль хэдийн илгээсэн бол False буцаана."""
+    if not idempotency_key:
+        return True
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO notification_locks (idempotency_key, channel) VALUES (?, ?)",
+            (idempotency_key.strip(), channel),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def get_lead_by_id(lead_id: int) -> Optional[Dict[str, Any]]:
+    """Бүртгэлийг ID-аар нь авч салбарын харьяаллыг (page_id) шалгах"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM registrations WHERE id = ?", (lead_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_appointment_by_id(appointment_id: int) -> Optional[Dict[str, Any]]:
+    """Цаг захиалгыг ID-аар нь авч салбарын харьяаллыг (page_id) шалгах"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 def sanitize_page_id(page_id: str) -> str:
     """URL эсвэл буруу форматаар орж ирсэн хуудасны ID-г найдвартай цэвэрлэх"""

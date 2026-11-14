@@ -109,6 +109,8 @@ async def run_automated_retention_checks(base_url: str = "http://localhost:8000"
             for c in candidates:
                 sid = c["sender_id"]
                 chn = c.get("channel", "web")
+                if not database.claim_notification_lock(f"followup:{pid}:abandoned_chat:{sid}", channel=chn):
+                    continue
                 success = await dispatch_channel_message(pid, sid, chn, msg)
                 if success:
                     database.record_sent_followup(pid, "abandoned_chat", sid, chn)
@@ -126,6 +128,8 @@ async def run_automated_retention_checks(base_url: str = "http://localhost:8000"
                     continue
                 chn = c.get("channel", "web")
                 code = c.get("tracking_code", "")
+                if not database.claim_notification_lock(f"followup:{pid}:cargo_pickup:{sid}:{code}", channel=chn):
+                    continue
                 custom_msg = f"{msg_tmpl}\n(Карго код: {code})"
                 if c.get("invoice_id"):
                     custom_msg += f"\n👉 QPay төлбөр төлөх холбоос: {base_url}/pay/{c['invoice_id']}"
@@ -145,6 +149,8 @@ async def run_automated_retention_checks(base_url: str = "http://localhost:8000"
                 if not sid:
                     continue
                 chn = c.get("channel", "web")
+                if not database.claim_notification_lock(f"followup:{pid}:retention_followup:{sid}", channel=chn):
+                    continue
                 success = await dispatch_channel_message(pid, sid, chn, msg)
                 if success:
                     database.record_sent_followup(pid, "retention_followup", sid, chn)

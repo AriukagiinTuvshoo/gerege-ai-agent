@@ -142,6 +142,9 @@ async def check_and_dispatch_appointment_reminders() -> int:
 
         if sid:
             try:
+                lock_key = f"appt_reminder:{a['id']}"
+                if not database.claim_notification_lock(lock_key, channel=chn):
+                    continue
                 success = await retention_service.dispatch_channel_message(pid, sid, chn, msg)
                 if success:
                     database.mark_appointment_reminder_sent(a["id"])

@@ -1,0 +1,46 @@
+name: Gerege Enterprise CI & Security Gate
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test-and-security-audit:
+    runs-on: ubuntu-latest
+    env:
+      ADMIN_PASSWORD: "ci_test_admin_password_2026"
+      GEMINI_MODEL: "gemini-3.5-flash-lite"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Initialize schema & verify Alembic models
+        run: |
+          python -c "import database; database.init_db(); from core import models, db_engine; engine = db_engine.create_sqlalchemy_engine(); models.Base.metadata.create_all(bind=engine)"
+
+      - name: Run Pytest Enterprise Suite (Phase 1 - Phase 5)
+        run: |
+          pytest tests/ -v
+
+      - name: Run Security P0 & Module E2E Regression Suites
+        run: |
+          python scratch/test_security_p0_e2e.py
+          python scratch/test_fintech_e2e.py
+          python scratch/test_cargo_e2e.py
+          python scratch/test_executive_e2e.py
+          python scratch/test_retention_e2e.py
+          python scratch/test_appointments_voice_e2e.py
