@@ -71,11 +71,23 @@ jobs:
         run: |
           python scripts/migrate_sqlite_to_postgres.py --dry-run
 
-      - name: Run Alembic Migration on PostgreSQL 16
+      - name: Verify Postgres Connectivity & Drivers
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
           pg_isready -h 127.0.0.1 -p 5432 -U gerege -d gerege_crm_test
+          python -c "import alembic, psycopg2, sqlalchemy; print('DRIVERS_OK')"
+
+      - name: Verify SQLAlchemy Postgres Engine Connection
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          python -c "from core.db_engine import create_sqlalchemy_engine; e = create_sqlalchemy_engine(); c = e.connect(); c.close(); print('PG_ENGINE_OK')"
+
+      - name: Run Alembic Migration on PostgreSQL 16
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
           python -m alembic upgrade head
 
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
