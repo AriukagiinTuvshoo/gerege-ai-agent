@@ -88,6 +88,11 @@ async def lifespan(app: FastAPI):
             await scheduler_task
         except asyncio.CancelledError:
             pass
+    try:
+        from core.db_engine import dispose_shared_engine
+        dispose_shared_engine()
+    except Exception as e:
+        logger.warning(f"Database engine dispose warning: {e}")
 
 app = FastAPI(
     title="Omnichannel AI Chatbot Agent & Multi-Tenant CRM Platform",
@@ -98,16 +103,30 @@ app.include_router(system_router.router)
 
 @app.middleware("http")
 async def telemetry_and_error_tracking_middleware(request: Request, call_next):
+    req_id = request.headers.get("X-Request-ID") or os.urandom(8).hex()
     t0 = time.perf_counter()
     try:
         resp = await call_next(request)
         dur = (time.perf_counter() - t0) * 1000.0
-        telemetry.record_request(request.url.path, request.method, resp.status_code, dur)
+        telemetry.record_request(request.url.path, request.method, resp.status_code, dur, request_id=req_id)
+        resp.headers["X-Request-ID"] = req_id
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         return resp
     except Exception as exc:
         dur = (time.perf_counter() - t0) * 1000.0
-        telemetry.record_request(request.url.path, request.method, 500, dur, error_detail=str(exc))
-        raise
+        telemetry.record_request(request.url.path, request.method, 500, dur, error_detail=str(exc), request_id=req_id)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "request_id": req_id},
+            headers={
+                "X-Request-ID": req_id,
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "strict-origin-when-cross-origin",
+            },
+        )
 
 os.makedirs("static/qrcodes", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -1240,7 +1259,11 @@ async def readiness_check():
     except Exception as e:
         logger.error(f"Readiness DB check failed: {e}")
 
-    q_stats = task_queue.get_queue_stats()
+    try:
+        q_stats = task_queue.get_queue_stats()
+    except Exception as qe:
+        logger.warning(f"Readiness queue stats fallback: {qe}")
+        q_stats = {"backend": "unavailable"}
     status_code = 200 if db_ok else 503
     return JSONResponse(
         status_code=status_code,

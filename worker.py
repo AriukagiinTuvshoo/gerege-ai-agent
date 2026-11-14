@@ -66,7 +66,10 @@ async def run_worker_tick(loop_count: int) -> dict:
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
     current_hm = now.strftime("%H:%M")
-    stats = {"queue_processed": 0, "reports_sent": 0, "reminders_sent": 0}
+    stats = {"queue_processed": 0, "stale_recovered": 0, "reports_sent": 0, "reminders_sent": 0}
+
+    # 0. Гацсан (PROCESSING visibility timeout хэтэрсэн) даалгавруудыг сэргээх
+    stats["stale_recovered"] = task_queue.recover_stale_jobs()
 
     # 1. Task Queue дахь даалгавруудыг гүйцэтгэх
     stats["queue_processed"] = await task_queue.process_pending_jobs(batch_size=25)
@@ -105,7 +108,13 @@ async def run_worker_tick(loop_count: int) -> dict:
     return stats
 
 
-async def worker_main_loop():
+def request_shutdown() -> None:
+    """Гаднаас болон тестээс worker loop-ийг аюулгүй зогсоох команд."""
+    if _SHUTDOWN_EVENT is not None:
+        _SHUTDOWN_EVENT.set()
+
+
+async def worker_main_loop(max_iterations: Optional[int] = None):
     global _SHUTDOWN_EVENT
     _SHUTDOWN_EVENT = asyncio.Event()
 
@@ -132,6 +141,9 @@ async def worker_main_loop():
         try:
             await run_worker_tick(loop_count)
             loop_count += 1
+            if max_iterations is not None and loop_count >= max_iterations:
+                _SHUTDOWN_EVENT.set()
+                break
         except Exception as e:
             logger.error(f"Worker loop error: {e}")
         try:
@@ -140,6 +152,7 @@ async def worker_main_loop():
             pass
 
     logger.info("Gerege Background Worker stopped cleanly.")
+    return loop_count
 
 
 if __name__ == "__main__":

@@ -724,7 +724,7 @@ class AIAgent:
             except Exception as alt_err:
                 logger.warning(f"Alternative AI provider fallback error: {alt_err}")
 
-        # 5. Нөөц хариу
+        # 5. Нөөц хариу (Deterministic fallback when external AI providers are unconfigured or unreachable)
         detected = extract_phone_and_name_fallback(text)
         if detected:
             r_id = database.save_registration(
@@ -736,14 +736,53 @@ class AIAgent:
                 notes=text,
                 page_id=page_id
             )
+            database.upsert_user_memory(
+                page_id=page_id,
+                user_id=sender_id,
+                customer_name=detected["name"],
+                phone=detected["phone"],
+                notes=text
+            )
             registered = True
             reg_info = {"id": r_id, "name": detected["name"], "phone": detected["phone"]}
             reply_text = f"Баярлалаа, {detected['name']}! Таны мэдээллийг хүлээн авлаа. Манай менежер тантай удахгүй холбогдох болно! 🤝"
         else:
             reply_text = f"Сайн байна уу? {page_name}-д тавтай морилно уу! Танд ямар мэдээлэл хэрэгтэй байна вэ?"
 
+        # Deterministic QPay payment intent fallback
+        invoice_order = None
+        if text:
+            payment_keywords = ["төлбөр төлье", "төлбөрөө төлье", "qpay линк", "qpay-ээр төлье", "нэхэмжлэх авъя", "хандив өгье"]
+            is_payment_intent = any(pk in text.lower() for pk in payment_keywords)
+            if is_payment_intent:
+                default_amount = 15000
+                if "хандив" in text.lower() or "кино" in text.lower():
+                    default_amount = 10000
+                amount_match = re.search(r'(\d+)[kк]', text.lower())
+                if amount_match:
+                    default_amount = int(amount_match.group(1)) * 1000
+                invoice_order = fintech_service.create_payment_order_sync(
+                    page_id=page_id,
+                    amount=default_amount,
+                    description=f"{page_name} төлбөр",
+                    sender_id=sender_id,
+                    channel=channel
+                )
+                if invoice_order and invoice_order.get("pay_url"):
+                    reply_text += (
+                        f"\n\n⚡ **QPay Төлбөрийн Шууд Холбоос:**\n"
+                        f"👉 **[ЭНД ДАРЖ ТӨЛӨХ]({invoice_order['pay_url']})**"
+                    )
+
         database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=reply_text, page_id=page_id)
-        return {"reply": reply_text, "registered": registered, "reg_info": reg_info, "model": "fallback", "is_custom_key": False}
+        return {
+            "reply": reply_text,
+            "registered": registered,
+            "reg_info": reg_info,
+            "invoice_order": invoice_order,
+            "model": "fallback",
+            "is_custom_key": False,
+        }
 
 agent = AIAgent()
 

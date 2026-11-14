@@ -21,6 +21,12 @@ from repositories import TenantRepository, CRMRepository, CommerceRepository
 from scripts import migrate_sqlite_to_postgres
 
 client = TestClient(app)
+with database.get_connection() as _conn:
+    _conn.execute(
+        "UPDATE pages SET tokens_used = 0, monthly_token_limit = 1000000 WHERE page_id = ?",
+        (database.DEFAULT_PAGE_ID,),
+    )
+    _conn.commit()
 
 
 # =============================================================

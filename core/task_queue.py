@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import time
 import socket
 import sqlite3
 import logging
@@ -18,34 +19,53 @@ REDIS_DLQ_KEY = "gerege:task_dlq"
 
 class TaskQueue:
     """
-    Phase 3 (P0): Production Redis & Database Persistent Task Queue.
+    Phase 3: Production Redis & Database Persistent Task Queue (At-Least-Once + Idempotent Execution).
     - Uses `database.get_connection()` (supports both PostgreSQL and SQLite WAL).
     - When `REDIS_URL` is configured and reachable, pushes job IDs to `gerege:task_queue` (`LPUSH`)
       and consumes via `RPOP`, while persisting durable job state in `task_jobs`.
-    - Implements atomic job claiming (`locked_by`, `locked_at`), exponential backoff (`next_run_at`),
-      per-task execution timeouts (`asyncio.wait_for`), stale `PROCESSING` recovery, and Dead-Letter Queue (`DEAD_LETTER`).
+    - Automatically reconnects to Redis if Redis restarts, without losing jobs (durable DB backing).
+    - Implements atomic job claiming (`locked_by`, `locked_at`), visibility timeout & stale `PROCESSING`
+      recovery, explicit job acknowledgment (`ack_job`), exponential backoff (`next_run_at`),
+      per-task execution timeouts (`asyncio.wait_for`), and Dead-Letter Queue (`DEAD_LETTER`).
     """
 
     def __init__(self, worker_id: Optional[str] = None):
         self.redis_url = os.getenv("REDIS_URL", "").strip()
         self._redis = None
+        self._last_redis_attempt = 0.0
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self.handlers: Dict[str, Callable[[Dict[str, Any]], Awaitable[Any]]] = {}
         self._connect_redis()
 
     def _connect_redis(self) -> None:
+        self.redis_url = os.getenv("REDIS_URL", "").strip()
         if not self.redis_url:
             self._redis = None
             return
+        self._last_redis_attempt = time.monotonic()
         try:
             import redis  # type: ignore
 
-            self._redis = redis.from_url(self.redis_url, decode_responses=True, socket_timeout=5.0)
-            self._redis.ping()
+            client = redis.from_url(self.redis_url, decode_responses=True, socket_timeout=3.0)
+            client.ping()
+            self._redis = client
             logger.info("TaskQueue connected to Redis backend.")
         except Exception as e:
             logger.warning(f"Redis unavailable ({e}), using durable DB-backed task_jobs queue.")
             self._redis = None
+
+    def _get_redis(self):
+        """Return active Redis client, attempting periodic auto-reconnect if REDIS_URL is configured."""
+        if self._redis is not None:
+            try:
+                self._redis.ping()
+                return self._redis
+            except Exception as e:
+                logger.warning(f"Redis connection lost ({e}), falling back to DB and scheduling reconnect.")
+                self._redis = None
+        if self.redis_url and (time.monotonic() - self._last_redis_attempt) > 5.0:
+            self._connect_redis()
+        return self._redis
 
     def register_handler(self, task_name: str, handler: Callable[[Dict[str, Any]], Awaitable[Any]]) -> None:
         self.handlers[task_name] = handler
@@ -115,14 +135,16 @@ class TaskQueue:
             raise
         conn.close()
 
-        if self._redis and delay_seconds <= 0:
+        r_client = self._get_redis()
+        if r_client and delay_seconds <= 0:
             try:
-                self._redis.lpush(
+                r_client.lpush(
                     REDIS_QUEUE_KEY,
                     json.dumps({"job_id": job_id, "task_name": task_name, "page_id": target_page}),
                 )
             except Exception as e:
-                logger.warning(f"Redis lpush warning: {e}")
+                logger.warning(f"Redis lpush warning (job persisted in DB): {e}")
+                self._redis = None
 
         return {"queued": True, "duplicate": False, "job_id": job_id, "status": "PENDING"}
 
@@ -163,12 +185,75 @@ class TaskQueue:
             conn.close()
             return None
 
+    def ack_job(self, job_id: str) -> bool:
+        """Explicitly acknowledge job completion (PROCESSING -> COMPLETED)."""
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = database.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE task_jobs
+            SET status = 'COMPLETED',
+                locked_by = NULL,
+                locked_at = NULL,
+                updated_at = ?
+            WHERE idempotency_key = ?
+            """,
+            (now_str, job_id),
+        )
+        changed = (cur.rowcount or 0) > 0
+        conn.commit()
+        conn.close()
+        return changed
+
+    def fail_job(self, job: Dict[str, Any], err_msg: str) -> str:
+        """Record job failure, schedule exponential backoff retry or move to DEAD_LETTER."""
+        job_id = str(job.get("idempotency_key") or "")
+        task_name = str(job.get("task_name") or "")
+        attempts = int(job.get("attempts") or 1)
+        max_retries = int(job.get("max_retries") or 3)
+        is_exhausted = attempts >= max_retries
+        new_status = "DEAD_LETTER" if is_exhausted else "PENDING"
+        backoff_sec = min(3600, 2 ** attempts)
+        next_run = (datetime.now() + timedelta(seconds=backoff_sec)).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = database.get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE task_jobs
+            SET status = ?,
+                last_error = ?,
+                next_run_at = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                updated_at = ?
+            WHERE idempotency_key = ?
+            """,
+            (new_status, err_msg, next_run, now_str, job_id),
+        )
+        conn.commit()
+        conn.close()
+
+        r_client = self._get_redis()
+        if is_exhausted and r_client:
+            try:
+                r_client.lpush(
+                    REDIS_DLQ_KEY,
+                    json.dumps({"job_id": job_id, "task_name": task_name, "error": err_msg}),
+                )
+            except Exception:
+                self._redis = None
+
+        return new_status
+
     def recover_stale_jobs(self, stale_after_seconds: int = 300) -> int:
         """
-        Recover jobs stuck in PROCESSING state after a worker crash or timeout.
+        Recover jobs stuck in PROCESSING state after a worker crash or visibility timeout.
         Jobs with remaining attempts return to PENDING; exhausted jobs move to DEAD_LETTER.
         """
-        cutoff = (datetime.now() - timedelta(seconds=max(10, int(stale_after_seconds)))).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = (datetime.now() - timedelta(seconds=max(1, int(stale_after_seconds)))).strftime("%Y-%m-%d %H:%M:%S")
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = database.get_connection()
         conn.row_factory = sqlite3.Row
@@ -177,7 +262,7 @@ class TaskQueue:
             """
             SELECT idempotency_key, attempts, max_retries
             FROM task_jobs
-            WHERE status = 'PROCESSING' AND locked_at IS NOT NULL AND locked_at < ?
+            WHERE status = 'PROCESSING' AND locked_at IS NOT NULL AND locked_at <= ?
             """,
             (cutoff,),
         )
@@ -211,15 +296,16 @@ class TaskQueue:
         Process up to `batch_size` ready jobs.
         1. Recovers stale PROCESSING jobs.
         2. Drains ready job IDs from Redis (`RPOP`) if Redis is connected, plus any DB-ready PENDING jobs.
-        3. Claims each job atomically, enforces `timeout_seconds`, and applies exponential backoff or DLQ on failure.
+        3. Claims each job atomically, enforces `timeout_seconds`, and acknowledges or applies backoff/DLQ.
         """
         self.recover_stale_jobs()
 
         candidate_ids: List[str] = []
-        if self._redis:
+        r_client = self._get_redis()
+        if r_client:
             try:
                 for _ in range(batch_size):
-                    raw_item = self._redis.rpop(REDIS_QUEUE_KEY)
+                    raw_item = r_client.rpop(REDIS_QUEUE_KEY)
                     if not raw_item:
                         break
                     try:
@@ -230,7 +316,8 @@ class TaskQueue:
                     except Exception:
                         pass
             except Exception as e:
-                logger.warning(f"Redis rpop warning: {e}")
+                logger.warning(f"Redis rpop warning (falling back to DB poll): {e}")
+                self._redis = None
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = database.get_connection()
@@ -288,67 +375,23 @@ class TaskQueue:
             try:
                 payload = json.loads(job.get("payload_json") or "{}")
                 await asyncio.wait_for(handler(payload), timeout=float(timeout_sec))
-                conn = database.get_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE task_jobs
-                    SET status = 'COMPLETED',
-                        locked_by = NULL,
-                        locked_at = NULL,
-                        updated_at = ?
-                    WHERE idempotency_key = ?
-                    """,
-                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), job_id),
-                )
-                conn.commit()
-                conn.close()
+                self.ack_job(job_id)
                 processed += 1
             except Exception as exc:
                 err_msg = f"{type(exc).__name__}: {exc}"
                 logger.error(f"Task job {job_id} ({task_name}) failed: {err_msg}")
-                attempts = int(job.get("attempts") or 1)
-                max_retries = int(job.get("max_retries") or 3)
-                is_exhausted = attempts >= max_retries
-                new_status = "DEAD_LETTER" if is_exhausted else "PENDING"
-                backoff_sec = min(3600, 2 ** attempts)
-                next_run = (datetime.now() + timedelta(seconds=backoff_sec)).strftime("%Y-%m-%d %H:%M:%S")
-
-                conn = database.get_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE task_jobs
-                    SET status = ?,
-                        last_error = ?,
-                        next_run_at = ?,
-                        locked_by = NULL,
-                        locked_at = NULL,
-                        updated_at = ?
-                    WHERE idempotency_key = ?
-                    """,
-                    (new_status, err_msg, next_run, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), job_id),
-                )
-                conn.commit()
-                conn.close()
-
-                if is_exhausted and self._redis:
-                    try:
-                        self._redis.lpush(
-                            REDIS_DLQ_KEY,
-                            json.dumps({"job_id": job_id, "task_name": task_name, "error": err_msg}),
-                        )
-                    except Exception:
-                        pass
+                self.fail_job(job, err_msg)
 
         return processed
 
     def get_queue_stats(self) -> Dict[str, Any]:
+        r_client = self._get_redis()
         conn = database.get_connection()
         cur = conn.cursor()
         stats = {
-            "backend": "redis+db" if self._redis else "db",
-            "redis_connected": bool(self._redis),
+            "backend": "redis+db" if r_client else "db",
+            "redis_connected": bool(r_client),
+            "worker_id": self.worker_id,
             "pending": 0,
             "processing": 0,
             "completed": 0,

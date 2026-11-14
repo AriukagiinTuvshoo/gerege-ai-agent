@@ -59,13 +59,13 @@ jobs:
         run: |
           python -m py_compile main.py database.py agent.py worker.py fintech_service.py cargo_service.py appointment_service.py retention_service.py executive_bot_service.py sheets_service.py core/security.py core/db_engine.py core/models.py core/task_queue.py core/backup_service.py core/ai_router.py core/monitoring.py routers/system_router.py scripts/migrate_sqlite_to_postgres.py
 
-      - name: Initialize SQLite schema & verify SQLAlchemy models
+      - name: Initialize SQLite schema & verify zero schema drift
         run: |
-          python -c "import database; database.init_db(); from core import models, db_engine; engine = db_engine.create_sqlalchemy_engine('sqlite:///:memory:'); models.Base.metadata.create_all(bind=engine)"
+          python -c "import database; database.init_db(); from core import models, db_engine; engine = db_engine.create_sqlalchemy_engine('sqlite:///:memory:'); models.Base.metadata.create_all(bind=engine); drift = db_engine.verify_schema_drift(); assert not drift['has_drift'], drift"
 
-      - name: Run Pytest Enterprise & AI Evaluation Suites (SQLite mode)
+      - name: Run Pytest Enterprise, AI Eval & 20-Scenario Failure Suites (SQLite mode)
         run: |
-          pytest tests/test_enterprise_phases.py tests/test_ai_eval_suite.py -v
+          pytest tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py -v
 
       - name: Run SQLite-to-PostgreSQL Dry-Run Verification
         run: |
@@ -78,7 +78,7 @@ jobs:
         run: |
           alembic upgrade head
           python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
-          pytest tests/test_enterprise_phases.py tests/test_ai_eval_suite.py -v
+          pytest tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py -v
 
       - name: Build Production Docker Image
         run: |

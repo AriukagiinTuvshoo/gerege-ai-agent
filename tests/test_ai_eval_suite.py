@@ -11,6 +11,12 @@ import appointment_service
 from core import ai_router
 
 database.init_db()
+with database.get_connection() as _conn:
+    _conn.execute(
+        "UPDATE pages SET tokens_used = 0, monthly_token_limit = 1000000 WHERE page_id = ?",
+        (database.DEFAULT_PAGE_ID,),
+    )
+    _conn.commit()
 
 
 def test_eval_1_greeting_and_faq():
@@ -77,10 +83,10 @@ def test_eval_4_cargo_tracking_lookup():
 
 def test_eval_5_appointment_booking():
     """5. Appointment booking & double-booking conflict detection"""
-    tenant_salon = "eval_salon_tenant"
+    tenant_salon = f"eval_salon_{os.urandom(3).hex()}"
     database.save_page(page_id=tenant_salon, name="Эвал Салон", category="salon")
     date_str = "2027-05-20"
-    time_str = f"1{os.urandom(1)[0] % 9}:00"
+    time_str = "14:00"
     b1 = appointment_service.book_appointment_from_ai(
         page_id=tenant_salon,
         customer_name="Сараа",
@@ -113,7 +119,10 @@ def test_eval_6_qpay_payment_flow():
         channel="web",
         page_id=database.DEFAULT_PAGE_ID,
     )
-    assert "/pay/QP-" in res.get("reply", "")
+    reply = res.get("reply", "")
+    assert "/pay/QP-" in reply or "/pay/INV-" in reply
+    assert res.get("invoice_order") is not None
+    assert int(res["invoice_order"].get("amount", 0)) == 20000
 
 
 def test_eval_7_receipt_upload_never_confirms_payment_alone():
@@ -212,8 +221,39 @@ def test_eval_10_malformed_inputs_and_user_data_deletion():
     assert database.get_user_memory(database.DEFAULT_PAGE_ID, del_sender) is None
 
 
+def test_eval_11_ci_no_api_key_deterministic_pipeline():
+    """11. Deterministic CI pipeline when external LLM keys (GEMINI_API_KEY) are absent"""
+    orig_client = agent.agent.default_client
+    try:
+        agent.agent.default_client = None
+        sender = f"eval_ci_nokey_{os.urandom(3).hex()}"
+        reg_res = agent.process_message(
+            text="Намайг Тэмүүлэн гэдэг, утас 88112233, бүртгүүлье",
+            sender_id=sender,
+            channel="web",
+            page_id=database.DEFAULT_PAGE_ID,
+        )
+        assert reg_res.get("registered") is True
+        mem = database.get_user_memory(database.DEFAULT_PAGE_ID, sender)
+        assert mem is not None
+        assert "88112233" in str(mem.get("phone") or "")
+
+        pay_res = agent.process_message(
+            text="QPay төлбөр төлье 35k",
+            sender_id=sender,
+            channel="web",
+            page_id=database.DEFAULT_PAGE_ID,
+        )
+        reply = pay_res.get("reply", "")
+        assert "/pay/INV-" in reply or "/pay/QP-" in reply
+        assert pay_res.get("invoice_order") is not None
+        assert int(pay_res["invoice_order"].get("amount", 0)) == 35000
+    finally:
+        agent.agent.default_client = orig_client
+
+
 if __name__ == "__main__":
-    print("=== RUNNING PHASE 5 AI EVALUATION SUITE (10 CATEGORIES) ===")
+    print("=== RUNNING PHASE 5 & 6 AI EVALUATION SUITE (11 CATEGORIES) ===")
     test_eval_1_greeting_and_faq()
     print("[PASS] 1. Greeting and FAQ")
     test_eval_2_pricing_and_service_questions()
@@ -234,4 +274,6 @@ if __name__ == "__main__":
     print("[PASS] 9. Cross-tenant probing & secret leak guard")
     test_eval_10_malformed_inputs_and_user_data_deletion()
     print("[PASS] 10. Malformed inputs & User Data Deletion ('Бүртгэл устгах')")
-    print("=== ALL 10 AI EVALUATION CATEGORIES PASSED 100% ===")
+    test_eval_11_ci_no_api_key_deterministic_pipeline()
+    print("[PASS] 11. Deterministic CI pipeline (without external API key)")
+    print("=== ALL 11 AI EVALUATION CATEGORIES PASSED 100% ===")

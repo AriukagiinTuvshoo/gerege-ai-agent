@@ -509,7 +509,12 @@ def authenticate_admin(password: str) -> bool:
     return secrets.compare_digest(p, DEFAULT_ADMIN_PASSWORD) or secrets.compare_digest(p.lower(), DEFAULT_ADMIN_PASSWORD.lower())
 
 
-def claim_notification_lock(idempotency_key: str, channel: str = "any", ttl_seconds: Optional[int] = None) -> bool:
+def claim_notification_lock(
+    idempotency_key: str,
+    channel: str = "any",
+    ttl_seconds: Optional[int] = None,
+    page_id: Optional[str] = None,
+) -> bool:
     """
     Давхар мэдэгдэл болон хуваарьт ажил давхардахаас сэргийлэх атомик түгжээ.
     Хэрэв `ttl_seconds` өгөгдсөн бөгөөд өмнөх түгжээний хугацаа дууссан бол шинэчилж түгжинэ.
