@@ -305,9 +305,16 @@ class AIAgent:
             database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=reply, page_id=page_id)
             return {"reply": reply, "human_takeover": True, "registered": False, "model": "escalated"}
 
-        # 1.5. Prompt Injection / Jailbreak хамгаалалт (Phase 3)
+        # 1.5. Prompt Injection / Jailbreak хамгаалалт (Phase 3 & Phase 5)
         is_injected, inj_reason = ai_router.detect_prompt_injection(text)
         if is_injected:
+            database.record_audit_log(
+                action="ai.prompt_injection.blocked",
+                page_id=page_id,
+                actor_role="user",
+                actor_id=sender_id,
+                details={"pattern": inj_reason, "text_preview": (text or "")[:120]},
+            )
             safe_reply = f"Сайн байна уу? Би зөвхөн {page_name}-ийн бүтээгдэхүүн, үйлчилгээний талаар мэдээлэл өгөх зориулалттай туслах байна. Танд ямар үйлчилгээ сонирхолтой байна вэ?"
             database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=safe_reply, page_id=page_id)
             return {
@@ -315,6 +322,29 @@ class AIAgent:
                 "registered": False,
                 "prompt_injection_blocked": True,
                 "model": "security_guard",
+            }
+
+        # 1.6. Хэрэглэгчийн өгөгдөл устгах хүсэлт ("Бүртгэл устгах" — Privacy & Memory Compliance Phase 5.2)
+        if ai_router.detect_data_deletion_request(text):
+            deleted_summary = database.delete_customer_data(page_id=page_id, sender_id=sender_id)
+            self.chat_sessions.pop(f"{page_id}_{sender_id}", None)
+            database.record_audit_log(
+                action="user.data.deleted",
+                page_id=page_id,
+                actor_role="user",
+                actor_id=sender_id,
+                details=deleted_summary,
+            )
+            del_reply = (
+                f"Таны {page_name} дахь бүртгэл болон харилцан ярианы санах ойн мэдээллийг "
+                "нууцлалын бодлогын дагуу системээс амжилттай устгалаа. 🔒"
+            )
+            return {
+                "reply": del_reply,
+                "registered": False,
+                "data_deleted": True,
+                "deleted_summary": deleted_summary,
+                "model": "privacy_guard",
             }
 
         # 2. Тухайн хуудасны Gemini Client болон Лимит шалгах
@@ -440,7 +470,10 @@ class AIAgent:
 
                 def register_customer(name: str, phone: str, service: str = "", notes: str = "") -> str:
                     nonlocal registered, reg_info
-                    allowed, reason = tool_guard.check_and_record("register_customer")
+                    allowed, reason = tool_guard.check_and_record(
+                        "register_customer",
+                        args={"name": name, "phone": phone, "service": service},
+                    )
                     if not allowed:
                         return reason
                     r_id = database.save_registration(
@@ -466,7 +499,10 @@ class AIAgent:
 
                 def check_sheet_cargo_status(tracking_or_phone: str) -> str:
                     """Бүх холбогдсон Карго агуулахын бааз, Google Sheets болон Excel хүснэгтүүдээс бараа, карго код, үнэ, захиалга эсвэл утасны дугаараар шүүж хайх"""
-                    allowed, reason = tool_guard.check_and_record("check_sheet_cargo_status")
+                    allowed, reason = tool_guard.check_and_record(
+                        "check_sheet_cargo_status",
+                        args={"tracking_or_phone": tracking_or_phone},
+                    )
                     if not allowed:
                         return reason
                     # 1. Албан ёсны карго агуулахын бодит цагийн сангаас хайх
@@ -490,7 +526,10 @@ class AIAgent:
                 def create_payment_invoice(amount: int = 15000, description: str = "") -> str:
                     """Хэрэглэгч төлбөр төлөх, үйлчилгээ худалдан авах, данс нэхэмжлэх үед QPay QR код болон банкны апп холбоос үүсгэх"""
                     nonlocal invoice_order
-                    allowed, reason = tool_guard.check_and_record("create_payment_invoice")
+                    allowed, reason = tool_guard.check_and_record(
+                        "create_payment_invoice",
+                        args={"amount": amount, "description": description},
+                    )
                     if not allowed:
                         return reason
                     safe_amount = tool_guard.validate_invoice_amount(amount, default_amount=15000)
@@ -514,7 +553,10 @@ class AIAgent:
                 ) -> str:
                     """Салон, эмнэлэг, үйлчилгээний цаг товлох, цагийн хуваарийн давхцал шалгаж захиалга баталгаажуулах хэрэгсэл."""
                     nonlocal registered, reg_info
-                    allowed, reason = tool_guard.check_and_record("book_service_appointment")
+                    allowed, reason = tool_guard.check_and_record(
+                        "book_service_appointment",
+                        args={"name": name, "phone": phone, "service": service, "date": date, "time": time},
+                    )
                     if not allowed:
                         return reason
                     import appointment_service

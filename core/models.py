@@ -1,5 +1,6 @@
 """
 SQLAlchemy Declarative Models for PostgreSQL & SQLite (Alembic Migration Target Metadata).
+Unified 100% with the authoritative runtime schema in `database.py`.
 """
 from datetime import datetime
 from sqlalchemy import (
@@ -54,7 +55,7 @@ class RegistrationModel(Base):
     page_id = Column(String(128), default="100799479495809", index=True)
     name = Column(String(255), nullable=False)
     phone = Column(String(64), nullable=False)
-    service = Column(String(255), nullable=False)
+    service = Column(String(255), nullable=True)
     channel = Column(String(64), default="web")
     sender_id = Column(String(255), nullable=True)
     notes = Column(Text, nullable=True)
@@ -89,7 +90,10 @@ class SessionStateModel(Base):
 
     sender_id = Column(String(255), primary_key=True)
     page_id = Column(String(128), default="100799479495809")
+    channel = Column(String(64), default="web")
     is_human_takeover = Column(Integer, default=0)
+    customer_name = Column(String(255), nullable=True)
+    customer_phone = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -99,50 +103,58 @@ class AuthSessionModel(Base):
     session_token = Column(String(255), primary_key=True)
     role = Column(String(32), nullable=False)
     page_id = Column(String(128), nullable=True)
+    revoked = Column(Integer, default=0)
+    revoked_at = Column(DateTime, nullable=True)
+    ip_address = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)
 
 
 class UserMemoryModel(Base):
-    __tablename__ = "user_memory"
+    __tablename__ = "user_memories"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     page_id = Column(String(128), nullable=False)
     user_id = Column(String(255), nullable=False)
     customer_name = Column(String(255), nullable=True)
     phone = Column(String(64), nullable=True)
-    preferences = Column(Text, nullable=True)
     interests = Column(Text, nullable=True)
     notes = Column(Text, nullable=True)
-    interaction_count = Column(Integer, default=1)
-    last_seen = Column(DateTime, default=datetime.utcnow)
+    last_topic = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
-        UniqueConstraint("page_id", "user_id", name="uq_user_memory_page_user"),
-        Index("idx_user_memory_lookup", "page_id", "user_id"),
+        UniqueConstraint("page_id", "user_id", name="uq_user_memories_page_user"),
+        Index("idx_user_memories_page_user", "page_id", "user_id"),
     )
 
 
 class PaymentInvoiceModel(Base):
-    __tablename__ = "payment_invoices"
+    __tablename__ = "invoices"
 
-    invoice_id = Column(String(128), primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    invoice_id = Column(String(128), unique=True, nullable=False)
     page_id = Column(String(128), nullable=False)
     sender_id = Column(String(255), nullable=True)
     channel = Column(String(64), default="web")
     amount = Column(Integer, nullable=False)
+    currency = Column(String(16), default="MNT")
     description = Column(Text, nullable=True)
     status = Column(String(32), default="PENDING")
     qr_text = Column(Text, nullable=True)
     qr_image_url = Column(Text, nullable=True)
     deep_links_json = Column(Text, default="[]")
+    qpay_invoice_id = Column(String(255), nullable=True)
+    provider_payment_id = Column(String(255), nullable=True)
+    callback_verified = Column(Integer, default=0)
     ebarimt_lottery = Column(String(64), nullable=True)
     ebarimt_qr = Column(Text, nullable=True)
     paid_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
-        Index("idx_invoices_page_status", "page_id", "status"),
+        Index("idx_invoices_page_id", "page_id"),
+        Index("idx_invoices_invoice_id", "invoice_id"),
     )
 
 
@@ -161,9 +173,10 @@ class CargoPackageModel(Base):
     status = Column(String(64), default="REGISTERED")
     warehouse_location = Column(String(255), default="УБ Агуулах")
     invoice_id = Column(String(128), nullable=True)
-    notes = Column(Text, nullable=True)
+    notified_at = Column(DateTime, nullable=True)
     arrived_at = Column(DateTime, nullable=True)
     delivered_at = Column(DateTime, nullable=True)
+    notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -260,6 +273,7 @@ class NotificationLockModel(Base):
 
     idempotency_key = Column(String(255), primary_key=True)
     channel = Column(String(64), default="any")
+    expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -273,10 +287,33 @@ class TaskJobModel(Base):
     status = Column(String(32), default="PENDING")
     attempts = Column(Integer, default=0)
     max_retries = Column(Integer, default=3)
+    timeout_seconds = Column(Integer, default=60)
+    next_run_at = Column(DateTime, nullable=True)
+    locked_by = Column(String(128), nullable=True)
+    locked_at = Column(DateTime, nullable=True)
     last_error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
         Index("idx_task_jobs_status", "status", "created_at"),
+    )
+
+
+class AuditLogModel(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    page_id = Column(String(128), nullable=True, index=True)
+    actor_role = Column(String(64), nullable=True)
+    actor_id = Column(String(255), nullable=True)
+    action = Column(String(128), nullable=False)
+    resource_type = Column(String(64), nullable=True)
+    resource_id = Column(String(255), nullable=True)
+    details_json = Column(Text, default="{}")
+    ip_address = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_audit_logs_page_created", "page_id", "created_at"),
     )

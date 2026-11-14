@@ -248,16 +248,24 @@ async def create_qpay_invoice_live(
     return None
 
 
-async def check_qpay_payment_live(
+async def check_qpay_payment_live_detailed(
     token: str,
     object_id: str,
     expected_amount: int = 0,
-) -> bool:
+    expected_currency: str = "MNT",
+) -> Dict[str, Any]:
     """
-    QPay v2 API (/v2/payment/check) дуудаж тухайн нэхэмжлэх бодитоор төлөгдсөн эсэхийг баталгаажуулах (Phase 1 P0).
+    QPay v2 API (/v2/payment/check) дуудаж тухайн нэхэмжлэх бодитоор төлөгдсөн эсэх,
+    мөнгөн дүн, валют болон provider_payment_id-г нарийвчлан шалгах (Phase 1.4 P0).
     """
+    result = {
+        "verified": False,
+        "provider_payment_id": None,
+        "paid_amount": 0,
+        "currency": expected_currency,
+    }
     if not token or not object_id:
-        return False
+        return result
     url = f"{QPAY_BASE_URL}/payment/check"
     headers = {"Authorization": f"Bearer {token}"}
     payload = {
@@ -271,16 +279,45 @@ async def check_qpay_payment_live(
             if res.status_code == 200:
                 data = res.json()
                 rows = data.get("rows") or []
-                paid_amt = int(data.get("paid_amount") or 0)
+                paid_amt = int(float(data.get("paid_amount") or 0))
+                result["paid_amount"] = paid_amt
                 for r in rows:
-                    if str(r.get("payment_status", "")).upper() == "PAID":
-                        if expected_amount <= 0 or paid_amt >= expected_amount or int(r.get("payment_amount") or 0) >= expected_amount:
-                            return True
+                    status_str = str(r.get("payment_status", "")).upper()
+                    row_currency = str(r.get("payment_currency") or expected_currency).upper()
+                    row_amt = int(float(r.get("payment_amount") or 0))
+                    if status_str == "PAID":
+                        if expected_currency and row_currency != expected_currency.upper():
+                            continue
+                        if expected_amount <= 0 or paid_amt >= expected_amount or row_amt >= expected_amount:
+                            result["verified"] = True
+                            result["provider_payment_id"] = str(r.get("payment_id") or r.get("id") or "")
+                            result["paid_amount"] = max(paid_amt, row_amt)
+                            result["currency"] = row_currency
+                            return result
                 if paid_amt > 0 and (expected_amount <= 0 or paid_amt >= expected_amount):
-                    return True
+                    result["verified"] = True
+                    return result
     except Exception as e:
         logger.error(f"QPay Payment Check Exception: {e}")
-    return False
+    return result
+
+
+async def check_qpay_payment_live(
+    token: str,
+    object_id: str,
+    expected_amount: int = 0,
+    expected_currency: str = "MNT",
+) -> bool:
+    """
+    QPay v2 API (/v2/payment/check) дуудаж тухайн нэхэмжлэх бодитоор төлөгдсөн эсэхийг баталгаажуулах (Phase 1 P0).
+    """
+    detail = await check_qpay_payment_live_detailed(
+        token=token,
+        object_id=object_id,
+        expected_amount=expected_amount,
+        expected_currency=expected_currency,
+    )
+    return bool(detail.get("verified"))
 
 # -------------------------------------------------------------
 # 4. НЭГДСЭН ТӨЛБӨРИЙН НЭХЭМЖЛЭХ ҮҮСГЭХ (UNIFIED FACTORY)
@@ -308,6 +345,7 @@ async def create_payment_order(
     qr_text = ""
     deep_links = []
     is_live = False
+    qpay_invoice_id = None
 
     # 1. Албан ёсны QPay эрх тохируулагдсан бол бодит API дуудах
     if qpay_user and qpay_pass and qpay_code:
@@ -324,6 +362,7 @@ async def create_payment_order(
             )
             if live_res and "qr_text" in live_res:
                 qr_text = live_res["qr_text"]
+                qpay_invoice_id = live_res.get("invoice_id")
                 is_live = True
                 # QPay-аас ирсэн банкуудын холбоос байгаа эсэх
                 qpay_urls = live_res.get("urls", [])
@@ -355,14 +394,18 @@ async def create_payment_order(
         qr_text=qr_text,
         qr_image_url=file_url or data_uri,
         deep_links=deep_links,
-        invoice_id=invoice_id
+        invoice_id=invoice_id,
+        currency="MNT",
+        qpay_invoice_id=qpay_invoice_id,
     )
 
     pay_page_url = f"{base_url.rstrip('/')}/pay/{invoice_id}" if base_url else f"/pay/{invoice_id}"
 
     return {
         "invoice_id": invoice_id,
+        "qpay_invoice_id": qpay_invoice_id,
         "amount": amount,
+        "currency": "MNT",
         "description": description,
         "status": "PENDING",
         "qr_text": qr_text,
@@ -388,9 +431,55 @@ def create_payment_order_sync(
     import uuid
     invoice_id = f"QP-{datetime.now().strftime('%Y%m%d%H%M')}-{uuid.uuid4().hex[:6].upper()}"
 
-    # Стандарт Монгол QPay payload формат
-    qr_text = f"qpay://payment?invoice_id={invoice_id}&amount={amount}&merchant={page_id}&desc={description}"
-    deep_links = build_bank_deep_links(qr_text)
+    page = database.get_page(page_id) or {}
+    qpay_user = page.get("qpay_username") or os.getenv("QPAY_USERNAME", "").strip()
+    qpay_pass = page.get("qpay_password") or os.getenv("QPAY_PASSWORD", "").strip()
+    qpay_code = page.get("qpay_invoice_code") or os.getenv("QPAY_INVOICE_CODE", "").strip()
+
+    qr_text = ""
+    deep_links = []
+    is_live = False
+    qpay_invoice_id = None
+
+    if qpay_user and qpay_pass and qpay_code:
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                tok_res = client.post(f"{QPAY_BASE_URL}/auth/token", auth=(qpay_user, qpay_pass))
+                if tok_res.status_code == 200:
+                    token = tok_res.json().get("access_token")
+                    if token:
+                        callback = f"{base_url.rstrip('/')}/api/fintech/qpay/callback?invoice_id={invoice_id}"
+                        inv_res = client.post(
+                            f"{QPAY_BASE_URL}/invoice",
+                            headers={"Authorization": f"Bearer {token}"},
+                            json={
+                                "invoice_code": qpay_code,
+                                "sender_invoice_no": invoice_id,
+                                "invoice_receiver_code": "terminal",
+                                "invoice_description": description,
+                                "amount": amount,
+                                "callback_url": callback,
+                            },
+                        )
+                        if inv_res.status_code == 200:
+                            live_res = inv_res.json()
+                            if live_res and "qr_text" in live_res:
+                                qr_text = live_res["qr_text"]
+                                qpay_invoice_id = live_res.get("invoice_id")
+                                is_live = True
+                                for u in live_res.get("urls", []):
+                                    deep_links.append({
+                                        "id": u.get("name", "").lower().replace(" ", ""),
+                                        "name": u.get("description") or u.get("name"),
+                                        "link": u.get("link"),
+                                        "logo_svg": "",
+                                    })
+        except Exception as e:
+            logger.error(f"QPay Sync Invoice Exception: {e}")
+
+    if not qr_text:
+        qr_text = f"qpay://payment?invoice_id={invoice_id}&amount={amount}&merchant={page_id}&desc={description}"
+        deep_links = build_bank_deep_links(qr_text)
 
     # QR зураг үүсгэж хадгалах
     data_uri, file_url = generate_qr_image(qr_text, filename=invoice_id)
@@ -405,14 +494,18 @@ def create_payment_order_sync(
         qr_text=qr_text,
         qr_image_url=file_url or data_uri,
         deep_links=deep_links,
-        invoice_id=invoice_id
+        invoice_id=invoice_id,
+        currency="MNT",
+        qpay_invoice_id=qpay_invoice_id,
     )
 
     pay_page_url = f"{base_url.rstrip('/')}/pay/{invoice_id}" if base_url else f"/pay/{invoice_id}"
 
     return {
         "invoice_id": invoice_id,
+        "qpay_invoice_id": qpay_invoice_id,
         "amount": amount,
+        "currency": "MNT",
         "description": description,
         "status": "PENDING",
         "qr_text": qr_text,
@@ -420,7 +513,7 @@ def create_payment_order_sync(
         "qr_image_url": file_url or data_uri,
         "deep_links": deep_links,
         "pay_url": pay_page_url,
-        "is_live_qpay": False,
+        "is_live_qpay": is_live,
         "created_at": inv.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -428,9 +521,14 @@ def create_payment_order_sync(
 # -------------------------------------------------------------
 # 5. ТӨЛБӨРИЙГ 1 СЕКУНДЭД АВТОМАТААР БАТАЛГААЖУУЛАХ (WEBHOOK / CALLBACK)
 # -------------------------------------------------------------
-async def process_successful_payment(invoice_id: str, callback_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def process_successful_payment(
+    invoice_id: str,
+    callback_data: Optional[Dict[str, Any]] = None,
+    provider_payment_id: Optional[str] = None,
+    callback_verified: int = 0,
+) -> Dict[str, Any]:
     """
-    Төлбөр төлөгдсөн үед:
+    Төлбөр төлөгдсөн үед (Idempotent & Replay-Protected):
     1. Нэхэмжлэхийг 'PAID' болгож тэмдэглэх
     2. И-Баримт (33 оронтой код + сугалаа) автоматаар үүсгэх
     3. CRM бүртгэлд (registrations) автоматаар оруулж баталгаажуулах
@@ -453,10 +551,36 @@ async def process_successful_payment(invoice_id: str, callback_data: Optional[Di
         }
 
     page_id = inv.get("page_id", database.DEFAULT_PAGE_ID)
+
+    # Idempotency & Replay Lock: concurrent callback-ууд давхар баримт олгохоос хамгаална
+    if not database.claim_notification_lock(
+        f"qpay_paid:{invoice_id}",
+        page_id=page_id,
+        channel="qpay",
+    ):
+        fresh_inv = database.get_invoice(invoice_id) or inv
+        return {
+            "success": True,
+            "message": "Аль хэдийн боловсруулагдсан байна (Idempotent Replay Guard)",
+            "invoice": fresh_inv,
+            "ebarimt": {
+                "lottery": fresh_inv.get("ebarimt_lottery"),
+                "qr_data": fresh_inv.get("ebarimt_qr"),
+            },
+        }
+
     amount = inv.get("amount", 0)
     sender_id = inv.get("sender_id", "")
     channel = inv.get("channel", "web")
     description = inv.get("description", "Үйлчилгээний төлбөр")
+
+    if not provider_payment_id and isinstance(callback_data, dict):
+        provider_payment_id = str(
+            callback_data.get("provider_payment_id")
+            or callback_data.get("payment_id")
+            or callback_data.get("qpay_payment_id")
+            or ""
+        ).strip() or None
 
     # 1. И-Баримт үүсгэх
     page = database.get_page(page_id) or {}
@@ -467,8 +591,28 @@ async def process_successful_payment(invoice_id: str, callback_data: Optional[Di
     updated_inv = database.mark_invoice_paid(
         invoice_id=invoice_id,
         ebarimt_lottery=ebarimt["lottery"],
-        ebarimt_qr=ebarimt["qr_data"]
+        ebarimt_qr=ebarimt["qr_data"],
+        provider_payment_id=provider_payment_id,
+        callback_verified=callback_verified,
     )
+
+    try:
+        database.record_audit_log(
+            action="payment.confirmed",
+            page_id=page_id,
+            actor_role="system",
+            actor_id=sender_id or "qpay_callback",
+            target_type="invoice",
+            target_id=invoice_id,
+            details={
+                "amount": amount,
+                "provider_payment_id": provider_payment_id,
+                "callback_verified": callback_verified,
+                "ebarimt_lottery": ebarimt["lottery"],
+            },
+        )
+    except Exception:
+        pass
 
     # 3. CRM бүртгэлд бүртгэх / төлөв шинэчлэх
     phone_clean = (sender_id or "").replace("meta_", "").replace("tg_", "") or "Утас бүртгэлгүй"

@@ -269,8 +269,16 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
         password = str(payload.get("password", "")).strip()
         if database.authenticate_admin(password):
             _LOGIN_ATTEMPTS.pop(client_ip, None)
-            token = database.create_session(role="admin", page_id=None)
-            response.set_cookie(key="session_token", value=token, max_age=86400*3, httponly=True, samesite="lax")
+            token = database.create_session(role="admin", page_id=None, ip_address=client_ip)
+            response.set_cookie(
+                key="session_token",
+                value=token,
+                max_age=86400 * 3,
+                httponly=True,
+                secure=core_security.is_production_mode(),
+                samesite="lax",
+            )
+            database.record_audit_log("auth.login.success", actor_role="admin", ip_address=client_ip)
             return {
                 "success": True,
                 "token": token,
@@ -280,21 +288,33 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
             }
         attempts.append(now_ts)
         _LOGIN_ATTEMPTS[client_ip] = attempts
+        database.record_audit_log("auth.login.failed", actor_role="admin", ip_address=client_ip)
         return JSONResponse({"success": False, "error": "Админы нууц үг буруу байна!"}, status_code=401)
 
     elif login_type in ["client", "magic"]:
         identifier = str(payload.get("identifier") or payload.get("username") or payload.get("token") or "").strip()
         password = payload.get("password")
+        requested_role = str(payload.get("role") or "client").strip().lower()
+        if requested_role not in core_security.TENANT_SCOPED_ROLES:
+            requested_role = "client"
         client_page, err_msg = database.authenticate_client_detailed(identifier, password)
         if client_page:
             _LOGIN_ATTEMPTS.pop(client_ip, None)
             page_id = client_page["page_id"]
-            token = database.create_session(role="client", page_id=page_id)
-            response.set_cookie(key="session_token", value=token, max_age=86400*3, httponly=True, samesite="lax")
+            token = database.create_session(role=requested_role, page_id=page_id, ip_address=client_ip)
+            response.set_cookie(
+                key="session_token",
+                value=token,
+                max_age=86400 * 3,
+                httponly=True,
+                secure=core_security.is_production_mode(),
+                samesite="lax",
+            )
+            database.record_audit_log("auth.login.success", page_id=page_id, actor_role=requested_role, actor_id=identifier, ip_address=client_ip)
             return {
                 "success": True,
                 "token": token,
-                "role": "client",
+                "role": requested_role,
                 "page_id": page_id,
                 "page_name": client_page.get("name", "Харилцагчийн Хуудас"),
                 "has_custom_key": bool(client_page.get("gemini_api_key")),
@@ -303,6 +323,7 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
             }
         attempts.append(now_ts)
         _LOGIN_ATTEMPTS[client_ip] = attempts
+        database.record_audit_log("auth.login.failed", actor_role="client", actor_id=identifier, ip_address=client_ip)
         return JSONResponse({"success": False, "error": err_msg or "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"}, status_code=401)
 
     return JSONResponse({"success": False, "error": "Үл мэдэгдэх төрөл"}, status_code=400)
@@ -338,6 +359,7 @@ async def auth_me(request: Request):
 async def auth_logout(request: Request, response: Response):
     token = request.cookies.get("session_token") or request.headers.get("Authorization", "").replace("Bearer ", "")
     if token:
+        database.revoke_session(token)
         database.delete_session(token)
     response.delete_cookie("session_token")
     return {"success": True, "message": "Амжилттай гарлаа"}
@@ -352,7 +374,7 @@ async def verify_meta_webhook(
     hub_challenge: Optional[str] = Query(None, alias="hub.challenge")
 ):
     expected_token = os.getenv("META_VERIFY_TOKEN", META_VERIFY_TOKEN).strip()
-    if hub_mode == "subscribe" and hub_verify_token == expected_token:
+    if hub_mode == "subscribe" and core_security.constant_time_equal(hub_verify_token, expected_token):
         logger.info("Meta Webhook баталгаажлаа!")
         return Response(content=hub_challenge, media_type="text/plain")
     return Response(content="Verification failed", status_code=403)
@@ -546,6 +568,10 @@ async def manychat_webhook_endpoint(request: Request, background_tasks: Backgrou
         payload = {}
 
     target_page_id = str(payload.get("page_id") or request.query_params.get("page_id") or database.DEFAULT_PAGE_ID)
+    if not core_security.verify_manychat_webhook_secret(request, page_id=target_page_id):
+        logger.warning("ManyChat webhook rejected by fail-closed secret check")
+        return Response(content="Forbidden", status_code=403)
+
     user_id = str(payload.get("user_id") or payload.get("id") or "manychat_user")
     message = str(payload.get("message") or payload.get("last_input_text") or payload.get("text") or "").strip()
 
@@ -585,6 +611,8 @@ async def manychat_webhook_endpoint(request: Request, background_tasks: Backgrou
         "registered": result.get("registered", False)
     })
 
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB max upload size
+
 @app.post("/api/upload-receipt")
 async def upload_receipt_endpoint(
     request: Request,
@@ -595,16 +623,15 @@ async def upload_receipt_endpoint(
     page_id: Optional[str] = Form(database.DEFAULT_PAGE_ID)
 ):
     """Дашбоардын Чат Симулятораас гүйлгээний баримт (Screenshot) шалгах"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
-    if user and user.get("role") == "client":
+    user = await core_security.resolve_current_user(request)
+    if user and not core_security.is_admin_role(user.get("role")):
         target_page_id = user["page_id"]
     else:
         target_page_id = page_id or database.DEFAULT_PAGE_ID
 
     image_bytes = await file.read()
+    if len(image_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Файлын хэмжээ 10MB-аас хэтэрсэн байна!")
     result = await asyncio.to_thread(
         agent.process_message,
         text=text or "",
@@ -623,39 +650,33 @@ async def upload_receipt_endpoint(
 @app.get("/api/pages")
 async def get_pages(request: Request):
     """
-    Хуудсуудын жагсаалт:
+    Хуудсуудын жагсаалт (Protected):
     - Админ: Бүх хуудсыг харна (бүх нууц токенууд устгагдаж зөвхөн _masked үлдэнэ)
-    - Client: Зөвхөн өөрийнхөө хуудсыг ганцаарчилж харна
-    - Guest: Нууц токен болон magic_token огт буцаахгүй
+    - Client / Tenant Role: Зөвхөн өөрийнхөө хуудсыг ганцаарчилж харна
+    - Unauthenticated: 401 Unauthorized
     """
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
-    if user and user.get("role") == "client":
+    user = await core_security.require_permission(request, "pages:read")
+    if not core_security.is_admin_role(user.get("role")):
         p = database.get_page(user["page_id"], mask_secrets=True, include_magic_token=True)
-        return JSONResponse({"total": 1, "data": [p] if p else []})
+        return JSONResponse({"total": 1 if p else 0, "data": [p] if p else []})
 
-    is_admin = bool(user and user.get("role") == "admin")
-    pages = database.get_all_pages(mask_secrets=True, include_magic_token=is_admin)
+    pages = database.get_all_pages(mask_secrets=True, include_magic_token=True)
     return JSONResponse({"total": len(pages), "data": pages})
 
 @app.get("/api/pages/detail")
 @app.get("/api/pages/{page_id}")
 async def get_page_detail(request: Request, page_id: Optional[str] = None):
-    target_id = request.query_params.get("page_id") or page_id
-    if not target_id:
+    raw_target = request.query_params.get("page_id") or page_id
+    if not raw_target:
         return JSONResponse({"error": "page_id missing"}, status_code=400)
 
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    target_id = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=raw_target,
+        require_auth=True,
+        permission="pages:read",
     )
-    if user and user.get("role") == "client" and user.get("page_id") != target_id:
-        return JSONResponse({"error": "Хандах эрхгүй хуудас байна!"}, status_code=403)
-
-    can_see_magic = bool(user and (user.get("role") == "admin" or user.get("page_id") == target_id))
-    p = database.get_page(target_id, mask_secrets=True, include_magic_token=can_see_magic)
+    p = database.get_page(target_id, mask_secrets=True, include_magic_token=True)
     if not p:
         return JSONResponse({"error": "Page not found"}, status_code=404)
     return JSONResponse(p)
@@ -663,14 +684,7 @@ async def get_page_detail(request: Request, page_id: Optional[str] = None):
 @app.post("/api/pages")
 async def create_or_update_page(payload: Dict[str, Any], request: Request):
     """Шинэ хуудас нэмэх (Зөвхөн Админ эрхтэй — P0-2)"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
-    if not user:
-        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
-    if user.get("role") != "admin":
-        return JSONResponse({"error": "Зөвхөн Супер Админ шинэ харилцагчийн хуудас нэмэх эрхтэй!"}, status_code=403)
+    await core_security.require_admin(request)
 
     raw_page_id = str(payload.get("page_id", "")).strip()
     page_id = database.sanitize_page_id(raw_page_id)
@@ -697,6 +711,7 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
         gemini_api_key=gemini_key,
         monthly_token_limit=monthly_limit
     )
+    database.record_audit_log("page.upsert", page_id=page_id, actor_role="admin", target_type="page", target_id=page_id)
     agent.reset_sessions(page_id)
     return {"status": "success", "message": f"{name} хуудас амжилттай хадгалагдлаа!", "page_id": page_id}
 
@@ -708,18 +723,12 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
     if not target_id:
         return JSONResponse({"error": "page_id missing"}, status_code=400)
 
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
-    if not user:
-        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
-    if user.get("role") != "admin":
-        return JSONResponse({"error": "Устгах эрхгүй!"}, status_code=403)
+    await core_security.require_admin(request)
 
     success = database.delete_page(str(target_id))
     if not success:
         return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
+    database.record_audit_log("page.delete", page_id=str(target_id), actor_role="admin", target_type="page", target_id=str(target_id))
     agent.reset_sessions(str(target_id))
     return {"status": "deleted", "page_id": target_id}
 
@@ -727,18 +736,16 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
 @app.post("/api/pages/{page_id}/gemini_key")
 async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Request, page_id: Optional[str] = None):
     """Харилцагчийн хувийн Gemini API түлхүүр шинэчлэх (Админ болон тухайн Client өөрөө засаж болно)"""
-    target_id = payload.get("page_id") or page_id
-    if not target_id:
+    raw_target = payload.get("page_id") or page_id
+    if not raw_target:
         return JSONResponse({"error": "page_id missing"}, status_code=400)
 
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    target_id = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=raw_target,
+        require_auth=True,
+        permission="knowledge:write",
     )
-    if not user:
-        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
-    if user.get("role") == "client" and user.get("page_id") != target_id:
-        return JSONResponse({"error": "Та зөвхөн өөрийнхөө хуудасны түлхүүрийг засах эрхтэй!"}, status_code=403)
 
     gemini_key = str(payload.get("gemini_api_key", "")).strip()
     monthly_limit = payload.get("monthly_token_limit")
@@ -754,14 +761,7 @@ async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Requ
 @app.post("/api/pages/{page_id}/credentials")
 async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Request, page_id: Optional[str] = None):
     """Харилцагчид зориулсан нэвтрэх эрх & Magic Link үүсгэх (Зөвхөн Админ — P0-2)"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
-    if not user:
-        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
-    if user.get("role") != "admin":
-        return JSONResponse({"error": "Эрх хүрэхгүй!"}, status_code=403)
+    await core_security.require_admin(request)
 
     target_page_id = payload.get("page_id") or page_id
     if not target_page_id:
@@ -773,49 +773,46 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
         return JSONResponse({"error": "Хэрэглэгчийн нэр оруулна уу"}, status_code=400)
 
     res = database.set_client_credentials(str(target_page_id), username, password)
+    database.record_audit_log("page.credentials.updated", page_id=str(target_page_id), actor_role="admin", target_type="page", target_id=str(target_page_id))
     return {"status": "success", "data": res}
 
 # -------------------------------------------------------------
 # 8. UNIFIED INBOX & HUMAN TAKEOVER (Client Isolation — P0-3)
 # -------------------------------------------------------------
 @app.get("/api/sessions")
-async def get_active_sessions(request: Request, page_id: Optional[str] = Query(None)):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+async def get_active_sessions(
+    request: Request,
+    page_id: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=True,
+        permission="sessions:read",
     )
-    if user and user.get("role") == "client":
-        target_page = user["page_id"]
-    elif user and user.get("role") == "admin":
-        target_page = page_id
-    else:
-        target_page = page_id or database.DEFAULT_PAGE_ID
     sessions = database.get_active_sessions(page_id=target_page)
-    return JSONResponse({"total": len(sessions), "data": sessions})
+    sliced = sessions[offset : offset + limit]
+    return JSONResponse({"total": len(sessions), "limit": limit, "offset": offset, "data": sliced})
 
 @app.get("/api/sessions/{sender_id}/messages")
 async def get_session_messages(sender_id: str, request: Request):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
+    user = await core_security.require_permission(request, "sessions:read")
     msgs = database.get_conversation_history(sender_id)
-    if user and user.get("role") == "client" and msgs:
-        # Client зөвхөн өөрийн хуудсанд хамаарах чатыг үзэх ёстой
-        if any(m.get("page_id") and m.get("page_id") != user["page_id"] for m in msgs):
-            return JSONResponse({"error": "Хандах эрхгүй чат!"}, status_code=403)
+    if msgs:
+        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
 
     is_takeover = database.is_session_human_takeover(sender_id)
     return JSONResponse({"sender_id": sender_id, "is_human_takeover": is_takeover, "messages": msgs})
 
 @app.post("/api/sessions/{sender_id}/takeover")
 async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool], request: Request):
-    user = await core_security.resolve_current_user(request)
+    user = await core_security.require_permission(request, "sessions:write")
     msgs = database.get_conversation_history(sender_id, limit=5)
     if msgs:
-        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"))
-    elif core_security.is_production_mode() and not user:
-        raise HTTPException(status_code=401, detail="Нэвтрэх шаардлагатай!")
+        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
     takeover = payload.get("takeover", False)
     database.set_human_takeover(sender_id, takeover)
     return {"status": "success", "is_human_takeover": takeover}
@@ -823,13 +820,11 @@ async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool], reques
 @app.post("/api/sessions/{sender_id}/send")
 async def manager_send_message(sender_id: str, payload: Dict[str, str], request: Request, background_tasks: BackgroundTasks):
     text = payload.get("message", "").strip()
-    user = await core_security.resolve_current_user(request)
+    user = await core_security.require_permission(request, "sessions:write")
     msgs = database.get_conversation_history(sender_id, limit=5)
     if msgs:
-        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"))
-    elif core_security.is_production_mode() and not user:
-        raise HTTPException(status_code=401, detail="Нэвтрэх шаардлагатай!")
-    target_page_id = user["page_id"] if (user and user.get("role") == "client") else payload.get("page_id", database.DEFAULT_PAGE_ID)
+        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
+    target_page_id = user["page_id"] if not core_security.is_admin_role(user.get("role")) else payload.get("page_id", database.DEFAULT_PAGE_ID)
 
     if not text:
         return JSONResponse({"error": "Empty message"}, status_code=400)
@@ -852,28 +847,43 @@ async def manager_send_message(sender_id: str, payload: Dict[str, str], request:
 # -------------------------------------------------------------
 @app.get("/api/registrations")
 @app.get("/api/leads")
-async def get_registrations(request: Request, page_id: Optional[str] = Query(None)):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+async def get_registrations(
+    request: Request,
+    page_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+):
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=True,
+        permission="leads:read",
     )
-    if user and user.get("role") == "client":
-        target_page = user["page_id"]
-    elif user and user.get("role") == "admin":
-        target_page = page_id
-    else:
-        target_page = page_id or database.DEFAULT_PAGE_ID
     rows = database.get_all_registrations(page_id=target_page)
-    return JSONResponse({"total": len(rows), "data": rows})
+    if status:
+        rows = [r for r in rows if str(r.get("status", "")).lower() == status.lower()]
+    if search:
+        q = search.lower()
+        rows = [
+            r for r in rows
+            if q in str(r.get("name", "")).lower()
+            or q in str(r.get("phone", "")).lower()
+            or q in str(r.get("service", "")).lower()
+            or q in str(r.get("notes", "")).lower()
+        ]
+    sliced = rows[offset : offset + limit]
+    return JSONResponse({"total": len(rows), "limit": limit, "offset": offset, "data": sliced})
 
 @app.post("/api/leads/{lead_id}/status")
 async def update_lead(lead_id: int, payload: Dict[str, Any], request: Request):
-    user = await core_security.resolve_current_user(request)
+    user = await core_security.require_permission(request, "leads:write")
     lead = database.get_lead_by_id(lead_id)
-    if lead:
-        core_security.verify_resource_tenant_ownership(user, lead.get("page_id"))
-    elif core_security.is_production_mode() and not user:
-        raise HTTPException(status_code=401, detail="Нэвтрэх шаардлагатай!")
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    core_security.verify_resource_tenant_ownership(user, lead.get("page_id"), require_auth=True)
     status = payload.get("status", "шинэ")
     notes = payload.get("notes")
     database.update_lead_status(lead_id, status, notes)
@@ -885,19 +895,13 @@ async def export_csv(
     page_id: Optional[str] = Query(None),
     token: Optional[str] = Query(None)
 ):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        auth_token=token
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=True,
+        permission="leads:export",
     )
-    
-    if user and user.get("role") == "client":
-        target_page = user.get("page_id")
-    elif user and user.get("role") == "admin":
-        target_page = page_id
-    else:
-        target_page = page_id or database.DEFAULT_PAGE_ID
-        
     csv_data = database.sync_to_csv(page_id=target_page)
     filename = f"leads_{target_page or 'all'}.csv"
     
@@ -907,7 +911,6 @@ async def export_csv(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Access-Control-Allow-Origin": "*"
         }
     )
 
@@ -917,19 +920,13 @@ async def export_excel(
     page_id: Optional[str] = Query(None),
     token: Optional[str] = Query(None)
 ):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        auth_token=token
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=True,
+        permission="leads:export",
     )
-    
-    if user and user.get("role") == "client":
-        target_page = user.get("page_id")
-    elif user and user.get("role") == "admin":
-        target_page = page_id
-    else:
-        target_page = page_id or database.DEFAULT_PAGE_ID
-        
     excel_stream = database.generate_excel(page_id=target_page)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     filename = f"leads_{target_page or 'all'}_{timestamp}.xlsx"
@@ -940,24 +937,25 @@ async def export_excel(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Access-Control-Allow-Origin": "*"
         }
     )
 
 @app.post("/api/pages/{page_id}/google_sheets")
 async def update_page_google_sheets_endpoint(page_id: str, payload: Dict[str, Any], request: Request):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="knowledge:write",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
-    if user["role"] == "client" and user["page_id"] != page_id:
-        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
-    
     url = payload.get("google_sheets_url", "").strip()
+    if url:
+        try:
+            sheets_service.normalize_sheet_csv_url(url)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
     database.update_page_google_sheets(page_id, url)
-    agent.reset_sessions()
+    agent.reset_sessions(page_id)
     return {"success": True, "page_id": page_id, "google_sheets_url": url}
 
 def _save_page_sheets_list(page_id: str, sheets_list: List[Dict[str, Any]]):
@@ -988,14 +986,12 @@ def _save_page_sheets_list(page_id: str, sheets_list: List[Dict[str, Any]]):
 
 @app.get("/api/pages/{page_id}/sheets")
 async def list_page_sheets_endpoint(page_id: str, request: Request):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="knowledge:read",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
-    if user["role"] == "client" and user["page_id"] != page_id:
-        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
 
     page_obj = database.get_page(page_id)
     if not page_obj:
@@ -1026,14 +1022,12 @@ async def list_page_sheets_endpoint(page_id: str, request: Request):
 
 @app.post("/api/pages/{page_id}/sheets/add")
 async def add_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any], request: Request):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="knowledge:write",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
-    if user["role"] == "client" and user["page_id"] != page_id:
-        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
 
     url = (payload.get("url") or payload.get("google_sheets_url") or "").strip()
     title = (payload.get("title") or "").strip()
@@ -1073,18 +1067,18 @@ async def add_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any], 
 
 @app.post("/api/pages/{page_id}/sheets/upload")
 async def upload_page_excel_sheets_endpoint(page_id: str, request: Request, file: UploadFile = File(...)):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="knowledge:write",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
-    if user["role"] == "client" and user["page_id"] != page_id:
-        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
 
     file_bytes = await file.read()
     if not file_bytes:
         return JSONResponse({"success": False, "error": "Хоосон файл байна."}, status_code=400)
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Excel файлын хэмжээ 10MB-аас хэтэрсэн байна!")
 
     try:
         extracted_sheets = sheets_service.parse_uploaded_excel_bytes(file_bytes, file.filename or "excel.xlsx")
@@ -1115,14 +1109,12 @@ async def upload_page_excel_sheets_endpoint(page_id: str, request: Request, file
 
 @app.delete("/api/pages/{page_id}/sheets/{sheet_id}")
 async def delete_page_sheet_endpoint(page_id: str, sheet_id: str, request: Request):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="knowledge:write",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
-    if user["role"] == "client" and user["page_id"] != page_id:
-        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
 
     page_obj = database.get_page(page_id)
     sheets = sheets_service.get_page_sheets_list(page_obj)
@@ -1132,14 +1124,12 @@ async def delete_page_sheet_endpoint(page_id: str, sheet_id: str, request: Reque
 
 @app.post("/api/pages/{page_id}/test_sheet")
 async def test_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any], request: Request):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="knowledge:read",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Нэвтэрнэ үү")
-    if user["role"] == "client" and user["page_id"] != page_id:
-        raise HTTPException(status_code=403, detail="Зөвшөөрөлгүй хандалт")
     
     url = payload.get("google_sheets_url", "").strip()
     if not url:
@@ -1171,11 +1161,12 @@ async def test_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any],
 # -------------------------------------------------------------
 @app.get("/api/knowledge")
 async def get_knowledge(request: Request, page_id: Optional[str] = Query(None)):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    target_id = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="knowledge:read",
     )
-    target_id = user["page_id"] if (user and user.get("role") == "client") else (page_id or database.DEFAULT_PAGE_ID)
     
     page_obj = database.get_page(target_id)
     if page_obj and page_obj.get("knowledge_json"):
@@ -1187,11 +1178,12 @@ async def get_knowledge(request: Request, page_id: Optional[str] = Query(None)):
 
 @app.post("/api/knowledge")
 async def update_knowledge(payload: Dict[str, Any], request: Request, page_id: Optional[str] = Query(None)):
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
+    target_id = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id or payload.get("page_id"),
+        require_auth=True,
+        permission="knowledge:write",
     )
-    target_id = user["page_id"] if (user and user.get("role") == "client") else (page_id or database.DEFAULT_PAGE_ID)
     
     page_obj = database.get_page(target_id)
     k_str = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -1210,7 +1202,7 @@ async def update_knowledge(payload: Dict[str, Any], request: Request, page_id: O
     if target_id == database.DEFAULT_PAGE_ID:
         knowledge_base.save_knowledge(payload)
 
-    agent.reset_sessions()
+    agent.reset_sessions(target_id)
     return {"status": "success", "message": f"{target_id} хуудасны мэдлэгийн сан амжилттай шинэчлэгдлээ!"}
 
 # -------------------------------------------------------------
@@ -1233,17 +1225,39 @@ async def health_check():
         "active_sessions": len(sessions)
     })
 
+@app.get("/api/ready")
+async def readiness_check():
+    """Readiness probe verifying database and task queue connectivity (Phase 8)"""
+    from core import db_engine, task_queue
+    db_ok = False
+    try:
+        conn = database.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        conn.close()
+        db_ok = True
+    except Exception as e:
+        logger.error(f"Readiness DB check failed: {e}")
+
+    q_stats = task_queue.get_queue_stats()
+    status_code = 200 if db_ok else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "ready": db_ok,
+            "status": "ready" if db_ok else "not_ready",
+            "database": "ok" if db_ok else "failed",
+            "engine": "postgresql" if db_engine.is_postgres() else "sqlite",
+            "queue_backend": q_stats.get("backend", "sqlite"),
+            "queue_stats": q_stats,
+        },
+    )
+
 @app.post("/api/update-keys")
 async def update_keys(payload: Dict[str, str], request: Request):
     """Админы системийн түлхүүрүүд засах (Зөвхөн Админ — P0-2)"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
-    if not user:
-        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
-    if user.get("role") != "admin":
-        return JSONResponse({"error": "Эрх хүрэхгүй!"}, status_code=403)
+    await core_security.require_admin(request)
 
     for k in ["gemini_key", "meta_token", "meta_verify", "tg_token", "tg_manager_id", "admin_password"]:
         v = payload.get(k, "").strip()
@@ -1261,22 +1275,26 @@ async def update_keys(payload: Dict[str, str], request: Request):
         elif k == "admin_password" and v:
             os.environ["ADMIN_PASSWORD"] = v
 
-    keys_map = {
-        "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
-        "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-        "META_PAGE_ACCESS_TOKEN": os.getenv("META_PAGE_ACCESS_TOKEN", ""),
-        "META_VERIFY_TOKEN": os.getenv("META_VERIFY_TOKEN", ""),
-        "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-        "TELEGRAM_MANAGER_CHAT_ID": os.getenv("TELEGRAM_MANAGER_CHAT_ID", ""),
-        "ADMIN_PASSWORD": os.getenv("ADMIN_PASSWORD", database.DEFAULT_ADMIN_PASSWORD),
-        "PORT": os.getenv("PORT", "8000")
-    }
-    try:
-        with open(".env", "w", encoding="utf-8") as f:
-            for k, v in keys_map.items():
-                f.write(f"{k}={v}\n")
-    except Exception as env_err:
-        logger.warning(f"Could not write .env file (read-only fs): {env_err}")
+    database.record_audit_log("system.keys.updated", actor_role="admin", details={"updated_fields": [k for k in payload if payload.get(k)]})
+
+    # Production горимд plaintext .env файл руу бичихгүй
+    if not core_security.is_production_mode() and os.getenv("ALLOW_ENV_FILE_WRITE", "0") == "1":
+        keys_map = {
+            "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
+            "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            "META_PAGE_ACCESS_TOKEN": os.getenv("META_PAGE_ACCESS_TOKEN", ""),
+            "META_VERIFY_TOKEN": os.getenv("META_VERIFY_TOKEN", ""),
+            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            "TELEGRAM_MANAGER_CHAT_ID": os.getenv("TELEGRAM_MANAGER_CHAT_ID", ""),
+            "ADMIN_PASSWORD": os.getenv("ADMIN_PASSWORD", database.DEFAULT_ADMIN_PASSWORD),
+            "PORT": os.getenv("PORT", "8000")
+        }
+        try:
+            with open(".env", "w", encoding="utf-8") as f:
+                for k, v in keys_map.items():
+                    f.write(f"{k}={v}\n")
+        except Exception as env_err:
+            logger.warning(f"Could not write .env file (read-only fs): {env_err}")
 
     return {"status": "success", "message": "Тохиргоо амжилттай хадгалагдлаа!"}
 
@@ -1345,8 +1363,15 @@ async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Qu
     page = database.get_page(inv.get("page_id", database.DEFAULT_PAGE_ID)) or {}
     qpay_user = page.get("qpay_username") or os.getenv("QPAY_USERNAME", "").strip()
     qpay_pass = page.get("qpay_password") or os.getenv("QPAY_PASSWORD", "").strip()
-    qpay_obj_id = body.get("object_id") or request.query_params.get("object_id") or request.query_params.get("qpay_payment_id")
+    qpay_obj_id = (
+        body.get("object_id")
+        or request.query_params.get("object_id")
+        or request.query_params.get("qpay_payment_id")
+        or inv.get("qpay_invoice_id")
+    )
     strict_qpay = core_security.is_production_mode() or os.getenv("STRICT_QPAY_VERIFICATION", "").strip() in ("1", "true")
+    provider_payment_id = None
+    callback_verified = 0
 
     if strict_qpay or (qpay_user and qpay_pass):
         if not (qpay_user and qpay_pass and qpay_obj_id):
@@ -1354,55 +1379,63 @@ async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Qu
         token = await fintech_service.get_qpay_token(qpay_user, qpay_pass)
         if not token:
             return Response(content="PROVIDER_AUTH_FAILED", media_type="text/plain", status_code=400)
-        is_verified = await fintech_service.check_qpay_payment_live(token, str(qpay_obj_id))
-        if not is_verified:
+        detail = await fintech_service.check_qpay_payment_live_detailed(
+            token,
+            str(qpay_obj_id),
+            expected_amount=int(inv.get("amount") or 0),
+            expected_currency=str(inv.get("currency") or "MNT"),
+        )
+        if not detail.get("verified"):
             return Response(content="FAILED_VERIFICATION", media_type="text/plain", status_code=400)
+        provider_payment_id = detail.get("provider_payment_id") or str(qpay_obj_id)
+        callback_verified = 1
 
-    await fintech_service.process_successful_payment(inv_id, callback_data=body)
+    await fintech_service.process_successful_payment(
+        inv_id,
+        callback_data=body,
+        provider_payment_id=provider_payment_id,
+        callback_verified=callback_verified,
+    )
     return Response(content="SUCCESS", media_type="text/plain", status_code=200)
 
 @app.post("/api/fintech/invoices/{invoice_id}/simulate-pay")
 async def simulate_invoice_payment_api(invoice_id: str, request: Request):
     """1 секундэд автоматаар баталгаажуулж турших (Simulator — Production горимд зөвхөн Админ эрх шаардана)"""
-    if os.getenv("ENV", "").lower() == "production" or os.getenv("DISABLE_PAYMENT_SIMULATOR") == "1":
-        user = await get_current_user(
-            authorization=request.headers.get("Authorization"),
-            session_token_cookie=request.cookies.get("session_token")
-        )
-        if not user or user.get("role") != "admin":
+    if core_security.is_production_mode() or os.getenv("DISABLE_PAYMENT_SIMULATOR") == "1":
+        user = await core_security.resolve_current_user(request)
+        if not user or not core_security.is_admin_role(user.get("role")):
             return JSONResponse({"success": False, "error": "Production орчинд симулятор хаалттай байна."}, status_code=403)
     res = await fintech_service.process_successful_payment(invoice_id)
     return res
 
 @app.get("/api/fintech/summary")
-async def get_fintech_summary_api(request: Request):
+async def get_fintech_summary_api(request: Request, page_id: Optional[str] = Query(None)):
     """Финтек хяналтын самбарын KPI тоон үзүүлэлтүүд"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=True,
+        permission="fintech:read",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    page_id = user.get("page_id")
-    return database.get_fintech_summary(page_id)
+    return database.get_fintech_summary(pid)
 
 @app.get("/api/fintech/invoices")
 async def get_fintech_invoices_api(
     request: Request,
+    page_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    limit: int = Query(50)
+    limit: int = Query(50, ge=1, le=500)
 ):
     """Нэхэмжлэхүүдийн жагсаалт"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=True,
+        permission="fintech:read",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    page_id = user.get("page_id")
-    return database.list_invoices(page_id=page_id, limit=limit, status=status)
+    return database.list_invoices(page_id=pid, limit=limit, status=status)
 
 @app.post("/api/fintech/settings")
 async def save_fintech_settings_api(
@@ -1410,21 +1443,15 @@ async def save_fintech_settings_api(
     request: Request
 ):
     """QPay худалдаа эрхлэгчийн эрх болон И-Баримт тохиргоо хадгалах"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=payload.get("page_id"),
+        require_auth=True,
+        permission="fintech:write",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    page_id = payload.get("page_id") or user.get("page_id")
-    if not page_id:
-        raise HTTPException(status_code=400, detail="page_id required")
-    if user.get("role") == "client" and user.get("page_id") != page_id:
-        raise HTTPException(status_code=403, detail="Forbidden")
 
     success = database.update_page_qpay_settings(
-        page_id=page_id,
+        page_id=pid,
         username=payload.get("qpay_username", ""),
         password=payload.get("qpay_password", ""),
         invoice_code=payload.get("qpay_invoice_code", ""),
@@ -1437,20 +1464,20 @@ async def create_invoice_manual_api(
     payload: Dict[str, Any],
     request: Request
 ):
-    """Самбараас шууд төлбөрийн нэхэмжлэх үүсгэх"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    """Самбараас шууд төлбөрийн нэхэмжлэх үүсгэх (Tenant Scoped — IDOR Protected)"""
+    page_id = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=payload.get("page_id"),
+        require_auth=True,
+        permission="fintech:write",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    page_id = payload.get("page_id") or user.get("page_id") or database.DEFAULT_PAGE_ID
     amount = int(payload.get("amount", 10000))
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Мөнгөн дүн 0-ээс их байх ёстой")
     desc = payload.get("description", "Үйлчилгээний төлбөр")
     base_url = str(request.base_url)
     order = await fintech_service.create_payment_order(
-        page_id=page_id,
+        page_id=page_id or database.DEFAULT_PAGE_ID,
         amount=amount,
         description=desc,
         sender_id=payload.get("sender_id", "admin_manual"),
@@ -1476,7 +1503,12 @@ async def serve_warehouse_scanner(request: Request, page_id: Optional[str] = Que
 @app.post("/api/cargo/scan")
 async def scan_cargo_package_api(payload: Dict[str, Any], request: Request):
     """Агуулахын ажилтан баркод уншуулах үед ачааг бүртгэж авто мэдэгдэл илгээх (Tenant Scoped)"""
-    pid = await core_security.enforce_tenant_scope(request, requested_page_id=payload.get("page_id"))
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=payload.get("page_id"),
+        require_auth=True,
+        permission="cargo:write",
+    )
     code = payload.get("tracking_code", "").strip()
     if not code:
         return JSONResponse(status_code=400, content={"error": "tracking_code is required"})
@@ -1495,52 +1527,59 @@ async def scan_cargo_package_api(payload: Dict[str, Any], request: Request):
 @app.post("/api/cargo/{tracking_code}/deliver")
 async def deliver_cargo_api(tracking_code: str, request: Request, page_id: Optional[str] = Query(None)):
     """Ачааг олгосон гэж тэмдэглэх (Tenant Scoped)"""
-    pid = await core_security.enforce_tenant_scope(request, requested_page_id=page_id)
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="cargo:write",
+    )
     pkg = database.mark_cargo_delivered(pid or database.DEFAULT_PAGE_ID, tracking_code)
     return {"success": bool(pkg), "package": pkg}
 
 @app.get("/api/cargo/packages")
 async def list_cargo_packages_api(
     request: Request,
+    page_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    limit: int = Query(50)
+    limit: int = Query(50, ge=1, le=500)
 ):
     """Карго ачаануудын жагсаалт"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="cargo:read",
     )
-    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
-    return database.list_cargo_packages(pid, status=status, limit=limit)
+    return database.list_cargo_packages(pid or database.DEFAULT_PAGE_ID, status=status, limit=limit)
 
 @app.get("/api/cargo/summary")
-async def get_cargo_summary_api(request: Request):
+async def get_cargo_summary_api(request: Request, page_id: Optional[str] = Query(None)):
     """Карго самбарын хураангуй KPI үзүүлэлтүүд"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="cargo:read",
     )
-    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
-    return database.get_cargo_summary(pid)
+    return database.get_cargo_summary(pid or database.DEFAULT_PAGE_ID)
 
 @app.post("/api/cargo/import-manifest")
 async def import_cargo_manifest_api(
     request: Request,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    page_id: Optional[str] = Query(None),
 ):
     """Excel файлаас карго ачаануудыг олноор нь импортлох"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="cargo:write",
     )
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    pid = user.get("page_id") or database.DEFAULT_PAGE_ID
     file_bytes = await file.read()
-    return cargo_service.import_manifest_from_excel_bytes(pid, file_bytes, file.filename)
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Excel файлын хэмжээ 10MB-аас хэтэрсэн байна!")
+    return cargo_service.import_manifest_from_excel_bytes(pid or database.DEFAULT_PAGE_ID, file_bytes, file.filename)
 
 # -------------------------------------------------------------
 # 11. ӨГЛӨӨНИЙ 08:30 ЭЗНИЙ ТАЙЛАН & TELEGRAM BOT API
@@ -1548,43 +1587,44 @@ async def import_cargo_manifest_api(
 @app.get("/api/executive/preview")
 async def preview_executive_report_api(
     request: Request,
+    page_id: Optional[str] = Query(None),
     date_str: Optional[str] = Query(None)
 ):
     """Өглөөний эзний тайлангийн шуурхай урьдчилсан харагдац"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="executive:read",
     )
-    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
-    report_text = executive_bot_service.format_executive_report(page_id=pid, target_date=date_str)
-    metrics = database.get_daily_executive_metrics(page_id=pid, date_str=date_str)
+    report_text = executive_bot_service.format_executive_report(page_id=pid or database.DEFAULT_PAGE_ID, target_date=date_str)
+    metrics = database.get_daily_executive_metrics(page_id=pid or database.DEFAULT_PAGE_ID, date_str=date_str)
     return {"report_text": report_text, "metrics": metrics}
 
 @app.post("/api/executive/send-report")
 async def send_executive_report_api(payload: Dict[str, Any], request: Request):
     """Тайланг яг одоо Telegram-аар илгээх"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=payload.get("page_id"),
+        require_auth=True,
+        permission="executive:write",
     )
-    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
     chat_id = payload.get("chat_id")
     date_str = payload.get("date_str")
-    res = await executive_bot_service.send_executive_report(chat_id=chat_id, page_id=pid, target_date=date_str)
+    res = await executive_bot_service.send_executive_report(chat_id=chat_id, page_id=pid or database.DEFAULT_PAGE_ID, target_date=date_str)
     return res
 
 @app.get("/api/executive/settings")
-async def get_executive_settings_api(request: Request):
+async def get_executive_settings_api(request: Request, page_id: Optional[str] = Query(None)):
     """Telegram бот болон өглөөний тайлангийн тохиргоог авах"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="executive:read",
     )
-    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
-    page = database.get_page(pid) or {}
+    page = database.get_page(pid or database.DEFAULT_PAGE_ID) or {}
     bot_token = page.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")
     masked_token = f"{bot_token[:6]}...{bot_token[-4:]}" if len(bot_token) > 10 else ("Тохируулаагүй" if not bot_token else "***")
     return {
@@ -1598,23 +1638,23 @@ async def get_executive_settings_api(request: Request):
 @app.post("/api/executive/settings")
 async def update_executive_settings_api(payload: Dict[str, Any], request: Request):
     """Telegram бот болон өглөөний тайлангийн тохиргоог хадгалах"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=payload.get("page_id"),
+        require_auth=True,
+        permission="executive:write",
     )
-    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
     bot_token = payload.get("telegram_bot_token", "")
     manager_chat_id = payload.get("telegram_manager_chat_id", "")
     daily_report_time = payload.get("daily_report_time", "08:30")
     daily_report_enabled = 1 if payload.get("daily_report_enabled", True) else 0
 
     if bot_token and "..." in bot_token:
-        page = database.get_page(pid) or {}
+        page = database.get_page(pid or database.DEFAULT_PAGE_ID) or {}
         bot_token = page.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 
     database.update_page_telegram_settings(
-        page_id=pid,
+        page_id=pid or database.DEFAULT_PAGE_ID,
         bot_token=bot_token,
         manager_chat_id=manager_chat_id,
         report_time=daily_report_time,
@@ -1626,26 +1666,26 @@ async def update_executive_settings_api(payload: Dict[str, Any], request: Reques
 # 12. АВТОМАТ МАРКЕТИНГ & ХАРИЛЦАГЧИЙГ СЭРГЭЭХ API (RETENTION & BROADCAST)
 # -------------------------------------------------------------
 @app.get("/api/retention/rules")
-async def get_retention_rules_api(request: Request):
+async def get_retention_rules_api(request: Request, page_id: Optional[str] = Query(None)):
     """Салбарын автомат сэргээлтийн дүрмүүдийн жагсаалт"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="retention:read",
     )
-    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
-    rules = database.get_automated_rules(pid)
+    rules = database.get_automated_rules(pid or database.DEFAULT_PAGE_ID)
     return {"rules": rules}
 
 @app.post("/api/retention/rules")
 async def update_retention_rule_api(payload: Dict[str, Any], request: Request):
     """Сэргээх дүрмийг шинэчлэх"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=payload.get("page_id"),
+        require_auth=True,
+        permission="retention:write",
     )
-    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
     rule_type = payload.get("rule_type")
     delay_hours = payload.get("delay_hours", 2)
     message_template = payload.get("message_template", "")
@@ -1655,7 +1695,7 @@ async def update_retention_rule_api(payload: Dict[str, Any], request: Request):
         raise HTTPException(status_code=400, detail="rule_type and message_template are required")
         
     database.update_automated_rule(
-        page_id=pid,
+        page_id=pid or database.DEFAULT_PAGE_ID,
         rule_type=rule_type,
         delay_hours=int(delay_hours),
         message_template=message_template,
@@ -1666,12 +1706,12 @@ async def update_retention_rule_api(payload: Dict[str, Any], request: Request):
 @app.post("/api/retention/broadcast")
 async def send_broadcast_api(payload: Dict[str, Any], request: Request):
     """1-Click Broadcast илгээх"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=payload.get("page_id"),
+        require_auth=True,
+        permission="retention:write",
     )
-    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
     title = payload.get("title", "").strip()
     message = payload.get("message", "").strip()
     target_segment = payload.get("target_segment", "all")
@@ -1681,7 +1721,7 @@ async def send_broadcast_api(payload: Dict[str, Any], request: Request):
         raise HTTPException(status_code=400, detail="Гарчиг болон зурвасын эх бичвэр шаардлагатай")
         
     res = await retention_service.send_broadcast(
-        page_id=pid,
+        page_id=pid or database.DEFAULT_PAGE_ID,
         title=title,
         message=message,
         target_segment=target_segment,
@@ -1690,30 +1730,35 @@ async def send_broadcast_api(payload: Dict[str, Any], request: Request):
     return res
 
 @app.get("/api/retention/campaigns")
-async def list_campaigns_api(request: Request, limit: int = Query(20)):
+async def list_campaigns_api(
+    request: Request,
+    page_id: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=200)
+):
     """Маркетингийн өмнөх кампэйнуудын түүх"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="retention:read",
     )
-    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
-    return database.list_marketing_campaigns(pid, limit=limit)
+    return database.list_marketing_campaigns(pid or database.DEFAULT_PAGE_ID, limit=limit)
 
 @app.get("/api/retention/summary")
-async def get_retention_summary_api(request: Request):
+async def get_retention_summary_api(request: Request, page_id: Optional[str] = Query(None)):
     """Маркетингийн нэгдсэн үзүүлэлтүүд"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="retention:read",
     )
-    pid = (user.get("page_id") if user else None) or database.DEFAULT_PAGE_ID
-    return database.get_marketing_summary(pid)
+    return database.get_marketing_summary(pid or database.DEFAULT_PAGE_ID)
 
 @app.post("/api/retention/trigger-checks")
 async def trigger_retention_checks_api(request: Request):
     """Автомат сэргээлтийн шалгалтыг гараар яг одоо ажиллуулах"""
+    await core_security.require_permission(request, "retention:write")
     base_url = str(request.base_url).rstrip("/")
     stats = await retention_service.run_automated_retention_checks(base_url=base_url)
     return {"success": True, "stats": stats}
@@ -1724,29 +1769,30 @@ async def trigger_retention_checks_api(request: Request):
 @app.get("/api/appointments")
 async def list_appointments_api(
     request: Request,
+    page_id: Optional[str] = Query(None),
     date_str: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    limit: int = Query(50)
+    limit: int = Query(50, ge=1, le=500)
 ):
     """Салбарын цаг захиалгуудын жагсаалт"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="appointments:read",
     )
-    pid = (user.get("page_id") if user else None) or request.query_params.get("page_id") or database.DEFAULT_PAGE_ID
-    appts = database.list_appointments(page_id=pid, date_str=date_str, status=status, limit=limit)
+    appts = database.list_appointments(page_id=pid or database.DEFAULT_PAGE_ID, date_str=date_str, status=status, limit=limit)
     return {"count": len(appts), "data": appts}
 
 @app.post("/api/appointments")
 async def create_appointment_manual_api(payload: Dict[str, Any], request: Request):
     """Самбараас шууд шинэ цаг захиалга нэмэх"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=payload.get("page_id"),
+        require_auth=True,
+        permission="appointments:write",
     )
-    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
     name = payload.get("customer_name", "").strip()
     phone = payload.get("customer_phone", "").strip()
     service = payload.get("service_name", "").strip()
@@ -1758,7 +1804,7 @@ async def create_appointment_manual_api(payload: Dict[str, Any], request: Reques
         raise HTTPException(status_code=400, detail="Нэр, утас, огноо, цаг заавал шаардлагатай")
 
     appt = database.create_appointment(
-        page_id=pid,
+        page_id=pid or database.DEFAULT_PAGE_ID,
         customer_name=name,
         customer_phone=phone,
         service_name=service or "Үйлчилгээ",
@@ -1774,26 +1820,25 @@ async def create_appointment_manual_api(payload: Dict[str, Any], request: Reques
 @app.post("/api/appointments/{appointment_id}/status")
 async def update_appointment_status_api(appointment_id: int, payload: Dict[str, Any], request: Request):
     """Цаг захиалгын төлөв өөрчлөх ('CONFIRMED', 'COMPLETED', 'CANCELLED') — Tenant Scoped"""
-    user = await core_security.resolve_current_user(request)
+    user = await core_security.require_permission(request, "appointments:write")
     appt = database.get_appointment_by_id(appointment_id)
-    if appt:
-        core_security.verify_resource_tenant_ownership(user, appt.get("page_id"))
-    elif core_security.is_production_mode() and not user:
-        raise HTTPException(status_code=401, detail="Нэвтрэх шаардлагатай!")
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    core_security.verify_resource_tenant_ownership(user, appt.get("page_id"), require_auth=True)
     new_status = payload.get("status", "CONFIRMED")
     success = database.update_appointment_status(appointment_id, new_status)
     return {"success": success, "status": new_status}
 
 @app.get("/api/appointments/summary")
-async def get_appointments_summary_api(request: Request):
+async def get_appointments_summary_api(request: Request, page_id: Optional[str] = Query(None)):
     """Цаг захиалгын хяналтын самбарын тооцоолол"""
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token"),
-        token=request.query_params.get("token") or request.query_params.get("client_token")
+    pid = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="appointments:read",
     )
-    pid = (user.get("page_id") if user else None) or request.query_params.get("page_id") or database.DEFAULT_PAGE_ID
-    return database.get_appointments_summary(pid)
+    return database.get_appointments_summary(pid or database.DEFAULT_PAGE_ID)
 
 # -------------------------------------------------------------
 # 14. MULTIMODAL VOICE NOTE CHAT API (ДУУТ ЗУРВАС СЕРВЕР)
@@ -1813,6 +1858,8 @@ async def voice_chat_endpoint(
         raise HTTPException(status_code=400, detail="Аудио файл шаардлагатай")
 
     audio_bytes = await upload.read()
+    if len(audio_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Аудио файлын хэмжээ 10MB-аас хэтэрсэн байна!")
     pid = page_id or database.DEFAULT_PAGE_ID
     mime = upload.content_type or "audio/webm"
     fname = (upload.filename or "").lower()

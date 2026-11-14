@@ -8,6 +8,7 @@ import secrets
 import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple
+from core.db_engine import get_db_connection
 
 logger = logging.getLogger("database")
 
@@ -15,6 +16,11 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "leads.db")
 CSV_PATH = os.path.join(os.path.dirname(__file__), "leads.csv")
 DEFAULT_PAGE_ID = "100799479495809"
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ADMIN2026")
+
+
+def get_connection():
+    """Нэгдсэн Authoritative Database Connection (PostgreSQL эсвэл SQLite WAL)"""
+    return get_db_connection(sqlite_path=DB_PATH)
 
 def mask_secret(secret: Optional[str], show_start: int = 6, show_end: int = 4) -> str:
     """Нууц токен болон түлхүүрүүдийг UI дээр ил задгай харагдахаас сэргийлж далдлах"""
@@ -55,7 +61,7 @@ def hmac_equal(a: str, b: str) -> bool:
 
 def init_db():
     """Өгөгдлийн санг үүсгэх / шинэчлэх (Multi-Tenant Agency & RBAC Auth Support)"""
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA busy_timeout=5000")
@@ -289,9 +295,13 @@ def init_db():
             idempotency_key TEXT UNIQUE,
             task_name TEXT NOT NULL,
             payload_json TEXT NOT NULL,
-            status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'
+            status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'DEAD_LETTER'
             attempts INTEGER DEFAULT 0,
             max_retries INTEGER DEFAULT 3,
+            timeout_seconds INTEGER DEFAULT 60,
+            next_run_at TIMESTAMP,
+            locked_by TEXT,
+            locked_at TIMESTAMP,
             last_error TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -299,11 +309,40 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_jobs_status ON task_jobs (status, created_at)")
 
+    # 14. Аюулгүй байдал ба AI Tool-ийн Аудит Бүртгэл (Audit Logs)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT,
+            actor_role TEXT,
+            actor_id TEXT,
+            action TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id TEXT,
+            details_json TEXT DEFAULT '{}',
+            ip_address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_page_created ON audit_logs (page_id, created_at)")
+
     # Багануудыг аюулгүй нэмэх (Migration check)
     tables_to_migrate = [
         ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
         ("messages", "page_id", "TEXT DEFAULT '100799479495809'"),
         ("session_states", "page_id", "TEXT DEFAULT '100799479495809'"),
+        ("sessions", "revoked", "INTEGER DEFAULT 0"),
+        ("sessions", "revoked_at", "TIMESTAMP"),
+        ("sessions", "ip_address", "TEXT"),
+        ("invoices", "currency", "TEXT DEFAULT 'MNT'"),
+        ("invoices", "qpay_invoice_id", "TEXT"),
+        ("invoices", "provider_payment_id", "TEXT"),
+        ("invoices", "callback_verified", "INTEGER DEFAULT 0"),
+        ("notification_locks", "expires_at", "TIMESTAMP"),
+        ("task_jobs", "timeout_seconds", "INTEGER DEFAULT 60"),
+        ("task_jobs", "next_run_at", "TIMESTAMP"),
+        ("task_jobs", "locked_by", "TEXT"),
+        ("task_jobs", "locked_at", "TIMESTAMP"),
         ("pages", "gemini_api_key", "TEXT DEFAULT ''"),
         ("pages", "ai_provider", "TEXT DEFAULT 'gemini'"),
         ("pages", "client_username", "TEXT"),
@@ -324,7 +363,7 @@ def init_db():
     for table, col, col_def in tables_to_migrate:
         try:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
-        except sqlite3.OperationalError:
+        except Exception:
             pass
 
     # Анхны Tuvshok хуудсыг автоматаар бүртгэж үүсгэх
@@ -382,43 +421,75 @@ def init_db():
     conn.close()
 
 # ----------------- AUTHENTICATION & RBAC SESSIONS -----------------
-def create_session(role: str, page_id: Optional[str] = None, hours: int = 72) -> str:
+def create_session(role: str, page_id: Optional[str] = None, hours: int = 72, ip_address: Optional[str] = None) -> str:
     """Шинэ нэвтрэлтийн сесс үүсгэх"""
     token = secrets.token_urlsafe(32)
     expires_at = datetime.utcnow() + timedelta(hours=hours)
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO sessions (session_token, role, page_id, expires_at)
-        VALUES (?, ?, ?, ?)
-    """, (token, role, page_id, expires_at.strftime("%Y-%m-%d %H:%M:%S")))
+        INSERT INTO sessions (session_token, role, page_id, revoked, ip_address, expires_at)
+        VALUES (?, ?, ?, 0, ?, ?)
+    """, (token, role, page_id, ip_address, expires_at.strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
     return token
 
 def get_session(token: str) -> Optional[Dict[str, Any]]:
-    """Сесс хүчинтэй эсэхийг шалгах"""
+    """Сесс хүчинтэй эсэхийг шалгах (Хугацаа дууссан эсвэл цуцлагдсан бол None буцаана)"""
     if not token:
         return None
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT session_token, role, page_id, created_at, expires_at
+        SELECT session_token, role, page_id, revoked, created_at, expires_at
         FROM sessions
-        WHERE session_token = ? AND datetime(expires_at) > datetime('now')
+        WHERE session_token = ?
+          AND COALESCE(revoked, 0) = 0
+          AND datetime(expires_at) > datetime('now')
     """, (token,))
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
 
-def delete_session(token: str):
-    """Гарах (Logout)"""
-    conn = sqlite3.connect(DB_PATH)
+def revoke_session(token: str) -> bool:
+    """Сессийг хүчингүй болгох (Revocation audit trail хадгална)"""
+    if not token:
+        return False
+    conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM sessions WHERE session_token = ?", (token,))
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+        UPDATE sessions
+        SET revoked = 1, revoked_at = ?
+        WHERE session_token = ?
+    """, (now_str, token))
+    changed = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    return changed
+
+def revoke_all_page_sessions(page_id: str) -> int:
+    """Тухайн салбарын бүх идэвхтэй сессийг хүчингүй болгох (Нууц үг солих эсвэл салбар устгах үед)"""
+    if not page_id:
+        return 0
+    conn = get_connection()
+    cursor = conn.cursor()
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("""
+        UPDATE sessions
+        SET revoked = 1, revoked_at = ?
+        WHERE page_id = ? AND COALESCE(revoked, 0) = 0
+    """, (now_str, str(page_id)))
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+def delete_session(token: str):
+    """Гарах (Logout — сессийг revoke хийнэ)"""
+    revoke_session(token)
 
 def authenticate_admin(password: str) -> bool:
     """Супер Админы нууц үгийг шалгах (Production болон ADMIN_PASSWORD тохируулсан үед анхдагч нууц үгийг бүрэн хаана)"""
@@ -438,28 +509,102 @@ def authenticate_admin(password: str) -> bool:
     return secrets.compare_digest(p, DEFAULT_ADMIN_PASSWORD) or secrets.compare_digest(p.lower(), DEFAULT_ADMIN_PASSWORD.lower())
 
 
-def claim_notification_lock(idempotency_key: str, channel: str = "any") -> bool:
-    """Давхар мэдэгдэл илгээхээс сэргийлэх атомик түгжээ. Амжилттай түгжвэл True, аль хэдийн илгээсэн бол False буцаана."""
+def claim_notification_lock(idempotency_key: str, channel: str = "any", ttl_seconds: Optional[int] = None) -> bool:
+    """
+    Давхар мэдэгдэл болон хуваарьт ажил давхардахаас сэргийлэх атомик түгжээ.
+    Хэрэв `ttl_seconds` өгөгдсөн бөгөөд өмнөх түгжээний хугацаа дууссан бол шинэчилж түгжинэ.
+    """
     if not idempotency_key:
         return True
-    conn = sqlite3.connect(DB_PATH)
+    key_clean = idempotency_key.strip()
+    now_utc = datetime.utcnow()
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+    exp_str = (now_utc + timedelta(seconds=ttl_seconds)).strftime("%Y-%m-%d %H:%M:%S") if ttl_seconds else None
+
+    conn = get_connection()
     cursor = conn.cursor()
     try:
+        if ttl_seconds:
+            cursor.execute(
+                "DELETE FROM notification_locks WHERE idempotency_key = ? AND expires_at IS NOT NULL AND expires_at < ?",
+                (key_clean, now_str),
+            )
         cursor.execute(
-            "INSERT INTO notification_locks (idempotency_key, channel) VALUES (?, ?)",
-            (idempotency_key.strip(), channel),
+            "INSERT INTO notification_locks (idempotency_key, channel, expires_at) VALUES (?, ?, ?)",
+            (key_clean, channel, exp_str),
         )
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except Exception:
         return False
     finally:
         conn.close()
 
 
+def record_audit_log(
+    action: str,
+    page_id: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    actor_id: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+    ip_address: Optional[str] = None,
+) -> int:
+    """Аюулгүй байдал, эрхийн өөрчлөлт болон AI Tool дуудлагын аудит лог бичих"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    details_str = json.dumps(details or {}, ensure_ascii=False)
+    cursor.execute(
+        """
+        INSERT INTO audit_logs (page_id, actor_role, actor_id, action, resource_type, resource_id, details_json, ip_address)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (page_id, actor_role, actor_id, action, resource_type, str(resource_id) if resource_id is not None else None, details_str, ip_address),
+    )
+    log_id = cursor.lastrowid or 0
+    conn.commit()
+    conn.close()
+    return log_id
+
+
+def list_audit_logs(page_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if page_id:
+        cursor.execute("SELECT * FROM audit_logs WHERE page_id = ? ORDER BY id DESC LIMIT ?", (str(page_id), limit))
+    else:
+        cursor.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def delete_customer_data(page_id: str, sender_id: Optional[str] = None, phone: Optional[str] = None) -> Dict[str, int]:
+    """Хэрэглэгчийн хувийн мэдээлэл ба санах ойг устгах (Privacy Policy 'Бүртгэл устгах' эрх)"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    deleted = {"registrations": 0, "memories": 0, "messages": 0}
+    if sender_id:
+        cursor.execute("DELETE FROM user_memories WHERE page_id = ? AND user_id = ?", (str(page_id), str(sender_id)))
+        deleted["memories"] += max(0, cursor.rowcount)
+        cursor.execute("DELETE FROM registrations WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
+        deleted["registrations"] += max(0, cursor.rowcount)
+        cursor.execute("DELETE FROM session_states WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
+    if phone:
+        cursor.execute("DELETE FROM registrations WHERE page_id = ? AND phone = ?", (str(page_id), str(phone)))
+        deleted["registrations"] += max(0, cursor.rowcount)
+        cursor.execute("DELETE FROM user_memories WHERE page_id = ? AND phone = ?", (str(page_id), str(phone)))
+        deleted["memories"] += max(0, cursor.rowcount)
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 def get_lead_by_id(lead_id: int) -> Optional[Dict[str, Any]]:
     """Бүртгэлийг ID-аар нь авч салбарын харьяаллыг (page_id) шалгах"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM registrations WHERE id = ?", (lead_id,))
@@ -470,7 +615,7 @@ def get_lead_by_id(lead_id: int) -> Optional[Dict[str, Any]]:
 
 def get_appointment_by_id(appointment_id: int) -> Optional[Dict[str, Any]]:
     """Цаг захиалгыг ID-аар нь авч салбарын харьяаллыг (page_id) шалгах"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,))
@@ -494,7 +639,7 @@ def authenticate_client_detailed(identifier: str, password: Optional[str] = None
     if not identifier:
         return None, "Байгууллагын нэвтрэх нэр эсвэл шууд холбоос оруулна уу."
     ident = identifier.strip()
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -542,7 +687,7 @@ def authenticate_client(identifier: str, password: Optional[str] = None) -> Opti
 
 def set_client_credentials(page_id: str, username: str, password: Optional[str] = None) -> Dict[str, str]:
     """Харилцагчийн нэвтрэх нэр, нууц үг, шууд орох Magic холбоос шинэчлэх"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     magic_token = secrets.token_urlsafe(24)
@@ -566,11 +711,17 @@ def set_client_credentials(page_id: str, username: str, password: Optional[str] 
 
     conn.commit()
     conn.close()
+    try:
+        revoke_all_page_sessions(p_clean)
+        if clean_pid != p_clean:
+            revoke_all_page_sessions(clean_pid)
+    except Exception:
+        pass
     return {"username": u_clean, "magic_token": magic_token}
 
 def update_page_google_sheets(page_id: str, sheets_url: str) -> bool:
     """Хуудасны Google Sheets холбоосыг шинэчлэх"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE pages 
@@ -583,7 +734,7 @@ def update_page_google_sheets(page_id: str, sheets_url: str) -> bool:
 
 def update_page_gemini_key(page_id: str, gemini_key: str, monthly_limit: Optional[int] = None) -> bool:
     """Харилцагчийн хувийн Gemini API түлхүүр болон лимитийг шинэчлэх"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     if monthly_limit is not None:
         cursor.execute("""
@@ -603,7 +754,7 @@ def update_page_gemini_key(page_id: str, gemini_key: str, monthly_limit: Optiona
 
 def increment_page_tokens(page_id: str, tokens: int) -> int:
     """Токен ашиглалтыг нэмэгдүүлж тооцох"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE pages 
@@ -640,7 +791,7 @@ def _sanitize_page_secrets(d: Dict[str, Any], include_magic_token: bool = False)
     return d
 
 def get_all_pages(mask_secrets: bool = True, include_magic_token: bool = False) -> List[Dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM pages ORDER BY created_at ASC")
@@ -661,7 +812,7 @@ def get_page(page_id: str, mask_secrets: bool = False, include_magic_token: bool
     if not page_id:
         return None
     p_id = str(page_id).strip()
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM pages WHERE page_id = ? OR LOWER(client_username) = LOWER(?)", (p_id, p_id))
@@ -696,7 +847,7 @@ def save_page(
         page_access_token = ""
     if "•" in (gemini_api_key or "") or "****" in (gemini_api_key or ""):
         gemini_api_key = ""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     magic = secrets.token_urlsafe(24)
     cursor.execute("""
@@ -722,12 +873,23 @@ def save_page(
 def delete_page(page_id: str) -> bool:
     if page_id == DEFAULT_PAGE_ID:
         return False  # Үндсэн хуудсыг устгахгүй
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM pages WHERE page_id = ?", (page_id,))
-    cursor.execute("DELETE FROM registrations WHERE page_id = ?", (page_id,))
-    cursor.execute("DELETE FROM messages WHERE page_id = ?", (page_id,))
-    cursor.execute("DELETE FROM session_states WHERE page_id = ?", (page_id,))
+    for tbl in (
+        "pages",
+        "registrations",
+        "messages",
+        "session_states",
+        "sessions",
+        "user_memories",
+        "invoices",
+        "cargo_packages",
+        "automated_rules",
+        "marketing_campaigns",
+        "sent_followups",
+        "appointments",
+    ):
+        cursor.execute(f"DELETE FROM {tbl} WHERE page_id = ?", (page_id,))
     conn.commit()
     conn.close()
     return True
@@ -743,7 +905,7 @@ def save_registration(
     status: str = "шинэ",
     page_id: str = DEFAULT_PAGE_ID
 ) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO registrations (page_id, name, phone, service, channel, sender_id, status, notes)
@@ -769,7 +931,7 @@ def save_registration(
     return reg_id
 
 def update_lead_status(lead_id: int, status: str, notes: Optional[str] = None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     if notes is not None:
         cursor.execute("UPDATE registrations SET status = ?, notes = ? WHERE id = ?", (status, notes, lead_id))
@@ -780,7 +942,7 @@ def update_lead_status(lead_id: int, status: str, notes: Optional[str] = None):
     sync_to_csv()
 
 def get_all_registrations(page_id: Optional[str] = None) -> List[Dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     if page_id:
@@ -943,7 +1105,7 @@ def generate_excel(page_id: Optional[str] = None) -> io.BytesIO:
 
 # ----------------- MESSAGES & SESSIONS -----------------
 def log_message(sender_id: str, channel: str, sender_type: str, content: str, page_id: str = DEFAULT_PAGE_ID):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO messages (page_id, sender_id, channel, sender_type, content)
@@ -965,7 +1127,7 @@ def save_chat_message(page_id: str, sender_id: str, channel: str, sender_type: s
     return log_message(sender_id=sender_id, channel=channel, sender_type=sender_type, content=content, page_id=page_id)
 
 def get_conversation_history(sender_id: str, limit: int = 50) -> List[Dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
@@ -979,7 +1141,7 @@ def get_conversation_history(sender_id: str, limit: int = 50) -> List[Dict]:
     return [dict(row) for row in rows]
 
 def get_active_sessions(page_id: Optional[str] = None) -> List[Dict]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     if page_id:
@@ -1006,7 +1168,7 @@ def get_active_sessions(page_id: Optional[str] = None) -> List[Dict]:
     return [dict(row) for row in rows]
 
 def set_human_takeover(sender_id: str, is_takeover: bool):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE session_states 
@@ -1017,7 +1179,7 @@ def set_human_takeover(sender_id: str, is_takeover: bool):
     conn.close()
 
 def is_session_human_takeover(sender_id: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT is_human_takeover FROM session_states WHERE sender_id = ?", (sender_id,))
     row = cursor.fetchone()
@@ -1028,7 +1190,7 @@ def is_session_human_takeover(sender_id: str) -> bool:
 
 def get_user_memory(page_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     """Хэрэглэгчийн санах ойг татаж авах (Нэр, утас, сонирхол, өмнөх хүсэлт)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
@@ -1052,7 +1214,7 @@ def upsert_user_memory(
     """Хэрэглэгчийн санах ойг үүсгэх эсвэл шинэчлэх (Idempotent update)"""
     if not page_id or not user_id:
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     # Өмнөх мэдээлэл байгаа эсэхийг шалгах
@@ -1099,7 +1261,9 @@ def create_invoice(
     qr_text: str = "",
     qr_image_url: str = "",
     deep_links: Optional[List[Dict[str, Any]]] = None,
-    invoice_id: Optional[str] = None
+    invoice_id: Optional[str] = None,
+    currency: str = "MNT",
+    qpay_invoice_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Шинэ төлбөрийн нэхэмжлэх үүсгэх"""
     if not invoice_id:
@@ -1107,17 +1271,17 @@ def create_invoice(
         invoice_id = f"INV-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
     
     deep_links_json = json.dumps(deep_links or [], ensure_ascii=False)
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO invoices (
-            invoice_id, page_id, sender_id, channel, amount, description,
-            status, qr_text, qr_image_url, deep_links_json
+            invoice_id, page_id, sender_id, channel, amount, currency, description,
+            status, qr_text, qr_image_url, deep_links_json, qpay_invoice_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
     """, (
-        invoice_id, str(page_id), sender_id, channel, int(amount), description,
-        qr_text, qr_image_url, deep_links_json
+        invoice_id, str(page_id), sender_id, channel, int(amount), str(currency or "MNT"), description,
+        qr_text, qr_image_url, deep_links_json, qpay_invoice_id
     ))
     conn.commit()
     conn.close()
@@ -1125,7 +1289,7 @@ def create_invoice(
 
 def get_invoice(invoice_id: str) -> Optional[Dict[str, Any]]:
     """Нэхэмжлэхийн мэдээлэл авах"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM invoices WHERE invoice_id = ?", (invoice_id,))
@@ -1143,24 +1307,39 @@ def get_invoice(invoice_id: str) -> Optional[Dict[str, Any]]:
 def mark_invoice_paid(
     invoice_id: str,
     ebarimt_lottery: str = "",
-    ebarimt_qr: str = ""
+    ebarimt_qr: str = "",
+    provider_payment_id: Optional[str] = None,
+    callback_verified: int = 0
 ) -> Optional[Dict[str, Any]]:
     """Нэхэмжлэхийг төлөгдсөн төлөвт оруулах ба И-Баримт олгох"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     paid_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute("""
         UPDATE invoices
-        SET status = 'PAID', paid_at = ?, ebarimt_lottery = ?, ebarimt_qr = ?
+        SET status = 'PAID',
+            paid_at = ?,
+            ebarimt_lottery = ?,
+            ebarimt_qr = ?,
+            provider_payment_id = COALESCE(?, provider_payment_id),
+            callback_verified = CASE WHEN ? > 0 THEN ? ELSE COALESCE(callback_verified, 0) END
         WHERE invoice_id = ?
-    """, (paid_at, ebarimt_lottery, ebarimt_qr, invoice_id))
+    """, (
+        paid_at,
+        ebarimt_lottery,
+        ebarimt_qr,
+        provider_payment_id,
+        int(callback_verified),
+        int(callback_verified),
+        invoice_id,
+    ))
     conn.commit()
     conn.close()
     return get_invoice(invoice_id)
 
 def list_invoices(page_id: Optional[str] = None, limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
     """Нэхэмжлэхүүдийн жагсаалт авах"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
@@ -1196,7 +1375,7 @@ def list_invoices(page_id: Optional[str] = None, limit: int = 50, status: Option
 
 def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
     """Финтек хяналтын самбарын тоон үзүүлэлтүүд (KPIs)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     where_clause = " WHERE page_id = ?" if page_id else ""
@@ -1229,7 +1408,7 @@ def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
 
 def update_page_qpay_settings(page_id: str, username: str, password: str, invoice_code: str, ebarimt_enabled: int = 1) -> bool:
     """Хуудасны QPay тохиргоог хадгалах"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE pages
@@ -1259,7 +1438,7 @@ def upsert_cargo_package(
 ) -> Dict[str, Any]:
     """Карго ачааны бүртгэл үүсгэх эсвэл шинэчлэх (Idempotent Upsert)"""
     tracking_clean = tracking_code.strip().upper()
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO cargo_packages (
@@ -1287,7 +1466,7 @@ def upsert_cargo_package(
 def get_cargo_package(page_id: str, tracking_code: str) -> Optional[Dict[str, Any]]:
     """Нэг карго ачааг кодоор хайх"""
     tracking_clean = tracking_code.strip().upper()
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM cargo_packages WHERE page_id = ? AND tracking_code = ?", (str(page_id), tracking_clean))
@@ -1298,7 +1477,7 @@ def get_cargo_package(page_id: str, tracking_code: str) -> Optional[Dict[str, An
 def find_cargo_by_phone_or_code(page_id: str, query: str) -> List[Dict[str, Any]]:
     """Утасны дугаар эсвэл карго кодоор ачаа хайх"""
     q_clean = query.strip().upper()
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
@@ -1330,7 +1509,7 @@ def scan_arrive_package(
     tracking_clean = tracking_code.strip().upper()
     arrived_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     # Хэрэв өмнө нь бүртгэлгүй байсан ч баркод уншуулсан бол шууд шинээр үүсгэнэ
@@ -1370,7 +1549,7 @@ def mark_cargo_delivered(page_id: str, tracking_code: str) -> Optional[Dict[str,
     """Ачааг олгосон төлөвт оруулах"""
     tracking_clean = tracking_code.strip().upper()
     delivered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE cargo_packages
@@ -1383,7 +1562,7 @@ def mark_cargo_delivered(page_id: str, tracking_code: str) -> Optional[Dict[str,
 
 def list_cargo_packages(page_id: str, status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
     """Карго ачаануудын жагсаалт"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     query = "SELECT * FROM cargo_packages WHERE page_id = ?"
@@ -1400,7 +1579,7 @@ def list_cargo_packages(page_id: str, status: Optional[str] = None, limit: int =
 
 def get_cargo_summary(page_id: str) -> Dict[str, Any]:
     """Карго хяналтын самбарын үзүүлэлтүүд"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     # Нийт ачаа
@@ -1439,7 +1618,7 @@ def update_page_telegram_settings(
     report_enabled: int = 1
 ) -> bool:
     """Хуудасны Telegram эзний тохиргоог хадгалах"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE pages
@@ -1454,7 +1633,7 @@ def update_page_telegram_settings(
 
 def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optional[str] = None) -> Dict[str, Any]:
     """Өчигдрийн эсвэл өнөөдрийн гүйцэтгэлийн нэгдсэн тайлангийн тоонууд"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     if not date_str:
@@ -1508,7 +1687,7 @@ def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optiona
 # -------------------------------------------------------------
 def get_automated_rules(page_id: str) -> List[Dict[str, Any]]:
     """Хуудасны автомат сэргээлтийн дүрмүүд (байхгүй бол анхны утгуудыг үүсгэнэ)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -1550,7 +1729,7 @@ def get_automated_rules(page_id: str) -> List[Dict[str, Any]]:
 
 def update_automated_rule(page_id: str, rule_type: str, delay_hours: int, message_template: str, is_active: bool) -> bool:
     """Сэргээх дүрмийг шинэчлэх"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO automated_rules (page_id, rule_type, delay_hours, message_template, is_active)
@@ -1566,7 +1745,7 @@ def update_automated_rule(page_id: str, rule_type: str, delay_hours: int, messag
 
 def record_sent_followup(page_id: str, rule_type: str, sender_id: str, channel: str = "web") -> bool:
     """Илгээсэн сэргээх зурвасыг бүртгэх (давхардахаас сэргийлэх)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
@@ -1583,7 +1762,7 @@ def record_sent_followup(page_id: str, rule_type: str, sender_id: str, channel: 
 
 def is_followup_sent(page_id: str, rule_type: str, sender_id: str) -> bool:
     """Өмнө нь энэ харилцагч руу энэ дүрмээр зурвас очсон эсэх"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id FROM sent_followups
@@ -1595,7 +1774,7 @@ def is_followup_sent(page_id: str, rule_type: str, sender_id: str) -> bool:
 
 def get_abandoned_chat_candidates(page_id: str, delay_hours: int = 2) -> List[Dict[str, Any]]:
     """Хаягдсан чат илрүүлэгч"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -1626,7 +1805,7 @@ def get_abandoned_chat_candidates(page_id: str, delay_hours: int = 2) -> List[Di
 
 def get_cargo_pickup_candidates(page_id: str, delay_hours: int = 48) -> List[Dict[str, Any]]:
     """Ачаагаа аваагүй байгаа хэрэглэгчид (ARRIVED_UB төлөвтэй, delay_hours өнгөрсөн)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -1652,7 +1831,7 @@ def get_cargo_pickup_candidates(page_id: str, delay_hours: int = 48) -> List[Dic
 
 def get_retention_candidates(page_id: str, delay_days: int = 25) -> List[Dict[str, Any]]:
     """25+ хоногийн өмнө бүртгэл үүссэн харилцагчид (хумс будалт, давтан үйлчилгээ)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -1677,7 +1856,7 @@ def get_retention_candidates(page_id: str, delay_days: int = 25) -> List[Dict[st
 
 def get_broadcast_audience(page_id: str, segment: str = "all") -> List[Dict[str, Any]]:
     """1-Click Broadcast илгээх зорилтот харилцагчид"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -1715,7 +1894,7 @@ def create_marketing_campaign(
     sent_count: int = 0
 ) -> Dict[str, Any]:
     """1-Click Broadcast кампэйн үүсгэж хадгалах"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO marketing_campaigns (page_id, title, message, target_segment, channel, status, sent_count)
@@ -1734,7 +1913,7 @@ def create_marketing_campaign(
 
 def list_marketing_campaigns(page_id: str, limit: int = 20) -> List[Dict[str, Any]]:
     """Өмнөх маркетинг кампэйнуудын жагсаалт"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
@@ -1748,7 +1927,7 @@ def list_marketing_campaigns(page_id: str, limit: int = 20) -> List[Dict[str, An
 
 def get_marketing_summary(page_id: str) -> Dict[str, Any]:
     """Маркетингийн хураангуй тооцоолол"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(id) FROM marketing_campaigns WHERE page_id = ?", (str(page_id),))
@@ -1776,7 +1955,7 @@ def get_marketing_summary(page_id: str) -> Dict[str, Any]:
 # -------------------------------------------------------------
 def is_slot_available(page_id: str, appointment_date: str, appointment_time: str, service_name: Optional[str] = None) -> bool:
     """Тухайн өдөр болон цагт сул цаг байгаа эсэх"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     query = "SELECT id FROM appointments WHERE page_id = ? AND appointment_date = ? AND appointment_time = ? AND status != 'CANCELLED'"
     params = [str(page_id), appointment_date.strip(), appointment_time.strip()]
@@ -1802,7 +1981,7 @@ def create_appointment(
     """Шинэ цаг захиалга үүсгэх (хэрэв сул бол)"""
     if not is_slot_available(page_id, appointment_date, appointment_time, service_name):
         return None
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO appointments (
@@ -1833,7 +2012,7 @@ def create_appointment(
 
 def get_appointment(appointment_id: int) -> Optional[Dict[str, Any]]:
     """Цаг захиалгын мэдээлэл авах"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM appointments WHERE id = ?", (int(appointment_id),))
@@ -1848,7 +2027,7 @@ def list_appointments(
     limit: int = 50
 ) -> List[Dict[str, Any]]:
     """Цаг захиалгуудын жагсаалт"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     conditions = ["page_id = ?"]
@@ -1868,7 +2047,7 @@ def list_appointments(
 
 def update_appointment_status(appointment_id: int, status: str) -> bool:
     """Цаг захиалгын төлөв өөрчлөх ('CONFIRMED', 'COMPLETED', 'CANCELLED')"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE appointments SET status = ? WHERE id = ?", (status, int(appointment_id)))
     success = cursor.rowcount > 0
@@ -1886,7 +2065,7 @@ def get_pending_appointment_reminders(hours_ahead: int = 2) -> List[Dict[str, An
     current_time_str = now.strftime("%H:%M")
     two_hours_later_str = (now + timedelta(hours=hours_ahead)).strftime("%H:%M")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
@@ -1903,7 +2082,7 @@ def get_pending_appointment_reminders(hours_ahead: int = 2) -> List[Dict[str, An
 
 def mark_appointment_reminder_sent(appointment_id: int) -> bool:
     """Сануулга илгээгдсэнийг тэмдэглэх"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE appointments SET reminder_sent = 1 WHERE id = ?", (int(appointment_id),))
     success = cursor.rowcount > 0
@@ -1914,7 +2093,7 @@ def mark_appointment_reminder_sent(appointment_id: int) -> bool:
 def get_appointments_summary(page_id: str) -> Dict[str, Any]:
     """Цаг захиалгын самбарын хураангуй тооцоолол"""
     today_str = datetime.now().strftime("%Y-%m-%d")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND appointment_date = ? AND status = 'CONFIRMED'", (str(page_id), today_str))

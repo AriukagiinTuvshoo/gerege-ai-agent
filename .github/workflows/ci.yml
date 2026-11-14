@@ -9,6 +9,32 @@ on:
 jobs:
   test-and-security-audit:
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gerege
+          POSTGRES_PASSWORD: ci_pg_password_2026
+          POSTGRES_DB: gerege_crm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U gerege -d gerege_crm_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+
     env:
       ADMIN_PASSWORD: "ci_test_admin_password_2026"
       GEMINI_MODEL: "gemini-3.5-flash-lite"
@@ -23,24 +49,37 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install system Postgres client & Python dependencies
         run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Initialize schema & verify Alembic models
+      - name: Compile & Syntax Verification
         run: |
-          python -c "import database; database.init_db(); from core import models, db_engine; engine = db_engine.create_sqlalchemy_engine(); models.Base.metadata.create_all(bind=engine)"
+          python -m py_compile main.py database.py agent.py worker.py fintech_service.py cargo_service.py appointment_service.py retention_service.py executive_bot_service.py sheets_service.py core/security.py core/db_engine.py core/models.py core/task_queue.py core/backup_service.py core/ai_router.py core/monitoring.py routers/system_router.py scripts/migrate_sqlite_to_postgres.py
 
-      - name: Run Pytest Enterprise Suite (Phase 1 - Phase 5)
+      - name: Initialize SQLite schema & verify SQLAlchemy models
         run: |
-          pytest tests/ -v
+          python -c "import database; database.init_db(); from core import models, db_engine; engine = db_engine.create_sqlalchemy_engine('sqlite:///:memory:'); models.Base.metadata.create_all(bind=engine)"
 
-      - name: Run Security P0 & Module E2E Regression Suites
+      - name: Run Pytest Enterprise & AI Evaluation Suites (SQLite mode)
         run: |
-          python scratch/test_security_p0_e2e.py
-          python scratch/test_fintech_e2e.py
-          python scratch/test_cargo_e2e.py
-          python scratch/test_executive_e2e.py
-          python scratch/test_retention_e2e.py
-          python scratch/test_appointments_voice_e2e.py
+          pytest tests/test_enterprise_phases.py tests/test_ai_eval_suite.py -v
+
+      - name: Run SQLite-to-PostgreSQL Dry-Run Verification
+        run: |
+          python scripts/migrate_sqlite_to_postgres.py --dry-run
+
+      - name: Run Alembic Migration & SQLite-to-PostgreSQL Migration Verification
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@localhost:5432/gerege_crm_test"
+          REDIS_URL: "redis://localhost:6379/0"
+        run: |
+          alembic upgrade head
+          python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
+          pytest tests/test_enterprise_phases.py tests/test_ai_eval_suite.py -v
+
+      - name: Build Production Docker Image
+        run: |
+          docker build -t gerege-ai-agent:ci .

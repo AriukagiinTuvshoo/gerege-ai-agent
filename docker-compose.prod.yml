@@ -15,6 +15,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
 
   redis:
     image: redis:7-alpine
@@ -27,6 +32,11 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
 
   web:
     build: .
@@ -37,6 +47,7 @@ services:
       ENV: production
       STRICT_SECURITY: "1"
       WEBHOOK_FAIL_CLOSED: "1"
+      STRICT_QPAY_VERIFICATION: "1"
       DISABLE_INLINE_SCHEDULER: "1"
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
       REDIS_URL: redis://redis:6379/0
@@ -53,6 +64,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=4)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 1024M
 
   worker:
     build: .
@@ -60,6 +81,7 @@ services:
     command: ["python", "worker.py"]
     environment:
       ENV: production
+      STRICT_SECURITY: "1"
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
       REDIS_URL: redis://redis:6379/0
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
@@ -71,6 +93,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
 
 volumes:
   pgdata:
