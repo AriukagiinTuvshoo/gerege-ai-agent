@@ -1,1 +1,23 @@
+# Environment & Secrets
+.env
+*.env.local
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Local Databases & Logs
+leads.db
+leads.db-journal
+leads.csv
+*.log
+
+# Static Generated Files (QRCodes)
+static/qrcodes/*.png
+
+# Vercel & Deployments
 .vercel
+.vscode/
+.idea/
