@@ -271,10 +271,30 @@
     }
   };
 
+  function escapeHtml(str) {
+    return String(str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function formatSafeBotMessage(str) {
+    const escaped = escapeHtml(str);
+    return escaped
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:#60a5fa;text-decoration:underline;font-weight:600;">$1</a>')
+      .replace(/\n/g, '<br>');
+  }
+
   function appendMsg(type, text) {
     const bubble = document.createElement('div');
     bubble.className = 'ai-bubble ai-bubble-' + type;
-    bubble.innerText = text;
+    if (type === 'bot') {
+      bubble.innerHTML = formatSafeBotMessage(text);
+    } else {
+      bubble.innerText = text;
+    }
     msgsDiv.insertBefore(bubble, typingDiv);
     msgsDiv.scrollTop = msgsDiv.scrollHeight;
   }

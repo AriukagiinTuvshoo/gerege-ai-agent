@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 ESCALATION_KEYWORDS = [
-    "хүнтэй ярих", "хүн байна уу", "оператор", "менежер", "гомдол", "хүнтэй холбогдох"
+    "хүнтэй ярих", "хүн байна уу", "оператор", "менежер", "гомдол", "хүнтэй холбогдох",
+    "huntei yarih", "hun tei yarih", "hun baina uu", "operator", "menejer", "gomdol"
 ]
 
 def build_system_instruction_for_page(page_data: Optional[Dict[str, Any]] = None, user_memory: Optional[Dict[str, Any]] = None) -> str:
@@ -143,26 +144,30 @@ def build_system_instruction_for_page(page_data: Optional[Dict[str, Any]] = None
 """
 
 def extract_phone_and_name_fallback(text: str) -> Optional[Dict[str, str]]:
-    phone_match = re.search(r'\b([8976]\d{7})\b', text.replace("-", "").replace(" ", ""))
+    if not text:
+        return None
+    # Монголын гар утасны дугаар (99, 95, 94, 96, 91, 90, 88, 89, 86, 85, 80, 77, 75, 70)
+    phone_match = re.search(r'(?<![A-Za-z0-9\-])((?:99|95|94|96|91|90|88|89|86|85|80|77|75|70)\d{2}[\s\-]?\d{4})(?![A-Za-z0-9\-])', text)
     if not phone_match:
-        phone_match = re.search(r'\b(\d{8})\b', text)
+        return None
     
-    if phone_match:
-        phone = phone_match.group(1)
-        name = "Харилцагч"
-        name_patterns = [
-            r'намайг\s+([А-Яа-яA-Za-z]+)\s+гэдэг',
-            r'нэр\s*:?\s*([А-Яа-яA-Za-z]+)',
-            r'([А-Яа-яA-Za-z]+)\s+байна',
-            r'^([А-Яа-яA-Za-z]+)\s+\d{8}',
-        ]
-        for pattern in name_patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m:
-                name = m.group(1).capitalize()
+    phone = re.sub(r'[\s\-]', '', phone_match.group(1))
+    name = "Харилцагч"
+    stop_names = {"сайн", "юу", "хэн", "хаана", "хэд", "бэлэн", "захиалга", "ачаа", "бараа", "үнэ", "карго", "байна", "танай", "уу", "үү", "би", "утас", "дугаар"}
+    name_patterns = [
+        r'намайг\s+([А-Яа-яӨөҮүЁёA-Za-z]{2,20})\s+гэдэг',
+        r'нэр\s*:?\s*([А-Яа-яӨөҮүЁёA-Za-z]{2,20})',
+        r'([А-Яа-яӨөҮүЁёA-Za-z]{2,20})\s+байна',
+        r'(?:^|\s)([А-Яа-яӨөҮүЁёA-Za-z]{2,20})\s+(?:\+?976[\s\-]?)?(?:99|95|94|91|90|85|80|88|89|86|72|75|77|70)\d{2}[\s\-]?\d{4}',
+    ]
+    for pattern in name_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate.lower() not in stop_names:
+                name = candidate.capitalize()
                 break
-        return {"name": name, "phone": phone}
-    return None
+    return {"name": name, "phone": phone}
 
 class AIAgent:
     def __init__(self):
@@ -221,11 +226,17 @@ class AIAgent:
         char_count = len(text) + len(reply)
         return max(40, int(char_count * 0.75) + 60)
 
-    def reset_sessions(self):
-        self.chat_sessions.clear()
+    def reset_sessions(self, page_id: Optional[str] = None):
+        if page_id:
+            prefix = f"{page_id}_"
+            keys_to_del = [k for k in self.chat_sessions if k.startswith(prefix)]
+            for k in keys_to_del:
+                self.chat_sessions.pop(k, None)
+        else:
+            self.chat_sessions.clear()
 
     def analyze_receipt_image(self, image_bytes: bytes, client: Optional[Any] = None) -> Dict[str, Any]:
-        """Gemini Vision ашиглан банкны гүйлгээний баримтыг таних"""
+        """Gemini Vision ашиглан банкны гүйлгээний баримтыг нарийвчлан шалгах (Substring false-positive хамгаалалттай)"""
         active_client = client or self.default_client
         if not active_client:
             return {"is_receipt": False, "details": "AI холбогдоогүй"}
@@ -234,21 +245,29 @@ class AIAgent:
             img = Image.open(io.BytesIO(image_bytes))
             prompt = """
 Энэ зургийг шинжилж дараах асуултад үнэн зөв хариул:
-1. Энэ нь банкны эсвэл цахим хэтэвчний (Голомт, Хаан, Хас, Төрийн банк, SocialPay, QPay г.м) гүйлгээний амжилттай болсон баримт мөн үү?
+1. Энэ нь банкны эсвэл цахим хэтэвчний (Голомт, Хаан, Хас, Төрийн банк, SocialPay, QPay г.м) гүйлгээний амжилттай болсон жинхэнэ баримт мөн үү?
 2. Гүйлгээний дүн хэдэн төгрөг байна вэ?
 3. Төлөв нь 'Амжилттай' гэсэн төлөвтэй байна уу?
 
-Хэрэв банкны гүйлгээний баримт мөн бөгөөд амжилттай болсон бол эхний мөрөнд: "VALID_RECEIPT|Дүн" гэж бичээд доор нь товч тайлбарла.
-Хэрэв биш бол: "INVALID_RECEIPT|Шалтгаан" гэж хариул.
+Хэрэв банкны гүйлгээний баримт мөн бөгөөд амжилттай болсон бол яг эхний мөрөнд: "VALID_RECEIPT|Дүн" гэж бичээд доор нь товч тайлбарла.
+Хэрэв баримт биш эсвэл амжилтгүй бол яг эхний мөрөнд: "INVALID_RECEIPT|Шалтгаан" гэж хариул.
 """
             resp = active_client.models.generate_content(
                 model=self.model_name,
                 contents=[prompt, img]
             )
-            text = resp.text or ""
-            is_valid = "VALID_RECEIPT" in text or "Амжилттай" in text or any(c in text for c in ["5,000", "10,000", "20,000", "төгрөг", "₮", "MNT"])
+            text = (resp.text or "").strip()
+            first_line = text.splitlines()[0].strip().upper() if text else ""
+            # Нарийн шалгалт: "INVALID_RECEIPT" дотор "VALID_RECEIPT" багтдаг тул startswith ашиглана
+            is_valid = first_line.startswith("VALID_RECEIPT") and not first_line.startswith("INVALID_RECEIPT")
+            parsed_amount = 0
+            if is_valid and "|" in first_line:
+                amt_digits = re.sub(r"[^\d]", "", first_line.split("|", 1)[1])
+                if amt_digits:
+                    parsed_amount = int(amt_digits)
             return {
                 "is_receipt": is_valid,
+                "amount": parsed_amount,
                 "analysis": text
             }
         except Exception as e:
@@ -267,7 +286,7 @@ class AIAgent:
     ) -> Dict[str, Any]:
         # Хуудасны мэдээллийг баазаас авах (Multi-Tenant Lookup)
         page_data = database.get_page(page_id)
-        page_name = page_data.get("name", "Манай суваг") if page_data else "Tuvshok Кино Суваг"
+        page_name = page_data.get("name", "Манай суваг") if page_data else "Гэрэгэ Систем"
 
         # Баазад тэмдэглэх
         log_content = text if text else ("[Дуут зурвас илгээв]" if audio_bytes else "[Зураг хавсаргав]")
@@ -300,9 +319,9 @@ class AIAgent:
                 database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=reply_limit, page_id=page_id)
                 return {"reply": reply_limit, "registered": False, "limit_exceeded": True, "model": "limit_exceeded"}
 
-        # Хуудас тус бүрийн линкүүдийг бэлтгэх
-        tg_link = "https://t.me/+9tgSTfrXiUs2ODk1"
-        fb_link = "https://www.facebook.com/groups/2991030297929100/"
+        # Хуудас тус бүрийн линкүүдийг бэлтгэх (Tenant-isolation: өөр салбарт өөр хүний линк өгөхгүй)
+        tg_link = ""
+        fb_link = ""
         if page_data and page_data.get("knowledge_json"):
             try:
                 k_obj = json.loads(page_data["knowledge_json"]) if isinstance(page_data["knowledge_json"], str) else page_data["knowledge_json"]
@@ -311,11 +330,11 @@ class AIAgent:
                 if links_obj.get("facebook_group"): fb_link = links_obj["facebook_group"]
             except Exception:
                 pass
-        else:
+        elif page_id == database.DEFAULT_PAGE_ID:
             kb = knowledge_base.load_knowledge()
             links = kb.get("links", {})
-            tg_link = links.get("telegram_group", tg_link)
-            fb_link = links.get("facebook_group", fb_link)
+            tg_link = links.get("telegram_group", "")
+            fb_link = links.get("facebook_group", "")
 
         # 3. ЗУРАГ / БАНКНЫ ХУУЛГА ИРСЭН ЭСЭХИЙГ ШАЛГАХ (VISION)
         if image_bytes:
@@ -527,8 +546,8 @@ class AIAgent:
                     if clean_reply:
                         reply_text = clean_reply
 
-                # 5. ТӨЛБӨРИЙН ХҮСЭЛТ ШАЛГАХ (QPAY INTENT FALLBACK)
-                payment_keywords = ["авъя", "үйлчилгээ авъя", "төлбөр төлье", "төлбөрөө төлье", "данс өгөөч", "дансны дугаар", "данс", "qpay", "төлөх", "хандив өгье", "холбогдох эрх"]
+                # 5. ТӨЛБӨРИЙН ХҮСЭЛТ ШАЛГАХ (QPAY EXPLICIT INTENT FALLBACK)
+                payment_keywords = ["төлбөр төлье", "төлбөрөө төлье", "qpay линк", "qpay-ээр төлье", "нэхэмжлэх авъя", "хандив өгье"]
                 is_payment_intent = any(pk in text.lower() for pk in payment_keywords)
 
                 if is_payment_intent and not invoice_order:
@@ -554,8 +573,10 @@ class AIAgent:
                         f"*(Утсан дээрээ дээрх линк дээр дармагц Хаан, Голомт SocialPay, М банк гэх мэт банкны апп шууд нээгдэнэ. Төлбөр хийгдсэн секундын дотор 100% автоматаар баталгаажин И-Баримт очих болно! 🎉)*"
                     )
 
-                # Токен тоолох ба хуудасны баазад нэмэх
-                tokens_spent = self.estimate_tokens(text, reply_text)
+                # Токен тоолох ба хуудасны баазад нэмэх (usage_metadata бодит тоо байвал ашиглах)
+                usage_meta = getattr(response, "usage_metadata", None)
+                real_tokens = getattr(usage_meta, "total_token_count", None) if usage_meta else None
+                tokens_spent = int(real_tokens) if real_tokens else self.estimate_tokens(text, reply_text)
                 database.increment_page_tokens(page_id, tokens_spent)
 
                 if not registered:
@@ -616,8 +637,8 @@ class AIAgent:
 
 agent = AIAgent()
 
-def reset_sessions():
-    agent.reset_sessions()
+def reset_sessions(page_id: Optional[str] = None):
+    agent.reset_sessions(page_id=page_id)
 
 def process_message(*args, **kwargs):
     return agent.process_message(*args, **kwargs)

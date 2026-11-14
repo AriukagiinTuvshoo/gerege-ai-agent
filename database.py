@@ -55,8 +55,10 @@ def hmac_equal(a: str, b: str) -> bool:
 
 def init_db():
     """Өгөгдлийн санг үүсгэх / шинэчлэх (Multi-Tenant Agency & RBAC Auth Support)"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
     
     # 0. Олон Хуудас / Харилцагчийн хүснэгт (Tenants / Pages)
     cursor.execute("""
@@ -199,6 +201,10 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_page_tracking ON cargo_packages (page_id, tracking_code)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_phone ON cargo_packages (customer_phone)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_status ON cargo_packages (status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_page ON messages (sender_id, page_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_page_created ON messages (page_id, created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_registrations_page_created ON registrations (page_id, created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_registrations_page_phone ON registrations (page_id, phone)")
 
     # 8. Автомат борлуулалт, сэргээх дүрмүүд (Smart Retention & Follow-up Rules)
     cursor.execute("""
@@ -388,10 +394,12 @@ def delete_session(token: str):
     conn.close()
 
 def authenticate_admin(password: str) -> bool:
-    """Супер Админы нууц үгийг шалгах (ADMIN2026)"""
-    expected = os.getenv("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD).strip()
-    p = password.strip()
-    return secrets.compare_digest(p, expected) or secrets.compare_digest(p.upper(), "ADMIN2026")
+    """Супер Админы нууц үгийг шалгах (ENV дээр ADMIN_PASSWORD тохируулсан бол зөвхөн түүнийг шалгана)"""
+    env_pw = os.getenv("ADMIN_PASSWORD", "").strip()
+    p = (password or "").strip()
+    if env_pw:
+        return secrets.compare_digest(p, env_pw)
+    return secrets.compare_digest(p, DEFAULT_ADMIN_PASSWORD) or secrets.compare_digest(p.lower(), DEFAULT_ADMIN_PASSWORD.lower())
 
 def sanitize_page_id(page_id: str) -> str:
     """URL эсвэл буруу форматаар орж ирсэн хуудасны ID-г найдвартай цэвэрлэх"""
@@ -532,7 +540,29 @@ def increment_page_tokens(page_id: str, tokens: int) -> int:
     return row[0] if row else 0
 
 # ----------------- PAGES / TENANTS CRUD -----------------
-def get_all_pages(mask_secrets: bool = True) -> List[Dict]:
+def _sanitize_page_secrets(d: Dict[str, Any], include_magic_token: bool = False) -> Dict[str, Any]:
+    """Нууц токенуудыг зөвхөн masked хэлбэрээр үлдээж, жинхэнэ утгуудыг dict-ээс бүрэн устгах"""
+    d["has_custom_gemini_key"] = bool(d.get("gemini_api_key"))
+    d["has_password"] = bool(d.get("client_password_hash"))
+    d["has_page_token"] = bool(d.get("page_access_token"))
+    d["has_qpay"] = bool(d.get("qpay_username") and d.get("qpay_password"))
+    d["has_bot_token"] = bool(d.get("telegram_bot_token"))
+    d["page_access_token_masked"] = mask_secret(d.get("page_access_token"), 6, 4)
+    d["gemini_api_key_masked"] = mask_secret(d.get("gemini_api_key"), 4, 4)
+    d["qpay_password_masked"] = mask_secret(d.get("qpay_password"), 2, 2)
+    d["telegram_bot_token_masked"] = mask_secret(d.get("telegram_bot_token"), 6, 4)
+    # Жинхэнэ нууц түлхүүрүүдийг устгах (API-аар хэзээ ч задрахгүй)
+    d.pop("page_access_token", None)
+    d.pop("gemini_api_key", None)
+    d.pop("qpay_password", None)
+    d.pop("telegram_bot_token", None)
+    d.pop("client_password_hash", None)
+    d.pop("client_salt", None)
+    if not include_magic_token:
+        d.pop("client_magic_token", None)
+    return d
+
+def get_all_pages(mask_secrets: bool = True, include_magic_token: bool = False) -> List[Dict]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -546,15 +576,11 @@ def get_all_pages(mask_secrets: bool = True) -> List[Dict]:
         d["has_custom_gemini_key"] = bool(d.get("gemini_api_key"))
         d["has_password"] = bool(d.get("client_password_hash"))
         if mask_secrets:
-            d["page_access_token_masked"] = mask_secret(d.get("page_access_token"), 6, 4)
-            d["gemini_api_key_masked"] = mask_secret(d.get("gemini_api_key"), 4, 4)
-            # Нууц үгийн хэшийг гаргахгүй
-            d.pop("client_password_hash", None)
-            d.pop("client_salt", None)
+            _sanitize_page_secrets(d, include_magic_token=include_magic_token)
         result.append(d)
     return result
 
-def get_page(page_id: str, mask_secrets: bool = False) -> Optional[Dict]:
+def get_page(page_id: str, mask_secrets: bool = False, include_magic_token: bool = False) -> Optional[Dict]:
     if not page_id:
         return None
     p_id = str(page_id).strip()
@@ -574,10 +600,7 @@ def get_page(page_id: str, mask_secrets: bool = False) -> Optional[Dict]:
     d["has_custom_gemini_key"] = bool(d.get("gemini_api_key"))
     d["has_password"] = bool(d.get("client_password_hash"))
     if mask_secrets:
-        d["page_access_token_masked"] = mask_secret(d.get("page_access_token"), 6, 4)
-        d["gemini_api_key_masked"] = mask_secret(d.get("gemini_api_key"), 4, 4)
-        d.pop("client_password_hash", None)
-        d.pop("client_salt", None)
+        _sanitize_page_secrets(d, include_magic_token=include_magic_token)
     return d
 
 def save_page(
@@ -592,6 +615,10 @@ def save_page(
     is_active: int = 1
 ) -> bool:
     clean_id = sanitize_page_id(page_id)
+    if "•" in (page_access_token or "") or "****" in (page_access_token or ""):
+        page_access_token = ""
+    if "•" in (gemini_api_key or "") or "****" in (gemini_api_key or ""):
+        gemini_api_key = ""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     magic = secrets.token_urlsafe(24)

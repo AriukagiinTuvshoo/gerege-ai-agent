@@ -1,0 +1,13 @@
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+leads.csv
+__pycache__/
+*.pyc
+.git/
+.gitignore
+scratch/
+.vscode/
+.idea/

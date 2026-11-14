@@ -1,6 +1,9 @@
 import os
 import io
 import json
+import time
+import hmac
+import hashlib
 import logging
 import asyncio
 from contextlib import asynccontextmanager
@@ -101,6 +104,10 @@ META_PAGE_ACCESS_TOKEN = os.getenv("META_PAGE_ACCESS_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_MANAGER_CHAT_ID = os.getenv("TELEGRAM_MANAGER_CHAT_ID", "")
 
+# Webhook deduplication & Login rate-limiting state
+_PROCESSED_MIDS: List[str] = []
+_LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
+
 # -------------------------------------------------------------
 # 1. ТУСЛАХ ИЛГЭЭГЧҮҮД (Meta, Telegram, Manager Notification)
 # -------------------------------------------------------------
@@ -111,7 +118,8 @@ async def send_meta_message(recipient_id: str, text: str, page_token: Optional[s
     if not token or not text:
         logger.warning(f"send_meta_message skipped: token_exists={bool(token)}, text_len={len(text)}")
         return
-    url = f"https://graph.facebook.com/v21.0/me/messages?access_token={token}"
+    graph_ver = os.getenv("META_GRAPH_API_VERSION", "v22.0")
+    url = f"https://graph.facebook.com/{graph_ver}/me/messages?access_token={token}"
     payload = {
         "recipient": {"id": recipient_id},
         "messaging_type": "RESPONSE",
@@ -224,14 +232,24 @@ async def get_current_user(
 # 3. НЭВТРЭЛТ БА ЭРХИЙН УДИРДЛАГА (Auth API)
 # -------------------------------------------------------------
 @app.post("/api/auth/login")
-async def auth_login(payload: Dict[str, Any], response: Response):
+async def auth_login(payload: Dict[str, Any], request: Request, response: Response):
+    client_ip = (request.client.host if request.client else "unknown")
+    now_ts = time.time()
+    attempts = [t for t in _LOGIN_ATTEMPTS.get(client_ip, []) if now_ts - t < 60.0]
+    if len(attempts) >= 10:
+        return JSONResponse(
+            {"success": False, "error": "Хэт олон удаа буруу оролдлого хийлээ. 1 минутын дараа дахин оролдоно уу."},
+            status_code=429
+        )
+
     login_type = payload.get("type", "admin")  # 'admin', 'client', 'magic'
     
     if login_type == "admin":
         password = str(payload.get("password", "")).strip()
         if database.authenticate_admin(password):
+            _LOGIN_ATTEMPTS.pop(client_ip, None)
             token = database.create_session(role="admin", page_id=None)
-            response.set_cookie(key="session_token", value=token, max_age=86400*3, httponly=True)
+            response.set_cookie(key="session_token", value=token, max_age=86400*3, httponly=True, samesite="lax")
             return {
                 "success": True,
                 "token": token,
@@ -239,6 +257,8 @@ async def auth_login(payload: Dict[str, Any], response: Response):
                 "page_id": None,
                 "page_name": "👑 Супер Админ"
             }
+        attempts.append(now_ts)
+        _LOGIN_ATTEMPTS[client_ip] = attempts
         return JSONResponse({"success": False, "error": "Админы нууц үг буруу байна!"}, status_code=401)
 
     elif login_type in ["client", "magic"]:
@@ -246,9 +266,10 @@ async def auth_login(payload: Dict[str, Any], response: Response):
         password = payload.get("password")
         client_page, err_msg = database.authenticate_client_detailed(identifier, password)
         if client_page:
+            _LOGIN_ATTEMPTS.pop(client_ip, None)
             page_id = client_page["page_id"]
             token = database.create_session(role="client", page_id=page_id)
-            response.set_cookie(key="session_token", value=token, max_age=86400*3, httponly=True)
+            response.set_cookie(key="session_token", value=token, max_age=86400*3, httponly=True, samesite="lax")
             return {
                 "success": True,
                 "token": token,
@@ -259,6 +280,8 @@ async def auth_login(payload: Dict[str, Any], response: Response):
                 "tokens_used": client_page.get("tokens_used", 0),
                 "monthly_token_limit": client_page.get("monthly_token_limit", 100000)
             }
+        attempts.append(now_ts)
+        _LOGIN_ATTEMPTS[client_ip] = attempts
         return JSONResponse({"success": False, "error": err_msg or "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"}, status_code=401)
 
     return JSONResponse({"success": False, "error": "Үл мэдэгдэх төрөл"}, status_code=400)
@@ -308,7 +331,7 @@ async def verify_meta_webhook(
     hub_challenge: Optional[str] = Query(None, alias="hub.challenge")
 ):
     expected_token = os.getenv("META_VERIFY_TOKEN", META_VERIFY_TOKEN).strip()
-    if hub_mode == "subscribe" and (hub_verify_token == expected_token or hub_verify_token == "agent_verify_secret_token_123"):
+    if hub_mode == "subscribe" and hub_verify_token == expected_token:
         logger.info("Meta Webhook баталгаажлаа!")
         return Response(content=hub_challenge, media_type="text/plain")
     return Response(content="Verification failed", status_code=403)
@@ -316,7 +339,16 @@ async def verify_meta_webhook(
 @app.post("/webhook")
 async def meta_webhook_events(request: Request, background_tasks: BackgroundTasks):
     try:
-        data = await request.json()
+        raw_body = await request.body()
+        app_secret = os.getenv("META_APP_SECRET", "").strip()
+        if app_secret:
+            sig_header = request.headers.get("X-Hub-Signature-256", "")
+            expected_sig = "sha256=" + hmac.new(app_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+            if not sig_header or not hmac.compare_digest(sig_header, expected_sig):
+                logger.warning("Meta webhook rejected: invalid X-Hub-Signature-256")
+                return Response(content="Invalid signature", status_code=403)
+
+        data = json.loads(raw_body.decode("utf-8") or "{}")
         for entry in data.get("entry", []):
             entry_page_id = entry.get("id")
             for messaging_event in entry.get("messaging", []):
@@ -325,6 +357,15 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
                 message = messaging_event.get("message")
                 if not message or message.get("is_echo"):
                     continue
+
+                # Meta webhook retry deduplication by mid
+                mid = message.get("mid")
+                if mid:
+                    if mid in _PROCESSED_MIDS:
+                        continue
+                    _PROCESSED_MIDS.append(mid)
+                    if len(_PROCESSED_MIDS) > 2000:
+                        del _PROCESSED_MIDS[:500]
                 
                 # Тухайн чат аль Facebook Page рүү ирснийг олох
                 target_page_id = str(recipient_id or entry_page_id or database.DEFAULT_PAGE_ID)
@@ -350,7 +391,8 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
                         break
 
                 if (user_text or image_bytes) and sender_id:
-                    result = agent.process_message(
+                    result = await asyncio.to_thread(
+                        agent.process_message,
                         text=user_text,
                         image_bytes=image_bytes,
                         sender_id=f"meta_{sender_id}",
@@ -374,6 +416,12 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
 @app.post("/telegram/webhook")
 async def telegram_webhook_events(request: Request, background_tasks: BackgroundTasks):
     try:
+        tg_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+        if tg_secret:
+            header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not header_secret or not hmac.compare_digest(header_secret, tg_secret):
+                return Response(content="Forbidden", status_code=403)
+
         data = await request.json()
         message = data.get("message", {})
         chat_id = message.get("chat", {}).get("id")
@@ -411,7 +459,8 @@ async def telegram_webhook_events(request: Request, background_tasks: Background
                     return {"status": "ok", "mode": "owner_command"}
 
             # 2. Энгийн харилцагчийн AI чатбот хариу (Текст болон Дуут зурвас)
-            result = agent.process_message(
+            result = await asyncio.to_thread(
+                agent.process_message,
                 text=user_text,
                 audio_bytes=voice_bytes,
                 audio_mime="audio/ogg" if message.get("voice") else "audio/mpeg",
@@ -455,7 +504,8 @@ async def web_chat_endpoint(payload: Dict[str, Any], request: Request, backgroun
     if not message:
         return JSONResponse({"reply": "Та мессежээ бичнэ үү.", "registered": False})
         
-    result = agent.process_message(
+    result = await asyncio.to_thread(
+        agent.process_message,
         text=message,
         sender_id=sender_id,
         channel="web",
@@ -491,7 +541,8 @@ async def manychat_webhook_endpoint(request: Request, background_tasks: Backgrou
             "reply": "Сайн байна уу! Танд хэрхэн туслах вэ?"
         })
 
-    result = agent.process_message(
+    result = await asyncio.to_thread(
+        agent.process_message,
         text=message,
         sender_id=f"mc_{user_id}",
         channel="manychat/instagram",
@@ -537,7 +588,8 @@ async def upload_receipt_endpoint(
         target_page_id = page_id or database.DEFAULT_PAGE_ID
 
     image_bytes = await file.read()
-    result = agent.process_message(
+    result = await asyncio.to_thread(
+        agent.process_message,
         text=text or "",
         image_bytes=image_bytes,
         sender_id=sender_id or "web_simulator_user",
@@ -555,18 +607,20 @@ async def upload_receipt_endpoint(
 async def get_pages(request: Request):
     """
     Хуудсуудын жагсаалт:
-    - Админ: Бүх хуудсыг харна (токенууд нууцлагдсан)
+    - Админ: Бүх хуудсыг харна (бүх нууц токенууд устгагдаж зөвхөн _masked үлдэнэ)
     - Client: Зөвхөн өөрийнхөө хуудсыг ганцаарчилж харна
+    - Guest: Нууц токен болон magic_token огт буцаахгүй
     """
     user = await get_current_user(
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
     if user and user.get("role") == "client":
-        p = database.get_page(user["page_id"], mask_secrets=True)
+        p = database.get_page(user["page_id"], mask_secrets=True, include_magic_token=True)
         return JSONResponse({"total": 1, "data": [p] if p else []})
 
-    pages = database.get_all_pages(mask_secrets=True)
+    is_admin = bool(user and user.get("role") == "admin")
+    pages = database.get_all_pages(mask_secrets=True, include_magic_token=is_admin)
     return JSONResponse({"total": len(pages), "data": pages})
 
 @app.get("/api/pages/detail")
@@ -583,19 +637,22 @@ async def get_page_detail(request: Request, page_id: Optional[str] = None):
     if user and user.get("role") == "client" and user.get("page_id") != target_id:
         return JSONResponse({"error": "Хандах эрхгүй хуудас байна!"}, status_code=403)
 
-    p = database.get_page(target_id, mask_secrets=True)
+    can_see_magic = bool(user and (user.get("role") == "admin" or user.get("page_id") == target_id))
+    p = database.get_page(target_id, mask_secrets=True, include_magic_token=can_see_magic)
     if not p:
         return JSONResponse({"error": "Page not found"}, status_code=404)
     return JSONResponse(p)
 
 @app.post("/api/pages")
 async def create_or_update_page(payload: Dict[str, Any], request: Request):
-    """Шинэ хуудас нэмэх (Зөвхөн Админ эрхтэй)"""
+    """Шинэ хуудас нэмэх (Зөвхөн Админ эрхтэй — P0-2)"""
     user = await get_current_user(
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    if user and user.get("role") == "client":
+    if not user:
+        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
+    if user.get("role") != "admin":
         return JSONResponse({"error": "Зөвхөн Супер Админ шинэ харилцагчийн хуудас нэмэх эрхтэй!"}, status_code=403)
 
     raw_page_id = str(payload.get("page_id", "")).strip()
@@ -623,13 +680,13 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
         gemini_api_key=gemini_key,
         monthly_token_limit=monthly_limit
     )
-    agent.reset_sessions()
+    agent.reset_sessions(page_id)
     return {"status": "success", "message": f"{name} хуудас амжилттай хадгалагдлаа!", "page_id": page_id}
 
 @app.delete("/api/pages")
 @app.delete("/api/pages/{page_id}")
 async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
-    """Хуудас устгах (Зөвхөн Админ эрхтэй)"""
+    """Хуудас устгах (Зөвхөн Админ эрхтэй — P0-2)"""
     target_id = request.query_params.get("page_id") or page_id
     if not target_id:
         return JSONResponse({"error": "page_id missing"}, status_code=400)
@@ -638,13 +695,15 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    if user and user.get("role") == "client":
+    if not user:
+        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
+    if user.get("role") != "admin":
         return JSONResponse({"error": "Устгах эрхгүй!"}, status_code=403)
 
     success = database.delete_page(str(target_id))
     if not success:
         return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
-    agent.reset_sessions()
+    agent.reset_sessions(str(target_id))
     return {"status": "deleted", "page_id": target_id}
 
 @app.post("/api/pages/gemini_key")
@@ -659,7 +718,9 @@ async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Requ
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    if user and user.get("role") == "client" and user.get("page_id") != target_id:
+    if not user:
+        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
+    if user.get("role") == "client" and user.get("page_id") != target_id:
         return JSONResponse({"error": "Та зөвхөн өөрийнхөө хуудасны түлхүүрийг засах эрхтэй!"}, status_code=403)
 
     gemini_key = str(payload.get("gemini_api_key", "")).strip()
@@ -669,18 +730,20 @@ async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Requ
         except Exception: monthly_limit = None
 
     database.update_page_gemini_key(str(target_id), gemini_key, monthly_limit)
-    agent.reset_sessions()
+    agent.reset_sessions(str(target_id))
     return {"status": "success", "message": "Gemini API тохиргоо амжилттай шинэчлэгдлээ!"}
 
 @app.post("/api/pages/credentials")
 @app.post("/api/pages/{page_id}/credentials")
 async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Request, page_id: Optional[str] = None):
-    """Харилцагчид зориулсан нэвтрэх эрх & Magic Link үүсгэх (Зөвхөн Админ)"""
+    """Харилцагчид зориулсан нэвтрэх эрх & Magic Link үүсгэх (Зөвхөн Админ — P0-2)"""
     user = await get_current_user(
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    if user and user.get("role") == "client":
+    if not user:
+        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
+    if user.get("role") != "admin":
         return JSONResponse({"error": "Эрх хүрэхгүй!"}, status_code=403)
 
     target_page_id = payload.get("page_id") or page_id
@@ -696,7 +759,7 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
     return {"status": "success", "data": res}
 
 # -------------------------------------------------------------
-# 8. UNIFIED INBOX & HUMAN TAKEOVER (Client Isolation)
+# 8. UNIFIED INBOX & HUMAN TAKEOVER (Client Isolation — P0-3)
 # -------------------------------------------------------------
 @app.get("/api/sessions")
 async def get_active_sessions(request: Request, page_id: Optional[str] = Query(None)):
@@ -704,7 +767,12 @@ async def get_active_sessions(request: Request, page_id: Optional[str] = Query(N
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    target_page = user["page_id"] if (user and user.get("role") == "client") else page_id
+    if user and user.get("role") == "client":
+        target_page = user["page_id"]
+    elif user and user.get("role") == "admin":
+        target_page = page_id
+    else:
+        target_page = page_id or database.DEFAULT_PAGE_ID
     sessions = database.get_active_sessions(page_id=target_page)
     return JSONResponse({"total": len(sessions), "data": sessions})
 
@@ -750,12 +818,12 @@ async def manager_send_message(sender_id: str, payload: Dict[str, str], request:
         background_tasks.add_task(send_meta_message, meta_id, text, page_token)
     elif sender_id.startswith("tg_"):
         tg_id = sender_id.replace("tg_", "")
-        background_tasks.add_task(send_telegram_message, tg_id, text)
+        background_tasks.add_task(send_telegram_message, tg_id, text, page_id=target_page_id)
 
     return {"status": "sent", "sender_id": sender_id, "message": text}
 
 # -------------------------------------------------------------
-# 9. CRM & LEADS PIPELINE (Client Isolation)
+# 9. CRM & LEADS PIPELINE (Client Isolation — P0-3)
 # -------------------------------------------------------------
 @app.get("/api/registrations")
 @app.get("/api/leads")
@@ -764,7 +832,12 @@ async def get_registrations(request: Request, page_id: Optional[str] = Query(Non
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    target_page = user["page_id"] if (user and user.get("role") == "client") else page_id
+    if user and user.get("role") == "client":
+        target_page = user["page_id"]
+    elif user and user.get("role") == "admin":
+        target_page = page_id
+    else:
+        target_page = page_id or database.DEFAULT_PAGE_ID
     rows = database.get_all_registrations(page_id=target_page)
     return JSONResponse({"total": len(rows), "data": rows})
 
@@ -787,11 +860,12 @@ async def export_csv(
         auth_token=token
     )
     
-    target_page = None
     if user and user.get("role") == "client":
         target_page = user.get("page_id")
-    else:
+    elif user and user.get("role") == "admin":
         target_page = page_id
+    else:
+        target_page = page_id or database.DEFAULT_PAGE_ID
         
     csv_data = database.sync_to_csv(page_id=target_page)
     filename = f"leads_{target_page or 'all'}.csv"
@@ -818,11 +892,12 @@ async def export_excel(
         auth_token=token
     )
     
-    target_page = None
     if user and user.get("role") == "client":
         target_page = user.get("page_id")
-    else:
+    elif user and user.get("role") == "admin":
         target_page = page_id
+    else:
+        target_page = page_id or database.DEFAULT_PAGE_ID
         
     excel_stream = database.generate_excel(page_id=target_page)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -1129,12 +1204,14 @@ async def health_check():
 
 @app.post("/api/update-keys")
 async def update_keys(payload: Dict[str, str], request: Request):
-    """Админы системийн түлхүүрүүд засах (Зөвхөн Админ)"""
+    """Админы системийн түлхүүрүүд засах (Зөвхөн Админ — P0-2)"""
     user = await get_current_user(
         authorization=request.headers.get("Authorization"),
         session_token_cookie=request.cookies.get("session_token")
     )
-    if user and user.get("role") == "client":
+    if not user:
+        return JSONResponse({"error": "Нэвтрэх шаардлагатай! (Unauthorized)"}, status_code=401)
+    if user.get("role") != "admin":
         return JSONResponse({"error": "Эрх хүрэхгүй!"}, status_code=403)
 
     for k in ["gemini_key", "meta_token", "meta_verify", "tg_token", "tg_manager_id", "admin_password"]:
@@ -1217,22 +1294,45 @@ async def get_invoice_status_api(invoice_id: str):
         }
     }
 
+@app.get("/api/fintech/qpay/callback")
 @app.post("/api/fintech/qpay/callback")
 async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Query(None)):
-    """Банк / QPay-ийн албан ёсны webhook хүлээн авагч"""
+    """Банк / QPay-ийн албан ёсны webhook хүлээн авагч (QPay v2 стандарт: HTTP 200 SUCCESS)"""
     try:
         body = await request.json()
     except Exception:
         body = {}
-    inv_id = invoice_id or body.get("sender_invoice_no") or body.get("invoice_id")
+    inv_id = invoice_id or request.query_params.get("qpay_payment_id") or body.get("sender_invoice_no") or body.get("invoice_id")
     if not inv_id:
         return JSONResponse(status_code=400, content={"error": "invoice_id missing"})
-    res = await fintech_service.process_successful_payment(inv_id, callback_data=body)
-    return res
+
+    # Бодит QPay тохиргоотой үед QPay v2 payment/check дуудаж баталгаажуулах (P0-4)
+    inv = database.get_invoice(inv_id)
+    if inv:
+        page = database.get_page(inv.get("page_id", database.DEFAULT_PAGE_ID)) or {}
+        qpay_user = page.get("qpay_username") or os.getenv("QPAY_USERNAME", "").strip()
+        qpay_pass = page.get("qpay_password") or os.getenv("QPAY_PASSWORD", "").strip()
+        qpay_obj_id = body.get("object_id") or request.query_params.get("object_id")
+        if qpay_user and qpay_pass and qpay_obj_id:
+            token = await fintech_service.get_qpay_token(qpay_user, qpay_pass)
+            if token:
+                is_verified = await fintech_service.check_qpay_payment_live(token, str(qpay_obj_id))
+                if not is_verified:
+                    return Response(content="FAILED_VERIFICATION", media_type="text/plain", status_code=400)
+
+    await fintech_service.process_successful_payment(inv_id, callback_data=body)
+    return Response(content="SUCCESS", media_type="text/plain", status_code=200)
 
 @app.post("/api/fintech/invoices/{invoice_id}/simulate-pay")
-async def simulate_invoice_payment_api(invoice_id: str):
-    """1 секундэд автоматаар баталгаажуулж турших (Simulator)"""
+async def simulate_invoice_payment_api(invoice_id: str, request: Request):
+    """1 секундэд автоматаар баталгаажуулж турших (Simulator — Production горимд зөвхөн Админ эрх шаардана)"""
+    if os.getenv("ENV", "").lower() == "production" or os.getenv("DISABLE_PAYMENT_SIMULATOR") == "1":
+        user = await get_current_user(
+            authorization=request.headers.get("Authorization"),
+            session_token_cookie=request.cookies.get("session_token")
+        )
+        if not user or user.get("role") != "admin":
+            return JSONResponse({"success": False, "error": "Production орчинд симулятор хаалттай байна."}, status_code=403)
     res = await fintech_service.process_successful_payment(invoice_id)
     return res
 
@@ -1679,7 +1779,8 @@ async def voice_chat_endpoint(
     elif "wav" in mime or fname.endswith(".wav"):
         mime = "audio/wav"
 
-    result = agent.process_message(
+    result = await asyncio.to_thread(
+        agent.process_message,
         text=text or "",
         audio_bytes=audio_bytes,
         audio_mime=mime,

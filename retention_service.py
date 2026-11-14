@@ -52,15 +52,16 @@ async def dispatch_channel_message(
             return False
 
     # 3. Facebook Messenger / Instagram Direct
-    if channel in ["facebook", "meta", "instagram"]:
+    if channel in ["facebook", "meta", "instagram", "facebook/instagram", "manychat/instagram"] or sender_id.startswith("meta_"):
+        raw_meta_id = sender_id.replace("meta_", "")
         token = page.get("page_access_token") or os.getenv("META_PAGE_ACCESS_TOKEN", "").strip()
         if not token:
             return False
-        url = f"https://graph.facebook.com/v21.0/me/messages?access_token={token}"
+        graph_ver = os.getenv("META_GRAPH_API_VERSION", "v22.0")
+        url = f"https://graph.facebook.com/{graph_ver}/me/messages?access_token={token}"
         payload = {
-            "recipient": {"id": sender_id},
-            "messaging_type": "MESSAGE_TAG",
-            "tag": "CONFIRMED_EVENT_UPDATE",
+            "recipient": {"id": raw_meta_id},
+            "messaging_type": "RESPONSE",
             "message": {"text": message_text}
         }
         try:
@@ -69,6 +70,9 @@ async def dispatch_channel_message(
                 if res.status_code == 200:
                     database.save_chat_message(page_id, sender_id, channel, "bot", message_text)
                     return True
+                else:
+                    logger.warning(f"Meta dispatch non-200 [{res.status_code}] to {sender_id}: {res.text}")
+                    return False
         except Exception as e:
             logger.error(f"Meta dispatch error to {sender_id}: {e}")
             return False

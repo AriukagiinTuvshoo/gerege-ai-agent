@@ -15,20 +15,22 @@ CACHE_TTL_SECONDS = 60
 def normalize_sheet_csv_url(sheet_url: str) -> str:
     """
     Converts any Google Sheets sharing URL or edit URL into a direct CSV export URL.
-    Supports:
-    - https://docs.google.com/spreadsheets/d/{ID}/edit#gid={GID}
-    - https://docs.google.com/spreadsheets/d/{ID}/edit?usp=sharing
-    - https://docs.google.com/spreadsheets/d/e/{PUB_ID}/pub?output=csv
+    Enforces strict SSRF validation: only https://docs.google.com/spreadsheets/... is allowed.
     """
     if not sheet_url:
         return ""
     url = sheet_url.strip()
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("https", "http") or parsed.hostname != "docs.google.com":
+        raise ValueError("Зөвхөн docs.google.com дээрх Google Sheets холбоос зөвшөөрөгдөнө (SSRF хамгаалалт).")
+
     if "output=csv" in url or "/export?format=csv" in url:
         return url
 
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
     if not match:
-        return url
+        raise ValueError("Google Sheets ID олдсонгүй. Зөв холбоос оруулна уу.")
 
     sheet_id = match.group(1)
     gid_match = re.search(r"[#&?]gid=([0-9]+)", url)
@@ -376,13 +378,11 @@ def get_page_sheets_lookup_context(page_data: Optional[Dict[str, Any]], user_tex
             "ЗААВАР: Дээрх хүснэгтээс олдсон бодит мөрүүд дээр үндэслэн хэрэглэгчид аль хүснэгтээс ямар мэдээлэл олдсоныг маш тодорхой, цэгцтэй хэлж өг!"
         )
     else:
-        lines.append("\n[ХҮСНЭГТҮҮДИЙН ЭХНИЙ МӨРҮҮДИЙН ЖИШЭЭ (Лавлагаа)]:")
-        for s in non_empty_sheets[:5]:
-            sample_rows = s["rows"][:5]
-            lines.append(f"  * «{s['title']}» хүснэгтийн жишээ мөрүүд:")
-            for r in sample_rows:
-                pairs = [f"{k}: {v}" for k, v in r.items() if v]
-                lines.append("    - " + " | ".join(pairs[:8]))
+        lines.append(
+            "\nЗААВАР: Хэрэглэгчийн асуултад тохирох мөр хараахан шүүгдээгүй байна. "
+            "Хэрэв хэрэглэгч ачаа, бараа, захиалга шалгуулах гэж байгаа бол утасны дугаар эсвэл трак кодыг нь асууж `check_sheet_cargo_status` багажийг дуудаж шалгаж өгнө үү. "
+            "Бусад хүний хувийн мэдээллийг задруулахгүй."
+        )
 
     return "\n".join(lines)
 

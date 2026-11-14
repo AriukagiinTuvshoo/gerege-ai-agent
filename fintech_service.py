@@ -467,11 +467,11 @@ async def process_successful_payment(invoice_id: str, callback_data: Optional[Di
 
     # Сувгаар нь хариу дамжуулах
     try:
-        if channel == "meta" and sender_id:
+        if (channel in ("meta", "facebook", "instagram", "facebook/instagram") or (sender_id and sender_id.startswith("meta_"))) and sender_id:
             from main import send_meta_message
             page_token = page.get("page_access_token")
             await send_meta_message(sender_id.replace("meta_", ""), receipt_msg, page_token=page_token)
-        elif channel == "telegram" and sender_id:
+        elif (channel == "telegram" or (sender_id and sender_id.startswith("tg_"))) and sender_id:
             from main import send_telegram_message
             await send_telegram_message(sender_id.replace("tg_", ""), receipt_msg)
     except Exception as e:
