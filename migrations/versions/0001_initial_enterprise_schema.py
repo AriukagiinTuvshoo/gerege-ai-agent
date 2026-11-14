@@ -21,8 +21,16 @@ def _existing_tables() -> set:
     return set(insp.get_table_names())
 
 
+def _ts_default():
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        return sa.text("CAST(CURRENT_TIMESTAMP AS VARCHAR)")
+    return sa.text("CURRENT_TIMESTAMP")
+
+
 def upgrade() -> None:
     existing = _existing_tables()
+    ts_default = _ts_default()
 
     if "pages" not in existing:
         op.create_table(
@@ -51,7 +59,7 @@ def upgrade() -> None:
             sa.Column("telegram_manager_chat_id", sa.String(128), server_default=""),
             sa.Column("daily_report_time", sa.String(32), server_default="08:30"),
             sa.Column("daily_report_enabled", sa.Integer(), server_default="1"),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
         )
         op.create_index("ix_pages_client_username", "pages", ["client_username"])
         op.create_index("ix_pages_client_magic_token", "pages", ["client_magic_token"])
@@ -68,7 +76,7 @@ def upgrade() -> None:
             sa.Column("sender_id", sa.String(255), nullable=True),
             sa.Column("status", sa.String(64), server_default="Шинэ"),
             sa.Column("notes", sa.Text(), nullable=True),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
         )
         op.create_index("idx_registrations_page_created", "registrations", ["page_id", "created_at"])
 
@@ -81,7 +89,7 @@ def upgrade() -> None:
             sa.Column("channel", sa.String(64), server_default="web"),
             sa.Column("sender_type", sa.String(32), nullable=False),
             sa.Column("content", sa.Text(), nullable=False),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
         )
         op.create_index("idx_messages_page_sender", "messages", ["page_id", "sender_id", "created_at"])
 
@@ -94,7 +102,7 @@ def upgrade() -> None:
             sa.Column("is_human_takeover", sa.Integer(), server_default="0"),
             sa.Column("customer_name", sa.String(255), nullable=True),
             sa.Column("customer_phone", sa.String(64), nullable=True),
-            sa.Column("updated_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("updated_at", sa.String(64), server_default=ts_default),
         )
         op.create_index("idx_session_states_page_updated", "session_states", ["page_id", "updated_at"])
 
@@ -104,7 +112,7 @@ def upgrade() -> None:
             sa.Column("session_token", sa.String(255), primary_key=True),
             sa.Column("role", sa.String(64), nullable=False),
             sa.Column("page_id", sa.String(128), nullable=True),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
             sa.Column("expires_at", sa.String(64), nullable=False),
             sa.Column("revoked", sa.Integer(), server_default="0"),
             sa.Column("revoked_at", sa.String(64), nullable=True),
@@ -123,7 +131,7 @@ def upgrade() -> None:
             sa.Column("interests", sa.Text(), nullable=True),
             sa.Column("notes", sa.Text(), nullable=True),
             sa.Column("last_topic", sa.Text(), nullable=True),
-            sa.Column("updated_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("updated_at", sa.String(64), server_default=ts_default),
             sa.UniqueConstraint("page_id", "user_id", name="uq_user_memory_page_user"),
         )
         op.create_index("idx_user_memories_lookup", "user_memories", ["page_id", "user_id"])
@@ -149,7 +157,7 @@ def upgrade() -> None:
             sa.Column("ebarimt_lottery", sa.String(64), nullable=True),
             sa.Column("ebarimt_qr", sa.Text(), nullable=True),
             sa.Column("paid_at", sa.String(64), nullable=True),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
         )
         op.create_index("idx_invoices_page_status", "invoices", ["page_id", "status"])
         op.create_index("idx_invoices_sender", "invoices", ["sender_id"])
@@ -173,7 +181,7 @@ def upgrade() -> None:
             sa.Column("arrived_at", sa.String(64), nullable=True),
             sa.Column("delivered_at", sa.String(64), nullable=True),
             sa.Column("notes", sa.Text(), nullable=True),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
             sa.UniqueConstraint("page_id", "tracking_code", name="uq_cargo_page_tracking"),
         )
         op.create_index("idx_cargo_page_tracking", "cargo_packages", ["page_id", "tracking_code"])
@@ -189,7 +197,7 @@ def upgrade() -> None:
             sa.Column("delay_hours", sa.Integer(), server_default="2"),
             sa.Column("message_template", sa.Text(), nullable=False),
             sa.Column("is_active", sa.Integer(), server_default="1"),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
             sa.UniqueConstraint("page_id", "rule_type", name="uq_automated_rule_page_type"),
         )
         op.create_index("idx_rules_page", "automated_rules", ["page_id"])
@@ -205,7 +213,7 @@ def upgrade() -> None:
             sa.Column("channel", sa.String(64), server_default="all"),
             sa.Column("status", sa.String(64), server_default="COMPLETED"),
             sa.Column("sent_count", sa.Integer(), server_default="0"),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
         )
         op.create_index("idx_campaigns_page", "marketing_campaigns", ["page_id"])
 
@@ -217,7 +225,7 @@ def upgrade() -> None:
             sa.Column("rule_type", sa.String(64), nullable=False),
             sa.Column("sender_id", sa.String(255), nullable=False),
             sa.Column("channel", sa.String(64), server_default="web"),
-            sa.Column("sent_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("sent_at", sa.String(64), server_default=ts_default),
             sa.UniqueConstraint("page_id", "rule_type", "sender_id", name="uq_sent_followup"),
         )
         op.create_index("idx_sent_followups", "sent_followups", ["page_id", "rule_type", "sender_id"])
@@ -237,7 +245,7 @@ def upgrade() -> None:
             sa.Column("status", sa.String(64), server_default="CONFIRMED"),
             sa.Column("reminder_sent", sa.Integer(), server_default="0"),
             sa.Column("notes", sa.Text(), nullable=True),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
             sa.UniqueConstraint("page_id", "appointment_date", "appointment_time", "service_name", name="uq_appointment_slot"),
         )
         op.create_index("idx_appointments_page_date", "appointments", ["page_id", "appointment_date"])
@@ -249,7 +257,7 @@ def upgrade() -> None:
             sa.Column("idempotency_key", sa.String(255), primary_key=True),
             sa.Column("channel", sa.String(64), server_default="any"),
             sa.Column("expires_at", sa.String(64), nullable=True),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
         )
 
     if "task_jobs" not in existing:
@@ -267,8 +275,8 @@ def upgrade() -> None:
             sa.Column("locked_by", sa.String(128), nullable=True),
             sa.Column("locked_at", sa.String(64), nullable=True),
             sa.Column("last_error", sa.Text(), nullable=True),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
-            sa.Column("updated_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
+            sa.Column("updated_at", sa.String(64), server_default=ts_default),
         )
         op.create_index("idx_task_jobs_status", "task_jobs", ["status", "created_at"])
 
@@ -284,7 +292,7 @@ def upgrade() -> None:
             sa.Column("resource_id", sa.String(255), nullable=True),
             sa.Column("details_json", sa.Text(), server_default="{}"),
             sa.Column("ip_address", sa.String(64), nullable=True),
-            sa.Column("created_at", sa.String(64), server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
         )
         op.create_index("idx_audit_logs_page_created", "audit_logs", ["page_id", "created_at"])
 
