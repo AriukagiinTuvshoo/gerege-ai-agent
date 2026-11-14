@@ -71,14 +71,24 @@ jobs:
         run: |
           python scripts/migrate_sqlite_to_postgres.py --dry-run
 
-      - name: Run Alembic Migration & SQLite-to-PostgreSQL Migration Verification
+      - name: Run Alembic Migration on PostgreSQL 16
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@localhost:5432/gerege_crm_test"
+        run: |
+          alembic upgrade head
+
+      - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@localhost:5432/gerege_crm_test"
+        run: |
+          python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
+
+      - name: Run All 3 Test Suites against Live PostgreSQL 16 & Redis 7
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@localhost:5432/gerege_crm_test"
           REDIS_URL: "redis://localhost:6379/0"
         run: |
-          alembic upgrade head
-          python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
-          pytest tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py -v
+          pytest tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py -v --tb=short
 
       - name: Build Production Docker Image
         run: |

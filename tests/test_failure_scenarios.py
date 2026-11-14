@@ -76,21 +76,27 @@ def test_scenario_03_worker_crash_mid_job_visibility_recovery():
 
     # Simulate a worker claiming the job and crashing 30 seconds ago
     past_ts = (datetime.now() - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
-    with database.get_connection() as conn:
+    conn = database.get_connection()
+    try:
         conn.execute(
             "UPDATE task_jobs SET status = 'PROCESSING', locked_by = 'dead-worker-99', locked_at = ? WHERE idempotency_key = ?",
             (past_ts, job_id),
         )
         conn.commit()
+    finally:
+        conn.close()
 
     recovered_count = q.recover_stale_jobs(stale_after_seconds=5)
     assert recovered_count >= 1
 
-    with database.get_connection() as conn:
+    conn = database.get_connection()
+    try:
         row = conn.execute("SELECT status, locked_by, last_error FROM task_jobs WHERE idempotency_key = ?", (job_id,)).fetchone()
         assert row["status"] == "PENDING"
         assert row["locked_by"] is None
         assert "Recovered from stale PROCESSING" in (row["last_error"] or "")
+    finally:
+        conn.close()
 
 
 def test_scenario_04_unhandled_exception_telemetry_and_secret_redaction():
@@ -120,9 +126,12 @@ def test_scenario_05_database_pool_and_concurrent_connections():
     assert "pooled" in pool_stat
 
     def _run_query(i: int) -> int:
-        with database.get_connection() as conn:
+        conn = database.get_connection()
+        try:
             row = conn.execute("SELECT COUNT(*) AS cnt FROM pages").fetchone()
             return int(row["cnt"])
+        finally:
+            conn.close()
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(_run_query, range(24)))
@@ -252,9 +261,12 @@ def test_scenario_13_interrupted_or_corrupted_restore_preserves_live_db():
         res = backup_service.restore_backup(fname)
         assert res["success"] is False
         # Verify live database is still 100% healthy and readable
-        with database.get_connection() as conn:
+        conn = database.get_connection()
+        try:
             cnt = conn.execute("SELECT COUNT(*) AS cnt FROM pages").fetchone()["cnt"]
             assert cnt >= 1
+        finally:
+            conn.close()
     finally:
         for ext in ("", ".sha256", ".meta.json"):
             p = fpath + ext
@@ -281,9 +293,12 @@ def test_scenario_15_ai_provider_quota_exceeded_guard():
     """15. AI provider rate limit / token quota exceeded -> Tenant token quota blocks excess calls"""
     quota_tenant = f"chaos_quota_{os.urandom(3).hex()}"
     database.save_page(page_id=quota_tenant, name="Quota Tenant", monthly_token_limit=100)
-    with database.get_connection() as conn:
+    conn = database.get_connection()
+    try:
         conn.execute("UPDATE pages SET monthly_token_limit = 100, tokens_used = 150 WHERE page_id = ?", (quota_tenant,))
         conn.commit()
+    finally:
+        conn.close()
 
     res = agent.process_message(text="Сайн байна уу?", sender_id="quota_user", channel="web", page_id=quota_tenant)
     assert res.get("limit_exceeded") is True
@@ -349,9 +364,12 @@ def test_scenario_19_concurrent_multi_worker_atomic_job_claiming():
     q2.register_handler("chaos_race_task", _single_run_handler)
 
     # Mark any prior pending jobs as completed so we isolate this test
-    with database.get_connection() as conn:
+    conn = database.get_connection()
+    try:
         conn.execute("UPDATE task_jobs SET status = 'COMPLETED' WHERE status = 'PENDING'")
         conn.commit()
+    finally:
+        conn.close()
 
     race_key = f"chaos_race_{os.urandom(4).hex()}"
     enq = q1.enqueue("chaos_race_task", {"test": "race"}, idempotency_key=race_key)
