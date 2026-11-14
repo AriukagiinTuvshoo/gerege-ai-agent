@@ -22,6 +22,7 @@ import fintech_service
 import cargo_service
 import executive_bot_service
 import retention_service
+import appointment_service
 
 load_dotenv(override=True)
 
@@ -61,6 +62,9 @@ async def executive_scheduler_loop():
             loop_count += 1
             if loop_count % 20 == 0:
                 await retention_service.run_automated_retention_checks()
+
+            # Цаг захиалгын 2 цагийн өмнөх сануулгыг шалгаж илгээх
+            await appointment_service.check_and_dispatch_appointment_reminders()
 
         except Exception as e:
             logger.error(f"Executive & Retention scheduler error: {e}")
@@ -374,21 +378,43 @@ async def telegram_webhook_events(request: Request, background_tasks: Background
         message = data.get("message", {})
         chat_id = message.get("chat", {}).get("id")
         user_text = message.get("text", "")
-        
-        if chat_id and user_text:
-            # 1. Эхлээд эзний интерактив комманд мөн эсэхийг шалгах (/start, /today, /report, /qpay, /cargo, /help)
-            owner_reply = await executive_bot_service.handle_owner_command(
-                chat_id=str(chat_id),
-                text=user_text,
-                page_id=database.DEFAULT_PAGE_ID
-            )
-            if owner_reply:
-                background_tasks.add_task(send_telegram_message, chat_id, owner_reply)
-                return {"status": "ok", "mode": "owner_command"}
+        voice_data = message.get("voice") or message.get("audio")
+        voice_bytes = None
 
-            # 2. Энгийн харилцагчийн AI чатбот хариу
+        if voice_data and chat_id:
+            file_id = voice_data.get("file_id")
+            page_data = database.get_page(database.DEFAULT_PAGE_ID) or {}
+            bot_token = page_data.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+            if bot_token and file_id:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        f_res = await client.get(f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}", timeout=10.0)
+                        if f_res.status_code == 200:
+                            f_path = f_res.json().get("result", {}).get("file_path")
+                            if f_path:
+                                dl_res = await client.get(f"https://api.telegram.org/file/bot{bot_token}/{f_path}", timeout=15.0)
+                                if dl_res.status_code == 200:
+                                    voice_bytes = dl_res.content
+                except Exception as ve:
+                    logger.error(f"Telegram voice download error: {ve}")
+        
+        if chat_id and (user_text or voice_bytes):
+            # 1. Эхлээд эзний интерактив комманд мөн эсэхийг шалгах (/start, /today, /report, /qpay, /cargo, /help)
+            if user_text:
+                owner_reply = await executive_bot_service.handle_owner_command(
+                    chat_id=str(chat_id),
+                    text=user_text,
+                    page_id=database.DEFAULT_PAGE_ID
+                )
+                if owner_reply:
+                    background_tasks.add_task(send_telegram_message, chat_id, owner_reply)
+                    return {"status": "ok", "mode": "owner_command"}
+
+            # 2. Энгийн харилцагчийн AI чатбот хариу (Текст болон Дуут зурвас)
             result = agent.process_message(
                 text=user_text,
+                audio_bytes=voice_bytes,
+                audio_mime="audio/ogg" if message.get("voice") else "audio/mpeg",
                 sender_id=f"tg_{chat_id}",
                 channel="telegram",
                 page_id=database.DEFAULT_PAGE_ID
@@ -1553,6 +1579,115 @@ async def trigger_retention_checks_api(request: Request):
     base_url = str(request.base_url).rstrip("/")
     stats = await retention_service.run_automated_retention_checks(base_url=base_url)
     return {"success": True, "stats": stats}
+
+# -------------------------------------------------------------
+# 13. ЦАГ ЗАХИАЛГА & ИНТЕРАКТИВ ХУАНЛИ API (APPOINTMENTS)
+# -------------------------------------------------------------
+@app.get("/api/appointments")
+async def list_appointments_api(
+    request: Request,
+    date_str: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50)
+):
+    """Салбарын цаг захиалгуудын жагсаалт"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or request.query_params.get("page_id") or database.DEFAULT_PAGE_ID
+    appts = database.list_appointments(page_id=pid, date_str=date_str, status=status, limit=limit)
+    return {"count": len(appts), "data": appts}
+
+@app.post("/api/appointments")
+async def create_appointment_manual_api(payload: Dict[str, Any], request: Request):
+    """Самбараас шууд шинэ цаг захиалга нэмэх"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or payload.get("page_id") or database.DEFAULT_PAGE_ID
+    name = payload.get("customer_name", "").strip()
+    phone = payload.get("customer_phone", "").strip()
+    service = payload.get("service_name", "").strip()
+    date_val = payload.get("appointment_date", "").strip()
+    time_val = payload.get("appointment_time", "").strip()
+    notes = payload.get("notes", "").strip()
+
+    if not name or not phone or not date_val or not time_val:
+        raise HTTPException(status_code=400, detail="Нэр, утас, огноо, цаг заавал шаардлагатай")
+
+    appt = database.create_appointment(
+        page_id=pid,
+        customer_name=name,
+        customer_phone=phone,
+        service_name=service or "Үйлчилгээ",
+        appointment_date=date_val,
+        appointment_time=time_val,
+        channel="dashboard",
+        notes=notes
+    )
+    if not appt:
+        return JSONResponse(status_code=409, content={"success": False, "message": f"{date_val} {time_val} цагт өөр захиалга байна"})
+    return {"success": True, "appointment": appt}
+
+@app.post("/api/appointments/{appointment_id}/status")
+async def update_appointment_status_api(appointment_id: int, payload: Dict[str, Any]):
+    """Цаг захиалгын төлөв өөрчлөх ('CONFIRMED', 'COMPLETED', 'CANCELLED')"""
+    new_status = payload.get("status", "CONFIRMED")
+    success = database.update_appointment_status(appointment_id, new_status)
+    return {"success": success, "status": new_status}
+
+@app.get("/api/appointments/summary")
+async def get_appointments_summary_api(request: Request):
+    """Цаг захиалгын хяналтын самбарын тооцоолол"""
+    user = await get_current_user(
+        authorization=request.headers.get("Authorization"),
+        session_token_cookie=request.cookies.get("session_token"),
+        token=request.query_params.get("token") or request.query_params.get("client_token")
+    )
+    pid = (user.get("page_id") if user else None) or request.query_params.get("page_id") or database.DEFAULT_PAGE_ID
+    return database.get_appointments_summary(pid)
+
+# -------------------------------------------------------------
+# 14. MULTIMODAL VOICE NOTE CHAT API (ДУУТ ЗУРВАС СЕРВЕР)
+# -------------------------------------------------------------
+@app.post("/api/chat/voice")
+async def voice_chat_endpoint(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    audio_file: Optional[UploadFile] = File(None),
+    page_id: Optional[str] = Form(None),
+    sender_id: Optional[str] = Form("web_voice_user"),
+    text: Optional[str] = Form("")
+):
+    """Вэб симулятор болон гадаад сувгаас дуут зурвас хүлээн авч Gemini AI-аар боловсруулах"""
+    upload = file or audio_file
+    if not upload:
+        raise HTTPException(status_code=400, detail="Аудио файл шаардлагатай")
+
+    audio_bytes = await upload.read()
+    pid = page_id or database.DEFAULT_PAGE_ID
+    mime = upload.content_type or "audio/webm"
+    fname = (upload.filename or "").lower()
+    if "ogg" in mime or fname.endswith(".ogg"):
+        mime = "audio/ogg"
+    elif "mp3" in mime or fname.endswith(".mp3"):
+        mime = "audio/mp3"
+    elif "wav" in mime or fname.endswith(".wav"):
+        mime = "audio/wav"
+
+    result = agent.process_message(
+        text=text or "",
+        audio_bytes=audio_bytes,
+        audio_mime=mime,
+        sender_id=sender_id,
+        channel="web_voice",
+        page_id=pid
+    )
+    return result
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)

@@ -328,6 +328,12 @@
           <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-rose-100 text-rose-800">1-Click</span>
         </button>
 
+        <button onclick="switchTab('appointments')" id="tab-btn-appointments" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-calendar-check text-teal-600 text-xs"></i>
+          <span>Цаг захиалга</span>
+          <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-teal-100 text-teal-800">Хуанли</span>
+        </button>
+
         <button onclick="switchTab('social')" id="tab-btn-social" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
           <i class="fa-solid fa-pen-nib text-stone-400 text-xs"></i>
           <span>Нийтлэлийн бэлдэц</span>
@@ -459,15 +465,38 @@
             </button>
           </div>
 
+          <!-- Audio / Voice Preview Bar -->
+          <div id="sim-audio-preview-bar" class="hidden px-3 py-2 bg-teal-50 border-t border-teal-200 flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <div class="w-8 h-8 rounded-lg bg-teal-600 text-white flex items-center justify-center text-xs">
+                <i class="fa-solid fa-microphone"></i>
+              </div>
+              <div class="text-[11px]">
+                <div id="sim-audio-name" class="font-bold text-teal-900 truncate max-w-[170px]">voice_note.ogg</div>
+                <div class="text-[10px] text-teal-700 font-medium flex items-center gap-1">
+                  <i class="fa-solid fa-waveform"></i> Дуут зурвас илгээхэд бэлэн
+                </div>
+              </div>
+            </div>
+            <button onclick="cancelAudioUpload()" class="text-stone-400 hover:text-red-500 text-xs px-2">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          </div>
+
           <!-- Phone Input Footer -->
           <form onsubmit="handleSimulatorSubmit(event)" class="p-2.5 bg-white border-t border-stone-200/80 flex items-center gap-2">
             <input type="file" id="sim-file-input" accept="image/*" class="hidden" onchange="handleFileSelect(event)">
+            <input type="file" id="sim-audio-input" accept="audio/*" class="hidden" onchange="handleAudioSelect(event)">
             
             <button type="button" onclick="document.getElementById('sim-file-input').click()" title="Гүйлгээний баримтын зураг оруулах" class="w-9 h-9 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-600 hover:text-stone-900 flex items-center justify-center transition border border-stone-200">
               <i class="fa-regular fa-image text-sm"></i>
             </button>
 
-            <input id="sim-input" type="text" placeholder="Мессеж бичих..." autocomplete="off" class="flex-1 bg-stone-50 border border-stone-200 rounded-xl px-3.5 py-2 text-xs text-stone-900 placeholder-stone-400 focus:bg-white focus:outline-none focus:border-emerald-600 transition">
+            <button type="button" onclick="startVoiceRecordingOrUpload()" id="sim-mic-btn" title="Дуут мессеж / Voice note илгээх" class="w-9 h-9 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-700 flex items-center justify-center transition border border-teal-200">
+              <i class="fa-solid fa-microphone text-sm"></i>
+            </button>
+
+            <input id="sim-input" type="text" placeholder="Мессеж бичих эсвэл микрофон дарах..." autocomplete="off" class="flex-1 bg-stone-50 border border-stone-200 rounded-xl px-3.5 py-2 text-xs text-stone-900 placeholder-stone-400 focus:bg-white focus:outline-none focus:border-emerald-600 transition">
 
             <button type="submit" id="sim-send-btn" class="w-9 h-9 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white flex items-center justify-center transition shadow-sm">
               <i class="fa-solid fa-paper-plane text-xs"></i>
@@ -1356,6 +1385,184 @@
 
         </div>
 
+      </div>
+    </div>
+
+    <!-- ==================== TAB: APPOINTMENT BOOKING & 2-HOUR REMINDER ==================== -->
+    <div id="tab-appointments" class="tab-content hidden space-y-6">
+      <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
+        
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="w-2.5 h-2.5 rounded-full bg-teal-500 animate-pulse"></span>
+              <span class="text-xs font-bold text-teal-800 uppercase tracking-wider bg-teal-50 px-2 py-0.5 rounded-lg border border-teal-200">
+                Авто Хуанли & Цаг захиалга
+              </span>
+            </div>
+            <h2 class="text-xl font-black text-stone-900">Цаг захиалга & 2 Цагийн Авто-Сануулагч</h2>
+            <p class="text-xs text-stone-500 mt-1 max-w-2xl">
+              Салон, эмнэлэг, авто сервис, сургалт, зөвлөх үйлчилгээнд зориулсан 24/7 авто цаг захиалга.
+              Давхардахаас хамгаалах автомат түгжээтэй ба цаг эхлэхээс 2 цагийн өмнө чатаар автоматаар сануулга очно.
+            </p>
+          </div>
+          
+          <div class="flex items-center gap-2 shrink-0">
+            <button onclick="loadAppointmentsData()" class="px-3.5 py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-semibold transition flex items-center gap-1.5 border border-stone-200">
+              <i class="fa-solid fa-rotate text-teal-600 text-xs"></i>
+              <span>Шинэчлэх</span>
+            </button>
+            <button onclick="openNewAppointmentModal()" class="px-4 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-plus text-xs"></i>
+              <span>Шинэ цаг товлох</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 4 KPI Summary Cards -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+          <div class="p-4 rounded-2xl bg-teal-50/60 border border-teal-100">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-[11px] font-bold text-teal-800 uppercase">Өнөөдрийн цагууд</span>
+              <i class="fa-solid fa-calendar-day text-teal-600 text-xs"></i>
+            </div>
+            <div id="appt-kpi-today" class="text-2xl font-black text-teal-950">0</div>
+            <div class="text-[10px] text-teal-700 mt-0.5">Баталгаажсан цаг</div>
+          </div>
+
+          <div class="p-4 rounded-2xl bg-indigo-50/60 border border-indigo-100">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-[11px] font-bold text-indigo-800 uppercase">Ирээдүйн цагууд</span>
+              <i class="fa-solid fa-calendar-week text-indigo-600 text-xs"></i>
+            </div>
+            <div id="appt-kpi-upcoming" class="text-2xl font-black text-indigo-950">0</div>
+            <div class="text-[10px] text-indigo-700 mt-0.5">Хүлээгдэж буй үйлчлүүлэгч</div>
+          </div>
+
+          <div class="p-4 rounded-2xl bg-emerald-50/60 border border-emerald-100">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-[11px] font-bold text-emerald-800 uppercase">Дууссан үйлчилгээ</span>
+              <i class="fa-solid fa-circle-check text-emerald-600 text-xs"></i>
+            </div>
+            <div id="appt-kpi-completed" class="text-2xl font-black text-emerald-950">0</div>
+            <div class="text-[10px] text-emerald-700 mt-0.5">Амжилттай үйлчилсэн</div>
+          </div>
+
+          <div class="p-4 rounded-2xl bg-stone-50 border border-stone-200">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-[11px] font-bold text-stone-700 uppercase">Нийт бүртгэл</span>
+              <i class="fa-solid fa-clipboard-list text-stone-500 text-xs"></i>
+            </div>
+            <div id="appt-kpi-total" class="text-2xl font-black text-stone-900">0</div>
+            <div class="text-[10px] text-stone-500 mt-0.5">Системд бүртгэлтэй</div>
+          </div>
+        </div>
+
+        <!-- Filters Bar -->
+        <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4 p-3 bg-stone-50 rounded-2xl border border-stone-200/80">
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-bold text-stone-700 ml-1">Шүүлтүүр:</span>
+            <div class="inline-flex p-1 bg-stone-200/70 rounded-xl text-xs">
+              <button onclick="setApptFilter('all')" id="appt-filter-all" class="appt-filter-btn px-3 py-1 rounded-lg bg-white font-bold text-stone-900 shadow-sm transition">Бүгд</button>
+              <button onclick="setApptFilter('today')" id="appt-filter-today" class="appt-filter-btn px-3 py-1 rounded-lg text-stone-600 hover:text-stone-900 transition">Өнөөдөр</button>
+              <button onclick="setApptFilter('tomorrow')" id="appt-filter-tomorrow" class="appt-filter-btn px-3 py-1 rounded-lg text-stone-600 hover:text-stone-900 transition">Маргааш</button>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <span class="text-[11px] text-stone-500 font-medium flex items-center gap-1">
+              <i class="fa-solid fa-bell text-amber-500 text-xs"></i> 2 цагийн сануулагч: Автомат (Background Loop)
+            </span>
+          </div>
+        </div>
+
+        <!-- Appointments Table -->
+        <div class="overflow-x-auto rounded-2xl border border-stone-200 bg-white">
+          <table class="w-full text-left text-xs">
+            <thead class="bg-stone-50 border-b border-stone-200 text-stone-600 font-bold uppercase tracking-wider text-[10px]">
+              <tr>
+                <th class="p-3.5">Харилцагч / Утас</th>
+                <th class="p-3.5">Үйлчилгээ</th>
+                <th class="p-3.5">Товлосон Огноо & Цаг</th>
+                <th class="p-3.5 text-center">2Ц Сануулга</th>
+                <th class="p-3.5 text-center">Суваг</th>
+                <th class="p-3.5 text-center">Төлөв</th>
+                <th class="p-3.5 text-right">Үйлдэл</th>
+              </tr>
+            </thead>
+            <tbody id="appt-table-body" class="divide-y divide-stone-100">
+              <tr>
+                <td colspan="7" class="p-8 text-center text-stone-400">
+                  <i class="fa-solid fa-spinner fa-spin text-lg mb-2 text-teal-600"></i>
+                  <p>Цаг захиалгын өгөгдлийг ачааллаж байна...</p>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Modal: New Appointment -->
+    <div id="modal-new-appointment" class="fixed inset-0 z-50 bg-stone-950/40 backdrop-blur-sm hidden flex items-center justify-center p-4">
+      <div class="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl border border-stone-200 space-y-4">
+        <div class="flex items-center justify-between pb-3 border-b border-stone-100">
+          <div class="flex items-center gap-2">
+            <div class="w-8 h-8 rounded-xl bg-teal-100 text-teal-800 flex items-center justify-center">
+              <i class="fa-solid fa-calendar-plus text-sm"></i>
+            </div>
+            <div>
+              <h3 class="font-black text-stone-900 text-base">Шинэ цаг товлох</h3>
+              <p class="text-[10px] text-stone-400">Харилцагчийн цагийг хуанлид гараар бүртгэх</p>
+            </div>
+          </div>
+          <button onclick="closeNewAppointmentModal()" class="w-8 h-8 rounded-full bg-stone-100 text-stone-400 hover:text-stone-700 flex items-center justify-center">
+            <i class="fa-solid fa-xmark text-xs"></i>
+          </button>
+        </div>
+
+        <div class="space-y-3">
+          <div>
+            <label class="block text-[11px] font-bold text-stone-700 mb-1">Үйлчлүүлэгчийн нэр *</label>
+            <input type="text" id="appt-input-name" placeholder="Жишээ: Анударь" class="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2 text-xs focus:bg-white focus:outline-none focus:border-teal-500">
+          </div>
+
+          <div>
+            <label class="block text-[11px] font-bold text-stone-700 mb-1">Утасны дугаар *</label>
+            <input type="tel" id="appt-input-phone" placeholder="Жишээ: 99112233" class="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2 text-xs focus:bg-white focus:outline-none focus:border-teal-500">
+          </div>
+
+          <div>
+            <label class="block text-[11px] font-bold text-stone-700 mb-1">Үйлчилгээний төрөл *</label>
+            <input type="text" id="appt-input-service" placeholder="Жишээ: Үс засалт, Маникюр, Зөвлөгөө" class="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2 text-xs focus:bg-white focus:outline-none focus:border-teal-500">
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-[11px] font-bold text-stone-700 mb-1">Огноо *</label>
+              <input type="date" id="appt-input-date" class="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2 text-xs focus:bg-white focus:outline-none focus:border-teal-500">
+            </div>
+            <div>
+              <label class="block text-[11px] font-bold text-stone-700 mb-1">Цаг (ЦЦ:ММ) *</label>
+              <input type="text" id="appt-input-time" placeholder="14:00" class="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2 text-xs focus:bg-white focus:outline-none focus:border-teal-500">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-[11px] font-bold text-stone-700 mb-1">Тэмдэглэл / Хүсэлт</label>
+            <input type="text" id="appt-input-notes" placeholder="Жишээ: Мастер стилист дээр" class="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2 text-xs focus:bg-white focus:outline-none focus:border-teal-500">
+          </div>
+        </div>
+
+        <div class="pt-3 border-t border-stone-100 flex items-center justify-end gap-2">
+          <button onclick="closeNewAppointmentModal()" class="px-4 py-2 rounded-xl bg-stone-100 text-stone-600 hover:bg-stone-200 text-xs font-semibold">
+            Болих
+          </button>
+          <button onclick="saveNewAppointment()" id="btn-save-appt" class="px-5 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold shadow-sm">
+            Цаг товлох
+          </button>
+        </div>
       </div>
     </div>
 
@@ -2350,6 +2557,7 @@
       if (tabId === 'cargo') loadCargoData();
       if (tabId === 'executive') loadExecutiveData();
       if (tabId === 'marketing') loadMarketingData();
+      if (tabId === 'appointments') loadAppointmentsData();
       if (tabId === 'links') loadKnowledge();
     }
 
@@ -3398,15 +3606,79 @@
 
     function cancelImageUpload() {
       currentSelectedFile = null;
-      document.getElementById('sim-file-input').value = '';
-      document.getElementById('sim-image-preview-bar').classList.add('hidden');
+      const input = document.getElementById('sim-file-input');
+      if (input) input.value = '';
+      const preview = document.getElementById('sim-image-preview-bar');
+      if (preview) preview.classList.add('hidden');
+    }
+
+    let currentSelectedAudio = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecordingAudio = false;
+
+    function handleAudioSelect(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      currentSelectedAudio = file;
+      document.getElementById('sim-audio-name').innerText = file.name;
+      document.getElementById('sim-audio-preview-bar').classList.remove('hidden');
+    }
+
+    function cancelAudioUpload() {
+      currentSelectedAudio = null;
+      const input = document.getElementById('sim-audio-input');
+      if (input) input.value = '';
+      const preview = document.getElementById('sim-audio-preview-bar');
+      if (preview) preview.classList.add('hidden');
+    }
+
+    async function startVoiceRecordingOrUpload() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        document.getElementById('sim-audio-input').click();
+        return;
+      }
+
+      const micBtn = document.getElementById('sim-mic-btn');
+      if (!isRecordingAudio) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaRecorder = new MediaRecorder(stream);
+          audioChunks = [];
+          mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) audioChunks.push(e.data);
+          };
+          mediaRecorder.onstop = () => {
+            const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+            const file = new File([audioBlob], 'voice_record.webm', { type: 'audio/webm' });
+            currentSelectedAudio = file;
+            document.getElementById('sim-audio-name').innerText = '🎤 Бичсэн дуут зурвас (' + Math.round(audioBlob.size / 1024) + ' KB)';
+            document.getElementById('sim-audio-preview-bar').classList.remove('hidden');
+            stream.getTracks().forEach(track => track.stop());
+          };
+          mediaRecorder.start();
+          isRecordingAudio = true;
+          micBtn.classList.remove('bg-teal-50', 'text-teal-700');
+          micBtn.classList.add('bg-red-500', 'text-white', 'animate-pulse');
+          showToast('🎙️ Дуу хурааж байна... Дуусгахдаа микрофон товчийг дахин дарна уу.');
+        } catch (err) {
+          document.getElementById('sim-audio-input').click();
+        }
+      } else {
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+        }
+        isRecordingAudio = false;
+        micBtn.classList.remove('bg-red-500', 'text-white', 'animate-pulse');
+        micBtn.classList.add('bg-teal-50', 'text-teal-700');
+      }
     }
 
     async function handleSimulatorSubmit(e) {
       if (e) e.preventDefault();
       const input = document.getElementById('sim-input');
       const text = input.value.trim();
-      if (!text && !currentSelectedFile) return;
+      if (!text && !currentSelectedFile && !currentSelectedAudio) return;
 
       const box = document.getElementById('sim-messages');
 
@@ -3432,6 +3704,20 @@
         `;
       }
 
+      if (currentSelectedAudio) {
+        box.innerHTML += `
+          <div class="flex justify-end">
+            <div class="msg-user p-2.5 rounded-2xl max-w-[80%] flex items-center gap-2 bg-teal-700 text-white shadow-sm">
+              <i class="fa-solid fa-microphone text-sm"></i>
+              <div class="text-[11px] font-medium leading-tight">
+                <div>🎤 Дуут зурвас илгээлээ</div>
+                <div class="text-[9px] opacity-80">${escapeHtml(currentSelectedAudio.name)}</div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
       input.value = '';
       box.scrollTop = box.scrollHeight;
 
@@ -3445,7 +3731,7 @@
             <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce"></span>
             <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 0.15s"></span>
             <span class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 0.3s"></span>
-            <span class="text-[11px] ml-1">Бичиж байна...</span>
+            <span class="text-[11px] ml-1">Боловсруулж байна...</span>
           </div>
         </div>
       `;
@@ -3453,7 +3739,18 @@
 
       try {
         let reply = "";
-        if (currentSelectedFile) {
+        if (currentSelectedAudio) {
+          const formData = new FormData();
+          formData.append('audio_file', currentSelectedAudio);
+          if (text) formData.append('text', text);
+          formData.append('page_id', activePageId);
+          formData.append('sender_id', simulatorSenderId);
+
+          const res = await fetch('/api/chat/voice', { method: 'POST', body: formData });
+          const json = await res.json();
+          reply = json.reply || "Дуут зурвасыг сонсож амжилттай боловсрууллаа.";
+          cancelAudioUpload();
+        } else if (currentSelectedFile) {
           const formData = new FormData();
           formData.append('file', currentSelectedFile);
           if (text) formData.append('text', text);
@@ -4775,6 +5072,213 @@
       } finally {
         btn.disabled = false;
         btn.innerHTML = `<i class="fa-solid fa-rotate text-rose-600 text-xs"></i> <span>Сэргээлт шалгах</span>`;
+      }
+    }
+
+    // ==================== APPOINTMENTS & REMINDERS MODULE ====================
+    let currentApptFilter = 'all';
+    let appointmentsList = [];
+
+    function setApptFilter(filter) {
+      currentApptFilter = filter;
+      document.querySelectorAll('.appt-filter-btn').forEach(btn => {
+        btn.classList.remove('bg-white', 'font-bold', 'text-stone-900', 'shadow-sm');
+        btn.classList.add('text-stone-600');
+      });
+      const activeBtn = document.getElementById('appt-filter-' + filter);
+      if (activeBtn) {
+        activeBtn.classList.add('bg-white', 'font-bold', 'text-stone-900', 'shadow-sm');
+        activeBtn.classList.remove('text-stone-600');
+      }
+      renderAppointmentsTable();
+    }
+
+    async function loadAppointmentsData() {
+      try {
+        // 1. Load Summary
+        const sumRes = await fetch(`/api/appointments/summary?page_id=${encodeURIComponent(activePageId)}`);
+        if (sumRes.ok) {
+          const sum = await sumRes.json();
+          document.getElementById('appt-kpi-today').textContent = sum.today_confirmed || 0;
+          document.getElementById('appt-kpi-upcoming').textContent = sum.total_upcoming || 0;
+          document.getElementById('appt-kpi-completed').textContent = sum.total_completed || 0;
+          document.getElementById('appt-kpi-total').textContent = sum.total_all || 0;
+        }
+
+        // 2. Load List
+        const listRes = await fetch(`/api/appointments?page_id=${encodeURIComponent(activePageId)}`);
+        if (listRes.ok) {
+          const json = await listRes.json();
+          appointmentsList = json.data || (Array.isArray(json) ? json : []);
+          renderAppointmentsTable();
+        }
+      } catch (err) {
+        console.error('Failed to load appointments:', err);
+      }
+    }
+
+    function renderAppointmentsTable() {
+      const tbody = document.getElementById('appt-table-body');
+      if (!tbody) return;
+
+      const todayStr = new Date().toISOString().split('T')[0];
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const tomorrowStr = tomorrow.toISOString().split('T')[0];
+
+      let filtered = appointmentsList;
+      if (currentApptFilter === 'today') {
+        filtered = filtered.filter(a => a.appointment_date === todayStr);
+      } else if (currentApptFilter === 'tomorrow') {
+        filtered = filtered.filter(a => a.appointment_date === tomorrowStr);
+      }
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="7" class="p-8 text-center text-stone-400">
+              <i class="fa-regular fa-calendar-xmark text-2xl mb-2 text-stone-300"></i>
+              <p>Одоогоор энэ шүүлтүүрээр товлосон цаг алга байна.</p>
+            </td>
+          </tr>
+        `;
+        return;
+      }
+
+      tbody.innerHTML = filtered.map(a => {
+        let statusBadge = '';
+        if (a.status === 'CONFIRMED') {
+          statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-teal-100 text-teal-800 border border-teal-200">Баталгаажсан</span>';
+        } else if (a.status === 'COMPLETED') {
+          statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">Дууссан</span>';
+        } else if (a.status === 'CANCELLED') {
+          statusBadge = '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-stone-100 text-stone-500 border border-stone-200">Цуцлагдсан</span>';
+        } else {
+          statusBadge = `<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800">${escapeHtml(a.status)}</span>`;
+        }
+
+        const reminderBadge = a.reminder_sent
+          ? '<span class="text-emerald-600 font-bold flex items-center justify-center gap-1"><i class="fa-solid fa-check"></i> Илгээгдсэн</span>'
+          : '<span class="text-stone-400 flex items-center justify-center gap-1"><i class="fa-regular fa-clock"></i> Хүлээгдэж буй</span>';
+
+        return `
+          <tr class="hover:bg-stone-50/70 transition">
+            <td class="p-3.5">
+              <div class="font-bold text-stone-900">${escapeHtml(a.customer_name || 'Нэргүй')}</div>
+              <div class="text-[11px] text-stone-500 font-mono">${escapeHtml(a.customer_phone || '-')}</div>
+            </td>
+            <td class="p-3.5">
+              <span class="font-semibold text-stone-800">${escapeHtml(a.service_name)}</span>
+              ${a.notes ? `<div class="text-[10px] text-stone-400 truncate max-w-[150px]">${escapeHtml(a.notes)}</div>` : ''}
+            </td>
+            <td class="p-3.5">
+              <div class="font-bold text-teal-900 font-mono">${escapeHtml(a.appointment_date)}</div>
+              <div class="text-[11px] text-stone-600 font-bold font-mono">${escapeHtml(a.appointment_time)}</div>
+            </td>
+            <td class="p-3.5 text-center text-[11px]">${reminderBadge}</td>
+            <td class="p-3.5 text-center">
+              <span class="px-2 py-0.5 rounded-md text-[10px] font-mono bg-stone-100 text-stone-700">${escapeHtml(a.channel || 'web')}</span>
+            </td>
+            <td class="p-3.5 text-center">${statusBadge}</td>
+            <td class="p-3.5 text-right space-x-1 whitespace-nowrap">
+              ${a.status === 'CONFIRMED' ? `
+                <button onclick="updateAppointmentStatus(${a.id}, 'COMPLETED')" class="px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[11px] font-bold transition">
+                  <i class="fa-solid fa-check"></i> Дуусгах
+                </button>
+                <button onclick="updateAppointmentStatus(${a.id}, 'CANCELLED')" class="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 text-[11px] font-bold transition">
+                  <i class="fa-solid fa-xmark"></i> Цуцлах
+                </button>
+              ` : `
+                <button onclick="updateAppointmentStatus(${a.id}, 'CONFIRMED')" class="px-2 py-1 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-600 text-[11px] transition">
+                  Сэргээх
+                </button>
+              `}
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function openNewAppointmentModal() {
+      const today = new Date().toISOString().split('T')[0];
+      document.getElementById('appt-input-date').value = today;
+      document.getElementById('appt-input-time').value = '14:00';
+      document.getElementById('modal-new-appointment').classList.remove('hidden');
+    }
+
+    function closeNewAppointmentModal() {
+      document.getElementById('modal-new-appointment').classList.add('hidden');
+    }
+
+    async function saveNewAppointment() {
+      const name = document.getElementById('appt-input-name').value.trim();
+      const phone = document.getElementById('appt-input-phone').value.trim();
+      const service = document.getElementById('appt-input-service').value.trim();
+      const date = document.getElementById('appt-input-date').value;
+      const time = document.getElementById('appt-input-time').value.trim();
+      const notes = document.getElementById('appt-input-notes').value.trim();
+
+      if (!name || !phone || !service || !date || !time) {
+        alert('Бүх одтой (*) талбаруудыг бүрэн бөглөнө үү.');
+        return;
+      }
+
+      const btn = document.getElementById('btn-save-appt');
+      btn.disabled = true;
+      btn.innerText = 'Хадгалж байна...';
+
+      try {
+        const res = await fetch('/api/appointments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            page_id: activePageId,
+            customer_name: name,
+            customer_phone: phone,
+            service_name: service,
+            appointment_date: date,
+            appointment_time: time,
+            notes: notes,
+            channel: 'web'
+          })
+        });
+
+        const json = await res.json();
+        if (json.success) {
+          showToast('✅ Цаг захиалга амжилттай товлогдлоо!');
+          closeNewAppointmentModal();
+          document.getElementById('appt-input-name').value = '';
+          document.getElementById('appt-input-phone').value = '';
+          document.getElementById('appt-input-service').value = '';
+          document.getElementById('appt-input-notes').value = '';
+          loadAppointmentsData();
+        } else {
+          alert('Цаг захиалахад алдаа гарлаа: ' + (json.message || 'Энэ цаг аль хэдийн захиалагдсан байж магадгүй.'));
+        }
+      } catch (err) {
+        alert('Холболтын алдаа: ' + err);
+      } finally {
+        btn.disabled = false;
+        btn.innerText = 'Цаг товлох';
+      }
+    }
+
+    async function updateAppointmentStatus(id, newStatus) {
+      try {
+        const res = await fetch(`/api/appointments/${id}/status`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: newStatus })
+        });
+        const json = await res.json();
+        if (json.success) {
+          showToast('✅ Төлөв амжилттай шинэчлэгдлээ!');
+          loadAppointmentsData();
+        } else {
+          alert('Алдаа: ' + (json.message || 'Шинэчилж чадсангүй'));
+        }
+      } catch (err) {
+        alert('Холболтын алдаа: ' + err);
       }
     }
 

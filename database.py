@@ -245,6 +245,28 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_followups ON sent_followups (page_id, rule_type, sender_id)")
 
+    # 11. Цаг захиалгын систем (Appointments & Booking Calendar)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS appointments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT NOT NULL,
+            customer_name TEXT NOT NULL,
+            customer_phone TEXT NOT NULL,
+            service_name TEXT NOT NULL,
+            appointment_date TEXT NOT NULL, -- YYYY-MM-DD
+            appointment_time TEXT NOT NULL, -- HH:MM
+            sender_id TEXT,
+            channel TEXT DEFAULT 'web',
+            status TEXT DEFAULT 'CONFIRMED', -- 'CONFIRMED', 'COMPLETED', 'CANCELLED'
+            reminder_sent INTEGER DEFAULT 0,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(page_id, appointment_date, appointment_time, service_name)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_appointments_page_date ON appointments (page_id, appointment_date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments (customer_phone)")
+
     # Багануудыг аюулгүй нэмэх (Migration check)
     tables_to_migrate = [
         ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
@@ -1643,6 +1665,172 @@ def get_marketing_summary(page_id: str) -> Dict[str, Any]:
         "total_broadcast_sent": int(total_broadcast_sent),
         "total_followups_sent": int(total_followups_sent),
         "total_audience": int(total_audience)
+    }
+
+# -------------------------------------------------------------
+# 10. ЦАГ ЗАХИАЛГА & ХУАНЛИЙН САН (APPOINTMENTS & CALENDAR)
+# -------------------------------------------------------------
+def is_slot_available(page_id: str, appointment_date: str, appointment_time: str, service_name: Optional[str] = None) -> bool:
+    """Тухайн өдөр болон цагт сул цаг байгаа эсэх"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    query = "SELECT id FROM appointments WHERE page_id = ? AND appointment_date = ? AND appointment_time = ? AND status != 'CANCELLED'"
+    params = [str(page_id), appointment_date.strip(), appointment_time.strip()]
+    if service_name:
+        query += " AND service_name = ?"
+        params.append(service_name.strip())
+    cursor.execute(query, tuple(params))
+    row = cursor.fetchone()
+    conn.close()
+    return row is None
+
+def create_appointment(
+    page_id: str,
+    customer_name: str,
+    customer_phone: str,
+    service_name: str,
+    appointment_date: str,
+    appointment_time: str,
+    sender_id: Optional[str] = None,
+    channel: str = "web",
+    notes: str = ""
+) -> Optional[Dict[str, Any]]:
+    """Шинэ цаг захиалга үүсгэх (хэрэв сул бол)"""
+    if not is_slot_available(page_id, appointment_date, appointment_time, service_name):
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO appointments (
+            page_id, customer_name, customer_phone, service_name,
+            appointment_date, appointment_time, sender_id, channel, notes, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIRMED')
+    """, (
+        str(page_id), customer_name.strip(), customer_phone.strip(), service_name.strip(),
+        appointment_date.strip(), appointment_time.strip(), sender_id, channel, notes.strip()
+    ))
+    a_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    # Сэжимд давхар хадгалах
+    save_registration(
+        name=customer_name,
+        phone=customer_phone,
+        service=f"{service_name} ({appointment_date} {appointment_time})",
+        channel=channel,
+        page_id=page_id,
+        sender_id=sender_id,
+        notes=f"Цаг захиалга #{a_id}: {notes}"
+    )
+
+    return get_appointment(a_id)
+
+def get_appointment(appointment_id: int) -> Optional[Dict[str, Any]]:
+    """Цаг захиалгын мэдээлэл авах"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM appointments WHERE id = ?", (int(appointment_id),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def list_appointments(
+    page_id: str,
+    date_str: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50
+) -> List[Dict[str, Any]]:
+    """Цаг захиалгуудын жагсаалт"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    conditions = ["page_id = ?"]
+    params = [str(page_id)]
+    if date_str:
+        conditions.append("appointment_date = ?")
+        params.append(date_str)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    query = f"SELECT * FROM appointments WHERE {' AND '.join(conditions)} ORDER BY appointment_date ASC, appointment_time ASC LIMIT ?"
+    params.append(limit)
+    cursor.execute(query, tuple(params))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def update_appointment_status(appointment_id: int, status: str) -> bool:
+    """Цаг захиалгын төлөв өөрчлөх ('CONFIRMED', 'COMPLETED', 'CANCELLED')"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE appointments SET status = ? WHERE id = ?", (status, int(appointment_id)))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
+def get_pending_appointment_reminders(hours_ahead: int = 2) -> List[Dict[str, Any]]:
+    """
+    2 цагийн өмнө сануулах шаардлагатай цаг захиалгууд:
+    (Өнөөдрийн огноо, цаг нь одоогоос <= 2 цагийн дараа эхлэх, reminder_sent = 0, status = 'CONFIRMED')
+    """
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    current_time_str = now.strftime("%H:%M")
+    two_hours_later_str = (now + timedelta(hours=hours_ahead)).strftime("%H:%M")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM appointments
+        WHERE appointment_date = ?
+          AND appointment_time >= ?
+          AND appointment_time <= ?
+          AND reminder_sent = 0
+          AND status = 'CONFIRMED'
+    """, (today_str, current_time_str, two_hours_later_str))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def mark_appointment_reminder_sent(appointment_id: int) -> bool:
+    """Сануулга илгээгдсэнийг тэмдэглэх"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE appointments SET reminder_sent = 1 WHERE id = ?", (int(appointment_id),))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
+def get_appointments_summary(page_id: str) -> Dict[str, Any]:
+    """Цаг захиалгын самбарын хураангуй тооцоолол"""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND appointment_date = ? AND status = 'CONFIRMED'", (str(page_id), today_str))
+    today_confirmed = cursor.fetchone()[0] or 0
+
+    cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND status = 'CONFIRMED'", (str(page_id),))
+    total_upcoming = cursor.fetchone()[0] or 0
+
+    cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND status = 'COMPLETED'", (str(page_id),))
+    total_completed = cursor.fetchone()[0] or 0
+
+    cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ?", (str(page_id),))
+    total_all = cursor.fetchone()[0] or 0
+
+    conn.close()
+    return {
+        "today_confirmed": int(today_confirmed),
+        "total_upcoming": int(total_upcoming),
+        "total_completed": int(total_completed),
+        "total_all": int(total_all)
     }
 
 if __name__ == "__main__":

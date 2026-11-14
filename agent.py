@@ -259,6 +259,8 @@ class AIAgent:
         self,
         text: str = "",
         image_bytes: Optional[bytes] = None,
+        audio_bytes: Optional[bytes] = None,
+        audio_mime: str = "audio/ogg",
         sender_id: str = "default",
         channel: str = "web",
         page_id: str = database.DEFAULT_PAGE_ID
@@ -268,7 +270,7 @@ class AIAgent:
         page_name = page_data.get("name", "Манай суваг") if page_data else "Tuvshok Кино Суваг"
 
         # Баазад тэмдэглэх
-        log_content = text if text else "[Зураг хавсаргав]"
+        log_content = text if text else ("[Дуут зурвас илгээв]" if audio_bytes else "[Зураг хавсаргав]")
         database.log_message(sender_id=sender_id, channel=channel, sender_type="user", content=log_content, page_id=page_id)
 
         # 0. Хүн удирдаж байгаа эсэх (Takeover check)
@@ -433,14 +435,51 @@ class AIAgent:
                     )
                     return f"QPay нэхэмжлэх үүслээ. Дугаар: {invoice_order['invoice_id']}, Төлөх холбоос: {invoice_order['pay_url']}"
 
+                def book_service_appointment(
+                    name: str,
+                    phone: str,
+                    service: str,
+                    date: str,
+                    time: str,
+                    notes: str = ""
+                ) -> str:
+                    """Салон, эмнэлэг, үйлчилгээний цаг товлох, цагийн хуваарийн давхцал шалгаж захиалга баталгаажуулах хэрэгсэл.
+                    Args:
+                        name: Үйлчлүүлэгчийн нэр
+                        phone: 8 оронтой утасны дугаар
+                        service: Захиалах үйлчилгээний нэр (жишээ: Гелин будалт, Массаж, Үзлэг)
+                        date: Захиалгын огноо (YYYY-MM-DD эсвэл өнөөдөр, маргааш)
+                        time: Захиалгын цаг (HH:MM формат, жишээ: 14:00)
+                        notes: Нэмэлт тайлбар
+                    """
+                    nonlocal registered, reg_info
+                    import appointment_service
+                    res = appointment_service.book_appointment_from_ai(
+                        page_id=page_id,
+                        customer_name=name,
+                        customer_phone=phone,
+                        service_name=service or page_name,
+                        appointment_date=date,
+                        appointment_time=time,
+                        sender_id=sender_id,
+                        channel=channel,
+                        notes=notes or text
+                    )
+                    if res.get("success"):
+                        registered = True
+                        reg_info = {"id": res["appointment"]["id"], "name": name, "phone": phone, "service": service}
+                    return res.get("message", "Цаг захиалгын мэдээлэл шалгагдлаа.")
+
                 # Хэрэглэгчийн санах ойг татаж авах (Mem0 & Zep загвар)
                 user_memory = database.get_user_memory(page_id, sender_id)
+
+                agent_tools = [register_customer, check_sheet_cargo_status, create_payment_invoice, book_service_appointment]
 
                 session_key = f"{page_id}_{sender_id}"
                 if session_key not in self.chat_sessions:
                     config = types.GenerateContentConfig(
                         system_instruction=build_system_instruction_for_page(page_data, user_memory=user_memory),
-                        tools=[register_customer, check_sheet_cargo_status, create_payment_invoice],
+                        tools=agent_tools,
                         temperature=0.7,
                     )
                     self.chat_sessions[session_key] = client.chats.create(
@@ -449,9 +488,17 @@ class AIAgent:
                     )
 
                 chat = self.chat_sessions[session_key]
-                message_payload = text
-                if sheet_context:
-                    message_payload = f"{text}\n\n{sheet_context}"
+                
+                if audio_bytes:
+                    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime)
+                    prompt_txt = text if text else "Энэ дуут зурвасыг сонсоод монгол хэлээр бүрэн ойлгож, найрсаг хариулж, хэрэгтэй үйлдлийг гүйцэтгэнэ үү."
+                    if sheet_context:
+                        prompt_txt += f"\n\n{sheet_context}"
+                    message_payload = [prompt_txt, audio_part]
+                else:
+                    message_payload = text
+                    if sheet_context:
+                        message_payload = f"{text}\n\n{sheet_context}"
 
                 try:
                     response = chat.send_message(message_payload)
@@ -461,7 +508,7 @@ class AIAgent:
                     self.chat_sessions.pop(session_key, None)
                     config = types.GenerateContentConfig(
                         system_instruction=build_system_instruction_for_page(page_data, user_memory=user_memory),
-                        tools=[register_customer, check_sheet_cargo_status, create_payment_invoice],
+                        tools=agent_tools,
                         temperature=0.7,
                     )
                     new_chat = client.chats.create(
