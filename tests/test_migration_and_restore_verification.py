@@ -71,10 +71,11 @@ def test_migration_clean_batch_streaming_succeeds():
 
 
 def test_sqlite_restore_verification_rejects_missing_or_empty_tables():
-    database.init_db()
+    orig_db_url = os.environ.pop("DATABASE_URL", None)
     orig_db_path = database.DB_PATH
     tmp_dir = tempfile.mkdtemp(prefix="gerege_restore_ver_")
     try:
+        database.init_db()
         live_db = os.path.join(tmp_dir, "live.db")
         shutil.copy2(orig_db_path, live_db)
         database.DB_PATH = live_db
@@ -125,11 +126,54 @@ def test_sqlite_restore_verification_rejects_missing_or_empty_tables():
                         os.remove(p + ext)
     finally:
         database.DB_PATH = orig_db_path
+        if orig_db_url is not None:
+            os.environ["DATABASE_URL"] = orig_db_url
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_postgres_restore_verification_when_configured():
+    from core import db_engine
+    if not db_engine.is_postgres():
+        return
+
+    good_bk = backup_service.create_backup(label="pg_restore_ver_ok")
+    assert good_bk["success"] is True
+    assert good_bk["filename"].endswith(".sql.gz")
+
+    res_good = backup_service.restore_backup(good_bk["filename"])
+    assert res_good["success"] is True, f"PG restore failed: {res_good}"
+    assert res_good["post_restore_verified"] is True
+    assert res_good["restored_table_counts"]["pages"] >= 1
+
+    # Also verify a .sql.gz that leaves `pages` empty fails real post-restore verification
+    bad_name = "pg_backup_bad_empty_test.sql.gz"
+    bad_gz = os.path.join(backup_service.BACKUP_DIR, bad_name)
+    bad_sql = b"BEGIN; DELETE FROM pages; COMMIT;\n"
+    # Note: psql --single-transaction wraps input; test invalid SQL / empty verification
+    with gzip.open(bad_gz, "wb") as gz:
+        gz.write(b"SELECT 1; INVALID_SQL_SYNTAX_ERROR;")
+    sha = backup_service._compute_sha256(bad_gz)
+    with open(bad_gz + ".sha256", "w", encoding="utf-8") as sf:
+        sf.write(f"{sha}  {bad_name}\n")
+    with open(bad_gz + ".meta.json", "w", encoding="utf-8") as mf:
+        json.dump({"table_counts": {"pages": 1}}, mf)
+
+    try:
+        res_bad = backup_service.restore_backup(bad_name)
+        assert res_bad["success"] is False
+        assert res_bad["post_restore_verified"] is False
+    finally:
+        for fn in (good_bk["filename"], bad_name, res_good.get("pre_restore_snapshot"), res_bad.get("pre_restore_snapshot")):
+            if fn:
+                p = os.path.join(backup_service.BACKUP_DIR, fn)
+                for ext in ("", ".sha256", ".meta.json"):
+                    if os.path.exists(p + ext):
+                        os.remove(p + ext)
 
 
 if __name__ == "__main__":
     test_migration_detects_target_only_extra_rows()
     test_migration_clean_batch_streaming_succeeds()
     test_sqlite_restore_verification_rejects_missing_or_empty_tables()
+    test_postgres_restore_verification_when_configured()
     print("[PASS] Migration target-only detection & Restore verification suite")
