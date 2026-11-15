@@ -96,12 +96,26 @@ jobs:
         run: |
           python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
 
-      - name: Run Enterprise Phases Suite (Live PostgreSQL 16 & Redis 7)
+      - name: Run Enterprise Phase 1 Tests (Live PostgreSQL 16 & Redis 7)
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
-          timeout 45s pytest tests/test_enterprise_phases.py -v --tb=short
+          timeout 45s pytest tests/test_enterprise_phases.py -k "phase1" -v --tb=short
+
+      - name: Run Enterprise Phase 2 Tests (Live PostgreSQL 16 & Redis 7)
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          timeout 45s pytest tests/test_enterprise_phases.py -k "phase2" -v --tb=short
+
+      - name: Run Enterprise Phase 3-5 Tests (Live PostgreSQL 16 & Redis 7)
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          timeout 45s pytest tests/test_enterprise_phases.py -k "phase3 or phase4 or phase5" -v --tb=short
 
       - name: Run AI Eval Suite (Live PostgreSQL 16 & Redis 7)
         env:
