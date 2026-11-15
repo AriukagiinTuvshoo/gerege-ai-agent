@@ -233,21 +233,139 @@ def verify_backup(filename: str) -> Dict[str, Any]:
     return {"valid": True, "filename": clean_name, "sha256": actual_sha}
 
 
+_REQUIRED_RESTORE_TABLES = (
+    "pages",
+    "registrations",
+    "messages",
+    "session_states",
+    "sessions",
+    "user_memories",
+    "invoices",
+    "cargo_packages",
+    "automated_rules",
+    "marketing_campaigns",
+    "sent_followups",
+    "appointments",
+    "notification_locks",
+    "task_jobs",
+    "audit_logs",
+)
+
+
+def _load_expected_counts(backup_fpath: str) -> Dict[str, int]:
+    meta_path = backup_fpath + ".meta.json"
+    if not os.path.exists(meta_path):
+        return {}
+    try:
+        with open(meta_path, "r", encoding="utf-8") as mf:
+            meta = json.load(mf)
+        raw = meta.get("table_counts") or {}
+        return {str(k): int(v) for k, v in raw.items() if isinstance(v, (int, float)) and v >= 0}
+    except Exception:
+        return {}
+
+
+def _verify_restored_sqlite(db_path: str, expected_counts: Dict[str, int]) -> Dict[str, Any]:
+    conn = sqlite3.connect(db_path)
+    try:
+        ic = conn.execute("PRAGMA integrity_check").fetchone()
+        if not ic or ic[0] != "ok":
+            return {"verified": False, "error": f"SQLite integrity_check failed: {ic}", "table_counts": {}}
+
+        existing = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        missing = [t for t in _REQUIRED_RESTORE_TABLES if t not in existing]
+        if missing:
+            return {"verified": False, "error": f"Missing required tables after restore: {missing}", "table_counts": {}}
+
+        actual_counts: Dict[str, int] = {}
+        mismatches: Dict[str, Any] = {}
+        for t in _REQUIRED_RESTORE_TABLES:
+            cnt = int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] or 0)
+            actual_counts[t] = cnt
+            if t in expected_counts:
+                exp = expected_counts[t]
+                if exp > 0 and cnt == 0:
+                    mismatches[t] = {"expected": exp, "actual": cnt, "reason": "empty_table_after_restore"}
+                elif cnt != exp:
+                    mismatches[t] = {"expected": exp, "actual": cnt, "reason": "row_count_mismatch"}
+
+        if mismatches:
+            return {
+                "verified": False,
+                "error": f"Restored SQLite row count mismatch: {mismatches}",
+                "table_counts": actual_counts,
+            }
+        return {"verified": True, "table_counts": actual_counts}
+    finally:
+        conn.close()
+
+
+def _verify_restored_postgres(pg_url: str, expected_counts: Dict[str, int]) -> Dict[str, Any]:
+    from sqlalchemy import create_engine, text
+
+    sa_url = pg_url
+    if sa_url.startswith("postgres://"):
+        sa_url = "postgresql+psycopg2://" + sa_url[len("postgres://"):]
+    elif sa_url.startswith("postgresql://"):
+        sa_url = "postgresql+psycopg2://" + sa_url[len("postgresql://"):]
+
+    engine = create_engine(sa_url, pool_pre_ping=True, future=True)
+    try:
+        with engine.connect() as conn:
+            existing = {
+                r[0]
+                for r in conn.execute(
+                    text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+                ).fetchall()
+            }
+            missing = [t for t in _REQUIRED_RESTORE_TABLES if t not in existing]
+            if missing:
+                return {"verified": False, "error": f"Missing required PostgreSQL tables: {missing}", "table_counts": {}}
+
+            actual_counts: Dict[str, int] = {}
+            mismatches: Dict[str, Any] = {}
+            for t in _REQUIRED_RESTORE_TABLES:
+                cnt = int(conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0)
+                actual_counts[t] = cnt
+                if t in expected_counts:
+                    exp = expected_counts[t]
+                    if exp > 0 and cnt == 0:
+                        mismatches[t] = {"expected": exp, "actual": cnt, "reason": "empty_table_after_restore"}
+                    elif cnt != exp:
+                        mismatches[t] = {"expected": exp, "actual": cnt, "reason": "row_count_mismatch"}
+
+            if mismatches:
+                return {
+                    "verified": False,
+                    "error": f"Restored PostgreSQL row count mismatch: {mismatches}",
+                    "table_counts": actual_counts,
+                }
+            return {"verified": True, "table_counts": actual_counts}
+    finally:
+        engine.dispose()
+
+
 def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[str, Any]:
     """
     Backup файлаас өгөгдлийн санг атомик байдлаар аюулгүй сэргээх (Recovery):
     1. Эхлээд файлын бүрэн бүтэн байдлыг (`verify_backup`) шалгана.
     2. Одоогийн баазыг `pre_restore` нэрээр автоматаар нөөцөлнө.
-    3. SQLite (`.db.gz`) үед тусдаа түр бааз дээр задлан шалгаад `sqlite3.Connection.backup`-аар атомик хуулна;
-       PostgreSQL (`.sql.gz`) үед `psql --single-transaction -v ON_ERROR_STOP=1` ашиглан атомик транзакциар сэргээнэ.
-    4. Сэргээсний дараа smoke test хийж, хэрэв алдаа гарсан бол `pre_restore` snapshot-оос буцаан сэргээнэ.
+    3. SQLite (`.db.gz`) үед тусдаа түр бааз дээр бүрэн бүтэн байдал, схем болон мөрийн тоог шалгаад
+       `sqlite3.Connection.backup`-аар атомик хуулж, live бааз дээр дахин баталгаажуулна;
+       PostgreSQL (`.sql.gz`) үед `psql --single-transaction -v ON_ERROR_STOP=1` ашиглан атомик сэргээж,
+       зорилтот PostgreSQL баазаас схем, хүснэгт болон мөрийн тоог бодитоор шалгана.
+    4. Баталгаажуулалт унавал `pre_restore` snapshot-оос буцаан сэргээнэ.
     """
     check = verify_backup(filename)
     if not check.get("valid"):
-        return {"success": False, "error": check.get("error", "Invalid backup")}
+        return {"success": False, "error": check.get("error", "Invalid backup"), "post_restore_verified": False}
 
     clean_name = os.path.basename(filename)
     fpath = os.path.join(BACKUP_DIR, clean_name)
+    expected_counts = _load_expected_counts(fpath)
 
     # Pre-restore safety snapshot
     pre_snap = create_backup(label="pre_restore")
@@ -257,23 +375,53 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
         try:
             with gzip.open(fpath, "rb") as f_in, open(tmp_restore, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
+
+            # Verify staging DB (integrity_check + required tables + row counts) BEFORE touching live DB
+            staging_check = _verify_restored_sqlite(tmp_restore, expected_counts)
+            if not staging_check.get("verified"):
+                raise RuntimeError(staging_check.get("error", "Staging DB failed post-restore verification"))
+
             src_conn = sqlite3.connect(tmp_restore)
-            # Verify integrity of decompressed staging DB before touching live DB
-            ic = src_conn.execute("PRAGMA integrity_check").fetchone()
-            if not ic or ic[0] != "ok":
-                src_conn.close()
-                raise RuntimeError(f"Staging DB failed integrity check: {ic}")
             dst_conn = sqlite3.connect(database.DB_PATH)
             with dst_conn:
                 src_conn.backup(dst_conn)
             dst_conn.close()
             src_conn.close()
+
+            live_check = _verify_restored_sqlite(database.DB_PATH, expected_counts)
+            if not live_check.get("verified"):
+                raise RuntimeError(live_check.get("error", "Live SQLite DB failed post-restore verification"))
         except Exception as e:
             logger.error(f"SQLite restore failed ({e}), rolling back from pre_restore snapshot.")
+            rollback_ok = False
+            pre_name = pre_snap.get("filename")
+            if pre_name:
+                pre_gz = os.path.join(BACKUP_DIR, pre_name)
+                tmp_rb = os.path.join(BACKUP_DIR, f".rb_{pre_name}.db")
+                try:
+                    with gzip.open(pre_gz, "rb") as f_in, open(tmp_rb, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                    rb_src = sqlite3.connect(tmp_rb)
+                    rb_dst = sqlite3.connect(database.DB_PATH)
+                    with rb_dst:
+                        rb_src.backup(rb_dst)
+                    rb_dst.close()
+                    rb_src.close()
+                    rollback_ok = True
+                except Exception as rb_err:
+                    logger.error(f"Rollback from pre_restore snapshot failed: {rb_err}")
+                finally:
+                    if os.path.exists(tmp_rb):
+                        try:
+                            os.remove(tmp_rb)
+                        except Exception:
+                            pass
             return {
                 "success": False,
                 "error": str(e),
-                "pre_restore_snapshot": pre_snap.get("filename"),
+                "post_restore_verified": False,
+                "rolled_back": rollback_ok,
+                "pre_restore_snapshot": pre_name,
             }
         finally:
             if os.path.exists(tmp_restore):
@@ -282,20 +430,23 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 except Exception:
                     pass
 
-        restored_counts = _collect_db_table_counts()
         return {
             "success": True,
             "engine": "sqlite",
             "restored_from": clean_name,
             "pre_restore_snapshot": pre_snap.get("filename"),
-            "post_restore_verified": restored_counts.get("pages", 0) >= 0,
-            "restored_table_counts": restored_counts,
+            "post_restore_verified": True,
+            "restored_table_counts": live_check.get("table_counts", {}),
         }
 
     if clean_name.endswith(".sql.gz"):
         pg_url = (target_db_url or get_database_url()).replace("postgresql+psycopg2://", "postgresql://")
         if not pg_url.startswith(("postgresql://", "postgres://")):
-            return {"success": False, "error": "PostgreSQL target DATABASE_URL is required to restore a .sql.gz backup"}
+            return {
+                "success": False,
+                "error": "PostgreSQL target DATABASE_URL is required to restore a .sql.gz backup",
+                "post_restore_verified": False,
+            }
         try:
             with gzip.open(fpath, "rb") as gz:
                 sql_bytes = gz.read()
@@ -306,21 +457,25 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 check=True,
                 timeout=180,
             )
-            restored_counts = _collect_db_table_counts()
+            pg_check = _verify_restored_postgres(pg_url, expected_counts)
+            if not pg_check.get("verified"):
+                raise RuntimeError(pg_check.get("error", "PostgreSQL post-restore verification failed"))
+
             return {
                 "success": True,
                 "engine": "postgresql",
                 "restored_from": clean_name,
                 "pre_restore_snapshot": pre_snap.get("filename"),
                 "post_restore_verified": True,
-                "restored_table_counts": restored_counts,
+                "restored_table_counts": pg_check.get("table_counts", {}),
                 "details": proc.stdout.decode("utf-8", errors="replace")[:500],
             }
         except Exception as e:
-            logger.error(f"PostgreSQL atomic psql restore failed (transaction rolled back): {e}")
+            logger.error(f"PostgreSQL restore failed ({e}); atomic rollback / pre_restore check.")
             return {
                 "success": False,
                 "error": str(e),
+                "post_restore_verified": False,
                 "atomic_rollback": True,
                 "pre_restore_snapshot": pre_snap.get("filename"),
             }

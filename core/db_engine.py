@@ -217,16 +217,33 @@ def translate_sql_for_postgres(sql: str) -> str:
 class PostgresCompatCursor:
     """
     PostgreSQL DB-API cursor-ийг `sqlite3.Cursor` интерфэйстэй 100% нийцүүлэх адаптер.
-    Statement бүрийг SAVEPOINT-оор хамгаалснаар `try ... except` доторх UniqueViolation эсвэл DDL алдаа
-    бүхэл транзакцийг `InFailedSqlTransaction` төлөвт оруулахаас бүрэн сэргийлнэ.
+    Statement бүрийг тусдаа control cursor дээр SAVEPOINT-оор хамгаалснаар:
+    1) `RELEASE SAVEPOINT` нь үндсэн `self._cur` дээрх SELECT result set-ийг устгахгүй,
+    2) `try ... except` доторх UniqueViolation эсвэл DDL алдаа бүхэл транзакцийг
+       `InFailedSqlTransaction` төлөвт оруулахаас бүрэн сэргийлнэ.
     """
 
     _sp_counter = 0
 
-    def __init__(self, raw_cursor):
+    def __init__(self, raw_cursor, raw_conn=None):
         self._cur = raw_cursor
+        self._conn = raw_conn if raw_conn is not None else getattr(raw_cursor, "connection", None)
         self.lastrowid: Optional[int] = None
         self.rowcount: int = -1
+
+    @property
+    def description(self):
+        return self._cur.description
+
+    def _run_control_sql(self, *statements: str) -> None:
+        if self._conn is None:
+            return
+        ctrl = self._conn.cursor()
+        try:
+            for stmt in statements:
+                ctrl.execute(stmt)
+        finally:
+            ctrl.close()
 
     def execute(self, sql: str, params: Sequence[Any] = ()):
         pg_sql = translate_sql_for_postgres(sql)
@@ -242,10 +259,13 @@ class PostgresCompatCursor:
 
         PostgresCompatCursor._sp_counter += 1
         sp_name = f"sp_gerege_{PostgresCompatCursor._sp_counter}"
-        use_savepoint = not pg_sql.lstrip().upper().startswith(("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"))
+        use_savepoint = (
+            self._conn is not None
+            and not pg_sql.lstrip().upper().startswith(("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"))
+        )
 
         if use_savepoint:
-            self._cur.execute(f"SAVEPOINT {sp_name}")
+            self._run_control_sql(f"SAVEPOINT {sp_name}")
         try:
             if params:
                 self._cur.execute(pg_sql, tuple(params))
@@ -258,34 +278,36 @@ class PostgresCompatCursor:
                 if row:
                     self.lastrowid = row[0]
             if use_savepoint:
-                self._cur.execute(f"RELEASE SAVEPOINT {sp_name}")
+                self._run_control_sql(f"RELEASE SAVEPOINT {sp_name}")
             return self
         except Exception:
             if use_savepoint:
                 try:
-                    self._cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
-                    self._cur.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    self._run_control_sql(
+                        f"ROLLBACK TO SAVEPOINT {sp_name}",
+                        f"RELEASE SAVEPOINT {sp_name}",
+                    )
                 except Exception:
                     pass
             raise
 
     def fetchone(self):
+        if self._cur.description is None:
+            return None
         row = self._cur.fetchone()
         if row is None:
             return None
-        if self._cur.description:
-            cols = [d[0] for d in self._cur.description]
-            return CompatRow(cols, row)
-        return row
+        cols = [d[0] for d in self._cur.description]
+        return CompatRow(cols, row)
 
     def fetchall(self) -> List[Any]:
+        if self._cur.description is None:
+            return []
         rows = self._cur.fetchall()
         if not rows:
             return []
-        if self._cur.description:
-            cols = [d[0] for d in self._cur.description]
-            return [CompatRow(cols, r) for r in rows]
-        return list(rows)
+        cols = [d[0] for d in self._cur.description]
+        return [CompatRow(cols, r) for r in rows]
 
     def close(self):
         self._cur.close()
@@ -299,7 +321,7 @@ class PostgresCompatConnection:
         self.row_factory = None
 
     def cursor(self) -> PostgresCompatCursor:
-        return PostgresCompatCursor(self._conn.cursor())
+        return PostgresCompatCursor(self._conn.cursor(), self._conn)
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> PostgresCompatCursor:
         cur = self.cursor()

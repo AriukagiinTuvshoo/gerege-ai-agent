@@ -305,8 +305,13 @@ def run_migration(
                     tuple(row_dict.get(c) for c in q_cols),
                 )
 
-            def _tgt_fetch_all(q_cols: List[str], tname: str, order_clause: str) -> List[Dict[str, Any]]:
-                rows = tgt_raw_conn.execute(f"SELECT {', '.join(q_cols)} FROM {tname} ORDER BY {order_clause}").fetchall()
+            def _tgt_fetch_batch(
+                q_cols: List[str], tname: str, order_clause: str, limit: int, offset: int
+            ) -> List[Dict[str, Any]]:
+                rows = tgt_raw_conn.execute(
+                    f"SELECT {', '.join(q_cols)} FROM {tname} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
                 return [dict(r) for r in rows]
 
             def _tgt_scalar(sql_str: str) -> int:
@@ -348,8 +353,20 @@ def run_migration(
                     row_dict,
                 )
 
-            def _tgt_fetch_all(q_cols: List[str], tname: str, order_clause: str) -> List[Dict[str, Any]]:
-                rows = pg_conn.execute(text(f"SELECT {', '.join(q_cols)} FROM {tname} ORDER BY {order_clause}")).mappings().all()
+            def _tgt_fetch_batch(
+                q_cols: List[str], tname: str, order_clause: str, limit: int, offset: int
+            ) -> List[Dict[str, Any]]:
+                rows = (
+                    pg_conn.execute(
+                        text(
+                            f"SELECT {', '.join(q_cols)} FROM {tname} ORDER BY {order_clause} "
+                            f"LIMIT :lim OFFSET :off"
+                        ),
+                        {"lim": limit, "off": offset},
+                    )
+                    .mappings()
+                    .all()
+                )
                 return [dict(r) for r in rows]
 
             def _tgt_scalar(sql_str: str) -> int:
@@ -377,16 +394,19 @@ def run_migration(
                 pk_cols = item["pk_cols"]
                 tinfo = source_summary["tables"].get(tname, {})
                 if not tinfo.get("exists"):
+                    tgt_cnt_empty = _tgt_scalar(f"SELECT COUNT(*) FROM {tname}")
                     report["migrated_tables"][tname] = {
                         "source_rows": 0,
+                        "target_rows": tgt_cnt_empty,
                         "inserted_rows": 0,
                         "identical_skipped": 0,
                         "missing_rows": 0,
+                        "target_only_rows": tgt_cnt_empty,
                         "conflicting_rows": 0,
                         "source_checksum": "",
                         "target_checksum": "",
-                        "checksum_match": True,
-                        "match": True,
+                        "checksum_match": tgt_cnt_empty == 0,
+                        "match": tgt_cnt_empty == 0,
                     }
                     continue
 
@@ -443,35 +463,82 @@ def run_migration(
                 if item.get("has_serial_id") and "id" in cols:
                     _tgt_reset_seq(tname)
 
-                # Row-level & Checksum verification on target for all migrated rows
-                all_src_rows = [
-                    dict(r)
-                    for r in src_cur.execute(f"SELECT * FROM {tname} ORDER BY {order_clause}").fetchall()
-                ]
-                all_tgt_rows = _tgt_fetch_all(cols, tname, order_clause)
-
-                tgt_by_pk = {compute_row_pk_tuple(r, pk_cols): r for r in all_tgt_rows}
+                # Bounded-memory batch-based streaming verification:
+                # 1) Stream source batches -> verify every PK & row hash exists identically on target
+                # 2) Stream target batches -> detect any target-only extra rows
+                target_count = _tgt_scalar(f"SELECT COUNT(*) FROM {tname}")
                 missing_rows = 0
-                matched_tgt_rows: List[Dict[str, Any]] = []
-                for srow in all_src_rows:
-                    pk_tup = compute_row_pk_tuple(srow, pk_cols)
-                    trow = tgt_by_pk.get(pk_tup)
-                    if trow is None:
-                        missing_rows += 1
-                    else:
-                        matched_tgt_rows.append(trow)
+                verify_conflicts = 0
+                src_stream_hasher = hashlib.sha256()
+                tgt_stream_hasher = hashlib.sha256()
 
-                src_checksum = tinfo["checksum"]
-                tgt_checksum = compute_table_checksum(matched_tgt_rows, cols, pk_cols)
-                checksum_match = (src_checksum == tgt_checksum) and (missing_rows == 0)
+                v_offset = 0
+                while v_offset < total_src_rows:
+                    src_batch = [
+                        dict(r)
+                        for r in src_cur.execute(
+                            f"SELECT * FROM {tname} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+                            (batch_size, v_offset),
+                        ).fetchall()
+                    ]
+                    if not src_batch:
+                        break
+                    for srow in src_batch:
+                        pk_params = {c: srow.get(c) for c in pk_cols}
+                        pk_str = "|".join(str(canonicalize_value(c, srow.get(c))["v"]) for c in pk_cols)
+                        s_hash = compute_canonical_row_hash(srow, cols)
+                        src_stream_hasher.update(f"{pk_str}:{s_hash}\n".encode("utf-8"))
+
+                        trow = _tgt_fetch_one(cols, tname, pk_cols, pk_params)
+                        if trow is None:
+                            missing_rows += 1
+                        else:
+                            t_hash = compute_canonical_row_hash(trow, cols)
+                            tgt_stream_hasher.update(f"{pk_str}:{t_hash}\n".encode("utf-8"))
+                            if s_hash != t_hash:
+                                verify_conflicts += 1
+                    v_offset += len(src_batch)
+
+                target_only_rows = 0
+                extra_target_samples: List[Dict[str, Any]] = []
+                pk_where_src = " AND ".join(f"{c} = ?" for c in pk_cols)
+                tgt_offset = 0
+                while True:
+                    tgt_batch = _tgt_fetch_batch(cols, tname, order_clause, batch_size, tgt_offset)
+                    if not tgt_batch:
+                        break
+                    for trow in tgt_batch:
+                        pk_tuple = tuple(trow.get(c) for c in pk_cols)
+                        exists_in_src = src_cur.execute(
+                            f"SELECT 1 FROM {tname} WHERE {pk_where_src} LIMIT 1",
+                            pk_tuple,
+                        ).fetchone()
+                        if exists_in_src is None:
+                            target_only_rows += 1
+                            if len(extra_target_samples) < 10:
+                                extra_target_samples.append({c: trow.get(c) for c in pk_cols})
+                    tgt_offset += len(tgt_batch)
+
+                src_checksum = src_stream_hasher.hexdigest()
+                tgt_checksum = tgt_stream_hasher.hexdigest()
+                exact_count_match = total_src_rows == target_count
+                checksum_match = (
+                    (src_checksum == tgt_checksum)
+                    and exact_count_match
+                    and (missing_rows == 0)
+                    and (target_only_rows == 0)
+                    and (verify_conflicts == 0)
+                )
 
                 report["migrated_tables"][tname] = {
                     "source_rows": total_src_rows,
-                    "target_rows": len(all_tgt_rows),
+                    "target_rows": target_count,
                     "inserted_rows": inserted_count,
                     "identical_skipped": identical_skipped,
                     "missing_rows": missing_rows,
-                    "conflicting_rows": len(table_conflicts),
+                    "target_only_rows": target_only_rows,
+                    "extra_target_samples": extra_target_samples,
+                    "conflicting_rows": len(table_conflicts) + verify_conflicts,
                     "source_checksum": src_checksum,
                     "target_checksum": tgt_checksum,
                     "checksum_match": checksum_match,
@@ -506,15 +573,22 @@ def run_migration(
             and pg_cargo_total == src_fin["cargo_total_price"]
         )
         rows_ok = all(
-            v.get("match", False) and v.get("checksum_match", False) and v.get("missing_rows", 1) == 0
+            v.get("match", False)
+            and v.get("checksum_match", False)
+            and v.get("missing_rows", 1) == 0
+            and v.get("target_only_rows", 1) == 0
+            and v.get("conflicting_rows", 1) == 0
+            and v.get("source_rows") == v.get("target_rows")
             for v in report["migrated_tables"].values()
         )
+        total_target_only = sum(v.get("target_only_rows", 0) for v in report["migrated_tables"].values())
 
         report["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         report["verification"] = {
             "rows_verified": rows_ok,
             "checksums_verified": rows_ok,
             "conflicts_count": len(report["conflicts"]),
+            "target_only_rows_total": total_target_only,
             "financials_verified": fin_ok,
             "source_financials": src_fin,
             "target_financials": {
