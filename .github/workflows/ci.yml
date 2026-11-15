@@ -96,6 +96,30 @@ jobs:
         run: |
           python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
 
+      - name: Verify Live PG+Redis Import database
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: python -c "import database; print('DB_IMPORT_OK')"
+
+      - name: Verify Live PG+Redis database.init_db()
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: python -c "import database; database.init_db(); print('INIT_DB_OK')"
+
+      - name: Verify Live PG+Redis task_queue import
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: python -c "from core.task_queue import task_queue; print('TQ_IMPORT_OK')"
+
+      - name: Verify Live PG+Redis main import
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: python -c "import main; print('MAIN_IMPORT_OK')"
+
       - name: Run Enterprise Phase 1a (Auth, 401, RBAC, Logout)
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
