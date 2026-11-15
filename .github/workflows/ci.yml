@@ -109,12 +109,26 @@ jobs:
         run: |
           pytest tests/test_migration_and_restore_verification.py -k "not postgres_restore" -v --tb=short
 
-      - name: Diag psql restore error on isolated DB
+      - name: Diag pg_dump has transaction_timeout or restrict
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
-          python -c "import gzip, os, subprocess, tempfile; from core import backup_service; u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); u_admin = u.rsplit('/', 1)[0] + '/postgres'; subprocess.run(['psql', u_admin, '-c', 'DROP DATABASE IF EXISTS restore_diag_db;'], check=True); subprocess.run(['psql', u_admin, '-c', 'CREATE DATABASE restore_diag_db;'], check=True); u_diag = u.rsplit('/', 1)[0] + '/restore_diag_db'; b = backup_service.create_backup('ci_d3'); f = tempfile.NamedTemporaryFile(suffix='.sql', delete=False); f.write(gzip.open(b['path'], 'rb').read()); f.close(); p = subprocess.run(['psql', '--single-transaction', '-v', 'ON_ERROR_STOP=1', '-f', f.name, u_diag], capture_output=True); os.unlink(f.name); subprocess.run(['psql', u_admin, '-c', 'DROP DATABASE IF EXISTS restore_diag_db;']); err = p.stderr.decode('utf-8', 'replace'); assert p.returncode == 0, f'PSQL_ERR({p.returncode}): {err[:400]}'"
+          python -c "import gzip; from core import backup_service; b = backup_service.create_backup('ci_d4'); txt = gzip.open(b['path'], 'rt', encoding='utf-8', errors='replace').read(); assert 'transaction_timeout' not in txt and '\\\\restrict' not in txt, f'FOUND_KW: tt={\"transaction_timeout\" in txt} rest={\"\\\\restrict\" in txt}'"
+
+      - name: Diag psql without ON_ERROR_STOP on isolated DB
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          python -c "import gzip, os, subprocess, tempfile; from core import backup_service; u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); u_admin = u.rsplit('/', 1)[0] + '/postgres'; subprocess.run(['psql', u_admin, '-c', 'DROP DATABASE IF EXISTS restore_diag2;'], check=True); subprocess.run(['psql', u_admin, '-c', 'CREATE DATABASE restore_diag2;'], check=True); u_diag = u.rsplit('/', 1)[0] + '/restore_diag2'; b = backup_service.create_backup('ci_d5'); f = tempfile.NamedTemporaryFile(suffix='.sql', delete=False); f.write(gzip.open(b['path'], 'rb').read()); f.close(); p = subprocess.run(['psql', '--single-transaction', '-f', f.name, u_diag], capture_output=True); os.unlink(f.name); subprocess.run(['psql', u_admin, '-c', 'DROP DATABASE IF EXISTS restore_diag2;']); assert p.returncode == 0"
+
+      - name: Diag psql without --single-transaction on isolated DB
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          python -c "import gzip, os, subprocess, tempfile; from core import backup_service; u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); u_admin = u.rsplit('/', 1)[0] + '/postgres'; subprocess.run(['psql', u_admin, '-c', 'DROP DATABASE IF EXISTS restore_diag3;'], check=True); subprocess.run(['psql', u_admin, '-c', 'CREATE DATABASE restore_diag3;'], check=True); u_diag = u.rsplit('/', 1)[0] + '/restore_diag3'; b = backup_service.create_backup('ci_d6'); f = tempfile.NamedTemporaryFile(suffix='.sql', delete=False); f.write(gzip.open(b['path'], 'rb').read()); f.close(); p = subprocess.run(['psql', '-v', 'ON_ERROR_STOP=1', '-f', f.name, u_diag], capture_output=True); os.unlink(f.name); subprocess.run(['psql', u_admin, '-c', 'DROP DATABASE IF EXISTS restore_diag3;']); assert p.returncode == 0"
 
       - name: Run Live PostgreSQL 16 Restore Good Verification
         if: ${{ !cancelled() }}
@@ -146,13 +160,21 @@ jobs:
         run: |
           pytest tests/test_ai_eval_suite.py -v --tb=short
 
-      - name: Run Failure Scenarios Suite (Live PostgreSQL 16 & Redis 7)
+      - name: Run Failure Scenarios Suite 01-19 (Live PostgreSQL 16 & Redis 7)
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
-          pytest tests/test_failure_scenarios.py -v --tb=short
+          pytest tests/test_failure_scenarios.py -k "not scenario_20" -v --tb=short
+
+      - name: Run Failure Scenario 20 (Live PostgreSQL 16 & Redis 7)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          pytest tests/test_failure_scenarios.py -k "scenario_20" -v --tb=short
 
       - name: Build Production Docker Image
         if: ${{ !cancelled() }}
