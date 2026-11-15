@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 import database
-from core.db_engine import is_postgres, get_database_url
+from core.db_engine import is_postgres, get_database_url, dispose_shared_engine
 
 logger = logging.getLogger("core.backup_service")
 
@@ -43,6 +43,10 @@ def _collect_db_table_counts() -> Dict[str, int]:
             counts[tbl] = int(row[0] or 0) if row else 0
         except Exception:
             counts[tbl] = 0
+    try:
+        conn.commit()
+    except Exception:
+        pass
     conn.close()
     return counts
 
@@ -448,6 +452,7 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 "post_restore_verified": False,
             }
         try:
+            dispose_shared_engine()
             with gzip.open(fpath, "rb") as gz:
                 sql_bytes = gz.read()
             proc = subprocess.run(
