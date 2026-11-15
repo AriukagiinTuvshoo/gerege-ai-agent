@@ -109,20 +109,6 @@ jobs:
         run: |
           pytest tests/test_migration_and_restore_verification.py -k "not postgres_restore" -v --tb=short
 
-      - name: Verify pg_dump create_backup on Live PostgreSQL 16
-        if: ${{ !cancelled() }}
-        env:
-          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
-        run: |
-          python -c "from core import backup_service; b = backup_service.create_backup('ci_pg_dbg'); assert b.get('success'), b; print('PG_DUMP_OK')"
-
-      - name: Verify psql single-transaction restore on Live PostgreSQL 16
-        if: ${{ !cancelled() }}
-        env:
-          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
-        run: |
-          python -c "import gzip, os, subprocess; from core import backup_service; b = backup_service.create_backup('ci_psql_dbg'); u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); sql = gzip.open(b['path'], 'rb').read(); p = subprocess.run(['psql', '--single-transaction', '-v', 'ON_ERROR_STOP=1', u], input=sql, capture_output=True); assert p.returncode == 0, p.stderr"
-
       - name: Run Live PostgreSQL 16 Restore Good Verification
         if: ${{ !cancelled() }}
         env:

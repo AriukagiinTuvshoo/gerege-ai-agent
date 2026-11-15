@@ -451,13 +451,13 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 "error": "PostgreSQL target DATABASE_URL is required to restore a .sql.gz backup",
                 "post_restore_verified": False,
             }
+        tmp_sql_path = os.path.join(BACKUP_DIR, f".restore_{clean_name}.sql")
         try:
             dispose_shared_engine()
-            with gzip.open(fpath, "rb") as gz:
-                sql_bytes = gz.read()
+            with gzip.open(fpath, "rb") as gz, open(tmp_sql_path, "wb") as sql_out:
+                shutil.copyfileobj(gz, sql_out)
             proc = subprocess.run(
-                ["psql", "--single-transaction", "-v", "ON_ERROR_STOP=1", pg_url],
-                input=sql_bytes,
+                ["psql", "--single-transaction", "-v", "ON_ERROR_STOP=1", "-f", tmp_sql_path, pg_url],
                 capture_output=True,
                 check=True,
                 timeout=180,
@@ -494,6 +494,12 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 "atomic_rollback": True,
                 "pre_restore_snapshot": pre_snap.get("filename"),
             }
+        finally:
+            if os.path.exists(tmp_sql_path):
+                try:
+                    os.remove(tmp_sql_path)
+                except Exception:
+                    pass
 
     return {"success": False, "error": "Unsupported backup format for automatic restore"}
 
