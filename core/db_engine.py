@@ -318,10 +318,13 @@ class PostgresCompatConnection:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            self._conn.commit()
-        else:
-            self._conn.rollback()
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
 
 
 def get_db_connection(sqlite_path: Optional[str] = None):
