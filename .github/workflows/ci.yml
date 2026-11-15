@@ -109,19 +109,12 @@ jobs:
         run: |
           pytest tests/test_migration_and_restore_verification.py -k "not postgres_restore" -v --tb=short
 
-      - name: Diag psql without --single-transaction
+      - name: Diag psql restore error on isolated DB
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
-          python -c "import gzip, os, subprocess, tempfile; from core import backup_service; b = backup_service.create_backup('ci_d1'); u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); f = tempfile.NamedTemporaryFile(suffix='.sql', delete=False); f.write(gzip.open(b['path'], 'rb').read()); f.close(); p = subprocess.run(['psql', '-v', 'ON_ERROR_STOP=1', '-f', f.name, u], capture_output=True); os.unlink(f.name); assert p.returncode == 0"
-
-      - name: Diag psql --single-transaction with clean schema
-        if: ${{ !cancelled() }}
-        env:
-          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
-        run: |
-          python -c "import gzip, os, subprocess, tempfile; from core import backup_service; b = backup_service.create_backup('ci_d2'); u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); raw = gzip.open(b['path'], 'rb').read(); clean_sql = b'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n' + raw; f = tempfile.NamedTemporaryFile(suffix='.sql', delete=False); f.write(clean_sql); f.close(); p = subprocess.run(['psql', '--single-transaction', '-v', 'ON_ERROR_STOP=1', '-f', f.name, u], capture_output=True); os.unlink(f.name); assert p.returncode == 0"
+          python -c "import gzip, os, subprocess, tempfile; from core import backup_service; u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); u_admin = u.rsplit('/', 1)[0] + '/postgres'; subprocess.run(['psql', u_admin, '-c', 'DROP DATABASE IF EXISTS restore_diag_db;'], check=True); subprocess.run(['psql', u_admin, '-c', 'CREATE DATABASE restore_diag_db;'], check=True); u_diag = u.rsplit('/', 1)[0] + '/restore_diag_db'; b = backup_service.create_backup('ci_d3'); f = tempfile.NamedTemporaryFile(suffix='.sql', delete=False); f.write(gzip.open(b['path'], 'rb').read()); f.close(); p = subprocess.run(['psql', '--single-transaction', '-v', 'ON_ERROR_STOP=1', '-f', f.name, u_diag], capture_output=True); os.unlink(f.name); subprocess.run(['psql', u_admin, '-c', 'DROP DATABASE IF EXISTS restore_diag_db;']); err = p.stderr.decode('utf-8', 'replace'); assert p.returncode == 0, f'PSQL_ERR({p.returncode}): {err[:400]}'"
 
       - name: Run Live PostgreSQL 16 Restore Good Verification
         if: ${{ !cancelled() }}
