@@ -470,6 +470,16 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 "restored_table_counts": pg_check.get("table_counts", {}),
                 "details": proc.stdout.decode("utf-8", errors="replace")[:500],
             }
+        except subprocess.CalledProcessError as e:
+            err_detail = (e.stderr or b"").decode("utf-8", errors="replace")[:500]
+            logger.error(f"PostgreSQL psql restore failed ({e}): {err_detail}")
+            return {
+                "success": False,
+                "error": f"{e} | stderr: {err_detail}",
+                "post_restore_verified": False,
+                "atomic_rollback": True,
+                "pre_restore_snapshot": pre_snap.get("filename"),
+            }
         except Exception as e:
             logger.error(f"PostgreSQL restore failed ({e}); atomic rollback / pre_restore check.")
             return {

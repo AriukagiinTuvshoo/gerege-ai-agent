@@ -109,12 +109,19 @@ jobs:
         run: |
           pytest tests/test_migration_and_restore_verification.py -k "not postgres_restore" -v --tb=short
 
-      - name: Run Live PostgreSQL 16 Restore Verification
+      - name: Run Live PostgreSQL 16 Restore Good Verification
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
-          pytest tests/test_migration_and_restore_verification.py -k "postgres_restore" -v --tb=short
+          pytest tests/test_migration_and_restore_verification.py -k "postgres_restore_good" -v --tb=short
+
+      - name: Run Live PostgreSQL 16 Restore Bad Rejection
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          pytest tests/test_migration_and_restore_verification.py -k "postgres_restore_bad" -v --tb=short
 
       - name: Run Enterprise Phases Suite (Live PostgreSQL 16 & Redis 7)
         if: ${{ !cancelled() }}
