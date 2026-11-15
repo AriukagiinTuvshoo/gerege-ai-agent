@@ -96,14 +96,23 @@ jobs:
         run: |
           python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
 
-      - name: Run Enterprise Phase 1 Tests (Live PostgreSQL 16 & Redis 7)
+      - name: Run Enterprise Phase 1a (Auth, 401, RBAC, Logout)
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
-          timeout 45s pytest tests/test_enterprise_phases.py -k "phase1" -v --tb=short
+          timeout 45s pytest tests/test_enterprise_phases.py -k "admin_default_password or unauthenticated_endpoints or rbac_role or session_revocation" -v --tb=short
+
+      - name: Run Enterprise Phase 1b (Webhooks, QPay, IDOR, SSRF, Receipt)
+        if: always()
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          timeout 45s pytest tests/test_enterprise_phases.py -k "webhooks_fail_closed or qpay_strict or cross_tenant_idor or google_sheets_ssrf or ai_receipt" -v --tb=short
 
       - name: Run Enterprise Phase 2 Tests (Live PostgreSQL 16 & Redis 7)
+        if: always()
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
@@ -111,6 +120,7 @@ jobs:
           timeout 45s pytest tests/test_enterprise_phases.py -k "phase2" -v --tb=short
 
       - name: Run Enterprise Phase 3-5 Tests (Live PostgreSQL 16 & Redis 7)
+        if: always()
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
@@ -118,6 +128,7 @@ jobs:
           timeout 45s pytest tests/test_enterprise_phases.py -k "phase3 or phase4 or phase5" -v --tb=short
 
       - name: Run AI Eval Suite (Live PostgreSQL 16 & Redis 7)
+        if: always()
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
@@ -125,6 +136,7 @@ jobs:
           timeout 45s pytest tests/test_ai_eval_suite.py -v --tb=short
 
       - name: Run Failure Scenarios Suite (Live PostgreSQL 16 & Redis 7)
+        if: always()
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
