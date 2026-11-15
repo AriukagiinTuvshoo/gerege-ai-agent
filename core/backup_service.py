@@ -454,8 +454,27 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
         tmp_sql_path = os.path.join(BACKUP_DIR, f".restore_{clean_name}.sql")
         try:
             dispose_shared_engine()
-            with gzip.open(fpath, "rb") as gz, open(tmp_sql_path, "wb") as sql_out:
-                shutil.copyfileobj(gz, sql_out)
+            server_ver = 0
+            try:
+                ver_proc = subprocess.run(
+                    ["psql", "-t", "-A", "-c", "SHOW server_version_num;", pg_url],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if ver_proc.returncode == 0 and ver_proc.stdout.strip().isdigit():
+                    server_ver = int(ver_proc.stdout.strip())
+            except Exception:
+                server_ver = 0
+
+            with gzip.open(fpath, "rt", encoding="utf-8", errors="replace") as gz, open(
+                tmp_sql_path, "w", encoding="utf-8", newline="\n"
+            ) as sql_out:
+                for line in gz:
+                    # pg_dump 17+ emits `SET transaction_timeout = 0;` which PG <= 16 rejects under ON_ERROR_STOP=1
+                    if server_ver and server_ver < 170000 and line.lstrip().startswith("SET transaction_timeout"):
+                        continue
+                    sql_out.write(line)
             proc = subprocess.run(
                 ["psql", "--single-transaction", "-v", "ON_ERROR_STOP=1", "-f", tmp_sql_path, pg_url],
                 capture_output=True,
