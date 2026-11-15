@@ -230,6 +230,7 @@ class PostgresCompatCursor:
         self._conn = raw_conn if raw_conn is not None else getattr(raw_cursor, "connection", None)
         self.lastrowid: Optional[int] = None
         self.rowcount: int = -1
+        self._closed = False
 
     @property
     def description(self):
@@ -310,7 +311,12 @@ class PostgresCompatCursor:
         return [CompatRow(cols, r) for r in rows]
 
     def close(self):
-        self._cur.close()
+        if not self._closed:
+            self._closed = True
+            try:
+                self._cur.close()
+            except Exception:
+                pass
 
 
 class PostgresCompatConnection:
@@ -318,6 +324,7 @@ class PostgresCompatConnection:
 
     def __init__(self, raw_conn):
         self._conn = raw_conn
+        self._closed = False
         self.row_factory = None
 
     def cursor(self) -> PostgresCompatCursor:
@@ -328,13 +335,20 @@ class PostgresCompatConnection:
         return cur.execute(sql, params)
 
     def commit(self):
-        self._conn.commit()
+        if not self._closed:
+            self._conn.commit()
 
     def rollback(self):
-        self._conn.rollback()
+        if not self._closed:
+            self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        if not self._closed:
+            self._closed = True
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
@@ -342,11 +356,11 @@ class PostgresCompatConnection:
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if exc_type is None:
-                self._conn.commit()
+                self.commit()
             else:
-                self._conn.rollback()
+                self.rollback()
         finally:
-            self._conn.close()
+            self.close()
 
 
 def get_db_connection(sqlite_path: Optional[str] = None):

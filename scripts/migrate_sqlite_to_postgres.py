@@ -65,6 +65,8 @@ MIGRATION_TABLES: List[Dict[str, Any]] = [
     {"table": "notification_locks", "pk_cols": ["idempotency_key"]},
     {"table": "task_jobs", "pk_cols": ["id"], "natural_unique_cols": ["idempotency_key"], "has_serial_id": True},
     {"table": "audit_logs", "pk_cols": ["id"], "has_serial_id": True},
+    {"table": "comment_automations", "pk_cols": ["id"], "has_serial_id": True},
+    {"table": "tracked_links", "pk_cols": ["id"], "natural_unique_cols": ["code"], "has_serial_id": True},
 ]
 
 

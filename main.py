@@ -12,7 +12,7 @@ from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, Response, BackgroundTasks, Query, UploadFile, File, Form, Header, Cookie, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import httpx
@@ -28,7 +28,7 @@ import retention_service
 import appointment_service
 from core import security as core_security
 from core.monitoring import telemetry
-from routers import system_router
+from routers import system_router, automation_router
 
 load_dotenv(override=True)
 
@@ -100,6 +100,7 @@ app = FastAPI(
 )
 
 app.include_router(system_router.router)
+app.include_router(automation_router.router)
 
 @app.middleware("http")
 async def telemetry_and_error_tracking_middleware(request: Request, call_next):
@@ -313,14 +314,17 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
     elif login_type in ["client", "magic"]:
         identifier = str(payload.get("identifier") or payload.get("username") or payload.get("token") or "").strip()
         password = payload.get("password")
-        requested_role = str(payload.get("role") or "client").strip().lower()
-        if requested_role not in core_security.TENANT_SCOPED_ROLES:
-            requested_role = "client"
         client_page, err_msg = database.authenticate_client_detailed(identifier, password)
         if client_page:
             _LOGIN_ATTEMPTS.pop(client_ip, None)
             page_id = client_page["page_id"]
-            token = database.create_session(role=requested_role, page_id=page_id, ip_address=client_ip)
+            # P0 Fix: Server-authoritative role resolution. User payload 'role' is never trusted.
+            resolved_role = core_security.resolve_tenant_login_role(
+                client_page=client_page,
+                requested_role=payload.get("role"),
+                auth_type=login_type,
+            )
+            token = database.create_session(role=resolved_role, page_id=page_id, ip_address=client_ip)
             response.set_cookie(
                 key="session_token",
                 value=token,
@@ -329,11 +333,11 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
                 secure=core_security.is_production_mode(),
                 samesite="lax",
             )
-            database.record_audit_log("auth.login.success", page_id=page_id, actor_role=requested_role, actor_id=identifier, ip_address=client_ip)
+            database.record_audit_log("auth.login.success", page_id=page_id, actor_role=resolved_role, actor_id=identifier, ip_address=client_ip)
             return {
                 "success": True,
                 "token": token,
-                "role": requested_role,
+                "role": resolved_role,
                 "page_id": page_id,
                 "page_name": client_page.get("name", "Харилцагчийн Хуудас"),
                 "has_custom_key": bool(client_page.get("gemini_api_key")),
@@ -463,11 +467,141 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
                         background_tasks.add_task(send_meta_message, sender_id, reply_text, page_token)
                     if result.get("registered") and result.get("reg_info"):
                         background_tasks.add_task(notify_manager_telegram, result["reg_info"])
-                        
+
+            for change in entry.get("changes", []):
+                field = change.get("field")
+                if field in ("feed", "comments"):
+                    target_page_id = str(entry_page_id or database.DEFAULT_PAGE_ID)
+                    page_obj = database.get_page(target_page_id)
+                    page_token = page_obj.get("page_access_token") if page_obj else os.getenv("META_PAGE_ACCESS_TOKEN", "")
+                    background_tasks.add_task(process_meta_comment_event, target_page_id, change, page_token)
+
         return Response(content="EVENT_RECEIVED", status_code=200)
     except Exception as e:
         logger.error(f"Meta webhook алдаа: {e}")
         return Response(content="Error", status_code=500)
+
+
+def _match_comment_automation(automations: List[Dict[str, Any]], post_id: str, comment_text: str) -> Optional[Dict[str, Any]]:
+    text_lower = (comment_text or "").lower()
+    for rule in automations:
+        if not rule.get("is_active"):
+            continue
+        rule_post = (rule.get("post_id") or "*").strip()
+        if rule_post != "*" and rule_post != str(post_id or ""):
+            continue
+        kw_raw = (rule.get("keyword_pattern") or "*").strip()
+        if kw_raw == "*":
+            return rule
+        keywords = [k.strip().lower() for k in kw_raw.split(",") if k.strip()]
+        if any(k in text_lower for k in keywords):
+            return rule
+    return None
+
+
+async def process_meta_comment_event(target_page_id: str, change: Dict[str, Any], page_token: str) -> Optional[Dict[str, Any]]:
+    """Facebook (feed) болон Instagram (comments) сэтгэгдэлд автоматаар хариулж DM илгээх"""
+    field = change.get("field")
+    value = change.get("value") or {}
+
+    if field == "feed":
+        if value.get("item") != "comment" or value.get("verb") != "add":
+            return None
+        comment_id = str(value.get("comment_id") or "").strip()
+        post_id = str(value.get("post_id") or "").strip()
+        comment_text = str(value.get("message") or "").strip()
+        from_id = str((value.get("from") or {}).get("id") or "").strip()
+        reply_edge = "comments"
+    elif field == "comments":
+        comment_id = str(value.get("id") or "").strip()
+        post_id = str((value.get("media") or {}).get("id") or "").strip()
+        comment_text = str(value.get("text") or "").strip()
+        from_id = str((value.get("from") or {}).get("id") or "").strip()
+        reply_edge = "replies"
+    else:
+        return None
+
+    if not comment_id or not comment_text:
+        return None
+    if from_id and from_id == str(target_page_id):
+        return None
+
+    if not database.claim_notification_lock(
+        f"comment_reply:{comment_id}",
+        page_id=target_page_id,
+        channel="meta_comment",
+        ttl_seconds=86400,
+    ):
+        logger.info(f"Duplicate comment webhook skipped: {comment_id}")
+        return None
+
+    automations = database.list_comment_automations(page_id=target_page_id, active_only=True)
+    matched = _match_comment_automation(automations, post_id, comment_text)
+    if not matched:
+        return None
+
+    token = page_token or os.getenv("META_PAGE_ACCESS_TOKEN", "")
+    if token:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            public_reply = (matched.get("public_reply_text") or "").strip()
+            if public_reply:
+                try:
+                    await client.post(
+                        f"https://graph.facebook.com/v19.0/{comment_id}/{reply_edge}",
+                        params={"access_token": token},
+                        json={"message": public_reply},
+                    )
+                except Exception as exc:
+                    logger.warning(f"Public comment reply failed for {comment_id}: {exc}")
+
+            cta_url = (matched.get("cta_url") or "").strip()
+            cta_text = (matched.get("cta_button_text") or "").strip()
+            dm_text = (matched.get("dm_message_text") or "").strip()
+            if cta_url and cta_text:
+                dm_payload = {
+                    "attachment": {
+                        "type": "template",
+                        "payload": {
+                            "template_type": "button",
+                            "text": dm_text,
+                            "buttons": [{"type": "web_url", "url": cta_url, "title": cta_text[:20]}],
+                        },
+                    }
+                }
+            else:
+                dm_payload = {"text": dm_text}
+
+            try:
+                await client.post(
+                    "https://graph.facebook.com/v19.0/me/messages",
+                    params={"access_token": token},
+                    json={"recipient": {"comment_id": comment_id}, "message": dm_payload},
+                )
+            except Exception as exc:
+                logger.warning(f"Private DM reply failed for {comment_id}: {exc}")
+
+    database.increment_comment_automation_trigger(matched["id"])
+    database.log_message(
+        sender_id=f"meta_comment_{from_id or comment_id}",
+        channel="facebook/instagram",
+        sender_type="bot",
+        content=matched.get("dm_message_text", ""),
+        page_id=target_page_id,
+    )
+    return matched
+
+
+@app.get("/r/{code}")
+async def redirect_tracked_link(code: str):
+    """CTR хяналттай богино холбоос (/r/{code}) — нээлттэй redirect хамгаалалттай"""
+    link_data = database.resolve_and_increment_tracked_link(code)
+    if not link_data:
+        raise HTTPException(status_code=404, detail="Холбоос олдсонгүй")
+    target = (link_data.get("target_url") or "").strip()
+    lowered = target.lower()
+    if lowered.startswith("//") or not (lowered.startswith("https://") or lowered.startswith("http://") or target.startswith("/")):
+        raise HTTPException(status_code=400, detail="Аюултай эсвэл буруу URL байна")
+    return RedirectResponse(url=target, status_code=307)
 
 # -------------------------------------------------------------
 # 5. TELEGRAM WEBHOOK (Customer Chatbot & Owner Executive Commands)
@@ -1249,15 +1383,27 @@ async def readiness_check():
     """Readiness probe verifying database and task queue connectivity (Phase 8)"""
     from core import db_engine, task_queue
     db_ok = False
+    conn = None
+    cur = None
     try:
         conn = database.get_connection()
         cur = conn.cursor()
         cur.execute("SELECT 1")
         cur.fetchone()
-        conn.close()
         db_ok = True
     except Exception as e:
         logger.error(f"Readiness DB check failed: {e}")
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     try:
         q_stats = task_queue.get_queue_stats()
@@ -1352,14 +1498,49 @@ async def serve_payment_page(invoice_id: str, request: Request):
     return HTMLResponse(content=rendered)
 
 @app.get("/api/fintech/invoices/{invoice_id}/status")
-async def get_invoice_status_api(invoice_id: str):
-    """Төлбөрийн төлөвийг шалгах (Real-time Polling)"""
+async def get_invoice_status_api(invoice_id: str, request: Request):
+    """
+    Төлбөрийн төлөвийг шалгах (Real-time Polling & PII Safe):
+    - Public хандалтад PII (утас, sender_id, хувийн мэдээлэл) задруулахгүй.
+    - Зөвхөн allowlist-ийн аюулгүй талбаруудыг буцаана.
+    - Хэрэв нэвтэрсэн Админ эсвэл тухайн салбарын эрхтэй хэрэглэгч бол бүрэн мэдээллийг харна.
+    """
     inv = database.get_invoice(invoice_id)
     if not inv:
         return JSONResponse(status_code=404, content={"error": "Invoice not found"})
+
+    # Check whether caller has authorized access to full internal invoice
+    user = await core_security.resolve_current_user(request)
+    is_authorized = False
+    if user:
+        role = str(user.get("role") or "").strip().lower()
+        if core_security.is_admin_role(role):
+            is_authorized = True
+        elif user.get("page_id") and str(user.get("page_id")) == str(inv.get("page_id")):
+            is_authorized = True
+
+    # PII-Safe public representation (Allowlist approach)
+    public_invoice = {
+        "invoice_id": inv.get("invoice_id"),
+        "page_id": inv.get("page_id"),
+        "amount": inv.get("amount"),
+        "currency": inv.get("currency", "MNT"),
+        "description": inv.get("description", "Үйлчилгээний төлбөр"),
+        "status": inv.get("status", "PENDING"),
+        "paid_at": inv.get("paid_at"),
+        "created_at": inv.get("created_at"),
+        "ebarimt_lottery": inv.get("ebarimt_lottery"),
+        "ebarimt_qr": inv.get("ebarimt_qr"),
+    }
+
+    if is_authorized:
+        returned_invoice = dict(inv)
+    else:
+        returned_invoice = public_invoice
+
     return {
         "status": inv.get("status", "PENDING"),
-        "invoice": inv,
+        "invoice": returned_invoice,
         "ebarimt": {
             "lottery": inv.get("ebarimt_lottery"),
             "qr_data": inv.get("ebarimt_qr")
@@ -1369,7 +1550,10 @@ async def get_invoice_status_api(invoice_id: str):
 @app.get("/api/fintech/qpay/callback")
 @app.post("/api/fintech/qpay/callback")
 async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Query(None)):
-    """Банк / QPay-ийн албан ёсны webhook хүлээн авагч (QPay v2 стандарт: HTTP 200 SUCCESS)"""
+    """
+    Банк / QPay-ийн албан ёсны webhook хүлээн авагч (QPay v2 стандарт: HTTP 200 SUCCESS)
+    P1-SEC-03 Hardening: Fail-Closed Provider Verification & Idempotency.
+    """
     try:
         body = await request.json()
     except Exception:
@@ -1378,10 +1562,14 @@ async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Qu
     if not inv_id:
         return JSONResponse(status_code=400, content={"error": "invoice_id missing"})
 
-    # Бодит QPay тохиргоотой эсвэл Production/Strict горимд QPay v2 payment/check заавал дуудаж баталгаажуулах (Phase 1 P0)
     inv = database.get_invoice(inv_id)
     if not inv:
         return JSONResponse(status_code=404, content={"error": "invoice not found"})
+
+    # 1. Idempotency check: Already paid invoices return SUCCESS immediately without duplicate processing
+    if inv.get("status") == "PAID":
+        logger.info(f"QPay callback for invoice {inv_id} already marked PAID (idempotent 200)")
+        return Response(content="SUCCESS", media_type="text/plain", status_code=200)
 
     page = database.get_page(inv.get("page_id", database.DEFAULT_PAGE_ID)) or {}
     qpay_user = page.get("qpay_username") or os.getenv("QPAY_USERNAME", "").strip()
@@ -1392,27 +1580,41 @@ async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Qu
         or request.query_params.get("qpay_payment_id")
         or inv.get("qpay_invoice_id")
     )
-    strict_qpay = core_security.is_production_mode() or os.getenv("STRICT_QPAY_VERIFICATION", "").strip() in ("1", "true")
-    provider_payment_id = None
-    callback_verified = 0
 
-    if strict_qpay or (qpay_user and qpay_pass):
-        if not (qpay_user and qpay_pass and qpay_obj_id):
+    # 2. Credential & Provider Verification (Fail-Closed)
+    allow_mock_callback = (
+        not core_security.is_production_mode()
+        and os.getenv("ALLOW_MOCK_QPAY_CALLBACK", "").strip() in ("1", "true")
+    )
+
+    if not (qpay_user and qpay_pass and qpay_obj_id):
+        if not allow_mock_callback:
+            logger.error(f"QPay callback rejected for {inv_id}: Provider verification required (credentials or object_id missing, Fail-Closed)")
             return Response(content="PROVIDER_VERIFICATION_REQUIRED", media_type="text/plain", status_code=400)
+        provider_payment_id = f"MOCK_QPAY_{int(time.time())}"
+        callback_verified = 0
+    else:
         token = await fintech_service.get_qpay_token(qpay_user, qpay_pass)
         if not token:
+            logger.error(f"QPay callback auth failed for {inv_id}: Unable to obtain provider token")
             return Response(content="PROVIDER_AUTH_FAILED", media_type="text/plain", status_code=400)
+
+        expected_amount = int(inv.get("amount") or 0)
+        expected_currency = str(inv.get("currency") or "MNT")
         detail = await fintech_service.check_qpay_payment_live_detailed(
             token,
             str(qpay_obj_id),
-            expected_amount=int(inv.get("amount") or 0),
-            expected_currency=str(inv.get("currency") or "MNT"),
+            expected_amount=expected_amount,
+            expected_currency=expected_currency,
         )
         if not detail.get("verified"):
+            logger.warning(f"QPay live verification failed for {inv_id}: {detail}")
             return Response(content="FAILED_VERIFICATION", media_type="text/plain", status_code=400)
+
         provider_payment_id = detail.get("provider_payment_id") or str(qpay_obj_id)
         callback_verified = 1
 
+    # 3. Only process payment once provider verification has genuinely passed
     await fintech_service.process_successful_payment(
         inv_id,
         callback_data=body,
@@ -1423,12 +1625,59 @@ async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Qu
 
 @app.post("/api/fintech/invoices/{invoice_id}/simulate-pay")
 async def simulate_invoice_payment_api(invoice_id: str, request: Request):
-    """1 секундэд автоматаар баталгаажуулж турших (Simulator — Production горимд зөвхөн Админ эрх шаардана)"""
-    if core_security.is_production_mode() or os.getenv("DISABLE_PAYMENT_SIMULATOR") == "1":
-        user = await core_security.resolve_current_user(request)
-        if not user or not core_security.is_admin_role(user.get("role")):
-            return JSONResponse({"success": False, "error": "Production орчинд симулятор хаалттай байна."}, status_code=403)
-    res = await fintech_service.process_successful_payment(invoice_id)
+    """
+    Төлбөрийн симулятор (P1-SEC-01 Hardening):
+    - Default нь DENY (Fail-Closed).
+    - Production орчинд ямар ч нөхцөлд симулятор ажиллахгүй (HTTP 403 Forbidden).
+    - Зөвхөн аюулгүй DEV/TEST горимд (ENABLE_PAYMENT_SIMULATOR=1 эсвэл ENV=test/development)
+      болон зөвхөн баталгаажсан Админ эрхтэй хэрэглэгч ажиллуулах эрхтэй.
+    - Tenant isolation: Хэрэв tenant-scoped эрхтэй хэрэглэгч бол тухайн салбарын нэхэмжлэх мөн эсэхийг шалгана.
+    """
+    if core_security.is_production_mode():
+        return JSONResponse(
+            {"success": False, "error": "Production орчинд төлбөрийн симулятор хаалттай (Forbidden)."},
+            status_code=403,
+        )
+
+    sim_enabled = os.getenv("ENABLE_PAYMENT_SIMULATOR", "").strip().lower() in ("1", "true", "yes")
+    env_name = os.getenv("ENV", "").strip().lower()
+    is_dev_test = env_name in ("development", "dev", "test", "testing")
+    if not (sim_enabled or is_dev_test):
+        return JSONResponse(
+            {"success": False, "error": "Төлбөрийн симулятор идэвхгүй байна (ENABLE_PAYMENT_SIMULATOR=1 шаардлагатай)."},
+            status_code=403,
+        )
+
+    user = await core_security.resolve_current_user(request)
+    if not user:
+        return JSONResponse(
+            {"success": False, "error": "Нэвтрэх шаардлагатай (Unauthorized)."},
+            status_code=401,
+        )
+
+    user_role = str(user.get("role") or "").strip().lower()
+    if not core_security.is_admin_role(user_role):
+        return JSONResponse(
+            {"success": False, "error": "Зөвхөн системийн админ симулятор ашиглах эрхтэй (Forbidden)."},
+            status_code=403,
+        )
+
+    inv = database.get_invoice(invoice_id)
+    if not inv:
+        return JSONResponse({"success": False, "error": "Нэхэмжлэх олдсонгүй"}, status_code=404)
+
+    user_pid = user.get("page_id")
+    if user_pid and inv.get("page_id") and str(inv.get("page_id")) != str(user_pid):
+        return JSONResponse(
+            {"success": False, "error": "Бусад салбарын нэхэмжлэхийг дуурайлган төлөх эрхгүй (Cross-tenant denied)."},
+            status_code=403,
+        )
+
+    res = await fintech_service.process_successful_payment(
+        invoice_id,
+        provider_payment_id=f"SIMULATED_{int(time.time())}",
+        callback_verified=0,
+    )
     return res
 
 @app.get("/api/fintech/summary")

@@ -262,9 +262,10 @@ def test_phase2_sqlalchemy_models_and_repositories():
         "user_memories", "invoices", "cargo_packages", "automated_rules",
         "marketing_campaigns", "sent_followups", "appointments",
         "notification_locks", "task_jobs", "audit_logs",
+        "comment_automations", "tracked_links",
     }
 
-    # Verify core/models.py AST defines all 15 tables
+    # Verify core/models.py AST defines all 17 tables
     models_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "core", "models.py"))
     with open(models_path, "r", encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename="core/models.py")

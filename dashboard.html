@@ -328,6 +328,12 @@
           <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-rose-100 text-rose-800">1-Click</span>
         </button>
 
+        <button onclick="switchTab('automations')" id="tab-btn-automations" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
+          <i class="fa-solid fa-bolt text-amber-500 text-xs"></i>
+          <span>Comment-to-DM & ROI</span>
+          <span class="px-1.5 py-0.5 text-[9px] font-bold rounded-full bg-amber-100 text-amber-800">noflow</span>
+        </button>
+
         <button onclick="switchTab('appointments')" id="tab-btn-appointments" class="tab-btn px-4 py-2 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-200/50 transition flex items-center gap-2 whitespace-nowrap">
           <i class="fa-solid fa-calendar-check text-teal-600 text-xs"></i>
           <span>Цаг захиалга</span>
@@ -1672,6 +1678,85 @@
       </div>
     </div>
 
+    <!-- ==================== TAB: COMMENT-TO-DM & ROI (NOFLOW) ==================== -->
+    <div id="tab-automations" class="tab-content hidden space-y-6">
+      <!-- ROI & Хэмнэсэн Цаг KPI Картууд -->
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div class="glass-card rounded-2xl p-5 border border-stone-200/80">
+          <span class="text-xs font-semibold text-stone-500 uppercase tracking-wider">Хэмнэсэн Цаг</span>
+          <div id="roi-hours-saved" class="text-2xl font-extrabold text-amber-600 mt-1">0 цаг</div>
+          <div id="roi-cost-saved" class="text-xs text-stone-500 mt-1">0₮ хэмнэлт</div>
+        </div>
+        <div class="glass-card rounded-2xl p-5 border border-stone-200/80">
+          <span class="text-xs font-semibold text-stone-500 uppercase tracking-wider">Нийт Харилцаа</span>
+          <div id="roi-total-interactions" class="text-2xl font-extrabold text-stone-900 mt-1">0</div>
+          <div id="roi-unique-contacts" class="text-xs text-stone-500 mt-1">0 харилцагч</div>
+        </div>
+        <div class="glass-card rounded-2xl p-5 border border-stone-200/80">
+          <span class="text-xs font-semibold text-stone-500 uppercase tracking-wider">Холбоос Дарсан (CTR)</span>
+          <div id="roi-link-clicks" class="text-2xl font-extrabold text-indigo-600 mt-1">0</div>
+          <div class="text-xs text-stone-500 mt-1">/r/{code} нийт даралт</div>
+        </div>
+        <div class="glass-card rounded-2xl p-5 border border-stone-200/80">
+          <span class="text-xs font-semibold text-stone-500 uppercase tracking-wider">Төлбөр Хөрвүүлэлт</span>
+          <div id="roi-payment-conv" class="text-2xl font-extrabold text-emerald-600 mt-1">0%</div>
+          <div id="roi-paid-revenue" class="text-xs text-stone-500 mt-1">0₮ орлого</div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- Comment-to-DM Автоматжуулалт -->
+        <div class="lg:col-span-7 glass-card rounded-3xl p-6 border border-stone-200/80 space-y-5">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-lg font-extrabold text-stone-900 flex items-center gap-2">
+                <i class="fa-solid fa-comments text-amber-500"></i>
+                Comment-to-DM Автоматжуулалт
+              </h2>
+              <p class="text-xs text-stone-500 mt-0.5">Facebook/Instagram сэтгэгдэлд нийтэд болон чат руу зэрэг хариулна</p>
+            </div>
+            <button onclick="loadNoflowAutomationData()" class="px-3 py-1.5 rounded-xl bg-stone-100 hover:bg-stone-200 text-xs font-semibold text-stone-700">Шинэчлэх</button>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 p-4 rounded-2xl bg-stone-50 border border-stone-200/70">
+            <input id="ca-name" type="text" placeholder="Нэр (ж: Үнэ асуухад DM)" class="px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white">
+            <input id="ca-keywords" type="text" placeholder="Түлхүүр үг (ж: үнэ,хэд вэ эсвэл *)" class="px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white">
+            <input id="ca-post-id" type="text" placeholder="Post ID (бүх пост бол *)" value="*" class="px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white">
+            <input id="ca-public-reply" type="text" placeholder="Сэтгэгдлийн нийтийн хариу" value="Танд чат руу дэлгэрэнгүй мэдээлэл илгээлээ! ✅" class="px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white">
+            <textarea id="ca-dm-text" rows="2" placeholder="Чат (DM)-аар илгээх мессеж..." class="sm:col-span-2 px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white"></textarea>
+            <input id="ca-cta-text" type="text" placeholder="CTA товчны нэр (сонголттой)" class="px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white">
+            <input id="ca-cta-url" type="text" placeholder="CTA холбоос https://... (сонголттой)" class="px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white">
+            <button onclick="createCommentAutomationRule()" class="sm:col-span-2 px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold transition">+ Автоматжуулалт нэмэх</button>
+          </div>
+
+          <div id="comment-automations-list" class="space-y-3">
+            <p class="text-xs text-stone-400">Ачааллаж байна...</p>
+          </div>
+        </div>
+
+        <!-- Tracked Short Links (/r/{code}) -->
+        <div class="lg:col-span-5 glass-card rounded-3xl p-6 border border-stone-200/80 space-y-5">
+          <div>
+            <h2 class="text-lg font-extrabold text-stone-900 flex items-center gap-2">
+              <i class="fa-solid fa-link text-indigo-500"></i>
+              Богино Холбоос & CTR Хяналт
+            </h2>
+            <p class="text-xs text-stone-500 mt-0.5">/r/{code} холбоосоор даралтын тоог бодит цагт хэмжинэ</p>
+          </div>
+
+          <div class="space-y-2.5 p-4 rounded-2xl bg-stone-50 border border-stone-200/70">
+            <input id="tl-title" type="text" placeholder="Холбоосын нэр (ж: Бүтээгдэхүүний каталог)" class="w-full px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white">
+            <input id="tl-url" type="text" placeholder="Очих URL (https://...)" class="w-full px-3 py-2 rounded-xl border border-stone-200 text-xs bg-white">
+            <button onclick="createTrackedLinkRule()" class="w-full px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition">+ Богино холбоос үүсгэх</button>
+          </div>
+
+          <div id="tracked-links-list" class="space-y-2.5">
+            <p class="text-xs text-stone-400">Ачааллаж байна...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- ==================== TAB 5: GROUP LINKS & BANK HUB ==================== -->
     <div id="tab-links" class="tab-content hidden max-w-4xl mx-auto space-y-6">
       <div class="glass-card rounded-3xl p-6 border border-stone-200/80">
@@ -2557,6 +2642,7 @@
       if (tabId === 'cargo') loadCargoData();
       if (tabId === 'executive') loadExecutiveData();
       if (tabId === 'marketing') loadMarketingData();
+      if (tabId === 'automations') loadNoflowAutomationData();
       if (tabId === 'appointments') loadAppointmentsData();
       if (tabId === 'links') loadKnowledge();
     }
@@ -5255,6 +5341,153 @@
         }
       } catch (err) {
         alert('Холболтын алдаа: ' + err);
+      }
+    }
+
+    // ==================== COMMENT-TO-DM & ROI (NOFLOW) ====================
+    async function loadNoflowAutomationData() {
+      const pid = activePageId ? encodeURIComponent(activePageId) : '';
+      try {
+        const [roiRes, autoRes, linkRes] = await Promise.all([
+          fetch(`/api/analytics/roi${pid ? '?page_id=' + pid : ''}`),
+          fetch(`/api/automations/comments${pid ? '?page_id=' + pid : ''}`),
+          fetch(`/api/automations/links${pid ? '?page_id=' + pid : ''}`)
+        ]);
+
+        if (roiRes.ok) {
+          const roi = await roiRes.json();
+          document.getElementById('roi-hours-saved').innerText = `${roi.estimated_hours_saved || 0} цаг`;
+          document.getElementById('roi-cost-saved').innerText = `${(roi.estimated_cost_saved_mnt || 0).toLocaleString()}₮ хэмнэлт`;
+          document.getElementById('roi-total-interactions').innerText = `${roi.total_interactions || 0}`;
+          document.getElementById('roi-unique-contacts').innerText = `${roi.unique_contacts || 0} харилцагч`;
+          document.getElementById('roi-link-clicks').innerText = `${roi.link_clicks || 0}`;
+          document.getElementById('roi-payment-conv').innerText = `${roi.payment_conversion_pct || 0}%`;
+          document.getElementById('roi-paid-revenue').innerText = `${(roi.paid_revenue_mnt || 0).toLocaleString()}₮ орлого`;
+        }
+
+        if (autoRes.ok) {
+          const autoJson = await autoRes.json();
+          const listEl = document.getElementById('comment-automations-list');
+          const items = autoJson.automations || [];
+          if (!items.length) {
+            listEl.innerHTML = '<p class="text-xs text-stone-400">Одоогоор Comment-to-DM дүрэм үүсгээгүй байна.</p>';
+          } else {
+            listEl.innerHTML = items.map(item => `
+              <div class="p-3.5 rounded-2xl border border-stone-200 bg-white flex items-start justify-between gap-3">
+                <div class="space-y-1 min-w-0">
+                  <div class="flex items-center gap-2">
+                    <span class="font-bold text-xs text-stone-900">${escapeHtml(item.name)}</span>
+                    <span class="px-2 py-0.5 text-[10px] rounded-full ${item.is_active ? 'bg-emerald-100 text-emerald-700' : 'bg-stone-100 text-stone-500'} font-semibold">${item.is_active ? 'ON' : 'OFF'}</span>
+                    <span class="text-[10px] text-stone-400">${item.trigger_count || 0} удаа ажилласан</span>
+                  </div>
+                  <div class="text-[11px] text-stone-500">Түлхүүр: <b>${escapeHtml(item.keyword_pattern)}</b> | Пост: <b>${escapeHtml(item.post_id)}</b></div>
+                  <div class="text-xs text-stone-700 truncate">${escapeHtml(item.dm_message_text)}</div>
+                </div>
+                <div class="flex items-center gap-1.5 shrink-0">
+                  <button onclick="toggleCommentAutomationRule(${item.id})" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold ${item.is_active ? 'bg-amber-100 text-amber-800 hover:bg-amber-200' : 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200'}">${item.is_active ? 'Унтраах' : 'Асаах'}</button>
+                  <button onclick="deleteCommentAutomationRule(${item.id})" class="px-2 py-1 rounded-lg text-[11px] bg-rose-50 text-rose-600 hover:bg-rose-100">Устгах</button>
+                </div>
+              </div>
+            `).join('');
+          }
+        }
+
+        if (linkRes.ok) {
+          const linkJson = await linkRes.json();
+          const linksEl = document.getElementById('tracked-links-list');
+          const links = linkJson.links || [];
+          if (!links.length) {
+            linksEl.innerHTML = '<p class="text-xs text-stone-400">Одоогоор богино холбоос үүсгээгүй байна.</p>';
+          } else {
+            linksEl.innerHTML = links.map(l => `
+              <div class="p-3 rounded-2xl border border-stone-200 bg-white flex items-center justify-between gap-2">
+                <div class="min-w-0">
+                  <div class="text-xs font-bold text-stone-900 truncate">${escapeHtml(l.title || l.code)}</div>
+                  <div class="text-[11px] text-indigo-600 font-mono">/r/${escapeHtml(l.code)}</div>
+                  <div class="text-[10px] text-stone-400 truncate">${escapeHtml(l.target_url)}</div>
+                </div>
+                <span class="px-2.5 py-1 rounded-xl bg-indigo-50 text-indigo-700 text-xs font-extrabold shrink-0">${l.clicks_count || 0} даралт</span>
+              </div>
+            `).join('');
+          }
+        }
+      } catch (err) {
+        console.error('loadNoflowAutomationData error:', err);
+      }
+    }
+
+    async function createCommentAutomationRule() {
+      const name = document.getElementById('ca-name').value.trim();
+      const dmText = document.getElementById('ca-dm-text').value.trim();
+      if (!name || !dmText) {
+        alert('Нэр болон DM мессежээ оруулна уу!');
+        return;
+      }
+      const res = await fetch('/api/automations/comments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          page_id: activePageId || null,
+          name,
+          keyword_pattern: document.getElementById('ca-keywords').value.trim() || '*',
+          post_id: document.getElementById('ca-post-id').value.trim() || '*',
+          public_reply_text: document.getElementById('ca-public-reply').value.trim(),
+          dm_message_text: dmText,
+          cta_button_text: document.getElementById('ca-cta-text').value.trim(),
+          cta_url: document.getElementById('ca-cta-url').value.trim()
+        })
+      });
+      if (res.ok) {
+        document.getElementById('ca-name').value = '';
+        document.getElementById('ca-dm-text').value = '';
+        showToast('✅ Comment-to-DM дүрэм үүслээ!');
+        loadNoflowAutomationData();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert('Алдаа: ' + (err.detail || 'Үүсгэж чадсангүй'));
+      }
+    }
+
+    async function toggleCommentAutomationRule(id) {
+      const res = await fetch(`/api/automations/comments/${id}/toggle`, { method: 'POST' });
+      if (res.ok) {
+        showToast('✅ Төлөв солигдлоо!');
+        loadNoflowAutomationData();
+      }
+    }
+
+    async function deleteCommentAutomationRule(id) {
+      const res = await fetch(`/api/automations/comments/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        showToast('🗑️ Устгагдлаа!');
+        loadNoflowAutomationData();
+      }
+    }
+
+    async function createTrackedLinkRule() {
+      const title = document.getElementById('tl-title').value.trim();
+      const targetUrl = document.getElementById('tl-url').value.trim();
+      if (!targetUrl) {
+        alert('Очих URL оруулна уу!');
+        return;
+      }
+      const res = await fetch('/api/automations/links', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          page_id: activePageId || null,
+          title,
+          target_url: targetUrl
+        })
+      });
+      if (res.ok) {
+        document.getElementById('tl-title').value = '';
+        document.getElementById('tl-url').value = '';
+        showToast('✅ Богино холбоос үүслээ!');
+        loadNoflowAutomationData();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert('Алдаа: ' + (err.detail || 'Үүсгэж чадсангүй'));
       }
     }
 

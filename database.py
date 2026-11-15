@@ -326,6 +326,40 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_page_created ON audit_logs (page_id, created_at)")
 
+    # 15. Сэтгэгдлээс шууд чат руу (Comment-to-DM Automations - noflow inspired)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS comment_automations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            post_id TEXT DEFAULT '*',
+            keyword_pattern TEXT DEFAULT '*',
+            public_reply_text TEXT DEFAULT 'Танд чат руу дэлгэрэнгүй мэдээлэл илгээлээ! ✅',
+            dm_message_text TEXT NOT NULL,
+            cta_button_text TEXT DEFAULT '',
+            cta_url TEXT DEFAULT '',
+            is_active INTEGER DEFAULT 1,
+            trigger_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_comment_auto_page_active ON comment_automations (page_id, is_active)")
+
+    # 16. Богино холбоос ба Click Tracking (CTR Analytics)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tracked_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            page_id TEXT NOT NULL,
+            automation_id INTEGER,
+            title TEXT DEFAULT '',
+            target_url TEXT NOT NULL,
+            clicks_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracked_links_code ON tracked_links (code)")
+
     # Багануудыг аюулгүй нэмэх (Migration check)
     tables_to_migrate = [
         ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
@@ -2120,6 +2154,378 @@ def get_appointments_summary(page_id: str) -> Dict[str, Any]:
         "total_completed": int(total_completed),
         "total_all": int(total_all)
     }
+
+# -------------------------------------------------------------
+# 10. COMMENT-TO-DM AUTOMATIONS, TRACKED LINKS & ROI ANALYTICS
+# -------------------------------------------------------------
+
+def create_comment_automation(
+    page_id: str,
+    name: str,
+    dm_message_text: str,
+    post_id: str = "*",
+    keyword_pattern: str = "*",
+    public_reply_text: str = "Танд чат руу дэлгэрэнгүй мэдээлэл илгээлээ! ✅",
+    cta_button_text: str = "",
+    cta_url: str = "",
+    is_active: int = 1,
+) -> Dict[str, Any]:
+    """Сэтгэгдлээс шууд DM рүү хариулах автоматжуулалт үүсгэх"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO comment_automations
+                (page_id, name, post_id, keyword_pattern, public_reply_text, dm_message_text, cta_button_text, cta_url, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(page_id or DEFAULT_PAGE_ID),
+                str(name).strip(),
+                str(post_id or "*").strip() or "*",
+                str(keyword_pattern or "*").strip() or "*",
+                str(public_reply_text or "").strip(),
+                str(dm_message_text).strip(),
+                str(cta_button_text or "").strip(),
+                str(cta_url or "").strip(),
+                1 if is_active else 0,
+            ),
+        )
+        new_id = cursor.lastrowid
+        conn.commit()
+        cursor.execute("SELECT * FROM comment_automations WHERE id = ?", (new_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else {"id": new_id, "page_id": page_id, "name": name}
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def list_comment_automations(page_id: Optional[str] = None, active_only: bool = False) -> List[Dict[str, Any]]:
+    """Тухайн салбарын Comment-to-DM автоматжуулалтын жагсаалт"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        conds = []
+        params: List[Any] = []
+        if page_id:
+            conds.append("page_id = ?")
+            params.append(str(page_id))
+        if active_only:
+            conds.append("is_active = 1")
+        where_sql = (" WHERE " + " AND ".join(conds)) if conds else ""
+        cursor.execute(f"SELECT * FROM comment_automations{where_sql} ORDER BY id DESC", tuple(params))
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_comment_automation(automation_id: int) -> Optional[Dict[str, Any]]:
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM comment_automations WHERE id = ?", (int(automation_id),))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def toggle_comment_automation(automation_id: int, page_id: Optional[str] = None, is_active: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Автоматжуулалтыг 1 товшилтоор ON/OFF болгох (Tenant-safe)"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        if page_id:
+            cursor.execute("SELECT * FROM comment_automations WHERE id = ? AND page_id = ?", (int(automation_id), str(page_id)))
+        else:
+            cursor.execute("SELECT * FROM comment_automations WHERE id = ?", (int(automation_id),))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        current = dict(row)
+        new_state = (1 if is_active else 0) if is_active is not None else (0 if current.get("is_active") else 1)
+        cursor.execute("UPDATE comment_automations SET is_active = ? WHERE id = ?", (new_state, int(automation_id)))
+        conn.commit()
+        current["is_active"] = new_state
+        return current
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def delete_comment_automation(automation_id: int, page_id: Optional[str] = None) -> bool:
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        if page_id:
+            cursor.execute("DELETE FROM comment_automations WHERE id = ? AND page_id = ?", (int(automation_id), str(page_id)))
+        else:
+            cursor.execute("DELETE FROM comment_automations WHERE id = ?", (int(automation_id),))
+        deleted = (cursor.rowcount or 0) > 0
+        conn.commit()
+        return deleted
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def increment_comment_automation_trigger(automation_id: int) -> None:
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE comment_automations SET trigger_count = COALESCE(trigger_count, 0) + 1 WHERE id = ?",
+            (int(automation_id),),
+        )
+        conn.commit()
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def create_tracked_link(
+    page_id: str,
+    target_url: str,
+    title: str = "",
+    automation_id: Optional[int] = None,
+    code: Optional[str] = None,
+) -> Dict[str, Any]:
+    """CTR хяналттай богино холбоос (/r/{code}) үүсгэх"""
+    short_code = (code or secrets.token_urlsafe(6)).replace("-", "").replace("_", "")[:10]
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO tracked_links (code, page_id, automation_id, title, target_url, clicks_count)
+            VALUES (?, ?, ?, ?, ?, 0)
+            """,
+            (short_code, str(page_id or DEFAULT_PAGE_ID), automation_id, str(title or "").strip(), str(target_url).strip()),
+        )
+        new_id = cursor.lastrowid
+        conn.commit()
+        cursor.execute("SELECT * FROM tracked_links WHERE id = ?", (new_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else {"id": new_id, "code": short_code, "target_url": target_url}
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def resolve_and_increment_tracked_link(code: str) -> Optional[Dict[str, Any]]:
+    """Богино холбоосыг олж, дарсан тоог атомикаар +1 нэмэгдүүлэх"""
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM tracked_links WHERE code = ?", (str(code).strip(),))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        link_data = dict(row)
+        cursor.execute("UPDATE tracked_links SET clicks_count = COALESCE(clicks_count, 0) + 1 WHERE id = ?", (link_data["id"],))
+        conn.commit()
+        link_data["clicks_count"] = int(link_data.get("clicks_count") or 0) + 1
+        return link_data
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def list_tracked_links(page_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        if page_id:
+            cursor.execute("SELECT * FROM tracked_links WHERE page_id = ? ORDER BY id DESC", (str(page_id),))
+        else:
+            cursor.execute("SELECT * FROM tracked_links ORDER BY id DESC")
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_roi_analytics(page_id: Optional[str] = None, seconds_per_reply: float = 30.0, hourly_wage_mnt: int = 15000) -> Dict[str, Any]:
+    """
+    noflow-аас санаа авсан ROI & Хэмнэсэн Цагийн Аналитик:
+    - Нийт харилцсан хүн (unique_contacts)
+    - Ботын илгээсэн мессеж (bot_messages)
+    - Хариулсан сэтгэгдэл (comment_replies)
+    - Холбоос дарсан тоо (link_clicks)
+    - Хэмнэсэн цаг ба төгрөгийн хэмнэлт (estimated_hours_saved, estimated_cost_saved_mnt)
+    - Төлбөрийн хөрвүүлэлт (invoices_created, invoices_paid, paid_revenue_mnt)
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        p_where = " WHERE page_id = ?" if page_id else ""
+        p_params = (str(page_id),) if page_id else ()
+
+        cursor.execute(f"SELECT COUNT(DISTINCT sender_id) FROM messages{p_where}", p_params)
+        unique_contacts = int(cursor.fetchone()[0] or 0)
+
+        msg_bot_where = " WHERE page_id = ? AND sender_type = 'bot'" if page_id else " WHERE sender_type = 'bot'"
+        cursor.execute(f"SELECT COUNT(id) FROM messages{msg_bot_where}", p_params)
+        bot_messages = int(cursor.fetchone()[0] or 0)
+
+        cursor.execute(f"SELECT COALESCE(SUM(trigger_count), 0), COUNT(id) FROM comment_automations{p_where}", p_params)
+        ca_row = cursor.fetchone()
+        comment_replies = int(ca_row[0] or 0)
+        automations_total = int(ca_row[1] or 0)
+
+        active_where = " WHERE page_id = ? AND is_active = 1" if page_id else " WHERE is_active = 1"
+        cursor.execute(f"SELECT COUNT(id) FROM comment_automations{active_where}", p_params)
+        automations_active = int(cursor.fetchone()[0] or 0)
+
+        cursor.execute(f"SELECT COALESCE(SUM(clicks_count), 0) FROM tracked_links{p_where}", p_params)
+        link_clicks = int(cursor.fetchone()[0] or 0)
+
+        cursor.execute(f"SELECT COUNT(id) FROM invoices{p_where}", p_params)
+        invoices_created = int(cursor.fetchone()[0] or 0)
+
+        paid_where = " WHERE page_id = ? AND status = 'PAID'" if page_id else " WHERE status = 'PAID'"
+        cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices{paid_where}", p_params)
+        paid_row = cursor.fetchone()
+        invoices_paid = int(paid_row[0] or 0)
+        paid_revenue_mnt = int(paid_row[1] or 0)
+
+        total_interactions = bot_messages + comment_replies
+        hours_saved = round((total_interactions * seconds_per_reply) / 3600.0, 1)
+        cost_saved_mnt = int(round(hours_saved * hourly_wage_mnt))
+        payment_conversion_pct = round((invoices_paid / invoices_created) * 100.0, 1) if invoices_created > 0 else 0.0
+
+        return {
+            "page_id": page_id,
+            "unique_contacts": unique_contacts,
+            "bot_messages": bot_messages,
+            "comment_replies": comment_replies,
+            "total_interactions": total_interactions,
+            "link_clicks": link_clicks,
+            "automations_total": automations_total,
+            "automations_active": automations_active,
+            "estimated_hours_saved": hours_saved,
+            "estimated_cost_saved_mnt": cost_saved_mnt,
+            "seconds_per_reply_assumption": seconds_per_reply,
+            "invoices_created": invoices_created,
+            "invoices_paid": invoices_paid,
+            "paid_revenue_mnt": paid_revenue_mnt,
+            "payment_conversion_pct": payment_conversion_pct,
+        }
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     init_db()

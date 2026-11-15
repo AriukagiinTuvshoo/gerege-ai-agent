@@ -160,6 +160,29 @@ def is_admin_role(role: Optional[str]) -> bool:
     return str(role or "").strip().lower() in ADMIN_ROLES
 
 
+def resolve_tenant_login_role(
+    client_page: Dict[str, Any],
+    requested_role: Optional[str] = None,
+    auth_type: str = "client",
+) -> str:
+    """
+    Server-authoritative role resolution for tenant logins (P0 Security Fix).
+    Prevents client-side privilege escalation:
+    - Never trusts user-supplied 'role' in request payloads to grant elevated permissions.
+    - Magic link tokens are strictly scoped to 'client' role.
+    - Client logins default strictly to 'client' role.
+    - Only server-side verified mappings (e.g. client_page['assigned_role']) can grant other tenant roles.
+    """
+    if auth_type == "magic":
+        return "client"
+
+    server_assigned = str(client_page.get("assigned_role") or "").strip().lower()
+    if server_assigned in TENANT_SCOPED_ROLES:
+        return server_assigned
+
+    return "client"
+
+
 def has_permission(role: Optional[str], permission: str) -> bool:
     r = str(role or "").strip().lower()
     if r in ADMIN_ROLES:

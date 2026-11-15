@@ -8,7 +8,7 @@ import hashlib
 import subprocess
 import logging
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import database
 from core.db_engine import is_postgres, get_database_url, dispose_shared_engine
@@ -29,25 +29,39 @@ def _compute_sha256(filepath: str) -> str:
 
 def _collect_db_table_counts() -> Dict[str, int]:
     counts: Dict[str, int] = {}
-    conn = database.get_connection()
-    cur = conn.cursor()
-    for tbl in (
-        "pages", "registrations", "messages", "session_states", "sessions",
-        "user_memories", "invoices", "cargo_packages", "automated_rules",
-        "marketing_campaigns", "sent_followups", "appointments",
-        "notification_locks", "task_jobs", "audit_logs",
-    ):
-        try:
-            cur.execute(f"SELECT COUNT(*) FROM {tbl}")
-            row = cur.fetchone()
-            counts[tbl] = int(row[0] or 0) if row else 0
-        except Exception:
-            counts[tbl] = 0
+    conn = None
+    cur = None
     try:
-        conn.commit()
-    except Exception:
-        pass
-    conn.close()
+        conn = database.get_connection()
+        cur = conn.cursor()
+        for tbl in (
+            "pages", "registrations", "messages", "session_states", "sessions",
+            "user_memories", "invoices", "cargo_packages", "automated_rules",
+            "marketing_campaigns", "sent_followups", "appointments",
+            "notification_locks", "task_jobs", "audit_logs",
+            "comment_automations", "tracked_links",
+        ):
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                row = cur.fetchone()
+                counts[tbl] = int(row[0] or 0) if row else 0
+            except Exception:
+                counts[tbl] = 0
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
     return counts
 
 
@@ -253,6 +267,8 @@ _REQUIRED_RESTORE_TABLES = (
     "notification_locks",
     "task_jobs",
     "audit_logs",
+    "comment_automations",
+    "tracked_links",
 )
 
 
@@ -352,6 +368,38 @@ def _verify_restored_postgres(pg_url: str, expected_counts: Dict[str, int]) -> D
         engine.dispose()
 
 
+def _apply_postgres_sql_file(sql_gz_path: str, pg_url: str, server_ver: int = 0) -> Tuple[bool, str]:
+    """Apply a .sql.gz dump to PostgreSQL under --single-transaction."""
+    tmp_path = os.path.join(BACKUP_DIR, f".apply_{os.path.basename(sql_gz_path)}.sql")
+    try:
+        dispose_shared_engine()
+        with gzip.open(sql_gz_path, "rt", encoding="utf-8", errors="replace") as gz, open(
+            tmp_path, "w", encoding="utf-8", newline="\n"
+        ) as sql_out:
+            for line in gz:
+                if server_ver and server_ver < 170000 and line.lstrip().startswith("SET transaction_timeout"):
+                    continue
+                sql_out.write(line)
+        proc = subprocess.run(
+            ["psql", "--single-transaction", "-v", "ON_ERROR_STOP=1", "-f", tmp_path, pg_url],
+            capture_output=True,
+            check=True,
+            timeout=180,
+        )
+        return True, proc.stdout.decode("utf-8", errors="replace")
+    except subprocess.CalledProcessError as cpe:
+        err = (cpe.stderr or b"").decode("utf-8", errors="replace")
+        return False, err
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[str, Any]:
     """
     Backup файлаас өгөгдлийн санг атомик байдлаар аюулгүй сэргээх (Recovery):
@@ -361,7 +409,7 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
        `sqlite3.Connection.backup`-аар атомик хуулж, live бааз дээр дахин баталгаажуулна;
        PostgreSQL (`.sql.gz`) үед `psql --single-transaction -v ON_ERROR_STOP=1` ашиглан атомик сэргээж,
        зорилтот PostgreSQL баазаас схем, хүснэгт болон мөрийн тоог бодитоор шалгана.
-    4. Баталгаажуулалт унавал `pre_restore` snapshot-оос буцаан сэргээнэ.
+    4. Баталгаажуулалт унавал `pre_restore` snapshot-оос буцаан бодитоор сэргээнэ (P0 Rollback Fix).
     """
     check = verify_backup(filename)
     if not check.get("valid"):
@@ -373,6 +421,14 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
 
     # Pre-restore safety snapshot
     pre_snap = create_backup(label="pre_restore")
+    if not pre_snap.get("success"):
+        return {
+            "success": False,
+            "error": f"Failed to create pre-restore snapshot: {pre_snap.get('error')}",
+            "post_restore_verified": False,
+            "rolled_back": False,
+            "atomic_rollback": False,
+        }
 
     if clean_name.endswith(".db.gz"):
         tmp_restore = os.path.join(BACKUP_DIR, f".restore_{clean_name}.db")
@@ -424,7 +480,9 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 "success": False,
                 "error": str(e),
                 "post_restore_verified": False,
+                "rollback_status": "ROLLED_BACK_TO_PRE_SNAPSHOT" if rollback_ok else "ROLLBACK_FAILED",
                 "rolled_back": rollback_ok,
+                "atomic_rollback": rollback_ok,
                 "pre_restore_snapshot": pre_name,
             }
         finally:
@@ -440,6 +498,8 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
             "restored_from": clean_name,
             "pre_restore_snapshot": pre_snap.get("filename"),
             "post_restore_verified": True,
+            "rolled_back": False,
+            "atomic_rollback": False,
             "restored_table_counts": live_check.get("table_counts", {}),
         }
 
@@ -450,77 +510,113 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 "success": False,
                 "error": "PostgreSQL target DATABASE_URL is required to restore a .sql.gz backup",
                 "post_restore_verified": False,
+                "rolled_back": False,
+                "atomic_rollback": False,
             }
-        tmp_sql_path = os.path.join(BACKUP_DIR, f".restore_{clean_name}.sql")
+
+        server_ver = 0
         try:
-            dispose_shared_engine()
-            server_ver = 0
-            try:
-                ver_proc = subprocess.run(
-                    ["psql", "-t", "-A", "-c", "SHOW server_version_num;", pg_url],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if ver_proc.returncode == 0 and ver_proc.stdout.strip().isdigit():
-                    server_ver = int(ver_proc.stdout.strip())
-            except Exception:
-                server_ver = 0
-
-            with gzip.open(fpath, "rt", encoding="utf-8", errors="replace") as gz, open(
-                tmp_sql_path, "w", encoding="utf-8", newline="\n"
-            ) as sql_out:
-                for line in gz:
-                    # pg_dump 17+ emits `SET transaction_timeout = 0;` which PG <= 16 rejects under ON_ERROR_STOP=1
-                    if server_ver and server_ver < 170000 and line.lstrip().startswith("SET transaction_timeout"):
-                        continue
-                    sql_out.write(line)
-            proc = subprocess.run(
-                ["psql", "--single-transaction", "-v", "ON_ERROR_STOP=1", "-f", tmp_sql_path, pg_url],
+            ver_proc = subprocess.run(
+                ["psql", "-t", "-A", "-c", "SHOW server_version_num;", pg_url],
                 capture_output=True,
-                check=True,
-                timeout=180,
+                text=True,
+                timeout=15,
             )
-            pg_check = _verify_restored_postgres(pg_url, expected_counts)
-            if not pg_check.get("verified"):
-                raise RuntimeError(pg_check.get("error", "PostgreSQL post-restore verification failed"))
+            if ver_proc.returncode == 0 and ver_proc.stdout.strip().isdigit():
+                server_ver = int(ver_proc.stdout.strip())
+        except Exception:
+            server_ver = 0
+
+        pre_name = pre_snap.get("filename")
+        pre_gz = os.path.join(BACKUP_DIR, pre_name) if pre_name else None
+        pre_counts = pre_snap.get("table_counts", {})
+
+        # Step 1: Apply SQL dump to PostgreSQL under --single-transaction
+        apply_ok, apply_output = _apply_postgres_sql_file(fpath, pg_url, server_ver=server_ver)
+
+        if not apply_ok:
+            # SQL execution failed; since --single-transaction was used, check if pre-existing state is intact
+            intact_check = _verify_restored_postgres(pg_url, pre_counts)
+            if intact_check.get("verified"):
+                return {
+                    "success": False,
+                    "error": f"psql restore execution failed: {apply_output[:400]}",
+                    "post_restore_verified": False,
+                    "rollback_status": "TRANSACTION_ABORTED_PRE_STATE_PRESERVED",
+                    "rolled_back": True,
+                    "atomic_rollback": True,
+                    "pre_restore_snapshot": pre_name,
+                }
+            # If not intact, actively recover from pre-restore snapshot
+            recovered = False
+            if pre_gz and os.path.exists(pre_gz):
+                rec_ok, _ = _apply_postgres_sql_file(pre_gz, pg_url, server_ver=server_ver)
+                if rec_ok and _verify_restored_postgres(pg_url, pre_counts).get("verified"):
+                    recovered = True
 
             return {
-                "success": True,
-                "engine": "postgresql",
-                "restored_from": clean_name,
-                "pre_restore_snapshot": pre_snap.get("filename"),
-                "post_restore_verified": True,
-                "restored_table_counts": pg_check.get("table_counts", {}),
-                "details": proc.stdout.decode("utf-8", errors="replace")[:500],
-            }
-        except subprocess.CalledProcessError as e:
-            err_detail = (e.stderr or b"").decode("utf-8", errors="replace")[:500]
-            logger.error(f"PostgreSQL psql restore failed ({e}): {err_detail}")
-            return {
                 "success": False,
-                "error": f"{e} | stderr: {err_detail}",
+                "error": f"psql restore execution failed: {apply_output[:400]}",
                 "post_restore_verified": False,
-                "atomic_rollback": True,
-                "pre_restore_snapshot": pre_snap.get("filename"),
+                "rollback_status": "ROLLED_BACK_TO_PRE_SNAPSHOT" if recovered else "ROLLBACK_FAILED",
+                "rolled_back": recovered,
+                "atomic_rollback": recovered,
+                "recovery_instruction": None if recovered else f"CRITICAL: Recovery required from {pre_name}",
+                "pre_restore_snapshot": pre_name,
             }
-        except Exception as e:
-            logger.error(f"PostgreSQL restore failed ({e}); atomic rollback / pre_restore check.")
-            return {
-                "success": False,
-                "error": str(e),
-                "post_restore_verified": False,
-                "atomic_rollback": True,
-                "pre_restore_snapshot": pre_snap.get("filename"),
-            }
-        finally:
-            if os.path.exists(tmp_sql_path):
-                try:
-                    os.remove(tmp_sql_path)
-                except Exception:
-                    pass
 
-    return {"success": False, "error": "Unsupported backup format for automatic restore"}
+        # Step 2: psql committed. Now verify restored schema, tables, and row counts.
+        pg_check = _verify_restored_postgres(pg_url, expected_counts)
+        if not pg_check.get("verified"):
+            # Post-restore verification failed! Must execute REAL ROLLBACK to pre-restore snapshot.
+            ver_err = pg_check.get("error", "PostgreSQL post-restore verification failed")
+            logger.warning(
+                f"PostgreSQL post-restore verification failed ({ver_err}); executing real rollback to pre_restore snapshot: {pre_name}"
+            )
+            rollback_ok = False
+            if pre_gz and os.path.exists(pre_gz):
+                rb_applied, rb_err = _apply_postgres_sql_file(pre_gz, pg_url, server_ver=server_ver)
+                if rb_applied:
+                    rb_verify = _verify_restored_postgres(pg_url, pre_counts)
+                    if rb_verify.get("verified"):
+                        rollback_ok = True
+
+            if rollback_ok:
+                logger.info(f"PostgreSQL rollback to pre_restore snapshot {pre_name} succeeded.")
+                return {
+                    "success": False,
+                    "error": ver_err,
+                    "post_restore_verified": False,
+                    "rollback_status": "ROLLED_BACK_TO_PRE_SNAPSHOT",
+                    "rolled_back": True,
+                    "atomic_rollback": True,
+                    "pre_restore_snapshot": pre_name,
+                }
+            else:
+                logger.error(f"PostgreSQL rollback to pre_restore snapshot {pre_name} FAILED!")
+                return {
+                    "success": False,
+                    "error": ver_err,
+                    "post_restore_verified": False,
+                    "rollback_status": "ROLLBACK_FAILED",
+                    "rolled_back": False,
+                    "atomic_rollback": False,
+                    "recovery_instruction": f"CRITICAL: Automatic rollback failed. Manual recovery required: psql {pg_url} < {pre_name}",
+                    "pre_restore_snapshot": pre_name,
+                }
+
+        # Restore and verification both succeeded!
+        return {
+            "success": True,
+            "engine": "postgresql",
+            "restored_from": clean_name,
+            "pre_restore_snapshot": pre_name,
+            "post_restore_verified": True,
+            "rolled_back": False,
+            "atomic_rollback": False,
+            "restored_table_counts": pg_check.get("table_counts", {}),
+            "details": apply_output[:500],
+        }
 
 
 def prune_old_backups(keep_days: int = 14) -> Dict[str, Any]:

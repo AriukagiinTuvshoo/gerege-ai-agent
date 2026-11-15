@@ -317,3 +317,41 @@ class AuditLogModel(Base):
     __table_args__ = (
         Index("idx_audit_logs_page_created", "page_id", "created_at"),
     )
+
+
+class CommentAutomationModel(Base):
+    __tablename__ = "comment_automations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    page_id = Column(String(128), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    post_id = Column(String(255), default="*")
+    keyword_pattern = Column(String(500), default="*")
+    public_reply_text = Column(Text, default="Танд чат руу дэлгэрэнгүй мэдээлэл илгээлээ! ✅")
+    dm_message_text = Column(Text, nullable=False)
+    cta_button_text = Column(String(128), default="")
+    cta_url = Column(Text, default="")
+    is_active = Column(Integer, default=1)
+    trigger_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_comment_auto_page_active", "page_id", "is_active"),
+    )
+
+
+class TrackedLinkModel(Base):
+    __tablename__ = "tracked_links"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(64), unique=True, nullable=False)
+    page_id = Column(String(128), nullable=False, index=True)
+    automation_id = Column(Integer, nullable=True)
+    title = Column(String(255), default="")
+    target_url = Column(Text, nullable=False)
+    clicks_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_tracked_links_code", "code"),
+    )

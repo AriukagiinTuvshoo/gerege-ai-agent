@@ -91,14 +91,15 @@ class TaskQueue:
             else now_str
         )
 
-        conn = database.get_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        conn = None
+        cur = None
         try:
+            conn = database.get_connection()
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
             cur.execute("SELECT idempotency_key, status FROM task_jobs WHERE idempotency_key = ?", (job_id,))
             existing = cur.fetchone()
             if existing:
-                conn.close()
                 return {
                     "queued": False,
                     "duplicate": True,
@@ -129,11 +130,20 @@ class TaskQueue:
             )
             conn.commit()
         except Exception as exc:
-            conn.close()
             if "unique" in str(exc).lower() or "duplicate" in str(exc).lower() or isinstance(exc, sqlite3.IntegrityError):
                 return {"queued": False, "duplicate": True, "job_id": job_id}
             raise
-        conn.close()
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         r_client = self._get_redis()
         if r_client and delay_seconds <= 0:
@@ -151,10 +161,12 @@ class TaskQueue:
     def _claim_job_atomically(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Atomically transition a single job from PENDING -> PROCESSING so two workers cannot claim it."""
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn = database.get_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        conn = None
+        cur = None
         try:
+            conn = database.get_connection()
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
             cur.execute(
                 """
                 UPDATE task_jobs
@@ -173,38 +185,59 @@ class TaskQueue:
             claimed = cur.rowcount
             conn.commit()
             if not claimed or claimed <= 0:
-                conn.close()
                 return None
 
             cur.execute("SELECT * FROM task_jobs WHERE idempotency_key = ?", (job_id,))
             row = cur.fetchone()
-            conn.close()
             return dict(row) if row else None
         except Exception as e:
             logger.error(f"Atomic job claim error ({job_id}): {e}")
-            conn.close()
             return None
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def ack_job(self, job_id: str) -> bool:
         """Explicitly acknowledge job completion (PROCESSING -> COMPLETED)."""
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE task_jobs
-            SET status = 'COMPLETED',
-                locked_by = NULL,
-                locked_at = NULL,
-                updated_at = ?
-            WHERE idempotency_key = ?
-            """,
-            (now_str, job_id),
-        )
-        changed = (cur.rowcount or 0) > 0
-        conn.commit()
-        conn.close()
-        return changed
+        conn = None
+        cur = None
+        try:
+            conn = database.get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE task_jobs
+                SET status = 'COMPLETED',
+                    locked_by = NULL,
+                    locked_at = NULL,
+                    updated_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (now_str, job_id),
+            )
+            changed = (cur.rowcount or 0) > 0
+            conn.commit()
+            return changed
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def fail_job(self, job: Dict[str, Any], err_msg: str) -> str:
         """Record job failure, schedule exponential backoff retry or move to DEAD_LETTER."""
@@ -218,23 +251,36 @@ class TaskQueue:
         next_run = (datetime.now() + timedelta(seconds=backoff_sec)).strftime("%Y-%m-%d %H:%M:%S")
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE task_jobs
-            SET status = ?,
-                last_error = ?,
-                next_run_at = ?,
-                locked_by = NULL,
-                locked_at = NULL,
-                updated_at = ?
-            WHERE idempotency_key = ?
-            """,
-            (new_status, err_msg, next_run, now_str, job_id),
-        )
-        conn.commit()
-        conn.close()
+        conn = None
+        cur = None
+        try:
+            conn = database.get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE task_jobs
+                SET status = ?,
+                    last_error = ?,
+                    next_run_at = ?,
+                    locked_by = NULL,
+                    locked_at = NULL,
+                    updated_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (new_status, err_msg, next_run, now_str, job_id),
+            )
+            conn.commit()
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         r_client = self._get_redis()
         if is_exhausted and r_client:
@@ -255,40 +301,53 @@ class TaskQueue:
         """
         cutoff = (datetime.now() - timedelta(seconds=max(1, int(stale_after_seconds)))).strftime("%Y-%m-%d %H:%M:%S")
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn = database.get_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT idempotency_key, attempts, max_retries
-            FROM task_jobs
-            WHERE status = 'PROCESSING' AND locked_at IS NOT NULL AND locked_at <= ?
-            """,
-            (cutoff,),
-        )
-        stale_rows = [dict(r) for r in cur.fetchall()]
+        conn = None
+        cur = None
         recovered = 0
-        for r in stale_rows:
-            jid = r["idempotency_key"]
-            att = int(r.get("attempts") or 1)
-            max_att = int(r.get("max_retries") or 3)
-            new_status = "DEAD_LETTER" if att >= max_att else "PENDING"
+        try:
+            conn = database.get_connection()
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
             cur.execute(
                 """
-                UPDATE task_jobs
-                SET status = ?,
-                    locked_by = NULL,
-                    locked_at = NULL,
-                    last_error = COALESCE(last_error, '') || ' [Recovered from stale PROCESSING]',
-                    updated_at = ?
-                WHERE idempotency_key = ? AND status = 'PROCESSING'
+                SELECT idempotency_key, attempts, max_retries
+                FROM task_jobs
+                WHERE status = 'PROCESSING' AND locked_at IS NOT NULL AND locked_at <= ?
                 """,
-                (new_status, now_str, jid),
+                (cutoff,),
             )
-            if cur.rowcount and cur.rowcount > 0:
-                recovered += 1
-        conn.commit()
-        conn.close()
+            stale_rows = [dict(r) for r in cur.fetchall()]
+            for r in stale_rows:
+                jid = r["idempotency_key"]
+                att = int(r.get("attempts") or 1)
+                max_att = int(r.get("max_retries") or 3)
+                new_status = "DEAD_LETTER" if att >= max_att else "PENDING"
+                cur.execute(
+                    """
+                    UPDATE task_jobs
+                    SET status = ?,
+                        locked_by = NULL,
+                        locked_at = NULL,
+                        last_error = COALESCE(last_error, '') || ' [Recovered from stale PROCESSING]',
+                        updated_at = ?
+                    WHERE idempotency_key = ? AND status = 'PROCESSING'
+                    """,
+                    (new_status, now_str, jid),
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    recovered += 1
+            conn.commit()
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return recovered
 
     async def process_pending_jobs(self, batch_size: int = 10) -> int:
@@ -320,26 +379,39 @@ class TaskQueue:
                 self._redis = None
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn = database.get_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT idempotency_key FROM task_jobs
-            WHERE status = 'PENDING'
-              AND idempotency_key IS NOT NULL
-              AND COALESCE(attempts, 0) < COALESCE(max_retries, 3)
-              AND (next_run_at IS NULL OR next_run_at <= ?)
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            (now_str, batch_size),
-        )
-        for r in cur.fetchall():
-            jid = r["idempotency_key"]
-            if jid and jid not in candidate_ids:
-                candidate_ids.append(jid)
-        conn.close()
+        conn = None
+        cur = None
+        try:
+            conn = database.get_connection()
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT idempotency_key FROM task_jobs
+                WHERE status = 'PENDING'
+                  AND idempotency_key IS NOT NULL
+                  AND COALESCE(attempts, 0) < COALESCE(max_retries, 3)
+                  AND (next_run_at IS NULL OR next_run_at <= ?)
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (now_str, batch_size),
+            )
+            for r in cur.fetchall():
+                jid = r["idempotency_key"]
+                if jid and jid not in candidate_ids:
+                    candidate_ids.append(jid)
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         processed = 0
         for job_id in candidate_ids[:batch_size]:
@@ -352,23 +424,36 @@ class TaskQueue:
             now_done = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if not handler:
                 logger.warning(f"No handler registered for task '{task_name}' (job_id={job_id})")
-                conn = database.get_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE task_jobs
-                    SET status = 'PENDING',
-                        attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
-                        locked_by = NULL,
-                        locked_at = NULL,
-                        last_error = ?,
-                        updated_at = ?
-                    WHERE idempotency_key = ?
-                    """,
-                    (f"No handler registered for {task_name}", now_done, job_id),
-                )
-                conn.commit()
-                conn.close()
+                no_h_conn = None
+                no_h_cur = None
+                try:
+                    no_h_conn = database.get_connection()
+                    no_h_cur = no_h_conn.cursor()
+                    no_h_cur.execute(
+                        """
+                        UPDATE task_jobs
+                        SET status = 'PENDING',
+                            attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                            locked_by = NULL,
+                            locked_at = NULL,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE idempotency_key = ?
+                        """,
+                        (f"No handler registered for {task_name}", now_done, job_id),
+                    )
+                    no_h_conn.commit()
+                finally:
+                    if no_h_cur is not None:
+                        try:
+                            no_h_cur.close()
+                        except Exception:
+                            pass
+                    if no_h_conn is not None:
+                        try:
+                            no_h_conn.close()
+                        except Exception:
+                            pass
                 continue
 
             timeout_sec = max(1, int(job.get("timeout_seconds") or 60))
@@ -386,8 +471,6 @@ class TaskQueue:
 
     def get_queue_stats(self) -> Dict[str, Any]:
         r_client = self._get_redis()
-        conn = database.get_connection()
-        cur = conn.cursor()
         stats = {
             "backend": "redis+db" if r_client else "db",
             "redis_connected": bool(r_client),
@@ -398,7 +481,11 @@ class TaskQueue:
             "dead_letter": 0,
             "failed": 0,
         }
+        conn = None
+        cur = None
         try:
+            conn = database.get_connection()
+            cur = conn.cursor()
             cur.execute("SELECT status, COUNT(*) FROM task_jobs GROUP BY status")
             for row in cur.fetchall():
                 st = str(row[0] or "").upper()
@@ -415,24 +502,48 @@ class TaskQueue:
                     stats["failed"] = cnt
         except Exception:
             pass
-        conn.close()
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return stats
 
     def list_failed_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
-        conn = database.get_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT * FROM task_jobs
-            WHERE status IN ('DEAD_LETTER', 'FAILED')
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
+        conn = None
+        cur = None
+        rows = []
+        try:
+            conn = database.get_connection()
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT * FROM task_jobs
+                WHERE status IN ('DEAD_LETTER', 'FAILED')
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return rows
 
 

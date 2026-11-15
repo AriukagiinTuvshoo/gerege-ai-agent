@@ -296,10 +296,44 @@ def upgrade() -> None:
         )
         op.create_index("idx_audit_logs_page_created", "audit_logs", ["page_id", "created_at"])
 
+    if "comment_automations" not in existing:
+        op.create_table(
+            "comment_automations",
+            sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+            sa.Column("page_id", sa.String(128), nullable=False),
+            sa.Column("name", sa.String(255), nullable=False),
+            sa.Column("post_id", sa.String(255), server_default="*"),
+            sa.Column("keyword_pattern", sa.String(500), server_default="*"),
+            sa.Column("public_reply_text", sa.Text(), server_default="Танд чат руу дэлгэрэнгүй мэдээлэл илгээлээ! ✅"),
+            sa.Column("dm_message_text", sa.Text(), nullable=False),
+            sa.Column("cta_button_text", sa.String(128), server_default=""),
+            sa.Column("cta_url", sa.Text(), server_default=""),
+            sa.Column("is_active", sa.Integer(), server_default="1"),
+            sa.Column("trigger_count", sa.Integer(), server_default="0"),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
+        )
+        op.create_index("idx_comment_auto_page_active", "comment_automations", ["page_id", "is_active"])
+
+    if "tracked_links" not in existing:
+        op.create_table(
+            "tracked_links",
+            sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+            sa.Column("code", sa.String(64), unique=True, nullable=False),
+            sa.Column("page_id", sa.String(128), nullable=False),
+            sa.Column("automation_id", sa.Integer(), nullable=True),
+            sa.Column("title", sa.String(255), server_default=""),
+            sa.Column("target_url", sa.Text(), nullable=False),
+            sa.Column("clicks_count", sa.Integer(), server_default="0"),
+            sa.Column("created_at", sa.String(64), server_default=ts_default),
+        )
+        op.create_index("idx_tracked_links_code", "tracked_links", ["code"])
+
 
 def downgrade() -> None:
     existing = _existing_tables()
     for tbl in (
+        "tracked_links",
+        "comment_automations",
         "audit_logs",
         "task_jobs",
         "notification_locks",
