@@ -109,6 +109,20 @@ jobs:
         run: |
           pytest tests/test_migration_and_restore_verification.py -k "not postgres_restore" -v --tb=short
 
+      - name: Diag psql without --single-transaction
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          python -c "import gzip, os, subprocess, tempfile; from core import backup_service; b = backup_service.create_backup('ci_d1'); u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); f = tempfile.NamedTemporaryFile(suffix='.sql', delete=False); f.write(gzip.open(b['path'], 'rb').read()); f.close(); p = subprocess.run(['psql', '-v', 'ON_ERROR_STOP=1', '-f', f.name, u], capture_output=True); os.unlink(f.name); assert p.returncode == 0"
+
+      - name: Diag psql --single-transaction with clean schema
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          python -c "import gzip, os, subprocess, tempfile; from core import backup_service; b = backup_service.create_backup('ci_d2'); u = os.environ['DATABASE_URL'].replace('postgresql+psycopg2://', 'postgresql://'); raw = gzip.open(b['path'], 'rb').read(); clean_sql = b'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n' + raw; f = tempfile.NamedTemporaryFile(suffix='.sql', delete=False); f.write(clean_sql); f.close(); p = subprocess.run(['psql', '--single-transaction', '-v', 'ON_ERROR_STOP=1', '-f', f.name, u], capture_output=True); os.unlink(f.name); assert p.returncode == 0"
+
       - name: Run Live PostgreSQL 16 Restore Good Verification
         if: ${{ !cancelled() }}
         env:
