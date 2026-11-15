@@ -102,12 +102,19 @@ jobs:
         run: |
           pytest tests/test_postgres_cursor_regression.py -v --tb=short
 
-      - name: Run Migration & Restore Verification Suite (Live PostgreSQL 16 & SQLite)
+      - name: Run Migration & SQLite Restore Verification Suite
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
-          pytest tests/test_migration_and_restore_verification.py -v --tb=short
+          pytest tests/test_migration_and_restore_verification.py -k "not postgres_restore" -v --tb=short
+
+      - name: Run Live PostgreSQL 16 Restore Verification
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          pytest tests/test_migration_and_restore_verification.py -k "postgres_restore" -v --tb=short
 
       - name: Run Enterprise Phases Suite (Live PostgreSQL 16 & Redis 7)
         if: ${{ !cancelled() }}
@@ -125,21 +132,13 @@ jobs:
         run: |
           pytest tests/test_ai_eval_suite.py -v --tb=short
 
-      - name: Run Failure Scenarios Suite 01-10 (Live PostgreSQL 16 & Redis 7)
+      - name: Run Failure Scenarios Suite (Live PostgreSQL 16 & Redis 7)
         if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
-          pytest tests/test_failure_scenarios.py -k "scenario_0" -v --tb=short
-
-      - name: Run Failure Scenarios Suite 10-20 (Live PostgreSQL 16 & Redis 7)
-        if: ${{ !cancelled() }}
-        env:
-          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
-          REDIS_URL: "redis://127.0.0.1:6379/0"
-        run: |
-          pytest tests/test_failure_scenarios.py -k "scenario_1 or scenario_2" -v --tb=short
+          pytest tests/test_failure_scenarios.py -v --tb=short
 
       - name: Build Production Docker Image
         if: ${{ !cancelled() }}
