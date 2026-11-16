@@ -1412,6 +1412,29 @@ def list_invoices(page_id: Optional[str] = None, limit: int = 50, status: Option
         res.append(d)
     return res
 
+def day_range_bounds(date_str: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Тухайн өдрийн [эхлэл, дараагийн өдрийн эхлэл) хязгаарыг буцаана.
+
+    P1-03 (B-04): `col LIKE '2026-11-16%'` нь зөвхөн TEXT баганад ажиллана. Хүснэгтийн
+    `created_at` нь жинхэнэ `TIMESTAMP` үед PostgreSQL
+    `operator does not exist: timestamp without time zone ~~ unknown` алдаа шиддэг.
+    Хязгаарын харьцуулалт нь TEXT (ISO-8601) болон TIMESTAMP хоёр дээр ижил ажиллана.
+    """
+    if date_str:
+        try:
+            start_dt = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+        except ValueError:
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(days=1)
+    return (
+        start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
 def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
     """Финтек хяналтын самбарын тоон үзүүлэлтүүд (KPIs)"""
     conn = get_connection()
@@ -1428,10 +1451,16 @@ def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
     cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PENDING'", params)
     pending_sum, pending_count = cursor.fetchone()
     
-    # Өнөөдрийн орлого
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    today_params = (str(page_id), f"{today_str}%") if page_id else (f"{today_str}%",)
-    today_where = " WHERE page_id = ? AND status = 'PAID' AND paid_at LIKE ?" if page_id else " WHERE status = 'PAID' AND paid_at LIKE ?"
+    # Өнөөдрийн орлого (P1-03: LIKE биш, хязгаарын харьцуулалт)
+    day_start, day_end = day_range_bounds()
+    today_params = (
+        (str(page_id), day_start, day_end) if page_id else (day_start, day_end)
+    )
+    today_where = (
+        " WHERE page_id = ? AND status = 'PAID' AND paid_at >= ? AND paid_at < ?"
+        if page_id
+        else " WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?"
+    )
     cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{today_where}", today_params)
     today_sum, today_count = cursor.fetchone()
 
@@ -1677,25 +1706,39 @@ def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optiona
     
     if not date_str:
         date_str = datetime.now().strftime("%Y-%m-%d")
-        
-    date_pattern = f"{date_str}%"
+
+    # P1-03 (B-04): range predicates work on both TEXT (ISO-8601) and TIMESTAMP columns.
+    day_start, day_end = day_range_bounds(date_str)
     p_cond = " AND page_id = ?" if page_id else ""
-    p_params = [date_pattern, str(page_id)] if page_id else [date_pattern]
-    
+    p_params = [day_start, day_end, str(page_id)] if page_id else [day_start, day_end]
+
     # 1. Шинэ харилцагч / Leads
-    cursor.execute(f"SELECT COUNT(id) FROM registrations WHERE created_at LIKE ?{p_cond}", tuple(p_params))
+    cursor.execute(
+        f"SELECT COUNT(id) FROM registrations WHERE created_at >= ? AND created_at < ?{p_cond}",
+        tuple(p_params),
+    )
     leads_count = cursor.fetchone()[0] or 0
-    
+
     # 2. Чат харилцан ярианууд
-    cursor.execute(f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at LIKE ?{p_cond}", tuple(p_params))
+    cursor.execute(
+        f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at >= ? AND created_at < ?{p_cond}",
+        tuple(p_params),
+    )
     chats_count = cursor.fetchone()[0] or 0
-    
+
     # 3. Карго ачаанууд (ирсэн)
-    cursor.execute(f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at LIKE ?{p_cond}", tuple(p_params))
+    cursor.execute(
+        f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at >= ? AND arrived_at < ?{p_cond}",
+        tuple(p_params),
+    )
     cargo_arrived = cursor.fetchone()[0] or 0
-    
+
     # 4. QPay төлбөрүүд
-    cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices WHERE status = 'PAID' AND paid_at LIKE ?{p_cond}", tuple(p_params))
+    cursor.execute(
+        f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices "
+        f"WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?{p_cond}",
+        tuple(p_params),
+    )
     paid_count, paid_amount = cursor.fetchone()
     
     # 5. Хүлээгдэж буй карго ачаа (төлөгдөөгүй)
@@ -1820,6 +1863,15 @@ def get_abandoned_chat_candidates(page_id: str, delay_hours: int = 2) -> List[Di
     threshold_iso = (datetime.now() - timedelta(hours=delay_hours)).strftime("%Y-%m-%d %H:%M:%S")
     max_threshold_iso = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
 
+    # P1-07 (B-12): `GROUP BY m.sender_id` while selecting m.channel / m.content /
+    # m.created_at is invalid SQL. SQLite silently returns an arbitrary row; PostgreSQL
+    # raises `GroupingError: column "m.channel" must appear in the GROUP BY clause`.
+    # Effect on production: abandoned-chat detection raised on every worker tick, so
+    # `run_worker_tick` aborted before retention reminders were dispatched.
+    #
+    # Portable fix: pick the *latest* message per sender explicitly. `m2.id` breaks ties
+    # deterministically, and the correlated aggregate works on SQLite, PostgreSQL and
+    # MySQL (no window functions required).
     cursor.execute("""
         SELECT m.sender_id, m.channel, m.content, m.created_at
         FROM messages m
@@ -1833,7 +1885,16 @@ def get_abandoned_chat_candidates(page_id: str, delay_hours: int = 2) -> List[Di
           AND m.sender_id NOT IN (
               SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'abandoned_chat'
           )
-        GROUP BY m.sender_id
+          AND NOT EXISTS (
+              SELECT 1 FROM messages m2
+              WHERE m2.page_id = m.page_id
+                AND m2.sender_id = m.sender_id
+                AND m2.sender_type = 'user'
+                AND (
+                    m2.created_at > m.created_at
+                    OR (m2.created_at = m.created_at AND m2.id > m.id)
+                )
+          )
         ORDER BY m.created_at DESC
         LIMIT 50
     """, (str(page_id), threshold_iso, max_threshold_iso, str(page_id), str(page_id)))

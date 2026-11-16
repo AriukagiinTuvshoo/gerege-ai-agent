@@ -38,6 +38,9 @@ jobs:
     env:
       ADMIN_PASSWORD: "ci_test_admin_password_2026"
       GEMINI_MODEL: "gemini-3.5-flash-lite"
+      # SEC-01/B-02: explicit CORS allowlist. Production must set this; there is no
+      # wildcard fallback when credentials are enabled.
+      ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000"
 
     steps:
       - name: Checkout repository
@@ -57,7 +60,13 @@ jobs:
 
       - name: Compile & Syntax Verification
         run: |
-          python -m py_compile main.py database.py agent.py worker.py fintech_service.py cargo_service.py appointment_service.py retention_service.py executive_bot_service.py sheets_service.py core/security.py core/db_engine.py core/models.py core/task_queue.py core/backup_service.py core/ai_router.py core/monitoring.py routers/system_router.py routers/automation_router.py scripts/migrate_sqlite_to_postgres.py tests/test_p0_security_role_escalation.py tests/test_postgres_restore_real_rollback.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py
+          python -m py_compile main.py database.py agent.py worker.py fintech_service.py cargo_service.py appointment_service.py retention_service.py executive_bot_service.py sheets_service.py core/security.py core/db_engine.py core/models.py core/task_queue.py core/backup_service.py core/ai_router.py core/monitoring.py core/serialization.py routers/system_router.py routers/automation_router.py scripts/migrate_sqlite_to_postgres.py tests/test_p0_security_role_escalation.py tests/test_postgres_restore_real_rollback.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_stage_b_regressions.py
+
+      - name: Dependency Vulnerability Audit
+        if: ${{ !cancelled() }}
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --progress-spinner off
 
       - name: Initialize SQLite schema & verify zero schema drift
         run: |
@@ -65,13 +74,15 @@ jobs:
 
       - name: Run Pytest Regression, Enterprise, AI Eval & Failure Suites (SQLite mode)
         run: |
-          pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py -v
+          pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py tests/test_stage_b_regressions.py -v
 
       - name: Run SQLite-to-PostgreSQL Dry-Run Verification
+        if: ${{ !cancelled() }}
         run: |
           python scripts/migrate_sqlite_to_postgres.py --dry-run
 
       - name: Verify Postgres Connectivity & Drivers
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
@@ -79,24 +90,28 @@ jobs:
           python -c "import alembic, psycopg2, sqlalchemy; print('DRIVERS_OK')"
 
       - name: Verify SQLAlchemy Postgres Engine Connection
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
           python -c "from core.db_engine import create_sqlalchemy_engine; e = create_sqlalchemy_engine(); c = e.connect(); c.close(); print('PG_ENGINE_OK')"
 
       - name: Run Alembic Migration on PostgreSQL 16
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
           python -m alembic upgrade head
 
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
           python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
 
       - name: Run PostgreSQL Cursor Regression Suite (Live PostgreSQL 16)
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
@@ -174,6 +189,14 @@ jobs:
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
           pytest tests/test_ai_eval_suite.py -v --tb=short
+
+      - name: Run Stage B P0/P1 Regression Suite (Live PostgreSQL 16)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          pytest tests/test_stage_b_regressions.py -v --tb=short
 
       - name: Run Failure Scenarios Suite (Live PostgreSQL 16 & Redis 7)
         if: ${{ !cancelled() }}

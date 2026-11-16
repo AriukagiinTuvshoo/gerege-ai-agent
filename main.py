@@ -12,7 +12,11 @@ from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, Response, BackgroundTasks, Query, UploadFile, File, Form, Header, Cookie, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+# P0-01 (B-01): every route builds an explicit JSONResponse, so `default_response_class`
+# alone is not enough. Aliasing the response class makes all 50+ call sites driver-safe
+# (datetime/Decimal/UUID/bytes) without touching each handler.
+from core.serialization import SafeJSONResponse, SafeJSONResponse as JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import httpx
@@ -96,7 +100,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Omnichannel AI Chatbot Agent & Multi-Tenant CRM Platform",
-    lifespan=lifespan
+    lifespan=lifespan,
+    # P0-01 (B-01): normalise driver values (datetime/Decimal/...) before JSON encoding.
+    # FastAPI only runs `jsonable_encoder` for implicit `dict` returns; every explicit
+    # `JSONResponse(...)` bypassed it and raised `TypeError: Object of type datetime is
+    # not JSON serializable` on PostgreSQL, surfacing as HTTP 500.
+    default_response_class=SafeJSONResponse,
 )
 
 app.include_router(system_router.router)
@@ -132,12 +141,22 @@ async def telemetry_and_error_tracking_middleware(request: Request, call_next):
 os.makedirs("static/qrcodes", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# SEC-01 (B-02): explicit origin allowlist. `allow_origins=["*"]` combined with
+# `allow_credentials=True` makes Starlette reflect the caller's Origin, which lets any
+# website read authenticated responses. See core_security.resolve_allowed_origins().
+_ALLOWED_ORIGINS = core_security.resolve_allowed_origins()
+if not _ALLOWED_ORIGINS and core_security.is_production_mode():
+    logger.error(
+        "CORS allowlist is empty in production. Set ALLOWED_ORIGINS "
+        "(e.g. https://app.example.mn). Cross-origin browsers calls will be rejected."
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-ManyChat-Secret", "X-Webhook-Secret"],
 )
 
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "agent_verify_secret_token_123")
@@ -1500,51 +1519,68 @@ async def serve_payment_page(invoice_id: str, request: Request):
 @app.get("/api/fintech/invoices/{invoice_id}/status")
 async def get_invoice_status_api(invoice_id: str, request: Request):
     """
-    Төлбөрийн төлөвийг шалгах (Real-time Polling & PII Safe):
-    - Public хандалтад PII (утас, sender_id, хувийн мэдээлэл) задруулахгүй.
-    - Зөвхөн allowlist-ийн аюулгүй талбаруудыг буцаана.
-    - Хэрэв нэвтэрсэн Админ эсвэл тухайн салбарын эрхтэй хэрэглэгч бол бүрэн мэдээллийг харна.
+    Төлбөрийн төлөвийг шалгах (Real-time Polling).
+
+    P1-04 (B-05) — Cross-tenant BOLA fix:
+    - Нэвтэрсэн хэрэглэгч зөвхөн ӨӨРИЙН tenant-ийн нэхэмжлэхийг харна; өөр tenant-ийн
+      нэхэмжлэх бол `404` (оршин байгаа эсэхийг ч задруулахгүй — enumeration-ээс сэргийлнэ).
+    - Админ бүх нэхэмжлэхийг харна.
+    - Нэвтрээгүй (public) хандалт нь allowlist-ийн projection авна: төлбөрийн хуудсанд
+      хэрэгтэй талбарууд (`status`, `amount`, `currency`, `description`, `ebarimt`) —
+      энэ нь тестээр баталгаажсан contract
+      (`tests/test_p1_payment_security.py::test_public_invoice_status_filters_pii`).
+    - `sender_id`, утас, `qpay_*`, `callback_verified` зэрэг PII/дотоод талбар хэзээ ч
+      буцахгүй.
+
+    Тэмдэглэл: энэ endpoint нь зөвхөн нээлттэй invoice ID-г мэддэг талд зориулагдсан
+    (төлбөрийн холбоос). Нэвтэрсэн хэрэглэгчийн хувьд tenant хязгаарыг энд хатуу
+    хэрэгжүүлдэг — өөр tenant-ийн нэхэмжлэхийг таах замаар уншиж болохгүй.
     """
     inv = database.get_invoice(invoice_id)
     if not inv:
         return JSONResponse(status_code=404, content={"error": "Invoice not found"})
 
-    # Check whether caller has authorized access to full internal invoice
     user = await core_security.resolve_current_user(request)
-    is_authorized = False
+
     if user:
         role = str(user.get("role") or "").strip().lower()
-        if core_security.is_admin_role(role):
-            is_authorized = True
-        elif user.get("page_id") and str(user.get("page_id")) == str(inv.get("page_id")):
-            is_authorized = True
+        is_admin = core_security.is_admin_role(role)
+        same_tenant = bool(user.get("page_id")) and str(user.get("page_id")) == str(
+            inv.get("page_id")
+        )
+        if not (is_admin or same_tenant):
+            # 404 (not 403): never confirm the existence of another tenant's invoice.
+            return JSONResponse(status_code=404, content={"error": "Invoice not found"})
+        return {
+            "status": inv.get("status", "PENDING"),
+            "invoice": dict(inv),
+            "ebarimt": {
+                "lottery": inv.get("ebarimt_lottery"),
+                "qr_data": inv.get("ebarimt_qr"),
+            },
+        }
 
-    # PII-Safe public representation (Allowlist approach)
-    public_invoice = {
-        "invoice_id": inv.get("invoice_id"),
-        "page_id": inv.get("page_id"),
-        "amount": inv.get("amount"),
-        "currency": inv.get("currency", "MNT"),
-        "description": inv.get("description", "Үйлчилгээний төлбөр"),
-        "status": inv.get("status", "PENDING"),
-        "paid_at": inv.get("paid_at"),
-        "created_at": inv.get("created_at"),
-        "ebarimt_lottery": inv.get("ebarimt_lottery"),
-        "ebarimt_qr": inv.get("ebarimt_qr"),
-    }
-
-    if is_authorized:
-        returned_invoice = dict(inv)
-    else:
-        returned_invoice = public_invoice
-
+    # Unauthenticated polling: allowlisted projection, PII never included.
+    # This shape is a tested contract (tests/test_p1_payment_security.py
+    # ::test_public_invoice_status_filters_pii) and is required for the payment page.
     return {
         "status": inv.get("status", "PENDING"),
-        "invoice": returned_invoice,
+        "invoice": {
+            "invoice_id": inv.get("invoice_id"),
+            "page_id": inv.get("page_id"),
+            "amount": inv.get("amount"),
+            "currency": inv.get("currency", "MNT"),
+            "description": inv.get("description", "Үйлчилгээний төлбөр"),
+            "status": inv.get("status", "PENDING"),
+            "paid_at": inv.get("paid_at"),
+            "created_at": inv.get("created_at"),
+            "ebarimt_lottery": inv.get("ebarimt_lottery"),
+            "ebarimt_qr": inv.get("ebarimt_qr"),
+        },
         "ebarimt": {
             "lottery": inv.get("ebarimt_lottery"),
-            "qr_data": inv.get("ebarimt_qr")
-        }
+            "qr_data": inv.get("ebarimt_qr"),
+        },
     }
 
 @app.get("/api/fintech/qpay/callback")

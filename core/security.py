@@ -2,7 +2,7 @@ import os
 import hmac
 import hashlib
 import logging
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, List, Optional, Set
 from fastapi import Request, HTTPException
 
 import database
@@ -223,6 +223,58 @@ def is_query_token_allowed() -> bool:
     if is_production_mode():
         return os.getenv("ALLOW_QUERY_TOKEN", "").strip() == "1"
     return True
+
+
+# ---------------------------------------------------------------------------
+# CORS origin allowlist (finding SEC-01 / B-02)
+# ---------------------------------------------------------------------------
+_DEV_DEFAULT_ORIGINS = (
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
+
+
+def resolve_allowed_origins() -> List[str]:
+    """
+    CORS-д зөвшөөрөгдөх origin-уудын жагсаалтыг буцаана.
+
+    Яагаад: `allow_origins=["*"]` ба `allow_credentials=True` хослолд Starlette нь
+    дуудагчийн `Origin`-ыг шууд буцаадаг ("reflect") тул дурын вэбсайт нэвтэрсэн
+    хэрэглэгчийн cookie-той хүсэлт илгээж хариуг уншиж чаддаг байсан (SEC-01).
+
+    Дүрэм:
+      * `ALLOWED_ORIGINS` (таслалаар тусгаарласан) байвал түүнийг л ашиглана.
+      * Wildcard (`*`) зөвхөн production БИШ үед зөвшөөрөгдөнө.
+      * Production/strict горимд жагсаалт хоосон бол аюулгүй default (өөрөө) —
+        хэзээ ч `*` руу буцахгүй (fail-closed).
+      * `null` origin-ыг хэзээ ч зөвшөөрөхгүй.
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    prod = is_production_mode()
+
+    if raw:
+        origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+        cleaned: List[str] = []
+        for origin in origins:
+            if origin == "*":
+                # Never permit credentialed wildcard, in any mode.
+                continue
+            if origin.lower() == "null":
+                continue
+            if origin not in cleaned:
+                cleaned.append(origin)
+        if cleaned:
+            return cleaned
+    elif not prod:
+        return list(_DEV_DEFAULT_ORIGINS)
+
+    # Production (or an unusable config): bind to the app's own origins only.
+    self_origin = os.getenv("APP_ORIGIN", "").strip().rstrip("/")
+    if self_origin and self_origin.lower() != "null":
+        return [self_origin]
+    return []
 
 
 def extract_token_from_request(

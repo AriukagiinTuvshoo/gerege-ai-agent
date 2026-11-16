@@ -49,6 +49,8 @@ services:
       WEBHOOK_FAIL_CLOSED: "1"
       STRICT_QPAY_VERIFICATION: "1"
       DISABLE_INLINE_SCHEDULER: "1"
+      # SEC-01/B-02: CORS allowlist is mandatory in production (no wildcard fallback).
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required (e.g. https://app.example.mn)}
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
       REDIS_URL: redis://redis:6379/0
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}

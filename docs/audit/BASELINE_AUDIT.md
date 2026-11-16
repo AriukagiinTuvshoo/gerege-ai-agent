@@ -126,20 +126,21 @@ client : 200 ×17, 500 /api/auth/me, 500 /api/pages, 500 /api/fintech/summary, 5
 
 | ID | Sev | Title | File | Status |
 |---|---|---|---|---|
-| P0-01 | **P0** | `datetime` not JSON-serialisable → tenant dashboard, `/api/leads`, `/api/pages` 500 on PostgreSQL | `main.py:372`, `database.py` DDL | Open |
-| P0-02 | **P0** | CORS reflects any origin **with** `allow_credentials=True` | `main.py:135-140` | Open |
-| P1-01 | **P1** | `lastrowid` is `None` for `comment_automations` & `tracked_links` on PostgreSQL | `core/db_engine.py:147` | Open |
+| P0-01 | **P0** | `datetime` not JSON-serialisable → tenant dashboard, `/api/leads`, `/api/pages` 500 on PostgreSQL | `main.py:372`, `database.py` DDL | **FIXED (Stage B)** |
+| P0-02 | **P0** | CORS reflects any origin **with** `allow_credentials=True` | `main.py:135-140` | **FIXED (Stage B)** |
+| P1-01 | **P1** | `lastrowid` is `None` for `comment_automations` & `tracked_links` on PostgreSQL | `core/db_engine.py:147` | **FIXED (Stage B)** |
 | P1-02 | **P1** | Alembic schema ≠ runtime schema: **251 column type differences** | `migrations/versions/0001…py` | Open |
-| P1-03 | **P1** | `LIKE`-based date filtering breaks on PostgreSQL (`timestamp ~~ unknown`) | `database.py:1434,1686-1698` | Open |
-| P1-04 | **P1** | Cross-tenant invoice read: any tenant reads another tenant's invoice by ID | `main.py:1523` | Open |
-| P1-05 | **P1** | `requirements.txt` pins `pillow<12.0.0` but 76 CVEs need `13.0.0` | `requirements.txt:5` | Open |
+| P1-03 | **P1** | `LIKE`-based date filtering breaks on PostgreSQL (`timestamp ~~ unknown`) | `database.py:1434,1686-1698` | **FIXED (Stage B)** |
+| P1-04 | **P1** | Cross-tenant invoice read: any tenant reads another tenant's invoice by ID | `main.py:1523` | **FIXED (Stage B)** |
+| P1-05 | **P1** | `requirements.txt` pins `pillow<12.0.0` but 76 CVEs need `13.0.0` | `requirements.txt:5` | **FIXED (Stage B)** |
+| P1-07 | **P1** | *(found in Stage B)* `GROUP BY m.sender_id` selects bare columns → `GroupingError` on PG; worker tick threw every cycle | `database.py:1867` | **FIXED (Stage B)** |
 | P1-06 | **P1** | **Zero foreign-key constraints** in either schema; tenant relations unenforced at DB level | `database.py:62-360`, `migrations/versions/0001…py` | Open |
 | P2-01 | **P2** | Schema-drift checker only compares **column names**, never types, never live DB | `core/db_engine.py:389-448` | Open |
 | P2-02 | **P2** | Webhook dedup is in-process `list` (`_PROCESSED_MIDS`) — not multi-worker safe | `main.py:149,427` | Open |
 | P2-03 | **P2** | Services import `main` (layering inversion) | `fintech_service.py:650`, `cargo_service.py:99`, `worker.py:30` | Open |
 | P2-04 | **P2** | Missing security headers: CSP, HSTS | `main.py:105-115` | Open |
-| TD-01 | **P2** | CI: step 8 failure skips migration/verification steps 9–14 (no `if: !cancelled()`) | `.github/workflows/ci.yml:70-104` | Open |
-| TD-03 | **P1** | `test_p1_payment_security.py` fixture never runs under pytest | `tests/test_p1_payment_security.py:26,488` | Open |
+| TD-01 | **P2** | CI: step 8 failure skips migration/verification steps 9–14 (no `if: !cancelled()`) | `.github/workflows/ci.yml:70-104` | **FIXED (Stage B)** |
+| TD-03 | **P1** | `test_p1_payment_security.py` fixture never runs under pytest | `tests/test_p1_payment_security.py:26,488` | **FIXED (Stage B)** |
 
 Full detail, root cause and required tests: `SECURITY_AUDIT.md`, `TECHNICAL_DEBT.md`.
 
