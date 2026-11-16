@@ -126,7 +126,7 @@ than the test changed.
 | `SEC-03` CSP / HSTS | **OPEN** | Stage B-10, intentionally after CORS lands |
 | `SEC-04` per-process webhook dedup | **OPEN** | Stage D (Redis) |
 | `SEC-07` in-memory rate limiting | **OPEN** | Stage D (Redis) |
-| Docker image build | **NOT TESTED** | no Docker in sandbox; validated by replicating Dockerfile steps in a clean venv |
+| Docker image build | **PASSED in CI** | no Docker in sandbox, but the real GitHub runner built the image successfully — see §8 |
 | Live Meta/Telegram/QPay/Gemini calls | **BLOCKED** | no credentials |
 | Browser/a11y/load tests | **NOT TESTED** | no browser/load harness |
 
@@ -154,3 +154,27 @@ whose column types differ between the Alembic migration and the runtime DDL. The
 
 **STAGE B STATUS: `PASS`** (blockers B1–B9 closed). Overall production readiness remains
 **blocked** until Stage C.
+
+---
+
+## 8. Verified CI run (real GitHub runner, not a local claim)
+
+**Run:** [`43809525617`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43809525617)
+**Trigger:** `pull_request` → `main` (branch `arena/d78ebf88-gerege-ai-agent`)
+**Result: `success`** — **33/33 steps `success`, 0 skipped.**
+
+This is the evidence the Phase 0 audit said was missing. Specifically it proves:
+
+- **TD-01 is fixed.** The migration steps (dry-run, driver check, PG engine, `alembic upgrade head`,
+  data migration, cursor regression) all **executed**. At `48e9c6f` they were `skipped`.
+- The two **new gates** ran and passed: `Dependency Vulnerability Audit` (`pip-audit` → 0 vulns)
+  and `Run Stage B P0/P1 Regression Suite (Live PostgreSQL 16)`.
+- Every live-PG suite that previously failed or was blocked now passes: P0-1 RBAC, P1 Payment,
+  NoFlow, Enterprise, AI Eval, Failure Scenarios.
+- `Build Production Docker Image` **succeeded** — the one item that could not be tested in the
+  local sandbox.
+
+| Run | Commit | Conclusion | Steps executed | Skipped |
+|---|---|---|---|---|
+| `43720772489` (main) | `48e9c6f` (base) | **failure** | 20 | **6** |
+| `43809525617` (PR #1) | `aa6ec97` (+ docs) | **success** | **33** | **0** |
