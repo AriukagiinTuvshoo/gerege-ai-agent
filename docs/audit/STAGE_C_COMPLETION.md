@@ -175,11 +175,37 @@ migration docstring and asserted by a test.
 
 | Suite | SQLite | PostgreSQL 16 |
 |---|---|---|
-| Full `tests/` | **129 passed, 1 skipped** | **129 passed, 1 skipped** |
-| `tests/test_stage_c_schema.py` | **18 passed** | **18 passed** |
+| Full `tests/` | **131 passed, 1 skipped** | **131 passed, 1 skipped** |
+| `tests/test_stage_c_schema.py` | **19 passed** | **19 passed** |
 
-Baseline before Stage C was 112 passed / 1 skipped, so the 17 new Stage C tests all
+Baseline before Stage C was 112 passed / 1 skipped, so the 19 new Stage C tests all
 pass and nothing regressed. The 1 skip is pre-existing.
+
+### Pre-existing first-run failures (not a Stage C regression)
+
+On a **freshly created** PostgreSQL database, four tests in the SQLite→PostgreSQL
+migration/restore group fail on the first run and pass on the second:
+
+`test_phase2_sqlite_to_postgres_migration_dry_run`,
+`test_scenario_11_migration_conflict_detected_and_aborted_without_overwrite`,
+`test_migration_detects_target_only_extra_rows`,
+`test_migration_clean_batch_streaming_succeeds`.
+
+This was verified against the **Stage B baseline** (`7676442`) in a clean git worktree
+with a fresh database — it fails the *same four tests*:
+
+```
+Stage B baseline (7676442), fresh PG database:
+  FAILED test_phase2_sqlite_to_postgres_migration_dry_run
+  FAILED test_scenario_11_migration_conflict_detected_and_aborted_without_overwrite
+  FAILED test_migration_detects_target_only_extra_rows
+  FAILED test_migration_clean_batch_streaming_succeeds
+  4 failed, 108 passed, 1 skipped
+```
+
+CI is unaffected because it migrates the database in an earlier step, which is why the
+Stage B CI run reported 32/32 green. The cause is not yet diagnosed; it is recorded here
+rather than hidden, and it is **not** claimed as fixed.
 
 Stage C tests assert the *end state*, not the implementation: schema convergence after
 `init_db()`, drift **detection** (including the drift the old checker missed),
@@ -239,3 +265,21 @@ Stage C closes P1-02 and P2-01. Still open, unchanged from the Stage B rescore:
 
 Score moves from **57.5** only after those land; this stage removes a *correctness and
 data-loss* class of defect rather than points on the rubric. It is still "do not ship".
+
+---
+
+## 9. Verification environment
+
+All numbers above were produced in this session against:
+
+* PostgreSQL **16.2** (local cluster, `--encoding=UTF8 --locale=C.utf8`)
+* Redis 7 (loopback `127.0.0.1:6379`)
+* Python 3.11, SQLAlchemy **2.1.8**, Alembic **1.20.1**, FastAPI 0.163.1
+
+**Incident during the work:** the sandbox reset mid-session, which destroyed the local
+Python virtualenv, the PostgreSQL cluster, and the *unpushed* git commits. No work was
+lost from the branch that matters — the Stage B commits were already on
+`origin/arena/d78ebf88-gerege-ai-agent`, and the untracked Stage C files survived. The
+tracked-file edits were re-applied and re-verified from scratch, and every result in §4
+and §5 was re-measured afterwards on the rebuilt environment. The practical lesson,
+now applied: commit as soon as a step verifies, rather than batching edits.
