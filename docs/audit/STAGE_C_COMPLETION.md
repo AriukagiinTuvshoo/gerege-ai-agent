@@ -175,37 +175,45 @@ migration docstring and asserted by a test.
 
 | Suite | SQLite | PostgreSQL 16 |
 |---|---|---|
-| Full `tests/` | **131 passed, 1 skipped** | **131 passed, 1 skipped** |
+| Full `tests/` | **132 passed, 1 skipped** | **132 passed, 1 skipped** |
 | `tests/test_stage_c_schema.py` | **19 passed** | **19 passed** |
 
 Baseline before Stage C was 112 passed / 1 skipped, so the 19 new Stage C tests all
 pass and nothing regressed. The 1 skip is pre-existing.
 
-### Pre-existing first-run failures (not a Stage C regression)
+### The first-run PostgreSQL failures were a real bug — now fixed
 
-On a **freshly created** PostgreSQL database, four tests in the SQLite→PostgreSQL
-migration/restore group fail on the first run and pass on the second:
+Four tests in the SQLite→PostgreSQL migration/restore group used to fail on the first run
+against a **freshly created** PostgreSQL database and pass on the second:
 
 `test_phase2_sqlite_to_postgres_migration_dry_run`,
 `test_scenario_11_migration_conflict_detected_and_aborted_without_overwrite`,
 `test_migration_detects_target_only_extra_rows`,
 `test_migration_clean_batch_streaming_succeeds`.
 
-This was verified against the **Stage B baseline** (`7676442`) in a clean git worktree
-with a fresh database — it fails the *same four tests*:
+They also reproduce at the Stage B baseline (`7676442`), so they predate Stage C. The
+cause was found while diagnosing the new CI schema-drift gate:
+
+> **P1-05 — the PostgreSQL restore "atomic rollback" was not atomic.** On a failed
+> restore the code replays the pre-restore snapshot with `pg_dump --clean`. Such a dump
+> only emits `DROP TABLE IF EXISTS` for the tables it contains, so a table created by the
+> rejected restore survives — while the API still reported `atomic_rollback: True`.
+
+The drift gate caught it as a leaked table:
 
 ```
-Stage B baseline (7676442), fresh PG database:
-  FAILED test_phase2_sqlite_to_postgres_migration_dry_run
-  FAILED test_scenario_11_migration_conflict_detected_and_aborted_without_overwrite
-  FAILED test_migration_detects_target_only_extra_rows
-  FAILED test_migration_clean_batch_streaming_succeeds
-  4 failed, 108 passed, 1 skipped
+diff_count: 1
+diffs: [('remove_table', Table('_dummy_temp_tbl', ...))]
 ```
 
-CI is unaffected because it migrates the database in an earlier step, which is why the
-Stage B CI run reported 32/32 green. The cause is not yet diagnosed; it is recorded here
-rather than hidden, and it is **not** claimed as fixed.
+**Fix:** drop and recreate the `public` schema before replaying the snapshot, so the
+replay is authoritative. A regression test asserts that a table created by a failed
+restore is gone after rollback. Result: **132 passed / 1 skipped on SQLite and on
+PostgreSQL, including a first run against a virgin database** — the four order-dependent
+failures are gone.
+
+CI was previously unaffected because it migrated the database in an earlier step. With
+the fix, the whole pipeline is green from a clean database as well.
 
 Stage C tests assert the *end state*, not the implementation: schema convergence after
 `init_db()`, drift **detection** (including the drift the old checker missed),
@@ -283,3 +291,24 @@ lost from the branch that matters — the Stage B commits were already on
 tracked-file edits were re-applied and re-verified from scratch, and every result in §4
 and §5 was re-measured afterwards on the rebuilt environment. The practical lesson,
 now applied: commit as soon as a step verifies, rather than batching edits.
+
+### P1-05 is closed
+
+`P1-05` in the master audit is the restore-rollback finding. It is now fixed and covered
+by a regression test; see the section above. The Stage C drift gate is what exposed it,
+which is the intended value of the gate: the database could previously diverge from
+`core/models.py` after a failed restore without anything noticing.
+
+### CI proof
+
+Run [`43908695706`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43908695706)
+on `11d6c68` — **success**, including every new gate:
+
+| Step | Result |
+|---|---|
+| Initialize SQLite schema & verify zero schema drift | success |
+| Migration integrity (0001 → 0002 → 0001 → 0002, data preserved) | success |
+| Stage C schema authority suite (SQLite) | success |
+| Verify zero schema drift on Live PostgreSQL 16 | success |
+| Stage C schema authority suite (Live PostgreSQL 16) | success |
+| Build Production Docker Image | success |
