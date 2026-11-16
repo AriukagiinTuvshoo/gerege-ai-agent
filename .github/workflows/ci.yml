@@ -73,13 +73,25 @@ jobs:
           # `init_db()` now builds the schema by running the migrations, so this also
           # proves the migration itself produces a schema identical to core/models.py.
           python -c "import database; database.init_db()"
-          python -c "
-          from core.schema_manager import drift_report, current_revision, head_revision
+          python - <<'PY'
+          import sys
+          from core.schema_manager import compare_with_models, current_revision, drift_report, head_revision
+
           report = drift_report()
-          assert current_revision() == head_revision(), (current_revision(), head_revision())
-          assert not report['has_drift'], report
-          print('schema drift: 0 diffs, at head', report['head_revision'])
-          "
+          print("revision:", current_revision(), "head:", head_revision())
+          print("drift:", report)
+          problems = []
+          if current_revision() != head_revision():
+              problems.append(f"not at head: {current_revision()} != {head_revision()}")
+          if report["has_drift"]:
+              problems.append(f"drift: {report['by_kind']}")
+              for diff in compare_with_models()[:10]:
+                  print("  DIFF:", diff)
+          if problems:
+              print("FAILED:", "; ".join(problems))
+              sys.exit(1)
+          print("schema drift: 0 diffs, at head", report["head_revision"])
+          PY
 
       - name: Migration integrity (0001 -> 0002 -> 0001 -> 0002, data preserved)
         run: |
@@ -87,7 +99,9 @@ jobs:
 
       - name: Run Stage C schema authority suite (SQLite)
         run: |
-          pytest tests/test_stage_c_schema.py -v --tb=short
+          python -c "import sys, sqlalchemy, alembic; print(sys.version); print('sqlalchemy', sqlalchemy.__version__, '| alembic', alembic.__version__)"
+          python -c "import database; print('DB_PATH =', database.DB_PATH)"
+          pytest tests/test_stage_c_schema.py -v --tb=short -p no:cacheprovider
 
       - name: Run Pytest Regression, Enterprise, AI Eval & Failure Suites (SQLite mode)
         run: |
@@ -229,7 +243,8 @@ jobs:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
-          pytest tests/test_stage_c_schema.py -v --tb=short
+          python -c "import database; print('DB_PATH =', database.DB_PATH)"
+          pytest tests/test_stage_c_schema.py -v --tb=short -p no:cacheprovider
 
       - name: Run Failure Scenarios Suite (Live PostgreSQL 16 & Redis 7)
         if: ${{ !cancelled() }}
