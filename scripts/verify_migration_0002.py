@@ -82,7 +82,16 @@ def check(cond: bool, label: str, detail: str = "") -> None:
 
 
 def main() -> int:
-    url = os.environ["DATABASE_URL"]
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        # Fall back to the application's own SQLite path so this can run anywhere.
+        from database import resolved_sqlite_path
+
+        url = f"sqlite:///{resolved_sqlite_path()}"
+        print(f"DATABASE_URL not set; using {url}")
+    # Pin the environment as well: `core.schema_manager` resolves the target itself, and
+    # it must pick the same database this script inspects.
+    os.environ["DATABASE_URL"] = url
     is_pg = url.startswith("postgresql")
     engine = sa.create_engine(url)
 
@@ -100,6 +109,24 @@ def main() -> int:
             mc = MigrationContext.configure(c, opts={"compare_type": True})
             raw = compare_metadata(mc, Base.metadata)
         return [x for d in raw for x in (d if isinstance(d, list) else [d])]
+
+    # Start from an empty database: leftover rows from a previous run would be copied
+    # through the migration and confuse the value assertions below.
+    if url.startswith("sqlite"):
+        db_file = url.replace("sqlite:///", "", 1)
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(db_file + suffix)
+            except FileNotFoundError:
+                pass
+        engine.dispose()
+    else:
+        try:
+            with engine.begin() as c:
+                c.execute(sa.text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+        except Exception as exc:  # pragma: no cover - only for convenience databases
+            print(f"Could not reset {url}: {exc}", file=sys.stderr)
+            return 1
 
     print("=== 1. build 0001 ===")
     command.upgrade(cfg, "0001_initial_enterprise_schema")
