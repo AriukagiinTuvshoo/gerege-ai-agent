@@ -14,9 +14,14 @@ also exercise the PostgreSQL `ALTER ... USING` path.
 """
 import os
 import sqlite3
+import sys
 
 import pytest
 import sqlalchemy as sa
+
+# Run from the repository root regardless of how pytest was invoked (CI runs plain
+# `pytest tests/...`; without this the modules under test are not importable).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 

@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import database
 from core import db_engine
+import sqlalchemy as sa
 from core import backup_service
 
 
@@ -309,3 +310,64 @@ if __name__ == "__main__":
     test_postgres_restore_checksum_invariant_across_failed_restore_and_rollback()
     print("[PASS] test_postgres_restore_checksum_invariant_across_failed_restore_and_rollback")
     print("=== ALL P0-2 TESTS PASSED 100% ===")
+
+
+def test_rollback_removes_tables_created_by_the_failed_restore():
+    """
+    B-06 / P1-05: a claimed atomic rollback must restore the *exact* pre-restore schema.
+
+    The 2026-11-16 CI run failed its schema-drift gate because this rollback left
+    `_dummy_temp_tbl` behind. The snapshot is applied with `pg_dump --clean`, which only
+    drops the tables the dump itself contains, so a table introduced by the rejected
+    restore survives and the database no longer matches `core/models.py`.
+    """
+    if not _is_pg():
+        print("[SKIP] Not connected to live PostgreSQL")
+        return
+
+    marker = f"_leaked_by_rollback_{uuid.uuid4().hex[:8]}"
+    tenant_id = f"rb_tenant_{uuid.uuid4().hex[:8]}"
+    database.save_page(page_id=tenant_id, name="Rollback Schema Tenant", category="fintech")
+
+    bad_name = f"pg_rb_leak_{uuid.uuid4().hex[:8]}.sql.gz"
+    bad_gz = os.path.join(backup_service.BACKUP_DIR, bad_name)
+    try:
+        with gzip.open(bad_gz, "wt", encoding="utf-8") as gz:
+            gz.write(f"CREATE TABLE IF NOT EXISTS {marker} (id INT);\n")
+
+        sha = backup_service._compute_sha256(bad_gz)
+        with open(bad_gz + ".sha256", "w", encoding="utf-8") as sf:
+            sf.write(f"{sha}  {bad_name}\n")
+        with open(bad_gz + ".meta.json", "w", encoding="utf-8") as mf:
+            json.dump({"table_counts": {"pages": 99999}}, mf)
+
+        res = backup_service.restore_backup(bad_name)
+        assert res["success"] is False
+        assert res["rolled_back"] is True
+
+        pg_url = db_engine.get_database_url().replace("postgresql+psycopg2://", "postgresql://")
+        engine = sa.create_engine(
+            "postgresql+psycopg2://" + pg_url[len("postgresql://"):], future=True
+        )
+        try:
+            with engine.connect() as conn:
+                left_behind = conn.execute(
+                    sa.text(
+                        "select table_name from information_schema.tables "
+                        "where table_schema='public' and table_name=:t"
+                    ),
+                    {"t": marker},
+                ).fetchall()
+        finally:
+            engine.dispose()
+
+        assert not left_behind, (
+            f"Rollback reported atomic_rollback=True but leaked table {marker!r}. "
+            "The pre-restore snapshot is re-applied with pg_dump --clean, which cannot "
+            "drop tables created after the dump was taken."
+        )
+    finally:
+        for ext in ("", ".sha256", ".meta.json"):
+            p = bad_gz + ext
+            if os.path.exists(p):
+                os.remove(p)

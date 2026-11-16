@@ -368,6 +368,38 @@ def _verify_restored_postgres(pg_url: str, expected_counts: Dict[str, int]) -> D
         engine.dispose()
 
 
+def _reset_public_schema(pg_url: str) -> Tuple[bool, str]:
+    """
+    Drop and recreate the `public` schema so a snapshot can be replayed onto a clean slate.
+
+    Replaying a `pg_dump` snapshot is NOT by itself a rollback: the dump only contains
+    `DROP TABLE IF EXISTS` for the tables it knows about, so any table created after the
+    dump was taken survives. That produced a database that no longer matched
+    `core/models.py` while the API still reported `atomic_rollback: True`
+    (caught by the CI schema-drift gate on 2026-11-16). Dropping the schema first makes
+    the replay authoritative.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "psql",
+                "--single-transaction",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;",
+                pg_url,
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            return False, (proc.stderr or b"").decode("utf-8", errors="replace")
+        return True, ""
+    except Exception as exc:  # pragma: no cover - depends on the server
+        return False, str(exc)
+
+
 def _apply_postgres_sql_file(sql_gz_path: str, pg_url: str, server_ver: int = 0) -> Tuple[bool, str]:
     """Apply a .sql.gz dump to PostgreSQL under --single-transaction."""
     tmp_path = os.path.join(BACKUP_DIR, f".apply_{os.path.basename(sql_gz_path)}.sql")
@@ -575,6 +607,12 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
             )
             rollback_ok = False
             if pre_gz and os.path.exists(pre_gz):
+                # Replay the snapshot onto a clean schema: the dump cannot drop tables that
+                # were created after it was taken, so dropping first is what makes the
+                # rollback actually atomic.
+                reset_ok, reset_err = _reset_public_schema(pg_url)
+                if not reset_ok:
+                    logger.error(f"Could not reset schema before rollback: {reset_err}")
                 rb_applied, rb_err = _apply_postgres_sql_file(pre_gz, pg_url, server_ver=server_ver)
                 if rb_applied:
                     rb_verify = _verify_restored_postgres(pg_url, pre_counts)
