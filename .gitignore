@@ -17,6 +17,7 @@ leads.csv
 *.log
 backups/
 .pytest_cache/
+.scratch/
 .last_working_commit
 
 # Static Generated Files (QRCodes)

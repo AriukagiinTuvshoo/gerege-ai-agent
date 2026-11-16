@@ -8,19 +8,40 @@ import secrets
 import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple
-from core.db_engine import get_db_connection
+from core.db_engine import get_db_connection, get_sqlite_db_path, verify_schema_drift
 
 logger = logging.getLogger("database")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "leads.db")
+#: The SQLite file this process writes to, resolved once at import time.
+#:
+#: Resolution: ``DB_PATH`` environment variable, else the repository default. Doing
+#: this at import (instead of inside `get_connection`) is what keeps the module
+#: attribute and the connection factory in agreement — callers that read
+#: ``database.DB_PATH`` (backup/restore, the SQLite→PostgreSQL migrator, tests) then
+#: observe the same file the application actually uses.
+_DEFAULT_DB_PATH = get_sqlite_db_path(None)
+DB_PATH = _DEFAULT_DB_PATH
 CSV_PATH = os.path.join(os.path.dirname(__file__), "leads.csv")
 DEFAULT_PAGE_ID = "100799479495809"
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ADMIN2026")
 
 
+def resolved_sqlite_path() -> str:
+    """The SQLite path the application is using right now.
+
+    Single authority: `database.DB_PATH` is initialised from the environment at
+    import, and may be rebound at runtime (tests, tooling). `core.schema_manager`
+    consults this function so migrations always target the same file the repositories
+    read and write — the split-brain that silently sent `init_db()`'s seed to
+    `leads.db` while the app read a configured path.
+    """
+    return DB_PATH
+
+
 def get_connection():
     """Нэгдсэн Authoritative Database Connection (PostgreSQL эсвэл SQLite WAL)"""
-    return get_db_connection(sqlite_path=DB_PATH)
+    return get_db_connection(sqlite_path=resolved_sqlite_path())
+
 
 def mask_secret(secret: Optional[str], show_start: int = 6, show_end: int = 4) -> str:
     """Нууц токен болон түлхүүрүүдийг UI дээр ил задгай харагдахаас сэргийлж далдлах"""
@@ -60,345 +81,36 @@ def hmac_equal(a: str, b: str) -> bool:
     return secrets.compare_digest(a, b)
 
 def init_db():
-    """Өгөгдлийн санг үүсгэх / шинэчлэх (Multi-Tenant Agency & RBAC Auth Support)"""
+    """Bring the database to the current schema, then seed first-run data.
+
+    **The schema is no longer defined here.** `init_db()` used to execute ~350 lines
+    of hand-written `CREATE TABLE` DDL plus an `ALTER TABLE ... ADD COLUMN` loop
+    wrapped in bare `except: pass`. That was a second, independent schema definition
+    next to `migrations/versions/0001_*.py`, and the two disagreed on every timestamp
+    (`VARCHAR(64)` vs `TIMESTAMP`) and on ~91 string widths — so the database shape
+    depended on how it happened to be created (findings P1-02 / P2-01).
+
+    Now `core/models.py` + Alembic are the only authority:
+
+      * an empty database is created by running the migrations (this function does it),
+      * an existing database is upgraded in place, with data preserved,
+      * the schema is guaranteed to be at `head` on return, or the call raises.
+
+    Everything below is *data*, not structure: the default tenant row, its magic
+    token, and a one-off cleanup of legacy URL-shaped `page_id` values.
+    """
+    from core.schema_manager import ensure_schema
+
+    report = ensure_schema()
+    logger.info(
+        "Schema ready: %s (%s -> %s)",
+        "upgraded" if report["upgraded"] else "already at head",
+        report["from"] or "<empty>",
+        report["to"],
+    )
+
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA busy_timeout=5000")
-    
-    # 0. Олон Хуудас / Харилцагчийн хүснэгт (Tenants / Pages)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS pages (
-            page_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            category TEXT DEFAULT 'general',
-            page_access_token TEXT,
-            verify_token TEXT DEFAULT 'agent_verify_secret_token_123',
-            is_active INTEGER DEFAULT 1,
-            knowledge_json TEXT,
-            gemini_api_key TEXT DEFAULT '',
-            client_username TEXT,
-            client_password_hash TEXT,
-            client_salt TEXT,
-            client_magic_token TEXT,
-            monthly_token_limit INTEGER DEFAULT 100000,
-            tokens_used INTEGER DEFAULT 0,
-            google_sheets_url TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 1. Бүртгэгдсэн харилцагчид (Leads)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS registrations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT DEFAULT '100799479495809',
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            service TEXT,
-            channel TEXT DEFAULT 'web',
-            sender_id TEXT,
-            status TEXT DEFAULT 'шинэ',
-            notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 2. Харилцан ярианы түүх (Chatwoot загвар - Unified Messages)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT DEFAULT '100799479495809',
-            sender_id TEXT NOT NULL,
-            channel TEXT DEFAULT 'web',
-            sender_type TEXT NOT NULL, -- 'user', 'bot', 'agent' (human)
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 3. Хэрэглэгчийн төлөв (Human takeover status)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS session_states (
-            sender_id TEXT PRIMARY KEY,
-            page_id TEXT DEFAULT '100799479495809',
-            channel TEXT DEFAULT 'web',
-            is_human_takeover INTEGER DEFAULT 0, -- 1 бол AI түр зогсоно
-            customer_name TEXT,
-            customer_phone TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 4. Нэвтрэлтийн сессүүд (RBAC Sessions)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_token TEXT PRIMARY KEY,
-            role TEXT NOT NULL, -- 'admin' or 'client'
-            page_id TEXT,       -- NULL for admin, specific page_id for client
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP
-        )
-    """)
-
-    # 5. Харилцагчийн 3-Түвшинт Санах Ой (Entity & Episodic Memory - Mem0 & Zep загвар)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            customer_name TEXT,
-            phone TEXT,
-            interests TEXT,
-            notes TEXT,
-            last_topic TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, user_id)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_memories_page_user ON user_memories (page_id, user_id)")
-
-    # 6. Финтек & Төлбөрийн нэхэмжлэхүүд (QPay v2 & Bank Deep Links)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS invoices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            invoice_id TEXT UNIQUE NOT NULL,
-            page_id TEXT NOT NULL,
-            sender_id TEXT,
-            channel TEXT DEFAULT 'web',
-            amount INTEGER NOT NULL,
-            description TEXT,
-            status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PAID', 'EXPIRED', 'CANCELLED'
-            qr_text TEXT,
-            qr_image_url TEXT,
-            deep_links_json TEXT,
-            ebarimt_lottery TEXT,
-            ebarimt_qr TEXT,
-            paid_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_page_id ON invoices (page_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_invoice_id ON invoices (invoice_id)")
-
-    # 7. Карго тээвэр ба агуулахын ачаанууд (Warehouse Barcode & Tracking)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS cargo_packages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            tracking_code TEXT NOT NULL,
-            customer_name TEXT,
-            customer_phone TEXT,
-            sender_id TEXT,
-            channel TEXT DEFAULT 'web',
-            weight_kg REAL DEFAULT 0.0,
-            price_amount INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'REGISTERED', -- REGISTERED, IN_TRANSIT, ARRIVED_UB, PAID, DELIVERED
-            warehouse_location TEXT DEFAULT 'УБ Агуулах',
-            invoice_id TEXT,
-            notified_at TIMESTAMP,
-            arrived_at TIMESTAMP,
-            delivered_at TIMESTAMP,
-            notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, tracking_code)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_page_tracking ON cargo_packages (page_id, tracking_code)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_phone ON cargo_packages (customer_phone)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_status ON cargo_packages (status)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_page ON messages (sender_id, page_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_page_created ON messages (page_id, created_at)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_registrations_page_created ON registrations (page_id, created_at)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_registrations_page_phone ON registrations (page_id, phone)")
-
-    # 8. Автомат борлуулалт, сэргээх дүрмүүд (Smart Retention & Follow-up Rules)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS automated_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            rule_type TEXT NOT NULL, -- 'abandoned_chat', 'cargo_pickup', 'retention_followup'
-            delay_hours INTEGER DEFAULT 2,
-            message_template TEXT NOT NULL,
-            is_active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, rule_type)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rules_page ON automated_rules (page_id)")
-
-    # 9. Маркетингийн кампэйн ба 1-Click Broadcast
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS marketing_campaigns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            message TEXT NOT NULL,
-            target_segment TEXT DEFAULT 'all', -- 'all', 'leads_only', 'unregistered'
-            channel TEXT DEFAULT 'all', -- 'all', 'facebook', 'telegram'
-            status TEXT DEFAULT 'COMPLETED',
-            sent_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_page ON marketing_campaigns (page_id)")
-
-    # 10. Илгээгдсэн сэргээх зурвасуудын түүх (Давхардахаас сэргийлэх)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sent_followups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            rule_type TEXT NOT NULL,
-            sender_id TEXT NOT NULL,
-            channel TEXT DEFAULT 'web',
-            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, rule_type, sender_id)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_followups ON sent_followups (page_id, rule_type, sender_id)")
-
-    # 11. Цаг захиалгын систем (Appointments & Booking Calendar)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS appointments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            customer_name TEXT NOT NULL,
-            customer_phone TEXT NOT NULL,
-            service_name TEXT NOT NULL,
-            appointment_date TEXT NOT NULL, -- YYYY-MM-DD
-            appointment_time TEXT NOT NULL, -- HH:MM
-            sender_id TEXT,
-            channel TEXT DEFAULT 'web',
-            status TEXT DEFAULT 'CONFIRMED', -- 'CONFIRMED', 'COMPLETED', 'CANCELLED'
-            reminder_sent INTEGER DEFAULT 0,
-            notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, appointment_date, appointment_time, service_name)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_appointments_page_date ON appointments (page_id, appointment_date)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments (customer_phone)")
-
-    # 12. Давхар мэдэгдлээс хамгаалах түгжээ (Idempotent Notification Lock)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS notification_locks (
-            idempotency_key TEXT PRIMARY KEY,
-            channel TEXT DEFAULT 'any',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 13. Асинхрон фоновые даалгаврын дараалал (Task Queue Jobs)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS task_jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            idempotency_key TEXT UNIQUE,
-            task_name TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'DEAD_LETTER'
-            attempts INTEGER DEFAULT 0,
-            max_retries INTEGER DEFAULT 3,
-            timeout_seconds INTEGER DEFAULT 60,
-            next_run_at TIMESTAMP,
-            locked_by TEXT,
-            locked_at TIMESTAMP,
-            last_error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_jobs_status ON task_jobs (status, created_at)")
-
-    # 14. Аюулгүй байдал ба AI Tool-ийн Аудит Бүртгэл (Audit Logs)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT,
-            actor_role TEXT,
-            actor_id TEXT,
-            action TEXT NOT NULL,
-            resource_type TEXT,
-            resource_id TEXT,
-            details_json TEXT DEFAULT '{}',
-            ip_address TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_page_created ON audit_logs (page_id, created_at)")
-
-    # 15. Сэтгэгдлээс шууд чат руу (Comment-to-DM Automations - noflow inspired)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS comment_automations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            post_id TEXT DEFAULT '*',
-            keyword_pattern TEXT DEFAULT '*',
-            public_reply_text TEXT DEFAULT 'Танд чат руу дэлгэрэнгүй мэдээлэл илгээлээ! ✅',
-            dm_message_text TEXT NOT NULL,
-            cta_button_text TEXT DEFAULT '',
-            cta_url TEXT DEFAULT '',
-            is_active INTEGER DEFAULT 1,
-            trigger_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_comment_auto_page_active ON comment_automations (page_id, is_active)")
-
-    # 16. Богино холбоос ба Click Tracking (CTR Analytics)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tracked_links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            page_id TEXT NOT NULL,
-            automation_id INTEGER,
-            title TEXT DEFAULT '',
-            target_url TEXT NOT NULL,
-            clicks_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracked_links_code ON tracked_links (code)")
-
-    # Багануудыг аюулгүй нэмэх (Migration check)
-    tables_to_migrate = [
-        ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
-        ("messages", "page_id", "TEXT DEFAULT '100799479495809'"),
-        ("session_states", "page_id", "TEXT DEFAULT '100799479495809'"),
-        ("sessions", "revoked", "INTEGER DEFAULT 0"),
-        ("sessions", "revoked_at", "TIMESTAMP"),
-        ("sessions", "ip_address", "TEXT"),
-        ("invoices", "currency", "TEXT DEFAULT 'MNT'"),
-        ("invoices", "qpay_invoice_id", "TEXT"),
-        ("invoices", "provider_payment_id", "TEXT"),
-        ("invoices", "callback_verified", "INTEGER DEFAULT 0"),
-        ("notification_locks", "expires_at", "TIMESTAMP"),
-        ("task_jobs", "timeout_seconds", "INTEGER DEFAULT 60"),
-        ("task_jobs", "next_run_at", "TIMESTAMP"),
-        ("task_jobs", "locked_by", "TEXT"),
-        ("task_jobs", "locked_at", "TIMESTAMP"),
-        ("pages", "gemini_api_key", "TEXT DEFAULT ''"),
-        ("pages", "ai_provider", "TEXT DEFAULT 'gemini'"),
-        ("pages", "client_username", "TEXT"),
-        ("pages", "client_password_hash", "TEXT"),
-        ("pages", "client_salt", "TEXT"),
-        ("pages", "client_magic_token", "TEXT"),
-        ("pages", "monthly_token_limit", "INTEGER DEFAULT 100000"),
-        ("pages", "tokens_used", "INTEGER DEFAULT 0"),
-        ("pages", "qpay_username", "TEXT DEFAULT ''"),
-        ("pages", "qpay_password", "TEXT DEFAULT ''"),
-        ("pages", "qpay_invoice_code", "TEXT DEFAULT ''"),
-        ("pages", "ebarimt_enabled", "INTEGER DEFAULT 1"),
-        ("pages", "telegram_bot_token", "TEXT DEFAULT ''"),
-        ("pages", "telegram_manager_chat_id", "TEXT DEFAULT ''"),
-        ("pages", "daily_report_time", "TEXT DEFAULT '08:30'"),
-        ("pages", "daily_report_enabled", "INTEGER DEFAULT 1")
-    ]
-    for table, col, col_def in tables_to_migrate:
-        try:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
-        except Exception:
-            pass
 
     # Анхны Tuvshok хуудсыг автоматаар бүртгэж үүсгэх
     cursor.execute("SELECT page_id FROM pages WHERE page_id = ?", (DEFAULT_PAGE_ID,))
@@ -451,6 +163,7 @@ def init_db():
     except Exception as e:
         logger.error(f"Migration page_id sanitization error: {e}")
 
+    conn.commit()
     conn.commit()
     conn.close()
 

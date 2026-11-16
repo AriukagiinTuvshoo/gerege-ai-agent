@@ -37,21 +37,22 @@ _HEAD_REVISION: Optional[str] = None
 def _resolved_sqlite_path() -> Optional[str]:
     """The SQLite file the *application* is actually using.
 
-    `database.DB_PATH` is the historical single source of truth for the running app,
-    and callers (tests, tooling, `scripts/migrate.py`) rebind it at runtime. Alembic
-    needs to migrate that same file, otherwise the schema is created in one database
-    and the application reads another — the split-brain this module exists to remove.
+    Delegated to `database.resolved_sqlite_path()` — one authority, so Alembic can
+    never migrate a different file than the repositories read and write. That
+    divergence used to happen: the migration path resolved `DB_PATH` from the
+    environment while the connection path used the module attribute, so `init_db()`
+    could report success against a schema it had created somewhere else.
     """
     if os.getenv("DATABASE_URL", "").strip():
         return None  # an explicit URL always wins
-    env_path = os.getenv("DB_PATH", "").strip()
-    if env_path:
-        return env_path
     try:
         import database as _database
 
+        resolver = getattr(_database, "resolved_sqlite_path", None)
+        if callable(resolver):
+            return resolver()
         return getattr(_database, "DB_PATH", None)
-    except Exception:  # pragma: no cover - database module always importable in practice
+    except Exception:  # pragma: no cover - database module is always importable in practice
         return None
 
 

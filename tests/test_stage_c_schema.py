@@ -382,25 +382,56 @@ def test_preflight_reports_no_pending_migrations(sqlite_db):
     assert report["pending_count"] == 0, report
 
 
-def test_get_connection_honours_db_path_env(tmp_path, monkeypatch):
-    """`DB_PATH` must actually direct the connection, not just `database.DB_PATH`.
+def test_db_path_env_is_honoured_at_import(tmp_path):
+    """`DB_PATH` must direct the connection *and* `database.DB_PATH`.
 
-    The original code passed `sqlite_path=DB_PATH` explicitly, which bypassed the
-    environment lookup: `init_db()` seeded the repository-local `leads.db` while the
-    operator's configured database stayed empty.
+    The original code passed `sqlite_path=DB_PATH` explicitly, bypassing the
+    environment lookup entirely: `init_db()` seeded the repository-local `leads.db`
+    while the operator's configured file stayed empty.
+
+    `DB_PATH` is resolved once at import, so this is proved in a subprocess with a
+    clean environment — that is the real deployment shape.
     """
-    target = tmp_path / "env_path.db"
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("DB_PATH", str(target))
-    monkeypatch.setattr(database, "DB_PATH", database._DEFAULT_DB_PATH)
+    import subprocess
+    import sys
 
-    database.init_db()
-    assert target.exists(), "DB_PATH was ignored"
-    conn = sqlite3.connect(target)
-    try:
-        assert conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] >= 1
-    finally:
-        conn.close()
+    target = tmp_path / "env_path.db"
+    env = {k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "DB_PATH")}
+    env["DB_PATH"] = str(target)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import database;"
+            "assert database.DB_PATH == database.resolved_sqlite_path(), 'split brain';"
+            "database.init_db();"
+            "import sqlite3;"
+            "c = sqlite3.connect(database.DB_PATH);"
+            "assert c.execute('select count(*) from pages').fetchone()[0] >= 1, 'no seed';"
+            "print('OK', database.DB_PATH)",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    assert "OK" in result.stdout
+    assert target.exists(), "DB_PATH was ignored: the configured file was never created"
+
+
+def test_schema_manager_and_connection_agree_on_the_sqlite_path(sqlite_db):
+    """Alembic and the repositories must target the same file.
+
+    They disagreed before: the migration path read `DB_PATH` from the environment while
+    the connection path used the module attribute, so a migration could "succeed"
+    against a database the application never opened.
+    """
+    from core.schema_manager import _resolved_sqlite_path
+
+    assert _resolved_sqlite_path() == database.resolved_sqlite_path()
+    assert _resolved_sqlite_path() == database.DB_PATH
 
 
 def test_schema_manager_detects_drift_on_a_stale_database(sqlite_db):

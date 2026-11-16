@@ -1,6 +1,5 @@
 import os
 import re
-import ast
 import sqlite3
 import logging
 import threading
@@ -466,62 +465,30 @@ def get_db_connection(sqlite_path: Optional[str] = None):
 
 
 def verify_schema_drift() -> Dict[str, Any]:
+    """Compare the live database with `core/models.py`, types included.
+
+    **This used to be blind.** The previous implementation AST-parsed
+    `core/models.py` and `0001_initial_enterprise_schema.py` and compared the set of
+    column *names*, so it reported "no drift" for two schemas whose column types and
+    nullability disagreed on 58 columns, and it never looked at the live database at
+    all (P2-01).
+
+    It now delegates to `core.schema_manager.drift_report()`, which uses Alembic's
+    autogenerate machinery with `compare_type=True` against the real database.
+
+    Returns a dict; `has_drift` is False only when the database matches the models
+    exactly, including types, indexes, and constraints.
     """
-    `core/models.py`, `migrations/versions/0001_initial_enterprise_schema.py` болон
-    ажиллаж буй өгөгдлийн сангийн 15 хүснэгт ба баганыг тулгаж Schema Drift байгаа эсэхийг шалгах.
-    """
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    models_path = os.path.join(root_dir, "core", "models.py")
-    mig_path = os.path.join(root_dir, "migrations", "versions", "0001_initial_enterprise_schema.py")
+    from core.schema_manager import drift_report
 
-    # 1. Extract tables & columns from core/models.py via AST
-    models_tree = ast.parse(open(models_path, "r", encoding="utf-8").read(), filename="core/models.py")
-    model_tables: Dict[str, Set[str]] = {}
-    for node in models_tree.body:
-        if isinstance(node, ast.ClassDef):
-            tname = None
-            cols: Set[str] = set()
-            for item in node.body:
-                if isinstance(item, ast.Assign):
-                    for target in item.targets:
-                        if isinstance(target, ast.Name):
-                            if target.id == "__tablename__" and isinstance(item.value, ast.Constant):
-                                tname = str(item.value.value)
-                            elif isinstance(item.value, ast.Call):
-                                func = item.value.func
-                                fname = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-                                if fname == "Column":
-                                    cols.add(target.id)
-            if tname:
-                model_tables[tname] = cols
-
-    # 2. Extract tables & columns from Alembic 0001_initial_enterprise_schema.py via AST
-    mig_tree = ast.parse(open(mig_path, "r", encoding="utf-8").read(), filename="0001_initial_enterprise_schema.py")
-    mig_tables: Dict[str, Set[str]] = {}
-    for node in ast.walk(mig_tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "create_table":
-            if node.args and isinstance(node.args[0], ast.Constant):
-                tname = str(node.args[0].value)
-                cols = set()
-                for arg in node.args[1:]:
-                    if isinstance(arg, ast.Call) and getattr(arg.func, "attr", "") == "Column":
-                        if arg.args and isinstance(arg.args[0], ast.Constant):
-                            cols.add(str(arg.args[0].value))
-                mig_tables[tname] = cols
-
-    # 3. Compare model_tables vs mig_tables
-    drift_details: Dict[str, Any] = {}
-    for tname, m_cols in model_tables.items():
-        a_cols = mig_tables.get(tname, set())
-        if m_cols != a_cols:
-            drift_details[tname] = {
-                "in_models_only": sorted(m_cols - a_cols),
-                "in_alembic_only": sorted(a_cols - m_cols),
-            }
-
+    report = drift_report()
     return {
-        "has_drift": bool(drift_details) or (set(model_tables.keys()) != set(mig_tables.keys())),
-        "table_count": len(model_tables),
-        "tables": sorted(model_tables.keys()),
-        "drift_details": drift_details,
+        "has_drift": report.get("has_drift", True),
+        "table_count": 0,  # retained for backward compatibility
+        "tables": [],  # retained for backward compatibility
+        "drift_details": report.get("by_kind", {}),
+        "diff_count": report.get("count", 0),
+        "current_revision": report.get("current_revision"),
+        "head_revision": report.get("head_revision"),
+        "comparison": "alembic.autogenerate(compare_type=True)",
     }

@@ -6,6 +6,7 @@ from datetime import datetime
 from sqlalchemy import (
     Column,
     Integer,
+    func,
     String,
     Text,
     Float,
@@ -16,6 +17,16 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
+
+#: Database-side default for every `created_at` / `updated_at` / `sent_at` column.
+#:
+#: The Python ``default=datetime.utcnow`` alone is not enough: a row inserted by raw
+#: SQL that omits the column (many helpers in `database.py` do exactly that) gets
+#: ``NULL``. The legacy runtime DDL used ``DEFAULT CURRENT_TIMESTAMP``, so dropping it
+#: in favour of migrations silently changed behaviour and made freshly created rows
+#: sort and render as "unknown time". Declaring the default on the model keeps both
+#: insert paths — ORM and raw SQL — producing a timestamp.
+TS_DEFAULT = func.current_timestamp()
 
 
 class PageModel(Base):
@@ -45,7 +56,7 @@ class PageModel(Base):
     tokens_used = Column(Integer, default=0)
     knowledge_json = Column(Text, default="{}")
     is_active = Column(Integer, default=1)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
 
 class RegistrationModel(Base):
@@ -60,7 +71,7 @@ class RegistrationModel(Base):
     sender_id = Column(String(255), nullable=True)
     notes = Column(Text, nullable=True)
     status = Column(String(64), default="шинэ")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         Index("idx_registrations_page_created", "page_id", "created_at"),
@@ -77,7 +88,7 @@ class MessageModel(Base):
     channel = Column(String(64), default="web")
     sender_type = Column(String(32), nullable=False)
     content = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         Index("idx_messages_sender_page", "sender_id", "page_id"),
@@ -94,7 +105,7 @@ class SessionStateModel(Base):
     is_human_takeover = Column(Integer, default=0)
     customer_name = Column(String(255), nullable=True)
     customer_phone = Column(String(64), nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
 
 class AuthSessionModel(Base):
@@ -106,7 +117,7 @@ class AuthSessionModel(Base):
     revoked = Column(Integer, default=0)
     revoked_at = Column(DateTime, nullable=True)
     ip_address = Column(String(64), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
     expires_at = Column(DateTime, nullable=False)
 
 
@@ -121,7 +132,7 @@ class UserMemoryModel(Base):
     interests = Column(Text, nullable=True)
     notes = Column(Text, nullable=True)
     last_topic = Column(Text, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         UniqueConstraint("page_id", "user_id", name="uq_user_memories_page_user"),
@@ -150,7 +161,7 @@ class PaymentInvoiceModel(Base):
     ebarimt_lottery = Column(String(64), nullable=True)
     ebarimt_qr = Column(Text, nullable=True)
     paid_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         Index("idx_invoices_page_id", "page_id"),
@@ -177,7 +188,7 @@ class CargoPackageModel(Base):
     arrived_at = Column(DateTime, nullable=True)
     delivered_at = Column(DateTime, nullable=True)
     notes = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         UniqueConstraint("page_id", "tracking_code", name="uq_cargo_page_tracking"),
@@ -196,7 +207,7 @@ class AutomatedRuleModel(Base):
     delay_hours = Column(Integer, default=2)
     message_template = Column(Text, nullable=False)
     is_active = Column(Integer, default=1)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         UniqueConstraint("page_id", "rule_type", name="uq_automated_rule_page_type"),
@@ -215,7 +226,7 @@ class MarketingCampaignModel(Base):
     channel = Column(String(64), default="all")
     status = Column(String(64), default="COMPLETED")
     sent_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         Index("idx_campaigns_page", "page_id"),
@@ -230,7 +241,7 @@ class SentFollowupModel(Base):
     rule_type = Column(String(64), nullable=False)
     sender_id = Column(String(255), nullable=False)
     channel = Column(String(64), default="web")
-    sent_at = Column(DateTime, default=datetime.utcnow)
+    sent_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         UniqueConstraint("page_id", "rule_type", "sender_id", name="uq_sent_followup"),
@@ -253,7 +264,7 @@ class AppointmentModel(Base):
     status = Column(String(64), default="CONFIRMED")
     reminder_sent = Column(Integer, default=0)
     notes = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         UniqueConstraint(
@@ -274,7 +285,7 @@ class NotificationLockModel(Base):
     idempotency_key = Column(String(255), primary_key=True)
     channel = Column(String(64), default="any")
     expires_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
 
 class TaskJobModel(Base):
@@ -292,8 +303,8 @@ class TaskJobModel(Base):
     locked_by = Column(String(128), nullable=True)
     locked_at = Column(DateTime, nullable=True)
     last_error = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
+    updated_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         Index("idx_task_jobs_status", "status", "created_at"),
@@ -312,7 +323,7 @@ class AuditLogModel(Base):
     resource_id = Column(String(255), nullable=True)
     details_json = Column(Text, default="{}")
     ip_address = Column(String(64), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         Index("idx_audit_logs_page_created", "page_id", "created_at"),
@@ -333,7 +344,7 @@ class CommentAutomationModel(Base):
     cta_url = Column(Text, default="")
     is_active = Column(Integer, default=1)
     trigger_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         Index("idx_comment_auto_page_active", "page_id", "is_active"),
@@ -350,7 +361,7 @@ class TrackedLinkModel(Base):
     title = Column(String(255), default="")
     target_url = Column(Text, nullable=False)
     clicks_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
         Index("idx_tracked_links_code", "code"),
