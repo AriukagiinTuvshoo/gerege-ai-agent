@@ -87,6 +87,18 @@ class AdmissionToken:
     window_seconds: Optional[int] = None
 
 
+class StoreAtCapacityError(RuntimeError):
+    """
+    The memory store is full of *live* counters and refused to make room.
+
+    E-02 Phase 4.4. Raised only by the process-local fallback, never by Redis. It is distinct
+    from a generic store failure because the account path must fail **closed** on it: admitting
+    an account whose failures cannot be recorded would grant that account an unlimited budget.
+    The IP scope deliberately treats it exactly like any other store error (fail open), because
+    there the alternative is a limiter outage logging everybody out.
+    """
+
+
 def _new_generation() -> str:
     """A fresh, unguessable generation marker for one counter incarnation."""
     return secrets.token_hex(8)
@@ -150,22 +162,37 @@ class _MemoryStore:
         self._lock = threading.Lock()
         self._counters: Dict[str, _MemoryCounter] = {}
 
-    def _evict_if_needed(self, now: float) -> None:
+    def _reclaim_expired(self, now: float) -> None:
         """
-        Keep the dict bounded. Called with the lock held.
+        Drop every counter whose window has passed. Called with the lock held.
 
-        Only whole counters are evicted, and only ones whose window has certainly passed, so an
-        eviction can never remove a live generation or a claim that still matters. If a hostile
-        client still manages to fill the dict with live windows, the oldest insertion order goes
-        — the same availability-over-precision trade the store has always made, now stated.
+        E-02 Phase 4.4. This *only* removes expired entries. The previous version reclaimed
+        expired entries and then, if still over the cap, dropped the oldest **live** counter —
+        which let an attacker erase any account's failure budget by filling the store, and which
+        contradicted its own docstring. A live counter is now never removed; capacity pressure
+        is refused instead (see `_make_room`).
         """
-        if len(self._counters) <= _MAX_TRACKED_IDENTITIES:
-            return
         stale = [k for k, c in self._counters.items() if c.expired_at(now)]
         for k in stale:
             self._counters.pop(k, None)
-        while len(self._counters) > _MAX_TRACKED_IDENTITIES:
-            self._counters.pop(next(iter(self._counters)))
+
+    def _make_room(self, now: float) -> bool:
+        """
+        Try to free a slot for a brand-new identity. Called with the lock held.
+
+        Returns True if a slot is available. Reclaims expired entries first — the safe way to
+        regain capacity — and refuses rather than displacing a live counter.
+
+        Refusing is the security-preserving direction: an account admitted while its counter
+        cannot be stored would never be throttled, which is a worse outcome than that identity
+        waiting for another account's window to lapse. The cost is availability for *new*
+        identities only; identities that already have a live counter are always served, so no
+        active limit is ever weakened by this path.
+        """
+        if len(self._counters) < _MAX_TRACKED_IDENTITIES:
+            return True
+        self._reclaim_expired(now)
+        return len(self._counters) < _MAX_TRACKED_IDENTITIES
 
     def _live_entry(self, key: str, now: float, window_seconds: Optional[int] = None):
         """
@@ -200,18 +227,34 @@ class _MemoryStore:
         """
         now = self._clock()
         with self._lock:
-            entry = self._live_entry(key, now, window_seconds)
+            entry = self._counters.get(key)
+            if entry is not None and entry.expired_at(now):
+                # Reclaim on sight, exactly as Redis has already done. Note the entry's own
+                # window decides this, not the caller's: see the policy note below.
+                self._counters.pop(key, None)
+                entry = None
+
             if entry is None or not entry.generation:
+                # E-02 Phase 4.4 policy: a counter's window is fixed when its generation is
+                # created, and later admissions inherit it. This is what Redis does — its TTL
+                # is written once inside the script that creates the counter and never
+                # revisited — and it is what the fixed-window model requires: a window that any
+                # caller can widen is not a window.
+                #
+                # This path creates a generation, so it is the only one that can grow the dict.
+                # Capacity pressure is refused here rather than by displacing a live counter.
+                if not self._make_room(now):
+                    raise StoreAtCapacityError(
+                        f"memory store is at capacity ({_MAX_TRACKED_IDENTITIES} live "
+                        "identities); refusing to admit a new identity"
+                    )
                 entry = _MemoryCounter(now, int(window_seconds), _new_generation())
                 self._counters[key] = entry
-            elif entry.window_seconds != int(window_seconds):
-                # The caller is using a different window on an existing counter. The counter's
-                # own window wins for expiry, so keep the wider of the two rather than letting
-                # a shorter call retroactively expire a longer-lived admission.
-                entry.window_seconds = max(entry.window_seconds, int(window_seconds))
+            # An existing generation keeps its own window; the caller's is deliberately ignored,
+            # so a later longer admission cannot extend this counter and a later shorter one
+            # cannot cut it short.
             entry.count += 1
             remaining = max(1, int(entry.window_seconds - (now - entry.started)))
-            self._evict_if_needed(now)
             return {"count": entry.count, "ttl": remaining, "generation": entry.generation}
 
     def read_counter(self, key: str, window_seconds: Optional[int] = None) -> int:
@@ -254,9 +297,17 @@ class _MemoryStore:
             return False
         now = self._clock()
         with self._lock:
-            entry = self._live_entry(key, now, token.window_seconds)
+            # E-02 Phase 4.4. Expiry is judged by the *counter's* window, never the token's.
+            # A token carries the window its caller asked for, which is not necessarily the
+            # window its generation actually has; letting the token decide made the same token
+            # live on Redis and dead on memory (scenario B in the audit evidence).
+            entry = self._counters.get(key)
             if entry is None:
-                # Absent or expired: the admission's window no longer exists.
+                return False
+            if entry.expired_at(now):
+                # Reclaim on sight: the generation is gone, exactly as Redis's TTL has already
+                # removed it.
+                self._counters.pop(key, None)
                 return False
             if entry.generation != token.generation:
                 # A different incarnation of this counter; the admission is not ours to undo.
@@ -1087,6 +1138,17 @@ def check_account_login_allowed(
         # same `incr_in_window_detailed` contract under its lock.
         result = limiter._store.incr_in_window_detailed(key, effective_window)
         count, remaining, generation = result["count"], result["ttl"], result["generation"]
+    except StoreAtCapacityError as exc:
+        # E-02 Phase 4.4. The memory store is full of live counters and would have had to evict
+        # one to admit this identity. Fail CLOSED: admitting an account whose failures cannot be
+        # recorded would hand it an unlimited budget. No token, no counter, no other identity
+        # touched. (Redis never raises this.)
+        logger.error(f"Account throttle at capacity for {ACCOUNT_SCOPE} ({exc}); refusing")
+        return {
+            "allowed": False, "count": 0, "limit": effective_limit,
+            "retry_after": effective_window, "identity": identity, "canonical": canonical,
+            "token": None, "at_capacity": True,
+        }
     except Exception as exc:  # pragma: no cover - depends on a live server
         # Same posture as the IP limiter: a store outage must not take login down. It is also
         # not silent — E-03 owns the general fail-open/fail-closed policy.
@@ -1113,7 +1175,12 @@ def check_account_login_allowed(
                 identity=identity,
                 generation=generation,
                 admission_id=_new_generation(),
-                window_seconds=int(effective_window),
+                # The generation's own window, not the one this caller asked for. `remaining`
+                # is what the store reports for this generation, so the token can never claim
+                # a longer (or shorter) life than the counter it belongs to. The refund takes
+                # the authoritative path in the store either way; this keeps the token honest
+                # for anyone inspecting it.
+                window_seconds=int(remaining),
             )
             if allowed
             else None
