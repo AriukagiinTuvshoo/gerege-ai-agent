@@ -220,11 +220,11 @@ image decoding in-process.
 |---|---|---|---|
 | SEC-01 | **P0** | CORS wildcard + credentials | Open |
 | SEC-02 | P1 | Cross-tenant invoice read | Open |
-| SEC-03 | P2 | Missing CSP / HSTS | Open |
-| SEC-04 | P2 | Per-process webhook dedup | Open |
+| SEC-03 | P2 | Missing CSP / HSTS | **Closed (Stage D)** — CSP + production HSTS |
+| SEC-04 | P2 | Per-process webhook dedup | **Closed (Stage D)** — cross-process webhook dedup |
 | SEC-05 | P2 | Masked exceptions / no tracebacks | Open |
 | SEC-06 | P1 | 76 Pillow CVEs unfixable due to pin | Open |
-| SEC-07 | P2 | In-memory rate limiting, unthrottled public endpoints | Open |
+| SEC-07 | P2 | In-memory rate limiting, unthrottled public endpoints | **Closed (Stage D)** — shared-store rate limits |
 | SEC-08 | P2 | Public guessable invoice IDs reveal amount/description | Open |
 
 `P0` count = **2** (`SEC-01`, plus data-integrity `P0-01` in `BASELINE_AUDIT.md`). **Production is blocked.**

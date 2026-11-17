@@ -39,6 +39,9 @@ Audit commit: `48e9c6f`. All measurements reproducible (see `BASELINE_AUDIT.md` 
 | B8 | `TD-01` CI skips migration verification | Regressions merge unseen | **S** (add `if: !cancelled()`) |
 | B9 | `TD-03` pytest fixture absent | 5 permanent false failures training green-blindness | **S** (fixture) |
 | B10 | `P1-06` zero foreign keys | Orphaned tenant rows; no referential integrity | **M** (FKs + backfill check) |
+| B11 | `SEC-03` no CSP/HSTS | Stored XSS or CDN compromise executes with operator session | **S** |
+| B12 | `SEC-04` per-process webhook dedup | Duplicate replies to customers with >1 worker | **S** |
+| B13 | `SEC-07` per-process rate limits | Login brute force limit is 10 × worker count; 3 public endpoints unlimited | **M** |
 
 `S` ≈ < 1 day, `L` ≈ 3–5 days. **Total to clear blocks: ~2–3 focused days**, of which schema rework (B3)
 is the long pole.
@@ -53,18 +56,31 @@ capped rather than guessed.
 | Dimension | Max | Score | Evidence / why not higher |
 |---|---|---|---|
 | Architecture | 10 | **4.5** | Clear separation exists (`core/`, `routers/`, services) and the compat layer is a thoughtful bridge. But: dual schema authority, 2.5 k-LOC `database.py`, services importing the app, 3 token extractors. |
-| Security | 15 | **10.5** | Strong: PBKDF2, timing-safe compares, fail-closed webhook sigs, server-authoritative roles, 6/6 escalation tests, prod admin fail-closed, payment simulator locked. Closed in Stage B: CORS bypass, cross-tenant invoice read, 78 CVEs. Remaining deductions: no CSP/HSTS (SEC-03), in-memory rate limits (SEC-07), per-process webhook dedup (SEC-04). |
-| Database & Integrity | 10 | **5.0** | Alembic up/down works; backups have SHA-256 + per-table counts; restore rollback verified 7/7. Closed in Stage B: `LIKE` date filters, `lastrowid` gaps. Remaining: 251 type diffs (P1-02), drift checker blind to types (P2-01), no FK constraints (P1-06) — all Stage C. |
-| Backend Reliability | 10 | **7.5** | DB-backed queue with atomic claim + visibility recovery + DLQ + graceful shutdown (all tested). Closed in Stage B: `P1-07` worker `GroupingError` (silent PostgreSQL-only outage), 4 × endpoint 500. Remaining: per-process dedup/limits/circuit-breakers, no inbound webhook retry/DLQ. |
+| Security | 15 | **13.0** | Strong: PBKDF2, timing-safe compares, fail-closed webhook sigs, server-authoritative roles, 6/6 escalation tests, prod admin fail-closed, payment simulator locked. Closed in Stage B: CORS bypass, cross-tenant invoice read, 78 CVEs. Closed in Stage D: CSP + production-only HSTS (SEC-03), cross-process webhook dedup in `notification_locks` (SEC-04), shared-store rate limits on login plus the three previously unthrottled public endpoints (SEC-07). Remaining deduction: the CSP still needs `'unsafe-inline'`/`'unsafe-eval'` because the dashboard uses 118 inline handlers and runtime Tailwind — a partial mitigation, documented as such. |
+| Database & Integrity | 10 | **9.0** | Alembic up/down works; backups have SHA-256 + per-table counts; restore rollback verified 8/8. Closed in Stage C: 251 type diffs (P1-02), drift checker blind to types (P2-01) — `models.py` is now the single authority and every schema origin converges to 0 diffs. Closed in Stage D: 16 foreign keys (P1-06) with CASCADE / SET NULL policies. Also fixed a real bug found by the new drift gate: the restore rollback replayed a snapshot without clearing the schema, so a rejected restore could leave tables behind while reporting `atomic_rollback: True`. Remaining deduction: no coverage gate on migrations. |
+| Backend Reliability | 10 | **8.5** | DB-backed queue with atomic claim + visibility recovery + DLQ + graceful shutdown (all tested). Closed in Stage B: `P1-07` worker `GroupingError` (silent PostgreSQL-only outage), 4 × endpoint 500. Remaining: circuit breakers are still per-process; no inbound webhook retry/DLQ. |
 | AI Quality | 10 | **5.5** | Injection detection, secret-leak evaluation, circuit breaker, retry/backoff, tool guard (max 3 calls), deterministic CI fallback. Deductions: no provider interface (Gemini-welded), no prompt versioning/regression dataset, token counts are estimates, no RAG. |
 | Omnichannel Integration | 10 | **4.5** | Meta/IG/Telegram/ManyChat/web widget all wired with fail-closed secret checks. Deductions: **zero live provider round-trips verified** (no credentials), comment-to-DM broken on PG, no per-channel adapter interface, no attachment validation. |
 | CRM & Automation | 10 | **5.5** | Leads, status, CSV/Excel, keyword rules, comment rules, delays, execution history, DLQ. Closed in Stage B: `/api/leads` 500 on PG, comment-to-DM `id: None` on PG. Remaining: no tags/custom fields/pipeline/merge/dedup/assignment/notes; no visual builder. |
 | Frontend & UX | 8 | **4.0** | All 66 handlers wired, no fake data, Mongolian, responsive Tailwind. Deductions: 5.5 k-LOC single file, 118 inline handlers, CDN runtime compile (CSP-hostile, outage-coupled), no a11y audit, no loading/empty/error-state audit. |
 | Performance & Scalability | 7 | **2.0** | **No load test exists and none was run** (see §4). List endpoints do in-Python filtering over up to 2,000 rows; unbounded `get_all_registrations`. Score capped because it is unmeasured. |
-| Testing & CI/CD | 5 | **4.5** | 113 real tests, **112 pass in both modes**; live PG+Redis; migration & restore suites genuinely exercise PG. Closed in Stage B: HEAD CI red, step-8 blocking, missing pytest fixture, dependency audit. Remaining: no coverage gate, no load/e2e-browser tests. |
+| Testing & CI/CD | 5 | **4.5** | 166 real tests, **165 pass in both modes** (live PostgreSQL 16 + Redis 7); live PG+Redis; migration & restore suites genuinely exercise PG. Closed in Stage B: HEAD CI red, step-8 blocking, missing pytest fixture, dependency audit. Remaining: no coverage gate, no load/e2e-browser tests. |
 | DevOps & Observability | 3 | **1.5** | Non-root Docker, healthchecks, compose limits, backup/restore, deploy+rollback scripts. Deductions: no Prometheus/metrics export, in-memory telemetry, no structured logging/tracebacks, no alerting. |
 | Documentation | 2 | **0.5** | Volume is high (7 doc areas), but `FINAL_PRODUCTION_READINESS.md` states "Zero Schema Drift" and "20/20 passed" — both falsified in this audit. Self-reported PASS is unsupported. |
-| **Total** | **100** | **57.5** | |
+| **Total** | **100** | **63.0** | Sum of the dimension scores above. |
+
+### Arithmetic correction (Stage D)
+
+The published total was **57.5**, but the dimension rows summed to **55.5** — the total was
+not the sum of its own parts. Rather than preserve an unsupported number, the table is now
+recomputed from the rows and the total is stated as the sum: **63.0**. Anyone can verify it
+with:
+
+```python
+re.findall(r'^\| ([A-Za-z &/]+) \| (\d+) \| \*\*([\d.]+)\*\*', open(path).read(), re.M)
+```
+
+This is a documentation honesty fix, not a score change on its own merit.
 
 ### Score deltas after Stage B (evidence, not intent)
 
@@ -87,7 +103,7 @@ Stage B did not touch them. Performance stays **2.0** because no load test has b
 | 90–94 | High quality, low risk | |
 | 80–89 | Good, possible blockers | |
 | 70–79 | Major improvements needed | |
-| **0–69** | **Do not ship** | **57.5 ⇒ do not ship** (was 45.5) |
+| **0–69** | **Do not ship** | **63.0 ⇒ do not ship** (was 45.5 → 57.5 → 63.0) |
 
 This is an internal engineering assessment, not an external certification.
 
