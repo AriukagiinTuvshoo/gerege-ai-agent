@@ -1026,7 +1026,17 @@ async def get_active_sessions(
         allow_admin_all=True,
         permission="sessions:read",
     )
-    sessions = database.get_active_sessions(page_id=target_page)
+    if target_page:
+        sessions = database.get_active_sessions(page_id=target_page)
+    else:
+        # Admin asked for every branch. E-01 removed the unscoped call, so the cross-tenant
+        # view is now an explicit per-tenant aggregate rather than a silent "all rows" query.
+        sessions = [
+            row
+            for page in database.get_all_pages()
+            for row in database.get_active_sessions(page_id=page["page_id"])
+        ]
+        sessions.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
     sliced = sessions[offset : offset + limit]
     return JSONResponse({"total": len(sessions), "limit": limit, "offset": offset, "data": sliced})
 

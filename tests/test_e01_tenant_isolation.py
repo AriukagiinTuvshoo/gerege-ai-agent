@@ -274,3 +274,169 @@ def test_session_identity_is_tenant_scoped_in_the_schema(client):
         assert cur.fetchone()[0] == 2, "two tenants could not both keep their own session"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Remaining mandated cases (9, 11, 12)
+# ---------------------------------------------------------------------------
+def test_message_bodies_are_not_mixed_between_tenants(client):
+    """
+    Test 9: with a session in BOTH tenants, neither message body may appear in the
+    other's transcript. Tests 2-3 check counts and flags; this checks the content.
+    """
+    _chat(client, "ACME-SECRET-CONTENT", ACME)
+    _chat(client, "GLOBEX-SECRET-CONTENT", GLOBEX)
+
+    acme = client.get(f"/api/sessions/{CUSTOMER}/messages", headers=_tenant_token(ACME)).json()
+    globex = client.get(f"/api/sessions/{CUSTOMER}/messages", headers=_tenant_token(GLOBEX)).json()
+
+    acme_text = " ".join((m.get("content") or "") for m in acme["messages"])
+    globex_text = " ".join((m.get("content") or "") for m in globex["messages"])
+
+    assert "ACME-SECRET-CONTENT" in acme_text, "Acme cannot read its own message"
+    assert "ACME-SECRET-CONTENT" not in globex_text, (
+        "E-01: Acme's message body appeared in Globex's transcript"
+    )
+    assert "GLOBEX-SECRET-CONTENT" in globex_text, "Globex cannot read its own message"
+    assert "GLOBEX-SECRET-CONTENT" not in acme_text, (
+        "E-01: Globex's message body appeared in Acme's transcript"
+    )
+    assert all(m["page_id"] == ACME for m in acme["messages"]), "Acme received a foreign page_id"
+    assert all(m["page_id"] == GLOBEX for m in globex["messages"]), "Globex received a foreign page_id"
+
+
+def test_concurrent_writes_from_two_tenants_do_not_collide(client):
+    """
+    Test 11: both tenants writing the same sender at the same time.
+
+    With a sender-only key the two upserts race on one row and one tenant overwrites the
+    other. With `(page_id, sender_id)` they address different rows, so both must survive
+    intact and no duplicate identity may be created.
+    """
+    import threading
+
+    errors = []
+
+    def write(page_id):
+        try:
+            for i in range(10):
+                database.log_message(
+                    sender_id=CUSTOMER, channel="web", sender_type="user",
+                    content=f"{page_id}-{i}", page_id=page_id,
+                )
+                database.save_registration(
+                    page_id=page_id, sender_id=CUSTOMER,
+                    name=f"{page_id}-name", phone=f"{page_id}-phone",
+                )
+        except Exception as exc:  # noqa: BLE001 - surfaced below
+            errors.append((page_id, exc))
+
+    threads = [threading.Thread(target=write, args=(p,)) for p in (ACME, GLOBEX, ACME, GLOBEX)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent writes raised: {errors}"
+
+    for page_id in (ACME, GLOBEX):
+        rows = _sessions(client, page_id)
+        assert len(rows) == 1, f"{page_id} has {len(rows)} session rows for one sender"
+        assert rows[0]["customer_name"] == f"{page_id}-name", (
+            f"E-01: {page_id}'s customer_name was overwritten by the other tenant"
+        )
+        assert rows[0]["customer_phone"] == f"{page_id}-phone", (
+            f"E-01: {page_id}'s customer_phone was overwritten by the other tenant"
+        )
+
+    conn = database.get_connection()
+    try:
+        n = conn.cursor().execute(
+            "SELECT COUNT(*) FROM session_states WHERE sender_id = ?", (CUSTOMER,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 2, f"expected exactly two tenant rows for the sender, found {n}"
+
+
+def test_migration_replay_preserves_rows(tmp_path):
+    """
+    Test 12: 0003 -> 0004 -> 0003 -> 0004 must preserve every session row.
+
+    Runs against its own database file so the shared `client` fixture state is untouched.
+    """
+    import sqlite3
+
+    from alembic import command
+    from alembic.config import Config
+
+    db = tmp_path / "replay.db"
+    cfg = Config(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "alembic.ini"))
+    url = f"sqlite:///{db}"
+
+    prev = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = url
+    try:
+        command.upgrade(cfg, "0003_foreign_keys")
+        c = sqlite3.connect(str(db))
+        c.execute("insert into pages (page_id,name) values ('A','A')")
+        c.execute("insert into pages (page_id,name) values ('B','B')")
+        c.execute(
+            "insert into session_states (sender_id,page_id,channel,customer_name,customer_phone,updated_at)"
+            " values ('S1','A','web','Bat','8800','2026-11-16 04:05:06')"
+        )
+        c.commit()
+        before = c.execute(
+            "select sender_id,page_id,customer_name,customer_phone,updated_at from session_states"
+        ).fetchall()
+        c.close()
+
+        for _ in range(2):
+            command.upgrade(cfg, "head")
+        for _ in range(2):
+            command.downgrade(cfg, "0003_foreign_keys")
+        command.upgrade(cfg, "head")
+
+        c = sqlite3.connect(str(db))
+        after = c.execute(
+            "select sender_id,page_id,customer_name,customer_phone,updated_at from session_states"
+        ).fetchall()
+        pk = [r[1] for r in c.execute("PRAGMA table_info(session_states)") if r[5]]
+        c.close()
+    finally:
+        if prev is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = prev
+
+    assert after == before, f"replay changed the rows: {before} -> {after}"
+    assert set(pk) == {"page_id", "sender_id"}, f"replay lost the composite key: {pk}"
+
+
+def test_admin_cross_tenant_view_is_explicit_and_client_scope_still_denied(client):
+    """
+    Test 10: removing the unscoped query must not break the legitimate admin view.
+
+    An admin without `page_id` sees every branch — but as an explicit per-tenant
+    aggregate, not an unscoped `SELECT *`. A tenant-scoped user asking for another branch
+    is still refused, so widening admin access did not widen client access.
+    """
+    _chat(client, "acme conversation", ACME)
+    _chat(client, "globex conversation", GLOBEX)
+
+    admin = {
+        "Authorization": "Bearer "
+        + database.create_session(role="admin", page_id=None, ip_address="10.0.0.1")
+    }
+    r = client.get("/api/sessions", headers=admin)
+    assert r.status_code == 200, r.text
+    seen = {row["page_id"] for row in r.json()["data"]}
+    assert seen == {ACME, GLOBEX}, f"admin all-branch view is incomplete: {seen}"
+
+    # Scoping an admin to one branch works too.
+    scoped = client.get("/api/sessions?page_id=" + ACME, headers=admin)
+    assert scoped.status_code == 200
+    assert {row["page_id"] for row in scoped.json()["data"]} == {ACME}
+
+    # A client asking for a foreign branch is still refused by the tenant guard.
+    assert client.get("/api/sessions?page_id=" + GLOBEX, headers=_tenant_token(ACME)).status_code == 403
