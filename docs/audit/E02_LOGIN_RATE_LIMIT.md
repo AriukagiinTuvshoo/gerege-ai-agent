@@ -404,3 +404,21 @@ recorded above is the job/step conclusion from the API. It confirms the E-02 ste
 exited 0, but it does **not** independently confirm the number of tests executed inside
 it. The local runs in §6 are the evidence for the test counts.
 
+### 11.1 Phase 3.1 CI run
+
+* Run: [`44001966414`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44001966414)
+* Commit: `53c7c51ae0466d617d89baee1d6b1490b80e3f03`
+* Conclusion: **success**, with **zero failed steps**
+
+| Step | Result |
+|---|---|
+| **Run E-02 trusted-proxy & login rate-limit suite (SQLite + live Redis)** | **success** |
+| Run Pytest Regression, Enterprise, AI Eval & Failure Suites | success |
+| Initialize SQLite schema & verify zero schema drift | success |
+| Verify zero schema drift on Live PostgreSQL 16 | success |
+| **Build Production Docker Image** | **success** |
+
+Per-step log text is still unreachable from this environment
+(`results-receiver.actions.githubusercontent.com` is outside the sandbox's egress
+allowlist), so the conclusions above come from the API. The local runs in §6 and §7 are
+the evidence for the counts.
