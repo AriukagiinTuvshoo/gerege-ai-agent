@@ -213,13 +213,39 @@ def test_107_unknown_aliases_of_one_absent_account_share_a_budget(app):
 def test_108_database_does_not_allow_duplicate_usernames(app, monkeypatch):
     """
     Duplicate `client_username` values would make "which account does this identifier mean?"
-    genuinely ambiguous. Confirm whether the schema permits it — the answer is needed to
-    justify canonicalization being unambiguous at all.
+    genuinely ambiguous. `set_client_credentials` must therefore refuse to create one.
+
+    E-02 Phase 6, R10. This test previously created the duplicate *through*
+    `set_client_credentials` — the very write condition that let a second tenant rewrite the
+    first tenant's row. That made the vulnerable path load-bearing for the audit's own
+    evidence. The duplicate is now fabricated with direct SQL (the same approach the Phase 4.2
+    suite already uses for `shared_login`), and the write path is asserted to refuse it.
+
+    The assertions on the resolver are retained unchanged: a database that somehow already
+    contains duplicates must still resolve them deterministically and report the ambiguity.
     """
+    import sqlite3
+
     database.save_page(page_id="page-dup-01", name="dup1", category="general")
     database.set_client_credentials(page_id="page-dup-01", username="shared_name", password="Dup-Pw-1")
     database.save_page(page_id="page-dup-02", name="dup2", category="general")
-    database.set_client_credentials(page_id="page-dup-02", username="shared_name", password="Dup-Pw-2")
+
+    # R10: the write path must now refuse the second tenant's colliding username.
+    with pytest.raises(database.CredentialConflictError):
+        database.set_client_credentials(page_id="page-dup-02", username="shared_name", password="Dup-Pw-2")
+
+    # Fabricate the duplicate directly, to prove the read path stays safe on legacy data.
+    conn = sqlite3.connect(database.DB_PATH)
+    try:
+        pw_hash, salt = database.hash_password("Dup-Pw-2")
+        conn.execute(
+            "UPDATE pages SET client_username = 'shared_name', client_password_hash = ?, "
+            "client_salt = ? WHERE page_id = 'page-dup-02'",
+            (pw_hash, salt),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     resolve = getattr(database, "resolve_canonical_account", None)
     assert resolve is not None, "no canonical resolver"
@@ -237,11 +263,30 @@ def test_108_database_does_not_allow_duplicate_usernames(app, monkeypatch):
 
 
 def test_109_ambiguity_does_not_leak_through_the_login_response(app):
-    """Two accounts sharing a username must still be indistinguishable from outside."""
+    """
+    Two accounts sharing a username must still be indistinguishable from outside.
+
+    E-02 Phase 6, R10: the duplicate is fabricated with direct SQL. The write path refuses to
+    create it (see `test_108`), but a database that already contains one must stay safe.
+    """
+    import sqlite3
+
     database.save_page(page_id="page-dup-a", name="da", category="general")
     database.set_client_credentials(page_id="page-dup-a", username="ambiguous_x", password="Aa-1")
     database.save_page(page_id="page-dup-b", name="db", category="general")
-    database.set_client_credentials(page_id="page-dup-b", username="ambiguous_x", password="Bb-2")
+    with pytest.raises(database.CredentialConflictError):
+        database.set_client_credentials(page_id="page-dup-b", username="ambiguous_x", password="Bb-2")
+    conn = sqlite3.connect(database.DB_PATH)
+    try:
+        pw_hash, salt = database.hash_password("Bb-2")
+        conn.execute(
+            "UPDATE pages SET client_username = 'ambiguous_x', client_password_hash = ?, "
+            "client_salt = ? WHERE page_id = 'page-dup-b'",
+            (pw_hash, salt),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     r = _login(app, "ambiguous_x", "wrong", ip="203.0.113.5")
     assert r.status_code == 401, f"ambiguous identifier answered {r.status_code}"
@@ -827,7 +872,18 @@ def test_145_the_app_itself_refuses_to_start_in_production(monkeypatch, tmp_path
 
 
 def test_146_the_app_starts_in_production_when_the_secret_is_present(monkeypatch, tmp_path):
-    """The same startup must succeed once a usable secret is configured."""
+    """
+    The same startup must succeed once a usable secret is configured.
+
+    E-02 Phase 6, R11 changed the deployment contract this test encodes: production now also
+    requires a shared store. The previous form of this test started production with **no**
+    `REDIS_URL` and asserted success — i.e. it pinned the exact degradation R11 removed, where
+    each worker kept a private counter and the effective limit became `limit x workers`. It is
+    split in two rather than relaxed:
+
+      * this test: a usable secret *and* a reachable Redis -> startup succeeds;
+      * `test_146b`: a usable secret, no Redis -> startup is refused (in the Phase 6 suite).
+    """
     monkeypatch.setenv("ENV", "production")
     monkeypatch.delenv("STRICT_SECURITY", raising=False)
     monkeypatch.setenv("E02_ACCOUNT_KEY_SECRET", "p" * 64)
@@ -838,7 +894,15 @@ def test_146_the_app_starts_in_production_when_the_secret_is_present(monkeypatch
     database.init_db()
     account_keys.refresh_secret()
 
-    import main
+    url = os.getenv("REDIS_URL", "").strip()
+    if not url:
+        pytest.skip("production startup now requires a shared store; needs REDIS_URL")
+    previous = rate_limit.get_limiter()
+    rate_limit.set_limiter(None)
+    try:
+        import main
 
-    with TestClient(main.app) as client:
-        assert client.get("/api/health").status_code == 200
+        with TestClient(main.app) as client:
+            assert client.get("/api/health").status_code == 200
+    finally:
+        rate_limit.set_limiter(previous)

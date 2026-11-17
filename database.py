@@ -648,32 +648,187 @@ def authenticate_client(identifier: str, password: Optional[str] = None) -> Opti
     client, _ = authenticate_client_detailed(identifier, password)
     return client
 
+class CredentialConflictError(ValueError):
+    """
+    A requested login username is already owned by a different tenant.
+
+    E-02 Phase 6, R10. Raised by `set_client_credentials` instead of performing the update.
+
+    Why an exception and not a silent no-op: the previous implementation matched on
+    `LOWER(client_username)` with no tenant scope, so tenant B setting a username that tenant A
+    already used rewrote **tenant A's row** — its password hash, salt, and magic token — while
+    leaving tenant B's own row untouched. One admin action became a cross-tenant account
+    takeover (tenant A's old password stopped working; tenant B's new one authenticated *as*
+    tenant A). Silently declining would still leave the caller believing the update succeeded,
+    so the failure is explicit and mapped to a 409 by the API layer.
+
+    Attributes:
+        username: the requested username, so callers can name it without parsing the message.
+    """
+
+    def __init__(self, message: str, username: str = "") -> None:
+        super().__init__(message)
+        self.username = username
+
+
 def set_client_credentials(page_id: str, username: str, password: Optional[str] = None) -> Dict[str, str]:
-    """Харилцагчийн нэвтрэх нэр, нууц үг, шууд орох Magic холбоос шинэчлэх"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    magic_token = secrets.token_urlsafe(24)
+    """
+    Харилцагчийн нэвтрэх нэр, нууц үг, шууд орох Magic холбоос шинэчлэх
+
+    Sets the login username, password and magic token for exactly one page.
+
+    E-02 Phase 6, R10. Two independent defects were fixed here:
+
+    1. **Tenant-unscoped write predicate.** The statement was
+       ``WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)``. The third
+       disjunct had no tenant scope, so setting a username that another tenant already used
+       updated *that other tenant's row*. The username branch is gone: a credential write is
+       addressed by `page_id` and by nothing else. (The old branch existed so that a caller who
+       passed a username as the page id would still find its row; that is now resolved
+       explicitly, below, and never by overwriting somebody else.)
+
+    2. **Ambiguous duplicate usernames.** Login, the account throttle, and
+       `resolve_canonical_account` all treat `LOWER(TRIM(client_username))` as the identity.
+       Two rows sharing one normalized username therefore make "who does this name mean?"
+       ambiguous, and the entire system has to disambiguate by `ORDER BY page_id LIMIT 1`. A
+       write path that can create that state is a defect, so it now raises
+       `CredentialConflictError` instead.
+
+    Accepted: a username already owned by the *same* tenant (i.e. its current value, a
+    case/whitespace variant of it, or its `page_id`). Only a collision with a **different**
+    tenant is refused.
+
+    Raises:
+        CredentialConflictError: the username belongs to another tenant, or is that tenant's
+            `page_id` (which is also a login identifier).
+        ValueError: `page_id` is blank.
+
+    Returns:
+        ``{"username", "magic_token"}`` as before. The magic token is regenerated on every
+        call, and the page's sessions are revoked — unchanged from the previous behaviour.
+    """
     u_clean = username.strip()
     p_clean = page_id.strip()
+    if not p_clean:
+        raise ValueError("page_id is required")
     clean_pid = sanitize_page_id(p_clean)
-    
-    if password:
-        pw_hash, salt = hash_password(password.strip())
-        cursor.execute("""
-            UPDATE pages 
-            SET client_username = ?, client_password_hash = ?, client_salt = ?, client_magic_token = ?
-            WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)
-        """, (u_clean, pw_hash, salt, magic_token, p_clean, clean_pid, u_clean))
-    else:
-        cursor.execute("""
-            UPDATE pages 
-            SET client_username = ?, client_magic_token = ?
-            WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)
-        """, (u_clean, magic_token, p_clean, clean_pid, u_clean))
 
-    conn.commit()
-    conn.close()
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        # Resolve the target row first: a credential write must address exactly one tenant.
+        # `p_clean` is the authoritative id; `clean_pid` is accepted as a convenience because
+        # that is what the caller sees when the id needed sanitizing.
+        cursor.execute(
+            "SELECT page_id FROM pages WHERE page_id = ?", (p_clean,)
+        )
+        row = cursor.fetchone()
+        owner_page_id = row[0] if row else None
+        if owner_page_id is None:
+            cursor.execute("SELECT page_id FROM pages WHERE page_id = ?", (clean_pid,))
+            row = cursor.fetchone()
+            owner_page_id = row[0] if row else None
+
+        # The two old call shapes that must keep working:
+        #   * callers that never created the page row (the login flow treats a missing page as
+        #     "no such tenant", so this is not a security boundary, but changing it would alter
+        #     documented behaviour) -> fall back to the old two-id address;
+        #   * callers that pass the *username* as the page id -> resolve it, but only when it
+        #     is unambiguous, so this can never pick a tenant arbitrarily.
+        if owner_page_id is None:
+            cursor.execute(
+                "SELECT page_id FROM pages WHERE page_id IN (?, ?) ORDER BY page_id LIMIT 1",
+                (p_clean, clean_pid),
+            )
+            row = cursor.fetchone()
+            owner_page_id = row[0] if row else None
+        if owner_page_id is None and u_clean:
+            cursor.execute(
+                "SELECT page_id FROM pages "
+                "WHERE LOWER(TRIM(client_username)) = LOWER(TRIM(?)) OR LOWER(TRIM(page_id)) = LOWER(TRIM(?)) "
+                "ORDER BY page_id LIMIT 2",
+                (u_clean, u_clean),
+            )
+            candidates = [r[0] for r in cursor.fetchall()]
+            if len(candidates) == 1:
+                owner_page_id = candidates[0]
+
+        # `page_id` is itself a login identifier (`authenticate_client_detailed` matches
+        # `LOWER(TRIM(page_id))`), so a username equal to *another* tenant's page_id recreates
+        # exactly the ambiguity R10 is about, through the other door. Refuse it too when we
+        # know which tenant we are writing (owner_page_id is None means "no row yet", in which
+        # case the generic check below already covers it).
+        if u_clean and owner_page_id is not None:
+            cursor.execute(
+                "SELECT page_id FROM pages WHERE LOWER(TRIM(page_id)) = LOWER(TRIM(?)) "
+                "AND page_id <> ?",
+                (u_clean, owner_page_id),
+            )
+            if cursor.fetchall():
+                raise CredentialConflictError(
+                    "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу.",
+                    username=u_clean,
+                )
+
+        # Ownership check for the requested username. Same normalization as login, so the
+        # uniqueness rule is the one the authentication path actually relies on.
+        if u_clean:
+            if owner_page_id is not None:
+                cursor.execute(
+                    "SELECT page_id FROM pages WHERE LOWER(TRIM(client_username)) = LOWER(TRIM(?)) "
+                    "AND page_id <> ?",
+                    (u_clean, owner_page_id),
+                )
+                clash = [r[0] for r in cursor.fetchall()]
+            else:
+                cursor.execute(
+                    "SELECT page_id FROM pages WHERE LOWER(TRIM(client_username)) = LOWER(TRIM(?)) "
+                    "OR LOWER(TRIM(page_id)) = LOWER(TRIM(?))",
+                    (u_clean, u_clean),
+                )
+                clash = [r[0] for r in cursor.fetchall()]
+            if clash:
+                raise CredentialConflictError(
+                    "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу.",
+                    username=u_clean,
+                )
+
+        magic_token = secrets.token_urlsafe(24)
+
+        if owner_page_id is not None:
+            if password:
+                pw_hash, salt = hash_password(password.strip())
+                cursor.execute(
+                    "UPDATE pages SET client_username = ?, client_password_hash = ?, "
+                    "client_salt = ?, client_magic_token = ? WHERE page_id = ?",
+                    (u_clean, pw_hash, salt, magic_token, owner_page_id),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE pages SET client_username = ?, client_magic_token = ? WHERE page_id = ?",
+                    (u_clean, magic_token, owner_page_id),
+                )
+        elif password:
+            # No row to address: the username is provably unused (checked above), so create the
+            # tenant row rather than performing a zero-row UPDATE that reported success.
+            pw_hash, salt = hash_password(password.strip())
+            cursor.execute(
+                "INSERT INTO pages (page_id, client_username, client_password_hash, client_salt, "
+                "client_magic_token, name, category) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (clean_pid, u_clean, pw_hash, salt, magic_token, clean_pid, "general"),
+            )
+            owner_page_id = clean_pid
+        else:
+            # Nothing to address and no password: preserve the old no-op-and-report-success
+            # contract for a magic-token-only call, without creating a half-built tenant.
+            conn.commit()
+            return {"username": u_clean, "magic_token": magic_token}
+
+        conn.commit()
+    finally:
+        conn.close()
+
     try:
         revoke_all_page_sessions(p_clean)
         if clean_pid != p_clean:
@@ -681,6 +836,7 @@ def set_client_credentials(page_id: str, username: str, password: Optional[str] 
     except Exception:
         pass
     return {"username": u_clean, "magic_token": magic_token}
+
 
 def update_page_google_sheets(page_id: str, sheets_url: str) -> bool:
     """Хуудасны Google Sheets холбоосыг шинэчлэх"""
@@ -772,13 +928,26 @@ def get_all_pages(mask_secrets: bool = True, include_magic_token: bool = False) 
     return result
 
 def get_page(page_id: str, mask_secrets: bool = False, include_magic_token: bool = False) -> Optional[Dict]:
+    """
+    Load one page by its `page_id`.
+
+    E-02 Phase 6, R10. The query used to be
+    ``WHERE page_id = ? OR LOWER(client_username) = LOWER(?)``. That second branch is not
+    tenant-scoped: `get_page("alice")` returned whichever row happened to own the *username*
+    `alice`, so any caller that reached this function with a value it believed was a page id
+    received another tenant's configuration — including `gemini_api_key` when `mask_secrets`
+    is False. Every caller in this repository passes a real `page_id` (a session's `page_id`,
+    a path parameter, or `DEFAULT_PAGE_ID`), and magic-link tokens are resolved by their own
+    dedicated query, so the username branch served no caller while creating a cross-tenant
+    read. It is removed: this lookup is now by primary key only.
+    """
     if not page_id:
         return None
     p_id = str(page_id).strip()
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pages WHERE page_id = ? OR LOWER(client_username) = LOWER(?)", (p_id, p_id))
+    cursor.execute("SELECT * FROM pages WHERE page_id = ?", (p_id,))
     row = cursor.fetchone()
     if not row and "/" in p_id:
         clean_id = sanitize_page_id(p_id)
