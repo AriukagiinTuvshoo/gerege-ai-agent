@@ -337,16 +337,31 @@ def test_44_counter_expires(app_client):
         rate_limit.set_limiter(previous)
 
 
-def test_45_successful_login_resets_the_account_counter(app_client):
+def test_45_successful_login_refunds_only_its_own_slot(app_client):
+    """
+    E-02 Phase 4.1 revised the reset semantics; this test was updated to match, and it is
+    strictly stronger than before.
+
+    Phase 4 deleted the whole counter on success. Under admission-then-verify ordering that
+    cannot distinguish a failure recorded *after* the success was admitted, so it silently
+    erased it (Phase 4.1 finding C). The guarantee now is: a success refunds exactly the one
+    slot it consumed, and nothing else.
+
+    So N failures followed by a success leave N — not 0 — and the assertion below pins that
+    exact value, which the old "== 0" did not: "== 0" was also satisfied by a build that
+    erased a concurrent failure.
+    """
     threshold, _ = _account_policy()
-    for i in range(threshold - 2):
+    failures = threshold - 2
+    for i in range(failures):
         _login(_client(app_client, f"203.0.113.{i + 130}"), ACME, "wrong")
-    assert rate_limit.get_account_failure_count(ACME) > 0
+    assert rate_limit.get_account_failure_count(ACME) == failures
 
     r = _login(_client(app_client, "203.0.113.180"), ACME, ACME_PW)
     assert r.status_code == 200, f"legitimate login failed: {r.status_code} {r.text}"
-    assert rate_limit.get_account_failure_count(ACME) == 0, (
-        "a successful login did not clear the account failure counter"
+    assert rate_limit.get_account_failure_count(ACME) == failures, (
+        "a successful login must refund the one slot it consumed and leave every earlier "
+        "failure recorded"
     )
 
 
@@ -375,8 +390,14 @@ def test_46_successful_login_does_not_reset_the_ip_counter(app_client):
         f"the IP counter went {before} -> {after}; a successful login must not clear the IP "
         "counter (only the account counter)"
     )
-    # And the account counter, which is the one success is allowed to clear, is gone.
-    assert rate_limit.get_account_failure_count(ACME) == 0
+    # The account counter is unchanged: the successful login's own admission (+1) is
+    # immediately refunded (-1), so the failures recorded before it remain. What must NOT
+    # happen is a drop to 0, which is what deleting the whole key would do.
+    assert rate_limit.get_account_failure_count(ACME) == account_before, (
+        f"the account counter went {account_before} -> "
+        f"{rate_limit.get_account_failure_count(ACME)}; a success must refund exactly its own "
+        "admission and leave earlier failures recorded"
+    )
 
 
 def test_47_unknown_username_is_also_counted(app_client):
@@ -495,23 +516,28 @@ def test_50_account_counter_survives_a_restart():
     second.reset("auth_account")
 
 
-def test_51_reset_does_not_erase_a_newer_failure(app_client):
+def test_51_success_does_not_erase_a_newer_failure(app_client):
     """
-    Reset-then-fail must leave the counter at 1, not 0.
+    A failure recorded after a successful login must survive it.
 
-    A reset that blindly deletes the key after a concurrent increment would lose the newest
-    failure — the difference between "cleared" and "cleared and then refilled".
+    This is the concrete form of Phase 4.1 finding C. Under whole-key deletion the counter
+    went back to 0 and the later failure was lost; under refund-on-success it stays counted.
+    The exact value is asserted, so a revert to deletion fails here.
     """
     _account_policy()
     c = _client(app_client, "203.0.113.210")
     _login(c, ACME, "wrong")
     _login(c, ACME, "wrong")
+    assert rate_limit.get_account_failure_count(ACME) == 2
     assert _login(c, ACME, ACME_PW).status_code == 200
-    assert rate_limit.get_account_failure_count(ACME) == 0
+    # Two failures consumed two slots; the success refunds only its own.
+    assert rate_limit.get_account_failure_count(ACME) == 2, (
+        "the successful login cleared failures it did not own"
+    )
 
     _login(c, ACME, "wrong")
-    assert rate_limit.get_account_failure_count(ACME) == 1, (
-        "the failure after a reset was lost; the reset raced with the increment"
+    assert rate_limit.get_account_failure_count(ACME) == 3, (
+        "the failure after a successful login was lost"
     )
 
 

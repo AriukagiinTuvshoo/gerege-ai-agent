@@ -1,0 +1,56 @@
+seeded 2 accounts (username != page_id) into /home/user/gerege-ai-agent/.scratch/sim41.db
+
+==============================================================================
+Setup
+==============================================================================
+2 workers, port 8171, Redis redis://127.0.0.1:6379/0
+health: 200
+distinct worker pids that SERVED requests: ['61715', '61716']
+
+==============================================================================
+A. REAL TCP peers, alternating username <-> page_id on ONE account
+==============================================================================
+  first 429 at attempt 21 (threshold 20), alias used: username
+  Retry-After: 899  body: {'success': False, 'error': 'Хэт олон удаа буруу оролдлого хийлээ. Хэсэг хугацааны дараа дахин оролдоно уу.'}
+  A: 21 attempts, statuses [401, 429]
+  => both aliases consumed ONE budget (throttled at 21, not 40)
+
+==============================================================================
+B. Redis key + TTL
+==============================================================================
+  1 account key(s):
+    ratelimit:auth_account:660b478cfc348028b946719da519bab5  ttl=899  value=21
+  no plaintext identifier in any key; every key has a bounded TTL
+
+==============================================================================
+C. Second account isolated
+==============================================================================
+  sim41_globex correct password -> 200
+
+==============================================================================
+D. Concurrent multi-process increments
+==============================================================================
+  two processes reported (429s, total): ['7 12', '7 12']
+  accepted=10  account counter=10
+  => every accepted attempt counted exactly once across both workers
+
+==============================================================================
+E. Success refunds one slot; concurrent failures survive
+==============================================================================
+  correct password -> 200; counter 10 -> 10
+  counter still 10: earlier failures preserved, none erased
+
+==============================================================================
+F. Production refuses to start without the secret
+==============================================================================
+  REFUSED: E02_ACCOUNT_KEY_SECRET is required when running in production: without
+
+==============================================================================
+RESULT
+==============================================================================
+PASS — one canonical counter per account across two workers:
+       aliases share it, TTL bounded, no identifier in keys,
+       concurrent increments exact, success refunds only itself,
+       other accounts isolated, production refuses to start without a secret.
+
+workers stopped

@@ -74,11 +74,16 @@ independent account-level counter that the source address does not affect.
 Both limits are enforced; neither replaces the other. A request must pass the IP limit
 **and** the account limit.
 
-**Set `E02_ACCOUNT_KEY_SECRET` in production.** If it is unset, account-level throttling is
-disabled entirely and a `WARNING` is logged at startup. This is a deliberate fail-closed
-choice on privacy: the alternative (hashing the username without a secret) would look like
-protection while letting anyone who can read Redis recover usernames from a dictionary. It
-does **not** silently fall back to an unkeyed hash.
+**`E02_ACCOUNT_KEY_SECRET` is REQUIRED in production.** If it is unset, blank, or shorter
+than 32 characters, the application **refuses to start**: `main`'s lifespan calls
+`core.account_keys.validate_secret_for_startup()`, which raises `RuntimeError` before the app
+serves a single request. `docker compose` additionally refuses to bring the `web` service up
+at all, because the compose file declares the variable with `:?`.
+
+That combination is deliberate. If the secret were optional, a deployment missing it would
+run with account-level throttling *silently disabled* — a security control that is believed to
+be present but is not, which is worse than not having it. Development and test mode keep
+working without it, and there the throttle degrades to "off" rather than to an unkeyed hash.
 
 Generate one with:
 
@@ -86,15 +91,29 @@ Generate one with:
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
+**Provision it as a secret, not as configuration.** Put it in your secret manager (Docker
+Swarm secrets, Kubernetes `Secret`, AWS Secrets Manager, Vault) and inject it as an
+environment variable at deploy time. Do not commit it, do not put it in `.env` in the
+repository, do not bake it into an image layer, and do not paste it into a ticket or a chat.
+The application never logs the value, never returns it from any endpoint, and never sends it
+to the browser — but it cannot protect a secret that was already copied somewhere else.
+
 Do **not** reuse `META_APP_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, `MANYCHAT_WEBHOOK_SECRET` or
 `GEMINI_API_KEY`. The webhook secrets rotate on the vendor's schedule and are shared with a
 third party, so a vendor-side rotation would silently reset every account counter; and
 widening a vendor secret's blast radius to login identifiers is unnecessary. A dedicated
 secret keeps the two lifecycles independent.
 
-Rotating the secret is **safe and self-healing**: existing counters become orphaned and
-expire within the window, which resets throttles but never locks anyone out. It is safe to
-rotate while serving traffic.
+Rotating the secret is **safe and self-healing**: existing counters are keyed with the old
+secret, so they become unreachable and effectively orphaned. They expire within the window
+(15 minutes by default) and are cleaned up by Redis. The practical effect is that every
+account's throttle resets — which can only ever *un*-throttle, never lock anyone out.
+
+Rotation takes effect on the next restart of each worker, because the value is read once at
+startup. To rotate: deploy the new value and restart. There is no dual-key window; during the
+brief period when workers hold different secrets, an account may have two counters (one per
+generation). Both expire on their own. A multi-key rotation scheme was considered and rejected
+as unnecessary complexity for a control whose worst failure mode is "throttle resets".
 
 What operators see in Redis:
 
@@ -127,6 +146,36 @@ Operational notes:
   the same body and comparable timing (an unknown account performs a dummy PBKDF2
   verification so it cannot be distinguished by response time). A throttled account returns
   429 with `Retry-After` and a fixed message, for known and unknown identifiers alike.
+
+### 1.3 Account identity and counter semantics (E-02 Phase 4.1)
+
+**One account has one budget, whatever alias the client uses.** The login form accepts either
+the tenant's `client_username` or its `page_id`. The throttle resolves the submitted identifier
+against the database (the same `LOWER(TRIM(...))` comparison the login query uses) and keys on
+the account's canonical `page_id`. Without this, an attacker alternating between the two
+aliases got two independent budgets — measured at 40 attempts against a threshold of 20.
+
+Identifiers that do not resolve to an account are keyed on the database-normalized submitted
+value, so unknown accounts stay throttled and the counter does not become an existence oracle.
+The digest is always a keyed BLAKE2b; no username or page id is ever written to Redis in
+readable form.
+
+**Normalization is the database's, not Python's.** `str.casefold()` is not `LOWER()`: it folds
+`ß` to `ss`, which neither SQLite nor PostgreSQL does, and it leaves `Σ`/`Ø` unfolded where
+SQLite's ASCII-only `LOWER` also leaves them alone but PostgreSQL folds them. Using it merged
+accounts the database keeps distinct and split ones it considers the same. The throttle now
+asks the database to evaluate the comparison, so it agrees with the engine on every platform.
+
+**Counter semantics.** Each admitted login consumes one slot atomically. A wrong password keeps
+that slot; a successful login refunds exactly the one slot it consumed. Nothing deletes the
+counter. This is what makes a failure recorded concurrently with a successful login survive it
+— a whole-key reset could not distinguish the two and silently erased it.
+
+Operationally this means **a successful login does not zero the counter**; earlier mistyping
+stays recorded until the window expires. A user who has failed a few times and then logs in
+correctly still has their remaining budget reduced by those earlier failures, for at most 15
+minutes. This is the intended trade: correctness under concurrency over the convenience of an
+instant reset.
 
 ---
 

@@ -83,10 +83,11 @@ async def executive_scheduler_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # E-02 Phase 4: read the account-key secret once at startup so a missing one produces a
-    # visible WARNING in the logs rather than being discovered during an incident. Account
-    # throttling is disabled when it is unset — there is no unkeyed fallback (see
-    # core/account_keys).
+    # E-02 Phase 4.1: validate BEFORE serving. In production a missing, blank or too-short
+    # E02_ACCOUNT_KEY_SECRET raises here and the process exits, instead of logging a warning
+    # and silently running with account-level throttling disabled. Development and tests are
+    # unaffected. The secret value is never logged.
+    core_rate_limit.validate_account_key_secret()
     core_rate_limit.refresh_account_key_secret()
 
     scheduler_task = None
@@ -349,10 +350,19 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
         identifier = str(payload.get("identifier") or payload.get("username") or payload.get("token") or "").strip()
         password = payload.get("password")
 
-        # E-02 Phase 4: account-level throttle, independent of the per-IP limit above. This
-        # is checked BEFORE authentication so a burned budget costs the attacker no database
-        # work and, more importantly, so a throttled account cannot be distinguished from a
-        # throttled unknown one by response time either.
+        # E-02 Phase 4/4.1: account-level throttle, independent of the per-IP limit above.
+        #
+        # Checked BEFORE authentication so a burned budget costs the attacker no password
+        # verification, and so a throttled account cannot be told from a throttled unknown one
+        # by response time.
+        #
+        # Phase 4.1 changes, all of them correctness fixes rather than new policy:
+        #   * the identity is the account's canonical page_id, resolved from the database, so
+        #     the username and page_id aliases of one account share one budget;
+        #   * the counter is incremented here, atomically with its expiry, and admitted
+        #     attempts consume a slot. A failed password keeps that slot; a successful one
+        #     refunds exactly that slot. Nothing deletes the counter, so a failure recorded
+        #     concurrently with a success is never erased.
         account_hit = core_rate_limit.check_account_login_allowed(identifier)
         if not account_hit["allowed"]:
             database.record_audit_log(
@@ -366,9 +376,12 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
 
         client_page, err_msg = database.authenticate_client_detailed(identifier, password)
         if client_page:
-            # Successful authentication clears the account's failure count — and only that
-            # counter (see reset_account_failures; the IP counter is deliberately kept).
-            core_rate_limit.reset_account_failures(identifier)
+            # Refund only the slot this successful login consumed. The IP counter is
+            # deliberately untouched, and residual failures from earlier mistyping remain
+            # until the window expires — see clear_account_failures_on_success.
+            core_rate_limit.clear_account_failures_on_success(
+                account_hit["identity"], canonical=account_hit["canonical"]
+            )
             page_id = client_page["page_id"]
             # P0 Fix: Server-authoritative role resolution. User payload 'role' is never trusted.
             resolved_role = core_security.resolve_tenant_login_role(
@@ -396,6 +409,10 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
                 "tokens_used": client_page.get("tokens_used", 0),
                 "monthly_token_limit": client_page.get("monthly_token_limit", 100000)
             }
+        # The slot this attempt consumed at admission stays counted as a failure: a wrong
+        # password is exactly what the counter is for.
+        core_rate_limit.record_account_failure(account_hit["identity"])
+
         # E-02 Phase 4: uniform failure. `err_msg` distinguishes "no such tenant" from
         # "wrong password" from "this tenant has no password set" from "no password sent" —
         # four different oracles in one string, and two of them also name the account.

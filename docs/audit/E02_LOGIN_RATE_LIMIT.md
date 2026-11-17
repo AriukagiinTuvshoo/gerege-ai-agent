@@ -352,11 +352,150 @@ to hardware and configuration, while this tracks the real cost automatically.
 Throttling does not re-open the oracle: `test_54` asserts a known and an unknown account reach
 429 on the *same attempt number*, and the throttle message is a fixed string.
 
+## 4.3 Phase 4.1 — hardening the account throttle
+
+An independent review of Phase 4 found five problems. All five were **reproduced against the
+code as it stood** before being fixed; none was taken on trust. Measurements are in
+`docs/audit/evidence/e02_phase41_before.txt` and `e02_phase41_live_2worker_redis.txt`.
+
+### A. Alias rotation gave one account several budgets — CONFIRMED
+
+The login lookup accepts `client_username` **or** `page_id`:
+
+```sql
+WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?))
+```
+
+Phase 4 keyed the throttle on the *submitted* string, so the two aliases of one account were
+two counters. Measured: after 20 failures through the username, the username answered 429 and
+the same account's `page_id` answered **401** — a second, fresh budget. Alternating the aliases
+allowed **40 attempts against a threshold of 20**.
+
+Fixed by resolving the identifier to the account's canonical `page_id` (the primary key of
+`pages`) before keying. Resolution is a database read; a client-supplied `page_id` that does not
+exist resolves to `None` and falls back to the normalized identifier, so it cannot be used to
+forge a canonical identity. Unknown identifiers keep their own digest, so they stay throttled
+and the counter is not an existence oracle.
+
+`pages.client_username` has a **non-unique** index, so duplicate usernames are permitted by the
+schema. `resolve_canonical_account()` picks the lowest `page_id` deterministically and
+`canonical_resolution_is_ambiguous()` reports the condition rather than hiding it
+(`test_108`). This is a pre-existing schema property, not introduced here; eliminating it would
+need a migration, which is out of scope.
+
+### B. `INCR` and `EXPIRE` were not atomic — CONFIRMED
+
+The Phase 4 store issued `INCR` and then, only when the result was 1, a separate `EXPIRE`. A
+crash between them left a counter with **no TTL**: an account throttled forever, which is
+exactly the permanent lockout this phase must not create.
+
+Fixed with a Lua script that increments and sets the expiry in one round-trip, returning the
+count and the remaining TTL together. The window stays **fixed, not sliding**: the TTL is set
+at creation and never refreshed, so an attacker cannot hold a counter open by continuing to
+guess. The script also self-heals a key that somehow has no expiry.
+
+`TIME` inside a script is not used, deliberately — `TTL` gives the remaining value directly and
+works on Redis 6.x, which is what the deployment runs and what CI provisions.
+
+### C. Reset-on-success could erase a concurrent failure — CONFIRMED
+
+Two problems compounded here, and the second was not in the original review.
+
+1. **The check was not the increment.** `check_account_login_allowed()` incremented at
+   admission, but nothing made admission the *only* consumption point, and the success path
+   then deleted the whole key. Any failure recorded between the success being admitted and the
+   deletion was silently erased:
+
+   ```
+   t0 attacker failure admitted  INCR -> 5
+   t1 victim   success admitted  INCR -> 6
+   t2 attacker failure admitted  INCR -> 7   (after the success event)
+   t3 victim   reset             DEL        -> the t2 failure is gone
+   ```
+
+2. **A whole-key delete cannot express "clear my own effect".**
+
+   The policy adopted instead: **each admitted login consumes exactly one slot; a failure keeps
+   its slot, and a successful login refunds exactly the one slot it consumed.** Nothing deletes
+   the counter. Decrementing is linearizable and idempotent per request, so no failure recorded
+   after the success was admitted can be lost, and a success can never erase a counter it did
+   not own. The refund is clamped at zero so repeated successes cannot manufacture budget.
+
+   Ordering guarantee, stated exactly: *the counter value at any instant is the number of
+   admissions that have not been refunded.* A failed request contributes +1 permanently until
+   the window expires; a successful request contributes +1 at admission and −1 at refund,
+   net zero.
+
+   The visible consequence is that **a successful login no longer zeroes the counter.** Earlier
+   mistyping stays recorded for the remainder of the window. This was a deliberate policy
+   change, and three Phase 4 tests plus `test_12` asserted the old behaviour — they were
+   updated to the new guarantee, and each update is *stricter* than what it replaced
+   (`== failures` instead of `== 0`). `test_12` was verified to fail if the implementation is
+   reverted to whole-key deletion, and to pass with the refund.
+
+### D. Production started without the secret — CONFIRMED
+
+Production imported cleanly with no `E02_ACCOUNT_KEY_SECRET` and account throttling silently
+off, logging only a WARNING. A control that can be absent while being believed present is worse
+than no control.
+
+Production now **refuses to start**: the lifespan calls
+`core.account_keys.validate_secret_for_startup()`, which raises `RuntimeError` naming the
+variable when it is unset, blank/whitespace-only, or shorter than 32 characters.
+`docker-compose.prod.yml` additionally declares the variable with `:?`, so `compose up` fails
+before a container is created. Development and tests are unaffected and keep an explicit,
+documented configuration (`tests/conftest.py` sets a clearly-labelled non-production value).
+
+The secret value is never logged, never returned by any endpoint, and never reaches a template.
+`test_135` asserts a startup failure does not echo the value; `test_136` asserts a successful
+request does not log it. Rotation is documented in §1.2 of the deployment guide: it orphans
+existing counters, which expire within the window, so it can only ever *un*-throttle.
+
+### E. `casefold()` did not match the database — CONFIRMED, in both directions
+
+Phase 4 normalized with `str.strip().casefold()`. Measured on the real engines:
+
+| Input pair | SQLite `LOWER` | PostgreSQL `LOWER` | Python `casefold` |
+|---|---|---|---|
+| `Straße` / `STRASSE` | distinct | distinct | **merged** (`strasse`) |
+| `Ø` / `ø` | distinct (ASCII-only) | **merged** | merged |
+| `ΣΊΣΥΦΟΣ` | distinct | **merged** | merged (final sigma `σ`) |
+| `ﬁle` / `file` | distinct | distinct | **merged** |
+
+Two failure modes, one test each: `casefold` **merged** accounts the database keeps distinct
+(so one tenant's failures throttled another — `test_140`), and on SQLite it did **not** merge
+what PostgreSQL would (so the throttle's behaviour differed by deployment).
+
+Fixed by not re-implementing the comparison at all: `normalize_identifier()` asks the database
+to evaluate the same `LOWER(TRIM(?))` expression the login query uses, on the authoritative
+connection. The key therefore agrees with the engine by construction. On SQLite that means
+`Ø`/`ø` are legitimately *not* folded, which is the engine's real behaviour and is why
+`test_141` skips there — reported as a skip, not hidden.
+
+Stored usernames are never modified (`test_142`); normalisation happens only when deriving a key.
+
+### Files and tests
+
+New: `tests/test_e02_phase41_hardening.py` (**46 functions → 50 cases**).
+Modified: `core/account_keys.py`, `core/rate_limit.py`, `database.py`, `main.py`,
+`tests/conftest.py`, `tests/test_e02_phase4_account_protection.py`,
+`tests/test_e02_login_rate_limit.py`, `tests/test_e02_phase41_hardening.py`,
+`.env.example`, `docker-compose.prod.yml`, `.github/workflows/ci.yml`, and three documents.
+
+**One test-helper bug found in my own new suite**, recorded because it produced misleading
+results for several runs: `_validate()` returned the validator instead of calling it, so
+`with pytest.raises(...): _validate()` asserted that *constructing a bound method* raises. It
+passed for the wrong reason in one direction and failed in the other. Fixed to call.
+
 ## 5. Storage and concurrency
 
-Phase 3 changed *what* the IP key is. Phase 4 adds a second scope
-(`auth_account`) alongside it, sharing the same store abstraction and the same fixed-window
-`INCR`. Both are subject to the per-process memory fallback described in §4.2E.
+Phase 3 changed *what* the IP key is. Phase 4 added a second scope (`auth_account`) sharing the
+same store abstraction. Phase 4.1 makes the account scope's increment atomic with its expiry
+(Lua, §4.3B) and replaces whole-key reset with a clamped refund (§4.3C); the IP scope keeps the
+`INCR`-then-`EXPIRE` sequence, which has the same crash window — recorded as a residual risk in
+§8 R9 because fixing it is a change to the IP layer rather than the account layer.
+
+Both scopes are subject to the per-process memory fallback described in §4.2E.
 
 ## 6. Test matrix
 
@@ -559,6 +698,18 @@ open, which is E-03 scope and unchanged here.
 exists and is called at startup and by tests, but a running deployment picks up a rotated
 secret only on restart. Because rotation self-heals (orphaned counters expire), the practical
 impact is that rotation is effective at the next deploy rather than instantly.
+
+**R9 — the IP counter still uses `INCR` then `EXPIRE` (Phase 4.1 scope note).** The account
+scope's increment is now atomic (§4.3B) but the IP scope's is not: a crash between the two
+commands there can still leave an IP counter with no TTL. Left alone deliberately — changing the
+IP layer's storage is outside the account-hardening scope the review authorised, and the
+consequence (one source permanently rate-limited until an operator deletes the key) is less
+severe than the account case. Fixing it is a small, isolated change whenever it is in scope.
+
+**R10 — duplicate `client_username` values are still permitted by the schema.** Phase 4.1 makes
+the ambiguity deterministic and visible rather than silent, but two tenants sharing a login name
+is a real operational hazard that only a migration (a unique index) would remove. Out of scope
+here; recorded so it is not mistaken for solved.
 
 **R8 — the account counter is checked before the admin branch is reached only for
 `client`/`magic`.** The shared admin password has its own path and is protected by the IP limit

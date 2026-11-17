@@ -462,6 +462,116 @@ def sanitize_page_id(page_id: str) -> str:
     cleaned = re.sub(r'[^a-zA-Z0-9_\-]', '_', p).strip('_')
     return cleaned or ("page_" + secrets.token_hex(4))
 
+def sql_lower_trim(value: str) -> str:
+    """
+    Evaluate `LOWER(TRIM(?))` on the authoritative connection.
+
+    E-02 Phase 4.1. The account throttle must key on the same comparison the login query makes.
+    Re-implementing that comparison in Python is not equivalent: `str.casefold()` folds `ß` to
+    `ss`, which neither SQLite nor PostgreSQL does, and SQLite's `LOWER` is ASCII-only while
+    PostgreSQL's is Unicode-aware and locale-dependent. Asking the database keeps the two in
+    step by construction and on every engine.
+
+    Returns the trimmed, lower-cased value exactly as the engine produces it.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT LOWER(TRIM(?))", (value,))
+        row = cursor.fetchone()
+        result = row[0] if row else ""
+        return "" if result is None else str(result)
+    finally:
+        conn.close()
+
+
+def resolve_canonical_account(identifier: str) -> Optional[str]:
+    """
+    Resolve a login identifier to the canonical account id (`pages.page_id`), or None.
+
+    E-02 Phase 4.1, finding A. The login lookup accepts `client_username` OR `page_id`, so an
+    account reachable through both had two independent failure budgets: 20 failures on the
+    username left the page_id alias free to start again. The throttle now keys on the resolved
+    account rather than on whatever spelling the client submitted, so every supported alias
+    consumes one budget.
+
+    `page_id` is the primary key of `pages`, so it is the natural canonical identity: stable,
+    unique, and not user-editable through the login form. It is only ever used as *input* to a
+    keyed digest, never written to the store in plaintext.
+
+    Returns None for identifiers that match no active account — the caller must then fall back
+    to keying on the normalized identifier, so unknown accounts stay protected and unsupported
+    identifiers keep an independent budget.
+
+    Never merges unrelated accounts: one row is returned, and a duplicate username (the schema
+    has no unique constraint on `client_username`) is resolved deterministically to the lowest
+    `page_id`; `canonical_resolution_is_ambiguous()` reports that case.
+    """
+    if not identifier:
+        return None
+    ident = str(identifier).strip()
+    if not ident:
+        return None
+
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    try:
+        # Same predicates as the login query, minus the magic-token branch: a magic token is
+        # a full credential, so it is not an account-guessing alias and is deliberately not
+        # folded into the canonical identity here.
+        cursor.execute(
+            """
+            SELECT page_id FROM pages
+            WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?))
+              AND is_active = 1
+            ORDER BY page_id
+            LIMIT 1
+            """,
+            (ident, ident),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        value = row["page_id"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(value) if value is not None else None
+    finally:
+        conn.close()
+
+
+def canonical_resolution_is_ambiguous(identifier: str) -> bool:
+    """
+    True when one identifier matches more than one active account.
+
+    `pages.client_username` carries a non-unique index, so duplicates are possible even though
+    the admin UI does not create them. Reporting the ambiguity lets the throttle and the tests
+    be explicit rather than silently picking a row: a duplicate means two tenants already share
+    a login name, and the honest response is to make that visible, not to merge their budgets
+    silently or to pretend the question does not exist.
+    """
+    if not identifier:
+        return False
+    ident = str(identifier).strip()
+    if not ident:
+        return False
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM pages
+            WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?))
+              AND is_active = 1
+            """,
+            (ident, ident),
+        )
+        row = cursor.fetchone()
+        return bool(row and int(row[0]) > 1)
+    finally:
+        conn.close()
+
+
 def authenticate_client_detailed(identifier: str, password: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Харилцагчийн нэвтрэлтийг нарийвчлан шалгаж, тодорхой алдааны тайлбар буцаах"""
     if not identifier:

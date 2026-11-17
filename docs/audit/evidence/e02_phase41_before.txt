@@ -1,0 +1,71 @@
+test_101_username_and_page_id_share_one_budget FAILED [  2%]
+test_102_alias_rotation_cannot_multiply_the_threshold FAILED [  4%]
+test_103_canonical_identity_resolves_both_aliases_to_one_account FAILED [  6%]
+test_104_different_accounts_stay_separate PASSED [  8%]
+test_105_unknown_username_is_still_protected PASSED [ 10%]
+test_106_unknown_page_id_is_still_protected PASSED [ 12%]
+test_107_unknown_aliases_of_one_absent_account_share_a_budget PASSED [ 14%]
+test_108_database_does_not_allow_duplicate_usernames FAILED [ 16%]
+test_109_ambiguity_does_not_leak_through_the_login_response PASSED [ 18%]
+test_110_no_plaintext_identifier_in_account_keys PASSED [ 20%]
+test_111_canonical_key_is_derived_from_the_account_not_the_alias FAILED [ 22%]
+test_112_canonical_lookup_does_not_trust_a_client_supplied_page_id FAILED [ 25%]
+test_113_first_increment_sets_a_ttl SKIPPED [ 27%]
+test_114_subsequent_increments_preserve_the_window SKIPPED [ 29%]
+test_115_increment_and_ttl_are_one_atomic_operation SKIPPED [ 31%]
+test_116_no_key_can_exist_without_a_ttl SKIPPED [ 33%]
+test_117_expiration_restores_the_budget SKIPPED [ 35%]
+test_118_concurrent_increments_lose_nothing SKIPPED [ 37%]
+test_119_atomic_increment_returns_the_ttl SKIPPED [ 39%]
+test_120_failure_then_success_resets_the_counter FAILED [ 41%]
+test_121_success_then_new_failure_keeps_the_new_failure FAILED [ 43%]
+test_122_reset_never_deletes_another_accounts_counter FAILED [ 45%]
+test_123_reset_leaves_the_ip_counter_alone PASSED [ 47%]
+test_124_concurrent_requests_cannot_overspend_the_budget PASSED [ 50%]
+test_125_admission_is_consumed_before_authentication FAILED [ 52%]
+test_126_success_reverses_only_its_own_admission FAILED [ 54%]
+test_127_old_behaviour_of_clearing_everything_is_gone FAILED [ 56%]
+test_128_refund_never_drives_the_counter_negative PASSED [ 58%]
+test_129_concurrent_success_and_failure_keep_a_bounded_count PASSED [ 60%]
+test_130_production_without_secret_refuses_to_start FAILED [ 62%]
+test_131_production_with_empty_secret_refuses_to_start FAILED [ 64%]
+test_132_production_with_short_secret_refuses_to_start FAILED [ 66%]
+test_133_production_with_good_secret_starts FAILED [ 68%]
+test_134_development_without_secret_still_starts FAILED [ 70%]
+test_135_startup_error_never_contains_the_secret FAILED [ 72%]
+test_136_secret_never_appears_in_logs_on_success PASSED [ 75%]
+test_137_ascii_case_and_whitespace_variants_share_one_budget[Acme-Mn] PASSED [ 77%]
+test_137_ascii_case_and_whitespace_variants_share_one_budget[ACME-MN] PASSED [ 79%]
+test_137_ascii_case_and_whitespace_variants_share_one_budget[  acme-mn  ] PASSED [ 81%]
+test_137_ascii_case_and_whitespace_variants_share_one_budget[\tAcme-Mn\n] PASSED [ 83%]
+test_137_ascii_case_and_whitespace_variants_share_one_budget[aCmE-mN] PASSED [ 85%]
+test_138_python_casefold_does_not_define_the_key FAILED [ 87%]
+test_139_key_matches_the_database_comparison_semantics FAILED [ 89%]
+test_140_distinct_unicode_identifiers_are_not_merged FAILED [ 91%]
+test_141_unicode_variants_the_database_does_fold_share_a_budget SKIPPED [ 93%]
+test_142_normalization_never_modifies_stored_usernames PASSED [ 95%]
+test_143_empty_and_whitespace_identifiers_get_no_key PASSED [ 97%]
+test_144_alias_and_username_normalization_agree FAILED [100%]
+FAILED test_101_username_and_page_id_share_one_budget
+FAILED test_102_alias_rotation_cannot_multiply_the_threshold
+FAILED test_103_canonical_identity_resolves_both_aliases_to_one_account
+FAILED test_108_database_does_not_allow_duplicate_usernames
+FAILED test_111_canonical_key_is_derived_from_the_account_not_the_alias
+FAILED test_112_canonical_lookup_does_not_trust_a_client_supplied_page_id
+FAILED test_120_failure_then_success_resets_the_counter
+FAILED test_121_success_then_new_failure_keeps_the_new_failure
+FAILED test_122_reset_never_deletes_another_accounts_counter
+FAILED test_125_admission_is_consumed_before_authentication
+FAILED test_126_success_reverses_only_its_own_admission
+FAILED test_127_old_behaviour_of_clearing_everything_is_gone
+FAILED test_130_production_without_secret_refuses_to_start
+FAILED test_131_production_with_empty_secret_refuses_to_start
+FAILED test_132_production_with_short_secret_refuses_to_start
+FAILED test_133_production_with_good_secret_starts
+FAILED test_134_development_without_secret_still_starts
+FAILED test_135_startup_error_never_contains_the_secret
+FAILED test_138_python_casefold_does_not_define_the_key
+FAILED test_139_key_matches_the_database_comparison_semantics
+FAILED test_140_distinct_unicode_identifiers_are_not_merged
+FAILED test_144_alias_and_username_normalization_agree
+================== 22 failed, 18 passed, 8 skipped in 20.05s ===================

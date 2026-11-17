@@ -61,10 +61,12 @@ services:
       # uvicorn runs with --no-proxy-headers (see Dockerfile), so this is the single
       # authority on forwarding.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
-      # E-02 Phase 4: keyed-HMAC secret for account-level failed-login counters.
-      # Unset = account throttling disabled (the app logs a startup warning). Passed through
-      # so `docker compose` does not silently drop it; the app fails closed on privacy.
-      E02_ACCOUNT_KEY_SECRET: ${E02_ACCOUNT_KEY_SECRET:-}
+      # E-02 Phase 4.1: keyed-HMAC secret for account-level failed-login counters.
+      # `compose` sets ENV=production (see the environment block above), so the app REFUSES
+      # TO START if this is unset, blank or shorter than 32 characters. Required, not optional:
+      # use ":?" so a missing value fails at `docker compose up` rather than at request time.
+      # Quoted: the `:?` message contains punctuation YAML would otherwise misparse.
+      E02_ACCOUNT_KEY_SECRET: ${E02_ACCOUNT_KEY_SECRET:?required, min 32 chars - see docs/deployment/PRODUCTION_DEPLOYMENT.md 1.2}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       META_APP_SECRET: ${META_APP_SECRET:-}
       META_VERIFY_TOKEN: ${META_VERIFY_TOKEN:-}

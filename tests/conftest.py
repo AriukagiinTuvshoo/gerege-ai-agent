@@ -33,8 +33,20 @@ from core import rate_limit  # noqa: E402
 TEST_ACCOUNT_KEY_SECRET = "e02-test-only-account-key-secret-not-for-production"
 
 
+@pytest.fixture()
+def _no_e02_secret_fixture():
+    """
+    Opt out of the automatic account-key secret for one test.
+
+    Tests that assert on secret *absence* (production refusing to start, no unkeyed fallback)
+    must control the variable themselves; without this the autouse fixture below would set it
+    and the assertion would be untestable.
+    """
+    return None
+
+
 @pytest.fixture(autouse=True)
-def _e02_account_key_secret(monkeypatch):
+def _e02_account_key_secret(monkeypatch, request):
     """
     Configure the account-key secret for every test.
 
@@ -43,6 +55,9 @@ def _e02_account_key_secret(monkeypatch):
     *absent* (to prove fail-closed behaviour) overrides this with
     `monkeypatch.delenv(..., raising=False)` plus `rate_limit.refresh_account_key_secret()`.
     """
+    if "_no_e02_secret_fixture" in request.fixturenames:
+        yield
+        return
     monkeypatch.setenv("E02_ACCOUNT_KEY_SECRET", TEST_ACCOUNT_KEY_SECRET)
     rate_limit.refresh_account_key_secret()
     yield

@@ -109,6 +109,29 @@ class _MemoryStore:
         with self._lock:
             self._counters.pop(key, None)
 
+    def decrement_floor_zero(self, key: str, window_seconds: Optional[int] = None) -> int:
+        """
+        Subtract one from the counter, never below zero, under the store lock.
+
+        Used to refund the slot a successful login consumed. Clamping at zero matters: without
+        it, repeated successes would drive the counter negative and hand out free budget.
+        """
+        now = self._clock()
+        with self._lock:
+            entry = self._counters.get(key)
+            if entry is None:
+                return 0
+            started, count = entry
+            if window_seconds is not None and now - started >= window_seconds:
+                self._counters.pop(key, None)
+                return 0
+            new_count = max(0, count - 1)
+            if new_count == 0:
+                self._counters.pop(key, None)
+            else:
+                self._counters[key] = (started, new_count)
+            return new_count
+
 
 class _RedisStore:
     """Counter store shared by every process pointed at the same Redis."""
@@ -122,16 +145,62 @@ class _RedisStore:
         self._client = redis.from_url(url, decode_responses=True, socket_timeout=3.0)
         self._client.ping()
 
+    #: Increment and set the expiry in ONE round-trip.
+    #:
+    #: Phase 4.1, finding B. The Phase 4 version issued `INCR` and then, only when the result
+    #: was 1, a separate `EXPIRE`. A crash, a dropped connection, or a killed worker between
+    #: those two commands left a counter with no TTL — a permanently throttled account that
+    #: never recovers, which is exactly the permanent lockout this phase must not create.
+    #:
+    #: The window policy is unchanged and deliberately *not* sliding: the TTL is set when the
+    #: counter is created and never refreshed, so N failures inside one window expire together
+    #: `window_seconds` after the first. Refreshing on every attempt would let an attacker hold
+    #: the window open indefinitely and would also let a counter outlive the documented bound.
+    #:
+    #: `TIME` inside the script gives the TTL that remains, so `retry_after` can be honest
+    #: rather than always reporting the full window. It works on Redis 6.x, unlike
+    #: `EXPIRE ... NX`, which needs 7.0.
+    _INCR_SCRIPT_SOURCE = """
+    local current = redis.call('INCR', KEYS[1])
+    if current == 1 then
+        redis.call('EXPIRE', KEYS[1], ARGV[1])
+        return {current, tonumber(ARGV[1])}
+    end
+    local ttl = redis.call('TTL', KEYS[1])
+    if ttl < 0 then
+        -- Self-healing: a key that somehow has no expiry (created by an older build, or
+        -- restored from a snapshot) gets one now rather than living forever.
+        redis.call('EXPIRE', KEYS[1], ARGV[1])
+        ttl = tonumber(ARGV[1])
+    end
+    return {current, ttl}
+    """
+
+    def __init__(self, url: str, clock: Callable[[], float]):
+        import redis  # imported lazily: optional at runtime
+
+        self._clock = clock
+        self._client = redis.from_url(url, decode_responses=True, socket_timeout=3.0)
+        self._client.ping()
+        self._incr_script = self._client.register_script(self._INCR_SCRIPT_SOURCE)
+        self._decr_script = self._client.register_script(self._DECR_SCRIPT_SOURCE)
+
+    def increment_is_atomic(self) -> bool:
+        """True when increment and expiry happen in one round-trip. Asserted by the tests."""
+        return getattr(self, "_incr_script", None) is not None
+
+    def incr_in_window_detailed(self, key: str, window_seconds: int) -> Dict[str, int]:
+        """
+        Atomically increment and return ``{"count", "ttl"}``.
+
+        The count and the remaining window come from the same script execution, so the two can
+        never disagree.
+        """
+        count, ttl = self._incr_script(keys=[key], args=[int(window_seconds)])
+        return {"count": int(count), "ttl": int(ttl)}
+
     def incr_in_window(self, key: str, window_seconds: int) -> int:
-        # INCR is atomic. `EXPIRE ... NX` would set the TTL only on creation, but that
-        # flag only exists in Redis >= 7.0; deployments run 6.x, where it raises
-        # "wrong number of arguments". Instead the TTL is (re)asserted only when the
-        # counter is created (`count == 1`), which is equivalent for a fixed window and
-        # works on every supported version.
-        count = int(self._client.incr(key))
-        if count == 1:
-            self._client.expire(key, window_seconds)
-        return count
+        return self.incr_in_window_detailed(key, window_seconds)["count"]
 
     def read_counter(self, key: str, window_seconds: Optional[int] = None) -> int:
         # A plain GET; expiry is Redis's own job, so `window_seconds` needs no applying.
@@ -139,6 +208,25 @@ class _RedisStore:
 
     def delete_counter(self, key: str) -> None:
         self._client.delete(key)
+
+    #: Clamped decrement in one round-trip. Deleting at zero keeps "no counter" and "zero
+    #: failures" the same state, so a fresh window cannot inherit a stale value.
+    _DECR_SCRIPT_SOURCE = """
+    local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+    if current <= 0 then
+        redis.call('DEL', KEYS[1])
+        return 0
+    end
+    local updated = redis.call('DECR', KEYS[1])
+    if updated <= 0 then
+        redis.call('DEL', KEYS[1])
+        return 0
+    end
+    return updated
+    """
+
+    def decrement_floor_zero(self, key: str, window_seconds: Optional[int] = None) -> int:
+        return int(self._decr_script(keys=[key]))
 
 
 class RateLimiter:
@@ -590,8 +678,10 @@ def account_rate_limit_key(identifier: Optional[str]) -> Optional[str]:
     """
     The account identity used in the store: a keyed digest, or None when unavailable.
 
-    Thin re-export so callers have one import. See `core/account_keys` for why the digest is
-    keyed and why a missing secret means None rather than an unkeyed fallback.
+    Kept for callers that already hold a canonical id or a normalized identifier. Prefer
+    `account_canonical_key()` on the request path, which resolves aliases first. See
+    `core/account_keys` for why the digest is keyed and why a missing secret means None rather
+    than an unkeyed fallback.
     """
     from core import account_keys
 
@@ -605,21 +695,98 @@ def refresh_account_key_secret() -> Optional[str]:
     return account_keys.refresh_secret()
 
 
-def _account_store_key(identifier: str) -> Optional[str]:
-    digest = account_rate_limit_key(identifier)
+def validate_account_key_secret() -> None:
+    """Fail closed in production when the account-key secret is unusable."""
+    from core import account_keys
+
+    account_keys.validate_secret_for_startup()
+
+
+def resolve_account_identity(identifier: str) -> Tuple[str, bool]:
+    """
+    Resolve a submitted login identifier to the value the account counter is keyed on.
+
+    Returns ``(identity_value, is_canonical)``.
+
+    E-02 Phase 4.1, finding A. The login lookup accepts `client_username` OR `page_id`, so the
+    Phase 4 implementation — which keyed on the raw submitted string — gave one account one
+    budget per alias. Measured: after exhausting the budget through the username, the page_id
+    alias still answered 401 and could start again.
+
+    * Known identifier -> the canonical `page_id`. Every supported alias of one account then
+      maps to the same counter by construction.
+    * Unknown identifier -> the DB-normalized submitted value. Privacy is preserved (it is only
+      ever fed to a keyed digest) and unknown accounts stay throttled, so the throttle cannot
+      become an existence oracle.
+
+    Resolution is a database read, never trust in a client-supplied value: a page_id that does
+    not exist resolves to None and takes the normalized-identifier path.
+
+    A database failure here must not take login down. If resolution raises, the caller's
+    identifier is normalized on a best-effort basis; the throttle then keys on the submitted
+    value, which is weaker (aliases get separate budgets) but never weaker than Phase 4.
+    """
+    try:
+        import database
+
+        canonical = database.resolve_canonical_account(identifier)
+        if canonical:
+            return canonical, True
+        return database.sql_lower_trim(str(identifier or "")), False
+    except Exception as exc:  # pragma: no cover - depends on a live database
+        logger.error(f"Account identity resolution failed ({exc}); keying on the raw identifier")
+        return str(identifier or "").strip().casefold(), False
+
+
+def account_canonical_key(identifier: str, canonical: Optional[str] = None) -> Optional[str]:
+    """
+    Derive the store identity for a login attempt.
+
+    `canonical` should be the value returned by `resolve_account_identity`. When it is None the
+    identifier is resolved here, so a caller cannot accidentally key on a raw alias.
+    """
+    if canonical is None:
+        canonical, _ = resolve_account_identity(identifier)
+    if not canonical:
+        return None
+    return account_rate_limit_key(canonical)
+
+
+def _account_store_key_for_identity(identity: Optional[str]) -> Optional[str]:
+    digest = account_rate_limit_key(identity)
     if not digest:
         return None
     return f"ratelimit:{ACCOUNT_SCOPE}:{digest}"
 
 
+def account_store_key(identifier: str, canonical: Optional[str] = None) -> Optional[str]:
+    """
+    Full store key for an identifier, resolving aliases. Returns None when unconfigured.
+
+    This is the function the request path uses; it is what makes `get_account_failure_count`
+    and the login route agree about which counter an account owns.
+    """
+    if canonical is None:
+        canonical, _ = resolve_account_identity(identifier)
+    return _account_store_key_for_identity(canonical)
+
+
 def get_account_failure_count(identifier: str) -> int:
     """
-    Current failure count for an account, without recording a new one.
+    Current recorded failures for an account, without recording a new one.
 
-    Returns 0 when account throttling is not configured, which is also the value callers
-    should read as "nothing recorded".
+    Accepts any alias of the account; resolution happens first, so the username and page_id
+    aliases report the same value. Returns 0 when account throttling is not configured.
     """
-    key = _account_store_key(identifier)
+    key = account_store_key(identifier)
+    if key is None:
+        return 0
+    return get_limiter().peek(key, ACCOUNT_FAILURE_WINDOW)
+
+
+def get_account_failure_count_by_identity(identity: str) -> int:
+    """Count for an already-resolved canonical identity. No database access."""
+    key = _account_store_key_for_identity(identity)
     if key is None:
         return 0
     return get_limiter().peek(key, ACCOUNT_FAILURE_WINDOW)
@@ -631,46 +798,117 @@ def check_account_login_allowed(
     window_seconds: Optional[int] = None,
 ) -> Dict[str, object]:
     """
-    Count one login attempt against `identifier` and report whether it may proceed.
+    Admit or refuse one login attempt against `identifier`.
 
-    Returns ``{"allowed", "count", "limit", "retry_after"}``. When account throttling is not
-    configured the call is a no-op that always allows — the documented degradation, logged
-    once at startup by `core.account_keys.refresh_secret`.
+    Returns ``{"allowed", "count", "limit", "retry_after", "identity", "canonical"}``.
+
+    The increment happens at admission, atomically with its expiry (finding B). That ordering
+    is what lets the failure be recorded *after* authentication without a second increment:
+    the attempt already holds a slot, and `record_account_failure()` decides whether to keep it.
+
+    When account throttling is not configured the call is a no-op that always allows — the
+    documented degradation, refused outright in production by
+    `core.account_keys.validate_secret_for_startup`.
     """
     effective_limit = ACCOUNT_FAILURE_THRESHOLD if limit is None else limit
     effective_window = ACCOUNT_FAILURE_WINDOW if window_seconds is None else window_seconds
-    key = _account_store_key(identifier)
+
+    identity, canonical = resolve_account_identity(identifier)
+    key = _account_store_key_for_identity(identity)
     if key is None:
-        return {"allowed": True, "count": 0, "limit": 0, "retry_after": 0}
+        return {
+            "allowed": True, "count": 0, "limit": 0, "retry_after": 0,
+            "identity": identity, "canonical": canonical,
+        }
 
     limiter = get_limiter()
     try:
-        count = limiter._store.incr_in_window(key, effective_window)
+        if hasattr(limiter._store, "incr_in_window_detailed"):
+            result = limiter._store.incr_in_window_detailed(key, effective_window)
+            count, remaining = result["count"], result["ttl"]
+        else:  # memory store: expiry is evaluated against its injected clock
+            count = limiter._store.incr_in_window(key, effective_window)
+            remaining = effective_window
     except Exception as exc:  # pragma: no cover - depends on a live server
-        # Same posture as the IP limiter: a store outage must not take login down. It is
-        # also not silent — E-03 owns the general fail-open/fail-closed policy.
+        # Same posture as the IP limiter: a store outage must not take login down. It is also
+        # not silent — E-03 owns the general fail-open/fail-closed policy.
         logger.error(f"Account throttle store failed for {ACCOUNT_SCOPE} ({exc}); allowing request")
-        return {"allowed": True, "count": 0, "limit": effective_limit, "retry_after": 0}
+        return {
+            "allowed": True, "count": 0, "limit": effective_limit, "retry_after": 0,
+            "identity": identity, "canonical": canonical,
+        }
 
     allowed = count <= effective_limit
     return {
         "allowed": allowed,
         "count": count,
         "limit": effective_limit,
-        "retry_after": effective_window if not allowed else 0,
+        # The real remaining window, not the nominal one, so Retry-After is honest.
+        "retry_after": max(1, int(remaining)) if not allowed else 0,
+        "identity": identity,
+        "canonical": canonical,
     }
+
+
+def record_account_failure(identity: str) -> None:
+    """
+    Record that an admitted attempt was a genuine authentication failure.
+
+    The admission in `check_account_login_allowed` already incremented the counter, so a failed
+    password needs no further action: the slot it consumed becomes a recorded failure. This
+    function exists as the explicit name for that decision, and as the single place to change
+    if the counting model ever separates "attempts" from "failures".
+    """
+    return None
+
+
+def clear_account_failures_on_success(identity: str, canonical: bool = True) -> bool:
+    """
+    Reverse the slot consumed by a *successful* login.
+
+    E-02 Phase 4.1, finding C. Phase 4 called `reset_account_failures()`, which deleted the
+    whole key. With admission-then-verify ordering that loses failures recorded concurrently:
+
+        t0  attacker failure admitted   INCR -> 5
+        t1  victim   success admitted   INCR -> 6
+        t2  attacker failure admitted   INCR -> 7   (after the success event)
+        t3  victim   reset              DEL         -> erases the t2 failure
+
+    The guarantee adopted instead: **a successful login removes exactly the one slot it
+    consumed, and nothing else.** Decrementing is linearizable and idempotent per request, so
+    no failure recorded after the success was admitted can be lost, and a success can never
+    erase a counter it did not own.
+
+    Consequences of the model, stated plainly:
+      * Successes do not clear the residual failures of earlier mistyping; they expire with the
+        window instead. `test_12` in the Phase 2 suite pins the exact number of attempts a
+        given history admits, so this is asserted rather than assumed.
+      * The counter is clamped at zero: a success with no failures behind it must not drive the
+        counter negative and hand out budget.
+    """
+    digest = account_rate_limit_key(identity)
+    if not digest:
+        return False
+    key = f"ratelimit:{ACCOUNT_SCOPE}:{digest}"
+    try:
+        return get_limiter()._store.decrement_floor_zero(key, ACCOUNT_FAILURE_WINDOW) > 0
+    except Exception as exc:  # pragma: no cover - depends on a live server
+        logger.error(f"Account counter refund failed for {ACCOUNT_SCOPE} ({exc})")
+        return False
 
 
 def reset_account_failures(identifier: str) -> None:
     """
-    Clear an account's failure count after a successful authentication.
+    Clear an account's recorded failures outright.
 
-    Clears *only* the account counter. The IP counter is intentionally left alone: a
-    successful login proves the account, not the source address, and an attacker holding one
-    valid credential could otherwise launder an abusive IP indefinitely by interleaving
-    successful logins with guessing.
+    **Not used by the login path** — see `clear_account_failures_on_success`, which refunds a
+    single slot instead of deleting the counter. This remains for operator use ("clear this
+    account now") and for tests.
+
+    Clears only the account counter. The IP counter is intentionally left alone: a successful
+    login proves the account, not the source address.
     """
-    key = _account_store_key(identifier)
+    key = account_store_key(identifier)
     if key is None:
         return
     get_limiter().reset_key(key)
