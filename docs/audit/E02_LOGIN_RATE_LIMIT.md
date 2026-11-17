@@ -1076,8 +1076,11 @@ right-to-left walk, a correct chain resolves without naming a hop count. Requiri
 operator to also state the hop count adds a way to misconfigure it.
 
 **R6 — account enumeration closed in Phase 4.** Both the message oracle and the 6× timing
-oracle are fixed and covered by `test_53`–`test_56`. Residual: a Redis outage still fails
-open, which is E-03 scope and unchanged here.
+oracle are fixed and covered by `test_53`–`test_56`.
+
+> **Superseded by Phase 6 (§12.1).** The residual noted here — "a Redis outage still fails
+> open" — no longer holds for the account scope: R14 was remediated, and a store failure now
+> refuses the login. The IP scope still fails open, deliberately (`test_612`).
 
 **R7 — the account secret is not hot-reloadable in a running worker.** `refresh_account_key_secret()`
 exists and is called at startup and by tests, but a running deployment picks up a rotated
@@ -1178,8 +1181,8 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", 
 | E-01 tenant isolation | **PASS** — 12/12 |
 | Existing login flow intact | **PASS** |
 | CI | see §11 |
-| Account-level protection | **NOT IMPLEMENTED** (Phase 4) |
-| Redis outage resilience | **NOT TESTED** / fail-open (E-03) |
+| Account-level protection | **IMPLEMENTED** (Phase 4–4.4, verified §11) |
+| Redis outage resilience | **IMPLEMENTED** — account fails CLOSED, readiness 503 (Phase 6, §12.1–12.2) |
 | SEC-07 overall | **FAIL** — E-02 Phase 4 and E-03 both outstanding |
 
 **Phase 3 is complete. E-02 is not. SEC-07 must not be reported as PASS.**
@@ -1323,3 +1326,147 @@ stricter than its predecessors in one respect: besides failing on any skip it re
 passing-case count to be exactly 17, so a renamed, deselected or silently dropped test cannot
 pass it. Verified not to be a no-op — silent with `REDIS_URL` live (0 skips, 17 passed) and
 tripping without it (6 skips → failure).
+
+---
+
+## 12. Phase 6 — remediation of the Phase 5 findings (R14, R11, R10, R15)
+
+Phase 5 was an audit only; it left four findings open and made the merge verdict conditional
+on them. This section records the remediation. Each finding states the defect, the exact
+change, and the test that was **verified to fail against the pre-remediation code** — the RED
+baseline is in `evidence/e02_phase6_before.txt` (35 failed / 18 passed / 7 skipped).
+
+### 12.1 R14 — the account limiter failed OPEN
+
+**Defect.** `core/rate_limit.py:check_account_login_allowed` caught `Exception` and returned
+`allowed=True`. Measured before the fix: a raising store produced
+`{'allowed': True, 'count': 0, 'token': None}`. With no counter incremented, nothing bounded
+how many passwords could be tried against one account.
+
+**Why it was not simply "the same posture as the IP limiter".** The two scopes protect
+different things. The IP limit is a volume control: failing it open costs a weaker limit on a
+shared address while the account limit still bounds each account. The account limit is the
+last line for one account, so failing it open does not weaken the control, it removes it.
+The IP scope therefore keeps its fail-open posture unchanged, and `test_612` pins that so the
+two policies cannot be merged by accident.
+
+**Change.** The generic handler now fails closed, sets `store_failed=True`, and returns the
+same `429` + `Retry-After` the client would see for a genuine throttle. The endpoint records
+`auth.login.throttle_store_failed` in the audit trail but returns an identical body, so an
+attacker cannot learn that the store is down. The `# pragma: no cover` is gone — the branch is
+now covered by seven tests.
+
+**Measured after.** `{'allowed': False, 'count': 0, 'token': None, 'store_failed': True,
+'retry_after': 900}`; a correct password is refused while the store is down (`test_607`).
+
+### 12.2 R11 — production could silently use a per-process counter
+
+**Defect.** `_build_store` caught every Redis init failure and returned `_MemoryStore` with a
+warning. Phase 5 measured two separate processes each admitting 20 attempts against a
+threshold of 20 (40 total).
+
+**Change.**
+* `RateLimitStoreUnavailable` and `_redis_is_required()` (`is_production_mode()`, i.e. `ENV`
+  in `{production, prod}` or `STRICT_SECURITY` truthy).
+* `_build_store` re-raises in production instead of falling back; development keeps the
+  documented fallback.
+* `validate_store_for_startup()` runs in the lifespan before the app serves: it requires a
+  non-blank `REDIS_URL`, performs a real `PING`, and requires the limiter to have selected a
+  shared backend. Errors name no host, port or credential — only the exception class.
+* `docker-compose.prod.yml` sets `--maxmemory 400mb --maxmemory-policy noeviction`
+  explicitly. `noeviction` is a **security** setting: evicting a live counter hands that
+  account a fresh budget, the same defect as the memory store's old capacity behaviour.
+  400mb is derived from measurement, not chosen: a 20,000-account fill used 40,000 keys and
+  ~389 bytes/account, so 400mb holds roughly 1,000,000 concurrently-throttled accounts inside
+  the existing 512M container limit. Re-measure if the key layout changes.
+* `.env.example` documents that `REDIS_URL` is mandatory in production and why.
+
+**Readiness.** `/api/ready` now includes the store in production (`rate_limit_store`,
+`rate_limit_store_required`, `rate_limit_store_ok`) and returns 503 when it is down, with the
+database still reported separately. It exposes no URL. **Liveness is deliberately unchanged**
+and never probes Redis: restarts cannot fix Redis, so liveness depending on it would turn an
+outage into a crash loop. `test_647` asserts both halves simultaneously.
+
+**Redis persistence note.** AOF (`--appendonly yes`) is already enabled. Counters are
+`window_seconds`-bounded and self-healing: losing them on restart gives an account at most one
+extra budget window, which is why they are not worth stronger durability than AOF — but it is
+also why `noeviction` matters, since silent eviction would do that on purpose, under load,
+without a restart.
+
+### 12.3 R10 — cross-tenant credential overwrite
+
+**Defect.** `set_client_credentials` used
+`WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)`. The third disjunct
+had no tenant scope, so tenant B setting a name tenant A already used rewrote **A's** row —
+hash, salt and magic token — while B's row kept its old value. Reproduced on SQLite and
+PostgreSQL 16: A's original password stopped working and B's password authenticated as A.
+
+**Change.**
+* The write is addressed by `page_id` only. The username disjunct is gone.
+* `CredentialConflictError` is raised when the normalized username already belongs to a
+  *different* tenant, or equals another tenant's `page_id` (also a login identifier). The same
+  tenant re-setting its own name, or a case/space variant of it, is accepted.
+* `POST /api/pages/credentials` maps it to **409** without naming the owning tenant, so the
+  endpoint cannot be used as a cross-tenant username oracle.
+* `get_page` had the same tenant-unscoped username branch (`database.py:781`). It returned
+  whichever row owned that *username*, i.e. potentially another tenant's configuration,
+  including `gemini_api_key` when `mask_secrets=False`. Every caller passes a real `page_id`
+  and magic tokens have their own query, so the branch served no caller and is removed.
+
+**Migration — deliberately NOT applied.** A unique index is the structural fix, but it can
+only be applied after the data assumptions are demonstrated, and this phase may not inspect or
+change production data. The detection query and the deployment order are specified in
+§12.5; until it runs clean, the write path is the enforced control.
+
+### 12.4 R15 — stale counts for non-default windows
+
+**Defect.** `get_account_failure_count` passed `ACCOUNT_FAILURE_WINDOW` (the *policy* window)
+to `peek`, which overrode the generation's own window in the memory store. A 100s generation
+read as `1` at age 150s while admission and refund already treated it as expired. Redis
+reported `0`, because its `GET` ignores the argument — so the backends disagreed.
+
+**Change.** Both read entry points pass no window, meaning "use the generation's own window",
+which is the rule admission and refund already apply. The Phase 4.4 fixed-window policy is
+untouched, TTLs are not extended, and stale/double-refund protection is re-asserted
+(`test_679`). `test_678` proves memory and Redis now agree.
+
+### 12.5 Required follow-up: the unique index is not yet applied
+
+Remediation of R10 at the application layer is complete, but the schema still permits the
+duplicates it refuses. Applying the constraint needs a production data question answered first.
+
+**Detection query (run against production before any migration):**
+
+```sql
+-- 1. duplicate normalized usernames
+SELECT LOWER(TRIM(client_username)) AS normalized, count(*), array_agg(page_id ORDER BY page_id)
+FROM pages
+WHERE client_username IS NOT NULL AND TRIM(client_username) <> ''
+GROUP BY 1 HAVING count(*) > 1;
+
+-- 2. usernames that collide with another tenant's page_id
+SELECT p.page_id AS owner, p.client_username, q.page_id AS colliding_page
+FROM pages p JOIN pages q
+  ON LOWER(TRIM(p.client_username)) = LOWER(TRIM(q.page_id))
+WHERE p.client_username IS NOT NULL AND TRIM(p.client_username) <> ''
+  AND p.page_id <> q.page_id;
+```
+
+Both queries returned **0 rows** on the disposable PostgreSQL 16 database used here, which
+proves nothing about production.
+
+**Intended index (not created):**
+`CREATE UNIQUE INDEX CONCURRENTLY uq_pages_client_username_norm ON pages (LOWER(TRIM(client_username))) WHERE client_username IS NOT NULL AND TRIM(client_username) <> '';`
+
+**Deployment order:** run the detection queries → reconcile conflicts **manually and with the
+tenant owner's involvement** (never automatically: choosing which tenant loses a username is a
+business decision, and deleting a row would delete a tenant) → re-run until both return 0 →
+create the index `CONCURRENTLY` (no write lock) → keep the application-level conflict check,
+which gives a clean 409 instead of a raw integrity error.
+
+**Rollback:** `DROP INDEX CONCURRENTLY uq_pages_client_username_norm;`. The application
+behaviour is unchanged by rollback — the write path refuses conflicts independently.
+
+**Blocker recorded:** reconciliation policy is an owner decision, so this portion is
+documented rather than implemented, per the Phase 6 instruction to stop at unresolved business
+rules and continue with the independent remediations.
