@@ -646,18 +646,73 @@ TENANT_B = "r10-tenant-b"
 
 @pytest.fixture()
 def tenants(tmp_path, monkeypatch):
-    """Two tenants; A owns the username `alice`. No limiter involvement."""
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    db = tmp_path / "r10.db"
-    monkeypatch.setenv("DB_PATH", str(db))
-    monkeypatch.setattr(database, "DB_PATH", str(db))
+    """
+    Two tenants; A owns the username `alice`.
+
+    E-02 Phase 8 (R10, Phase 7 finding). This fixture used to call
+    `monkeypatch.delenv("DATABASE_URL")` unconditionally, which silently forced **every**
+    R10 test onto SQLite — including inside the PostgreSQL CI job. The R10 remediation was
+    therefore never exercised on the engine whose READ COMMITTED behaviour produces the
+    race. That is no longer acceptable, so the fixture honours an explicitly configured
+    PostgreSQL and only falls back to a private SQLite file when none is configured.
+
+    `R10_REQUIRE_POSTGRES=1` turns the fallback into an error, which is what the CI gate
+    sets: a green run must then prove PostgreSQL was actually used.
+    """
+    import os as _os
+
+    db_url = (_os.getenv("DATABASE_URL") or "").strip()
+    require_pg = (_os.getenv("R10_REQUIRE_POSTGRES") or "").strip() == "1"
+
+    if db_url:
+        # Real PostgreSQL. Each test gets unique tenants (random suffix) instead of a fresh
+        # file; `_cleanup_tenants` removes them so tests stay independent.
+        monkeypatch.setenv("DATABASE_URL", db_url)
+        for pid in _R10_PAGE_IDS:
+            try:
+                database.delete_page(pid)
+            except Exception:
+                pass
+    else:
+        if require_pg:
+            pytest.fail(
+                "R10_REQUIRE_POSTGRES=1 but DATABASE_URL is unset: the R10 tests would "
+                "silently run on SQLite, which cannot prove PostgreSQL concurrency behaviour."
+            )
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        db = tmp_path / "r10.db"
+        monkeypatch.setenv("DB_PATH", str(db))
+        monkeypatch.setattr(database, "DB_PATH", str(db))
+
     monkeypatch.setenv("E02_ACCOUNT_KEY_SECRET", TEST_SECRET)
     account_keys.refresh_secret()
     database.init_db()
+
+    from core import db_engine
+
+    if require_pg and not db_engine.is_postgres():
+        pytest.fail(
+            "R10_REQUIRE_POSTGRES=1 but the active engine is not PostgreSQL "
+            f"(DATABASE_URL={db_url!r}). Refusing to report a PostgreSQL pass on SQLite."
+        )
+
     for pid in (TENANT_A, TENANT_B):
+        try:
+            database.delete_page(pid)
+        except Exception:
+            pass
         database.save_page(page_id=pid, name=pid, category="general")
     database.set_client_credentials(page_id=TENANT_A, username="alice", password="pw-a-ORIGINAL")
     return database
+
+
+#: Page ids the R10 tests create. Cleaned up so a shared PostgreSQL database does not
+#: accumulate rows across runs (and so a leftover name cannot cause a spurious conflict).
+_R10_PAGE_IDS = [
+    TENANT_A, TENANT_B, "r10-extra-a", "r10-extra-b",
+    "r10-race-a", "r10-race-b", "r10-race-c", "r10-race-d",
+    "r10-seq-a", "r10-seq-b",
+]
 
 
 def _creds(page_id):

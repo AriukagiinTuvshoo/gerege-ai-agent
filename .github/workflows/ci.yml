@@ -373,6 +373,85 @@ jobs:
         run: |
           python -m alembic upgrade head
 
+      - name: E-02 Phase 8 — username uniqueness (R10) on PostgreSQL
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          # Turn a silent SQLite fallback into a hard failure: a "PostgreSQL pass" reported for
+          # a run that actually used SQLite is exactly the false evidence this gate exists to stop.
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase8-account-key-secret-0123456789abc"
+        run: |
+          # E-02 Phase 8. Phase 7 confirmed that the Phase 6 409 was only a SEQUENTIAL guard:
+          # under genuine concurrency two tenants still both committed the same normalized
+          # username (12/12 trials, PostgreSQL 16.2 and SQLite). The remediation is a
+          # database-enforced invariant -- a partial UNIQUE index on LOWER(TRIM(client_username))
+          # -- so the race is now unrepresentable rather than merely re-checked.
+          #
+          # These tests must run on PostgreSQL: the SQLite fallback would not prove the
+          # concurrency behaviour, hence R10_REQUIRE_POSTGRES=1 above.
+          pytest tests/test_e02_phase8_username_uniqueness.py -v --tb=short | tee /tmp/p8.log
+
+          # No skip is legitimate here. Every case can run against PostgreSQL, and a skip would
+          # be the exact silent-coverage-loss the Phase 8 rules forbid.
+          if grep -qE "SKIPPED" /tmp/p8.log; then
+            echo "::error::E-02 Phase 8 skipped a case; every case must run on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/p8.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p8.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 33 ]; then
+            echo "::error::E-02 Phase 8 expected at least 33 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          # Named findings, so a rename or deletion cannot pass silently.
+          for t in test_801_the_unique_index_is_installed_and_correct \
+                   test_802_the_index_rejects_a_duplicate_normalized_username \
+                   test_831_two_tenants_one_username_natural_concurrency \
+                   test_836_repeated_races_never_produce_a_duplicate \
+                   test_851_preflight_detects_a_fabricated_duplicate \
+                   test_856_startup_refuses_a_database_without_the_invariant \
+                   test_870_repair_tool_recreates_a_dropped_index \
+                   test_872_repair_tool_refuses_to_touch_existing_collisions; do
+            grep -q "$t .*PASSED" /tmp/p8.log || {
+              echo "::error::E-02 Phase 8: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertions of the invariant itself -- not a restatement of a test
+          # PASS. A suite that passes while the index is absent or wrong-shaped would be
+          # worthless; this asks the database directly.
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".")
+          import database
+          from core import username_uniqueness as uniq
+          from core.db_engine import is_postgres
+
+          if not is_postgres():
+              sys.exit("::error::Phase 8 gate is not running on PostgreSQL")
+
+          conn = database.get_connection()
+          try:
+              if not uniq.index_is_correct(conn):
+                  sys.exit("::error::the uniqueness invariant is not in force: "
+                           + repr(uniq.describe_index(conn)))
+              dupes = uniq.find_duplicate_usernames(conn)
+              if dupes:
+                  sys.exit("::error::duplicate normalized usernames exist: "
+                           + uniq.duplicate_report_text(dupes))
+          finally:
+              conn.close()
+
+          # The application must refuse to serve without the invariant, and must boot with it.
+          from core.schema_manager import assert_security_invariants
+          assert_security_invariants()
+          print("Phase 8: index shape verified on PostgreSQL, no duplicates, startup guard satisfied.")
+          PY
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:
