@@ -58,6 +58,78 @@ proxy's address and lock everyone out together.
 
 ---
 
+### 1.2 Account-level failed-login protection and `E02_ACCOUNT_KEY_SECRET` (E-02 Phase 4)
+
+The IP limit in §1.1 caps how fast **one source** can guess. It cannot cap how many times
+**one account** is guessed: an attacker with a proxy pool gets a fresh per-IP budget per
+address, so 400 attempts against one login cost 40 addresses and 60 seconds. Phase 4 adds an
+independent account-level counter that the source address does not affect.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ACCOUNT_FAILURE_THRESHOLD` | `20` | failed attempts per account per window before throttling |
+| `ACCOUNT_FAILURE_WINDOW` | `900` (15 min) | window length; also the maximum `Retry-After` |
+| `E02_ACCOUNT_KEY_SECRET` | *(unset)* | keyed-HMAC secret for the counter keys |
+
+Both limits are enforced; neither replaces the other. A request must pass the IP limit
+**and** the account limit.
+
+**Set `E02_ACCOUNT_KEY_SECRET` in production.** If it is unset, account-level throttling is
+disabled entirely and a `WARNING` is logged at startup. This is a deliberate fail-closed
+choice on privacy: the alternative (hashing the username without a secret) would look like
+protection while letting anyone who can read Redis recover usernames from a dictionary. It
+does **not** silently fall back to an unkeyed hash.
+
+Generate one with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Do **not** reuse `META_APP_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, `MANYCHAT_WEBHOOK_SECRET` or
+`GEMINI_API_KEY`. The webhook secrets rotate on the vendor's schedule and are shared with a
+third party, so a vendor-side rotation would silently reset every account counter; and
+widening a vendor secret's blast radius to login identifiers is unnecessary. A dedicated
+secret keeps the two lifecycles independent.
+
+Rotating the secret is **safe and self-healing**: existing counters become orphaned and
+expire within the window, which resets throttles but never locks anyone out. It is safe to
+rotate while serving traffic.
+
+What operators see in Redis:
+
+```
+ratelimit:auth_account:7d91ec73dbc3af26059b99c7cd2a00e6   TTL 899
+```
+
+The suffix is a keyed BLAKE2b digest. **No username or tenant name appears in any key**, so
+an operator with Redis access cannot enumerate customers from the keyspace.
+
+Operational notes:
+
+* **This throttles, it does not lock out.** The counter expires on its own after the window,
+  and a successful login clears it. There is no permanent lockout to unlock by hand. If you
+  must clear an account immediately, delete its `ratelimit:auth_account:*` key.
+* **A throttled account refuses all attempts, including the correct password**, until the
+  window expires. That is inherent: verifying the password in order to admit the owner would
+  verify every guess. The bound is the window (15 min default), which is why the window is
+  capped below an hour.
+* **A successful login clears the account counter only.** The IP counter deliberately
+  survives, so an attacker holding one valid credential cannot launder an abusive address by
+  interleaving successful logins.
+* **Redis is required for cross-worker enforcement.** With Redis reachable, two workers (and
+  any number of replicas) share one counter. If Redis is unreachable the limiter falls back
+  to a **per-process** counter, which means the effective limit becomes
+  `threshold × number of workers` — it does **not** provide cross-worker protection. The
+  fallback is logged loudly. The general fail-open/fail-closed policy for a Redis outage is
+  out of scope here (E-03).
+* **Responses are uniform.** A wrong password and an unknown account return the same status,
+  the same body and comparable timing (an unknown account performs a dummy PBKDF2
+  verification so it cannot be distinguished by response time). A throttled account returns
+  429 with `Retry-After` and a fixed message, for known and unknown identifiers alike.
+
+---
+
 ## 2. Liveness & Readiness Probes
 
 | Endpoint | Purpose | Checks Performed | HTTP Status |

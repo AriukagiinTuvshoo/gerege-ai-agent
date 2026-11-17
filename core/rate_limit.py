@@ -87,6 +87,28 @@ class _MemoryStore:
                     self._counters.pop(next(iter(self._counters)))
             return count
 
+    def read_counter(self, key: str, window_seconds: Optional[int] = None) -> int:
+        """
+        Current count, treating an entry older than `window_seconds` as expired.
+
+        The window has to be applied here as well as in `incr_in_window`: a caller asking
+        "how many failures has this account had?" must get 0 once the window has passed,
+        otherwise a throttle would appear to persist after it has actually lapsed.
+        """
+        now = self._clock()
+        with self._lock:
+            entry = self._counters.get(key)
+            if entry is None:
+                return 0
+            started, count = entry
+            if window_seconds is not None and now - started >= window_seconds:
+                return 0
+            return count
+
+    def delete_counter(self, key: str) -> None:
+        with self._lock:
+            self._counters.pop(key, None)
+
 
 class _RedisStore:
     """Counter store shared by every process pointed at the same Redis."""
@@ -110,6 +132,13 @@ class _RedisStore:
         if count == 1:
             self._client.expire(key, window_seconds)
         return count
+
+    def read_counter(self, key: str, window_seconds: Optional[int] = None) -> int:
+        # A plain GET; expiry is Redis's own job, so `window_seconds` needs no applying.
+        return int(self._client.get(key) or 0)
+
+    def delete_counter(self, key: str) -> None:
+        self._client.delete(key)
 
 
 class RateLimiter:
@@ -146,6 +175,33 @@ class RateLimiter:
 
     def backend(self) -> str:
         return getattr(self._store, "backend_name", "unknown")
+
+    def peek(self, key: str, window_seconds: Optional[int] = None) -> int:
+        """
+        Read a counter without incrementing it. Diagnostics and tests only.
+
+        Takes the store's own lock (memory) or a plain `GET` (Redis), so a concurrent
+        increment can never be observed half-applied. `window_seconds` makes the memory
+        store treat an expired entry as absent, matching Redis TTL semantics.
+        """
+        try:
+            return self._store.read_counter(key, window_seconds)
+        except Exception as exc:  # pragma: no cover - depends on a live server
+            logger.error(f"Rate limiter store failed to read {key} ({exc}); reporting 0")
+            return 0
+
+    def reset_key(self, key: str) -> None:
+        """
+        Delete exactly one counter.
+
+        Used to clear an account's failure count on successful authentication. Deliberately
+        narrower than `reset(scope)`, which takes a prefix and would also clear unrelated
+        accounts.
+        """
+        try:
+            self._store.delete_counter(key)
+        except Exception as exc:  # pragma: no cover - depends on a live server
+            logger.error(f"Rate limiter store failed to delete {key} ({exc})")
 
     def is_shared(self) -> bool:
         """True when limits are enforced across processes."""
@@ -475,3 +531,146 @@ def check_request_limit(request, scope: str) -> Optional[Dict[str, object]]:
         return None
     result = get_limiter().check(scope, client_identity(request), limit, window)
     return None if result["allowed"] else result
+
+
+# =============================================================================
+# E-02 Phase 4 — account-level failed-login protection
+# =============================================================================
+# The gap Phase 3 left open
+# -------------------------
+# Phase 3 made the client IP trustworthy, so an attacker can no longer *claim* somebody
+# else's address. It does nothing about an attacker who simply uses addresses it really
+# has: a botnet, a residential proxy pool, or one cloud VM per attempt. With `auth_login`
+# at 10/60s per IP, 400 attempts against one account cost 40 addresses and 60 seconds —
+# and the Phase 2 suite demonstrated exactly that (40 attempts from 40 IPs, all accepted).
+#
+# The two limits are therefore independent and neither replaces the other:
+#   * IP limit   — caps how fast one source can guess against *any* account.
+#   * Acct limit — caps how many times one account can be guessed against from *anywhere*.
+#
+# A note on what is deliberately NOT here: there is no lockout. This is a temporary
+# throttle that expires on its own, and a successful authentication clears it outright.
+# A permanent or long lockout converts a brute-force defence into a trivial denial of
+# service — anyone who can reach the login form could lock the owner out of their own
+# tenant indefinitely by guessing wrong. That trade is not worth it, so the throttle is
+# bounded below an hour and always self-heals.
+#
+# Threshold rationale (not invented — tied to what it must stop)
+# --------------------------------------------------------------
+# 20 failures / 15 minutes per account. Against a real password space the arithmetic that
+# matters is guesses-per-hour-per-account, not per-IP:
+#   * 20/15min ≈ 80/hour ≈ 1,900/day. Against even a modest password lifted from a
+#     top-1,000 list (which 1 attempt in 1,000 would hit), a day of continuous attack is
+#     still well inside the margin a normal user's password should have — but it is 20x
+#     slower than the per-IP limit alone allows when addresses are free.
+#   * It is far above human mistyping: 20 failures in a 15-minute window is not a person
+#     fumbling a password, so support load stays nil.
+#   * Because success clears the counter, the "I finally remembered it" path is untouched.
+# These are configurable through the environment so a deployment can raise them without a
+# code change; the defaults are the reviewable policy.
+ACCOUNT_FAILURE_THRESHOLD = 20
+
+#: Sliding-window length in seconds for the account counter (15 minutes).
+#:
+#: Bounded at one hour by `test_43`: past that it stops behaving like a throttle and starts
+#: behaving like a lockout, which is the thing this phase must not introduce.
+ACCOUNT_FAILURE_WINDOW = 15 * 60
+
+#: Scope name, matching `ratelimit:auth_account:<keyed digest>` in Redis.
+ACCOUNT_SCOPE = "auth_account"
+
+#: Throttle message. Fixed text, identical for known and unknown accounts, so the response
+#: cannot become the enumeration oracle that the error message no longer is.
+ACCOUNT_THROTTLE_MESSAGE = (
+    "Хэт олон удаа буруу оролдлого хийлээ. Хэсэг хугацааны дараа дахин оролдоно уу."
+)
+
+
+def account_rate_limit_key(identifier: Optional[str]) -> Optional[str]:
+    """
+    The account identity used in the store: a keyed digest, or None when unavailable.
+
+    Thin re-export so callers have one import. See `core/account_keys` for why the digest is
+    keyed and why a missing secret means None rather than an unkeyed fallback.
+    """
+    from core import account_keys
+
+    return account_keys.account_key(identifier)
+
+
+def refresh_account_key_secret() -> Optional[str]:
+    """Re-read the account-key secret from the environment (startup, tests, rotation)."""
+    from core import account_keys
+
+    return account_keys.refresh_secret()
+
+
+def _account_store_key(identifier: str) -> Optional[str]:
+    digest = account_rate_limit_key(identifier)
+    if not digest:
+        return None
+    return f"ratelimit:{ACCOUNT_SCOPE}:{digest}"
+
+
+def get_account_failure_count(identifier: str) -> int:
+    """
+    Current failure count for an account, without recording a new one.
+
+    Returns 0 when account throttling is not configured, which is also the value callers
+    should read as "nothing recorded".
+    """
+    key = _account_store_key(identifier)
+    if key is None:
+        return 0
+    return get_limiter().peek(key, ACCOUNT_FAILURE_WINDOW)
+
+
+def check_account_login_allowed(
+    identifier: str,
+    limit: Optional[int] = None,
+    window_seconds: Optional[int] = None,
+) -> Dict[str, object]:
+    """
+    Count one login attempt against `identifier` and report whether it may proceed.
+
+    Returns ``{"allowed", "count", "limit", "retry_after"}``. When account throttling is not
+    configured the call is a no-op that always allows — the documented degradation, logged
+    once at startup by `core.account_keys.refresh_secret`.
+    """
+    effective_limit = ACCOUNT_FAILURE_THRESHOLD if limit is None else limit
+    effective_window = ACCOUNT_FAILURE_WINDOW if window_seconds is None else window_seconds
+    key = _account_store_key(identifier)
+    if key is None:
+        return {"allowed": True, "count": 0, "limit": 0, "retry_after": 0}
+
+    limiter = get_limiter()
+    try:
+        count = limiter._store.incr_in_window(key, effective_window)
+    except Exception as exc:  # pragma: no cover - depends on a live server
+        # Same posture as the IP limiter: a store outage must not take login down. It is
+        # also not silent — E-03 owns the general fail-open/fail-closed policy.
+        logger.error(f"Account throttle store failed for {ACCOUNT_SCOPE} ({exc}); allowing request")
+        return {"allowed": True, "count": 0, "limit": effective_limit, "retry_after": 0}
+
+    allowed = count <= effective_limit
+    return {
+        "allowed": allowed,
+        "count": count,
+        "limit": effective_limit,
+        "retry_after": effective_window if not allowed else 0,
+    }
+
+
+def reset_account_failures(identifier: str) -> None:
+    """
+    Clear an account's failure count after a successful authentication.
+
+    Clears *only* the account counter. The IP counter is intentionally left alone: a
+    successful login proves the account, not the source address, and an attacker holding one
+    valid credential could otherwise launder an abusive IP indefinitely by interleaving
+    successful logins with guessing.
+    """
+    key = _account_store_key(identifier)
+    if key is None:
+        return
+    get_limiter().reset_key(key)

@@ -125,6 +125,21 @@ def _login(client, username, password, headers=None, payload_type_override=None,
     return client.post("/api/auth/login", json=payload, headers=headers or {})
 
 
+def _login_via_peer(app, username, password, peer_ip):
+    """
+    One login from a specific, real source address.
+
+    `TestClient(app)` with no `client=` presents an unparseable peer, which collapses every
+    request into the single IP identity "unknown". That is fine for testing the IP limiter's
+    own behaviour, but it makes it impossible to isolate the account layer — so tests that
+    vary the account must also vary the peer.
+    """
+    # `app_client` yields a TestClient, other callers may pass an ASGI app.
+    app = getattr(app, "app", app)
+    peer = TestClient(app, raise_server_exceptions=False, client=(peer_ip, 41000))
+    return _login(peer, username, password)
+
+
 def _login_failures_until_blocked(client, headers_for, max_attempts=40):
     """
     Drive failed logins, changing only the transport identity via `headers_for(i)`.
@@ -370,29 +385,63 @@ def test_11b_enumeration_oracle_is_not_available_through_any_login_type(app_clie
 
 def test_12_successful_login_resets_the_account_counter(app_client, fresh_limiter):
     """
-    Test 12. A legitimate user who mistypes a few times and then succeeds must not stay
-    near the lockout threshold for the rest of the window.
+    Test 12. A legitimate user who mistypes a few times and then succeeds must not still be
+    carrying those failures.
 
-    Policy asserted: success clears the *account* failure counter. Success must NOT clear
-    the IP counter outright (that would let an attacker with one valid credential launder
-    an abusive IP), so only the account side is asserted here.
+    Policy asserted: success clears the *account* failure counter. Success must NOT clear the
+    IP counter outright (that would let an attacker with one valid credential launder an
+    abusive IP), so only the account side is asserted here.
+
+    Harness note (E-02 Phase 4). The previous version sent every request through
+    `TestClient(main.app)` with no peer address, so `resolve_client_ip` collapsed them all to
+    the single identity "unknown" and the *IP* limiter decided the outcome. It failed for the
+    wrong reason — and with a realistic peer it passed even against a build with no
+    account-level protection at all, because its loop never reached the account threshold.
+    See `docs/audit/evidence/e02_phase4_test12_vacuous.txt`. Both halves are fixed: each
+    request presents its own peer address, and the assertions are ordered so a build without
+    account-level resetting FAILS.
+
+    On not asserting "the owner can log in while throttled": a throttle that verified the
+    password in order to let the owner through would verify *every* guess, which is the
+    protection removed. Refusing all attempts for the window is what the mechanism means;
+    that the window is bounded and self-healing is asserted by
+    `test_44_counter_expires` and the Phase 4 suite.
     """
-    for i in range(LOGIN_LIMIT - 1):
-        _login(app_client, ACME_USER, "wrong", headers={"X-Forwarded-For": f"203.0.113.{i}"})
+    threshold = rate_limit.ACCOUNT_FAILURE_THRESHOLD
+    spent = threshold - 3
 
-    ok = _login(app_client, ACME_USER, ACME_PASS, headers={"X-Forwarded-For": "203.0.113.200"})
+    # (a) Spend most — but not all — of the budget, one distinct peer per attempt so the
+    # per-IP limit can never be what decides the outcome.
+    for i in range(spent):
+        r = _login_via_peer(app_client, ACME_USER, "wrong", f"203.0.113.{i + 1}")
+        assert r.status_code == 401, (
+            f"attempt {i + 1} of {spent} was answered {r.status_code}; it is below the "
+            f"threshold {threshold} and must not be throttled"
+        )
+
+    # (b) The real user now remembers the password.
+    ok = _login_via_peer(app_client, ACME_USER, ACME_PASS, "203.0.113.249")
     assert ok.status_code == 200, f"legitimate login blocked: {ok.status_code} {ok.text}"
 
-    # With the account counter cleared, a full fresh budget is available.
-    remaining = 0
-    for i in range(LOGIN_LIMIT + 5):
-        r = _login(app_client, ACME_USER, "wrong", headers={"X-Forwarded-For": f"198.51.100.{i}"})
+    # (c) The discriminating assertion. If success cleared the counter, a full fresh budget
+    # of `threshold - 1` further attempts is available before throttling. If it did not, the
+    # three leftover failures leave only three, and we throttle immediately.
+    allowed = 0
+    for i in range(threshold + 5):
+        r = _login_via_peer(app_client, ACME_USER, "wrong", f"198.51.100.{i + 1}")
         if r.status_code == 429:
             break
-        remaining += 1
-    assert remaining >= LOGIN_LIMIT - 1, (
-        f"E-02: after a successful login only {remaining} further attempts were allowed; "
-        "the failure counter was not reset"
+        allowed += 1
+    # A build with no account counter at all never throttles, so `allowed` would run to the
+    # loop bound. A build that counts but does not reset throttles after `threshold - spent`.
+    # Only a build that counts AND resets lands at `threshold - 1`, so this pins both.
+    # `check` allows while `count <= limit`, so a cleared account admits exactly `threshold`
+    # attempts before the first 429.
+    assert allowed == threshold, (
+        f"E-02: after a successful login {allowed} further attempts were allowed, expected "
+        f"exactly {threshold}. Fewer means the {spent} failures before the successful login "
+        "were not cleared; more (or no throttle at all) means there is no account-level "
+        "counter"
     )
 
 

@@ -1,0 +1,54 @@
+E-02 Phase 4 — evidence that the original test_12 asserted nothing
+==================================================================
+The Phase 2 test `test_12_successful_login_resets_the_account_counter` failed at the end of
+Phase 3.1. It was not a real regression: it was a defective test.
+
+Defect 1 — wrong harness
+  `app_client` yields `TestClient(main.app)` with no `client=` argument. Starlette's default
+  peer is `("testclient", 50000)`, which `resolve_client_ip` cannot parse, so EVERY request
+  collapsed to the single IP identity "unknown" (observed key:
+  ratelimit:auth_login:unknown). The per-IP limit (10/60s) therefore decided the outcome, not
+  the account counter. Measured: the IP counter reached 10 and the first request of the test's
+  own loop returned 429 with Retry-After: 60, while the account counter was correctly 0.
+
+Defect 2 — the assertion is satisfied without the feature
+  With the peer fixed (a distinct IP per request), the original assertion
+  `remaining >= LOGIN_LIMIT - 1` i.e. `>= 9` holds on the BASE COMMIT 402672f, which has no
+  account-level protection whatsoever:
+
+    $ (worktree at 402672f) python /tmp/vac.py
+    RESULT attempts_allowed=15 threshold_required=9
+    VERDICT VACUOUS-test_12-passes-with-zero-account-protection
+
+  The reason is arithmetic: the account threshold is 20, the loop bound is LOGIN_LIMIT + 5 =
+  15, so the loop can never reach the threshold and `remaining` is always 15. The test cannot
+  fail for an account-level reason.
+
+  Confirmed again after adding the account layer: same script, same verdict (15 >= 9).
+
+Repair
+  Two changes, both required for the test to be able to fail:
+    1. `_login_via_peer()` gives each request its own TCP peer, so the per-IP limit can never
+       be the thing under test.
+    2. The assertions now pin the EXACT number of attempts a cleared account admits
+       (`threshold`), which is a value only a build that both COUNTS and RESETS can produce.
+
+  Verified in both directions:
+    * branch (implementation present):       1 passed
+    * base 402672f, account constants stubbed so the module imports and the test can run:
+      `AssertionError: after a successful login 25 further attempts were allowed, expected
+       exactly 20` -> 1 failed.
+
+  The stubbed baseline is the stronger check: it removes the trivial "the attribute does not
+  exist" failure and leaves only the behavioural one.
+
+Design question raised and resolved by this work
+------------------------------------------------
+Should a throttled account still admit the owner's correct password?
+  No. Verifying the password in order to decide whether to admit it verifies *every* guess,
+  which is the protection deleted. Refusing all attempts for a bounded, self-healing window is
+  what the mechanism means (fail2ban, Django-axes, Rails `lockable` all behave this way).
+  The anti-DoS property is therefore the bounded window plus the reset on success, asserted by
+  `test_44_counter_expires` and the Phase 4 suite — not by admitting guesses while throttled.
+  An assertion to the contrary was written, failed, and was corrected rather than the
+  implementation being weakened to satisfy it.

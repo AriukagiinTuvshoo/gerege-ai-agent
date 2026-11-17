@@ -116,12 +116,27 @@ jobs:
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
           # These files were previously absent from the workflow, so their assertions never
-          # ran in CI. tests/test_e02_login_rate_limit.py contains tests that still fail by
-          # design until E-02 Phase 4 lands, so this step runs only the Phase 3 subset plus
-          # the whole trusted-proxy suite. The "|| true" is deliberately NOT used: a
-          # failure here must fail the build.
+          # ran in CI. E-02 Phase 4 is complete, so the *whole* login rate-limit file runs
+          # here now - the `-k` subset that used to exclude test_11/test_11b/test_12 is gone
+          # because those tests pass. The "|| true" is deliberately NOT used: a failure here
+          # must fail the build.
           pytest tests/test_e02_trusted_proxy.py -v --tb=short
-          pytest tests/test_e02_login_rate_limit.py -v --tb=short -k "test_01 or test_02 or test_03 or test_03b or test_04 or test_05 or test_06 or test_07 or test_08 or test_09 or test_10 or test_13 or test_14 or test_16 or test_17 or test_18 or test_19 or test_20"
+          pytest tests/test_e02_login_rate_limit.py -v --tb=short
+
+          # E-02 Phase 4: account-level failed-login protection.
+          #
+          # This runs against the live Redis service defined at the top of this file, which
+          # matters: three of these tests (multi-process shared counter, counter survives a
+          # restart, TTL is bounded) SKIP without REDIS_URL. Skipping is not passing, so the
+          # step asserts they were actually collected and executed rather than relying on a
+          # green tick that could come from skips. The grep fails the build if the summary
+          # shows any skip.
+          set -o pipefail
+          pytest tests/test_e02_phase4_account_protection.py -v --tb=short | tee /tmp/p4.log
+          if grep -qE "[0-9]+ skipped" /tmp/p4.log; then
+            echo "::error::E-02 Phase 4 tests skipped; REDIS_URL must be live for these to run"
+            exit 1
+          fi
 
       - name: Run Pytest Regression, Enterprise, AI Eval & Failure Suites (SQLite mode)
         run: |

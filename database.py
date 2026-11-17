@@ -80,6 +80,32 @@ def hmac_equal(a: str, b: str) -> bool:
     """Timing attack хамгаалалттай харьцуулалт"""
     return secrets.compare_digest(a, b)
 
+
+#: Dummy credential for the unknown-account path (E-02 Phase 4).
+#:
+#: Generated once per process, so no fixed value can be recognised, and it is never stored
+#: anywhere — nothing can authenticate against it.
+_DUMMY_HASH, _DUMMY_SALT = hash_password(secrets.token_hex(32))
+
+
+def dummy_password_verify(password: Optional[str]) -> bool:
+    """
+    Spend the same work as `verify_password` when there is no account to verify against.
+
+    Why this exists: `authenticate_client_detailed` returns as soon as the account lookup
+    misses, so an unknown username answered in ~6 ms while a known one took ~38 ms
+    (measured, `docs/audit/evidence/e02_phase4_before.txt`). That 6x gap is a practical
+    enumeration oracle — it tells an attacker which tenant names are real without ever
+    needing a valid password.
+
+    This runs the *same* PBKDF2-HMAC-SHA256 at the same iteration count as a real
+    verification, against a throwaway credential, so both paths cost the same. It is a real
+    verification rather than a `sleep` on purpose: a sleep has to be tuned to a cost that
+    changes with hardware and configuration, while this tracks the real cost automatically.
+    """
+    verify_password(password or "", _DUMMY_HASH, _DUMMY_SALT)
+    return False
+
 def init_db():
     """Bring the database to the current schema, then seed first-run data.
 
@@ -461,6 +487,10 @@ def authenticate_client_detailed(identifier: str, password: Optional[str] = None
     row = cursor.fetchone()
     if not row:
         conn.close()
+        # E-02 Phase 4: no account means no password to check, which would return in ~6 ms
+        # instead of ~38 ms and disclose which tenant names exist. Spend the same work on a
+        # throwaway credential first.
+        dummy_password_verify(password)
         return None, f"'{ident}' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
 
     p_dict = dict(row)
@@ -469,10 +499,15 @@ def authenticate_client_detailed(identifier: str, password: Optional[str] = None
 
     if not stored_hash or not salt:
         conn.close()
+        # Same equalisation: this branch is only reachable for a REAL account, so without it
+        # "exists but unconfigured" would answer faster than "exists with a password".
+        dummy_password_verify(password)
         return None, f"'{p_dict.get('name')}' салбарт одоогоор нууц үг хадгалаагүй байна. Админ самбарын 'Хандалт' цонхноос шинэ нууц үг хадгалж өгөх эсвэл Magic Link-ээр орно уу."
 
     if not password or not password.strip():
         conn.close()
+        # verify_password() also returns early on an empty password, so equalise here too.
+        dummy_password_verify(password)
         return None, "Нууц үгээ оруулна уу."
 
     if verify_password(password.strip(), stored_hash, salt):

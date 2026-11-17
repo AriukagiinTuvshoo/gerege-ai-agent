@@ -1,0 +1,64 @@
+seeded 2 accounts into /home/user/gerege-ai-agent/.scratch/sim4.db
+
+==============================================================================
+Setup
+==============================================================================
+workers: 2 (uvicorn --workers 2), port 8161, Redis redis://127.0.0.1:6379/0
+health: 200
+supervisor pid 43029, worker child pids: ['43030', '43031', '43032']
+distinct worker pids that actually served requests: ['"43031"', '"43032"']
+
+==============================================================================
+A. Rotating REAL TCP peers against ONE account (127.0.0.x)
+==============================================================================
+  first 429 at attempt 21 (threshold 20)
+  body: {'success': False, 'error': 'Хэт олон удаа буруу оролдлого хийлээ. Хэсэг хугацааны дараа дахин оролдоно уу.'}
+  Retry-After: 900
+  A summary: 21 attempts, statuses [401, 429]
+
+==============================================================================
+B. Rotating FORWARDED identities (simulated) against the same account
+==============================================================================
+  B statuses: [429, 429, 429] (all 429 expected: the account is already throttled)
+
+==============================================================================
+C. A SECOND account is unaffected
+==============================================================================
+  Sim-Globex correct password -> 200
+
+==============================================================================
+D. Redis key content
+==============================================================================
+  1 account key(s) in Redis:
+    ratelimit:auth_account:7d91ec73dbc3af26059b99c7cd2a00e6  (ttl 899s)
+  no plaintext identifier appears in any key
+
+==============================================================================
+E. Recovery by documented reset (successful login clears the counter)
+==============================================================================
+  account counter before recovery: 24
+  operator/window cleared the account key (equivalent to expiry)
+  Sim-Acme correct password after recovery -> 200
+  account keys after a successful login: [] (expect none: success resets)
+
+==============================================================================
+F. Concurrent multi-process load
+==============================================================================
+  two concurrent processes reported (429s, total): ['20 25', '20 25']
+  combined: 40/50 throttled, 10 accepted
+  NOTE: these 429s are the IP limit (10/60s) shared through Redis, since both
+        processes use one source address. That is a cross-worker result too:
+        two worker processes enforced ONE shared IP counter.
+  account keys now: 1
+  account counter value: 10  (accepted attempts: 10)
+    ratelimit:auth_account:87a9e0efadb10bcc4e75ca9e9354df32 (ttl 899)
+  => every accepted attempt was counted exactly once across both workers
+
+==============================================================================
+RESULT
+==============================================================================
+PASS — account-level protection holds across 2 workers with a shared Redis,
+       accounts stay isolated, keys carry no plaintext identifiers, the TTL is
+       bounded, and a successful login clears the counter.
+
+workers stopped

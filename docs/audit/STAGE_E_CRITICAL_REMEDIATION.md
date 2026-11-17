@@ -14,7 +14,7 @@ Strictly sequential. Parallelising these would make each failure ambiguous.
 | Step | Priority | Subject | Status |
 |---|---|---|---|
 | **E-01** | P0 | Tenant isolation of session state, messages and PII | **FIXED — verified** |
-| **E-02** | P0 | Login rate limit, trusted proxy, account-level lockout | **Phase 3 + 3.1 done** · Phase 4 not started |
+| **E-02** | P0 | Login rate limit, trusted proxy, account-level throttle | **Phases 2, 3, 3.1, 4 done** — complete |
 | **E-03** | P1 | Redis outage truthfulness in health; per-endpoint fail policy | Not started |
 | **E-04** | P1 | Durable webhook processing: lease, retry, idempotency | Not started |
 
@@ -135,9 +135,9 @@ bytes, junk aborts to the peer).
 | SQLite / PostgreSQL regression | **PASS** |
 | E-01 regression | **PASS** 12/12 |
 | CI | **PASS** — [`44000307785`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44000307785) on `d39fac6`, all steps green incl. Docker build (step conclusions only; log text unreachable) |
-| Account-level protection | **NOT IMPLEMENTED** — Phase 4 |
+| Account-level protection | **IMPLEMENTED** — Phase 4 (§4.2 of the E-02 report) |
 
-**E-02 is NOT complete and SEC-07 remains FAIL.**
+**E-02 is complete (Phases 2, 3, 3.1, 4). SEC-07's remaining gap is closed.**
 
 ### Corrected test count
 
@@ -146,13 +146,25 @@ was split into `test_11` and `test_11b`). Both environment totals — SQLite 15+
 PostgreSQL 16+5 — equal 21 and were correct. Full per-test table in the E-02 report.
 
 `test_20` passes pre-fix because Redis already shares whatever is counted; it is left
-passing deliberately. After Phase 4 it keeps its green result but asserts that the
-*account* counter survives a restart rather than an arbitrary key.
+passing deliberately. It keeps its green result after Phase 4; the account-specific
+restart-safety case is `test_50` in the Phase 4 suite.
+
+### Phase 4 correction to this document's earlier claim
+
+The Phase 2 `test_12` was described above as a pending Phase 4 requirement. It was in fact a
+**defective test**, not an unmet requirement: its harness gave every request the identity
+`"unknown"` (so the IP limiter decided the outcome) and its assertion was satisfiable with no
+account-level protection at all. Both defects are fixed and the assertion strengthened from
+`>= 9` to `== 20`; the measurements are in
+`docs/audit/evidence/e02_phase4_test12_vacuous.txt` and §6.6 of the E-02 report.
 
 ## Outstanding across Stage E
 
-* E-02: 0/13 rotating-`X-Forwarded-For` bypasses still succeed on a real uvicorn; no
-  account-level lockout (SEC-07 is **FAIL**, not fixed by E-01).
+* E-02: **complete.** 0/13 rotating-`X-Forwarded-For` bypasses succeed on a real uvicorn, and
+  account-level throttling now holds against rotating source addresses across two workers with
+  a shared Redis. Residual limits (documented, not hidden): per-worker counters without Redis
+  (§4.2E), a 15-minute refusal of even the correct password while throttled (§4.2C), and a
+  secret that takes effect on restart (R7).
 * E-03: Redis failure still fails open, and `/api/health` still reports
   `rate_limits_shared_across_workers: true` when it is not.
 * E-04: webhook processing still claims before processing, with a 14-day swallow window.

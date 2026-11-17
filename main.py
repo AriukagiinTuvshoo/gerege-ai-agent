@@ -83,6 +83,12 @@ async def executive_scheduler_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # E-02 Phase 4: read the account-key secret once at startup so a missing one produces a
+    # visible WARNING in the logs rather than being discovered during an incident. Account
+    # throttling is disabled when it is unset — there is no unkeyed fallback (see
+    # core/account_keys).
+    core_rate_limit.refresh_account_key_secret()
+
     scheduler_task = None
     if os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1":
         scheduler_task = asyncio.create_task(executive_scheduler_loop())
@@ -342,8 +348,27 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
     elif login_type in ["client", "magic"]:
         identifier = str(payload.get("identifier") or payload.get("username") or payload.get("token") or "").strip()
         password = payload.get("password")
+
+        # E-02 Phase 4: account-level throttle, independent of the per-IP limit above. This
+        # is checked BEFORE authentication so a burned budget costs the attacker no database
+        # work and, more importantly, so a throttled account cannot be distinguished from a
+        # throttled unknown one by response time either.
+        account_hit = core_rate_limit.check_account_login_allowed(identifier)
+        if not account_hit["allowed"]:
+            database.record_audit_log(
+                "auth.login.account_throttled", actor_role="client", ip_address=client_ip
+            )
+            return JSONResponse(
+                {"success": False, "error": core_rate_limit.ACCOUNT_THROTTLE_MESSAGE},
+                status_code=429,
+                headers={"Retry-After": str(account_hit["retry_after"])},
+            )
+
         client_page, err_msg = database.authenticate_client_detailed(identifier, password)
         if client_page:
+            # Successful authentication clears the account's failure count — and only that
+            # counter (see reset_account_failures; the IP counter is deliberately kept).
+            core_rate_limit.reset_account_failures(identifier)
             page_id = client_page["page_id"]
             # P0 Fix: Server-authoritative role resolution. User payload 'role' is never trusted.
             resolved_role = core_security.resolve_tenant_login_role(
@@ -371,8 +396,16 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
                 "tokens_used": client_page.get("tokens_used", 0),
                 "monthly_token_limit": client_page.get("monthly_token_limit", 100000)
             }
+        # E-02 Phase 4: uniform failure. `err_msg` distinguishes "no such tenant" from
+        # "wrong password" from "this tenant has no password set" from "no password sent" —
+        # four different oracles in one string, and two of them also name the account.
+        # It is kept for the server-side audit trail below, never for the client.
         database.record_audit_log("auth.login.failed", actor_role="client", actor_id=identifier, ip_address=client_ip)
-        return JSONResponse({"success": False, "error": err_msg or "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"}, status_code=401)
+
+        return JSONResponse(
+            {"success": False, "error": "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"},
+            status_code=401,
+        )
 
     return JSONResponse({"success": False, "error": "Үл мэдэгдэх төрөл"}, status_code=400)
 

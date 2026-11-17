@@ -213,11 +213,150 @@ Both were mine, and both were caught before the fix landed:
   hop, so it exited via the first loop and proved nothing. Corrected to use an
   all-trusted chain, which is what actually reaches that path.
 
+## 4.2 Phase 4 — account-level failed-login protection
+
+### The gap Phase 3 left open
+
+Phase 3 made the client IP trustworthy, so an attacker can no longer *claim* an address it
+does not have. It does nothing about an attacker that simply **uses addresses it does have**:
+a botnet, a residential proxy pool, or one cloud VM per attempt. `auth_login` allows 10
+attempts per 60 seconds *per IP*, so 400 attempts against one account cost 40 addresses and
+one minute.
+
+The Phase 2 suite already demonstrated this concretely: 40 attempts against one account from
+40 distinct source IPs were all accepted. Nothing bounded attempts *per account*.
+
+### Design
+
+Two limits, independent, both enforced:
+
+| Layer | Key | Default | Stops |
+|---|---|---|---|
+| IP (Phase 3) | `ratelimit:auth_login:<client ip>` | 10 / 60 s | how fast one source can guess |
+| Account (Phase 4) | `ratelimit:auth_account:<keyed digest>` | 20 / 900 s | how often one account can be guessed |
+
+A request must pass both. The account check runs **before** authentication, so a burned
+budget costs the attacker no database work, and a throttled request never reaches password
+verification.
+
+### A. Identity normalization
+
+The real lookup is `LOWER(TRIM(client_username)) = LOWER(?)`, i.e. login is *already*
+case-insensitive and whitespace-insensitive. The throttle key therefore applies
+`str.strip().casefold()` so both agree.
+
+| Input | Behavior | Test |
+|---|---|---|
+| `Acme-Mn`, `acme-mn`, `ACME-MN`, `  Acme-Mn  `, `aCME-mN` | one shared budget | `test_36` (6 spellings) |
+| `Acme-Mn` vs `Acme.Mn` | separate budgets — casefolding does not touch `.` | `test_37` |
+| empty, whitespace, NUL, 5 KB, non-ASCII, path traversal | no crash; 400/401/422/429 | `test_38` |
+
+If normalization were *not* applied, each spelling would get its own budget and the limit
+would multiply by however many spellings an attacker cared to try. The direction of any
+disagreement between `casefold()` and SQLite `LOWER` is toward **sharing** a budget (which can
+only over-throttle the same name written differently), never toward splitting one — splitting
+is what would multiply the budget.
+
+Empty or missing identifiers produce **no key at all** rather than a shared "empty" bucket,
+because a shared bucket would let an unauthenticated stranger throttle every user at once.
+
+### B. Key derivation — why keyed, and why a new secret
+
+Keys are `blake2b(key=secret, person=..., digest_size=16)` over the normalized identifier.
+
+* **Not plaintext.** A username in Redis is a leak of the customer list.
+* **Not plain SHA-256.** Usernames are low entropy (`<brand>-mn`); an unkeyed digest is a
+  dictionary lookup away from plaintext, so it is a privacy *theatre*, not a control.
+* **No silent fallback.** With no secret, `account_key()` returns `None` and account counting
+  is skipped. A fallback to an unkeyed hash would look like protection while leaking
+  identifiers — strictly worse than the honest gap. Asserted by `test_41`.
+
+A **dedicated** `E02_ACCOUNT_KEY_SECRET` is required. The existing secrets were assessed and
+rejected:
+
+| Secret | Why not |
+|---|---|
+| `META_APP_SECRET` | vendor-shared, rotates on Meta's schedule — a rotation would silently reset all counters; widens that secret's blast radius to login identifiers |
+| `TELEGRAM_WEBHOOK_SECRET` | same problem, different vendor |
+| `MANYCHAT_WEBHOOK_SECRET` | same problem |
+| `GEMINI_API_KEY` | billable credential — never use a credential as a MAC key |
+
+Verified by `test_40` (the key differs when the secret changes, and is not a plain SHA-256)
+and `test_39` (no plaintext identifier appears in any key).
+
+### C. Threshold, window, and why this is a throttle and not a lockout
+
+`ACCOUNT_FAILURE_THRESHOLD = 20`, `ACCOUNT_FAILURE_WINDOW = 900 s`. Rationale, tied to what it
+must stop rather than a round number:
+
+* 20/15 min ≈ 80 guesses/hour ≈ 1,900/day per account, and **independent of how many
+  addresses the attacker has** — which is the entire point.
+* 20 failures in 15 minutes is not a person mistyping.
+* The window is capped at one hour by `test_43`; beyond that a "throttle" becomes the lockout
+  this phase must not introduce.
+
+**No permanent lockout.** The counter expires by itself. A successful login clears it. There
+is nothing an operator must remember to unlock.
+
+One consequence is worth stating plainly: while an account is throttled, **the owner's
+correct password is refused too**. That is inherent — verifying the password in order to
+admit the owner would verify every guess, which is the protection deleted. The mitigation is
+that the refusal is bounded (15 minutes) and self-healing. An assertion that the owner should
+be admitted while throttled was written during this phase, failed, and was *corrected* rather
+than the implementation being weakened to satisfy it (see
+`docs/audit/evidence/e02_phase4_test12_vacuous.txt`).
+
+### D. Redis atomicity
+
+Increments use `INCR` (atomic) with the TTL asserted on creation, inheriting the Phase 2
+`incr_in_window` implementation. There is **no read-then-write** anywhere:
+
+* `check_account_login_allowed` → single `INCR`.
+* `reset_account_failures` → single `DEL` of exactly one key (not a prefix scan, so it cannot
+  erase a neighbouring account).
+* `get_account_failure_count` → single `GET`.
+
+Verified cross-process: `test_49` (two interpreter processes, one Redis) and the live
+simulation, where 10 accepted attempts across two worker processes produced a counter of
+exactly 10 — no lost updates.
+
+A reset racing an increment can still lose the increment, which is the *safe* direction: the
+account ends one failure lower, never higher. `test_51` pins that a failure occurring after a
+reset is counted.
+
+### E. Memory fallback — the limitation, stated
+
+With no Redis, the store is a per-process dict. **This does not provide cross-worker
+protection.** With N workers the effective account limit becomes `threshold × N`. The fallback
+is thread-safe (one lock, atomic incr) and logs loudly. It is not a substitute for Redis, and
+the E-03 outage policy is out of scope here.
+
+### F. Enumeration protection
+
+Before this phase the login endpoint disclosed account existence two ways:
+
+1. **Message.** Unknown account → `'X' нэртэй харилцагчийн салбар олдсонгүй`; known account
+   with a wrong password → `Нууц үг буруу байна!`. Both 401, so only the body differed.
+2. **Timing.** Measured median: **37.7 ms** for a known account vs **6.3 ms** for an unknown
+   one — a **6× oracle**. The unknown path returned before PBKDF2 ran.
+
+Both are closed. The client now receives one fixed message for every failure; `err_msg` is
+kept for the server-side audit trail only. Every early-return path in
+`authenticate_client_detailed` that would skip PBKDF2 now runs `dummy_password_verify` — a
+real PBKDF2-HMAC-SHA256 at the configured 100,000 iterations against a per-process throwaway
+credential. It is a real verification rather than a `sleep` on purpose: a sleep must be tuned
+to hardware and configuration, while this tracks the real cost automatically.
+
+`test_55` asserts the ratio stays within 0.5–2.0×; before the fix it failed at **5.8×**.
+
+Throttling does not re-open the oracle: `test_54` asserts a known and an unknown account reach
+429 on the *same attempt number*, and the throttle message is a fixed string.
+
 ## 5. Storage and concurrency
 
-Unchanged by this phase. The limiter remains a fixed-window `INCR` on Redis when
-`REDIS_URL` is reachable, with a per-process memory fallback. Phase 3 only changes *what
-the key is*, not how it is stored.
+Phase 3 changed *what* the IP key is. Phase 4 adds a second scope
+(`auth_account`) alongside it, sharing the same store abstraction and the same fixed-window
+`INCR`. Both are subject to the per-process memory fallback described in §4.2E.
 
 ## 6. Test matrix
 
@@ -298,6 +437,67 @@ touches the resolver.
 to "falls back to the peer" and an over-hop case was added. The bound is the safer
 behaviour; the original assertion would have required raising it for no reason.
 
+### 6.5 Phase 4 suite — `tests/test_e02_phase4_account_protection.py`
+
+**28 test functions → 34 collected cases** (parametrisation adds 6: 6 spelling variants of
+`test_36`, 2 of `test_34`). With a live `REDIS_URL`: **34 passed, 0 skipped**. Without one:
+31 passed, 3 skipped — the three that *require* a shared store. Skipping is not passing, so
+CI fails the step if any skip appears (§11.2).
+
+| Group | Tests | Covers |
+|---|---|---|
+| Account identity | `test_31`–`test_38` (8 functions, 14 cases) | same acct same IP; same acct 8 rotating real peers; rotating `X-Forwarded-For`; rotating `X-Real-IP` and `Forwarded` (2 cases); different accounts same IP; 6 spelling variants share one budget; distinct accounts not merged; malformed/empty identifiers don't crash |
+| Key privacy | `test_39`–`test_41` | no plaintext identifier in any key; not a plain SHA-256 and changes with the secret; no secret ⇒ no key (no unkeyed fallback) |
+| Counter behaviour | `test_42`–`test_47` | increment; threshold ⇒ temporary throttle and `window <= 3600`; expiry via an advanceable clock; success resets account; success does **not** reset IP; unknown account counted |
+| Redis / concurrency | `test_48`–`test_52` | 30 concurrent threads counted atomically; two interpreter processes share one Redis counter; counter survives a fresh limiter (restart); reset does not erase a newer failure; TTL bounded in `(0, window]` |
+| Enumeration | `test_53`–`test_56` | unknown vs wrong password identical status+body; throttling reaches 429 on the same attempt for known and unknown; timing ratio 0.5–2.0×; no plaintext username in logs |
+| Regression guards | `test_57`–`test_58` | IP limit still works alongside the account limit; successful login still returns a token |
+
+Two flaws in my own tests were found and fixed before the suite went green, both recorded
+rather than quietly patched:
+
+* `test_35` initially asserted that a second account on the *same IP* still logs in after 23
+  failures — but 23 failures from one IP legitimately exhausts the **IP** limit (10/60 s), so
+  it was testing the wrong layer. It now rotates the peer so only the account counter matters.
+* `test_46` read the IP counter *after* the successful login, which correctly increments it.
+  The counter is now read before and after, asserting `before + 1`, not "unchanged".
+
+### 6.6 The Phase 2 `test_12` repair
+
+`test_12_successful_login_resets_the_account_counter` failed at the end of Phase 3.1. It was
+not a regression — it was **two defects in the test**, both now fixed
+(`docs/audit/evidence/e02_phase4_test12_vacuous.txt` carries the measurements):
+
+1. **Wrong harness.** `app_client` yields `TestClient(main.app)` with no `client=` argument.
+   Starlette's default peer `("testclient", 50000)` is unparseable, so every request collapsed
+   onto the identity `"unknown"` and the *IP* limiter (10/60 s) decided the outcome. Measured:
+   IP counter 10, first request of the test's own loop → 429, while the account counter was
+   correctly 0. It failed for the wrong reason.
+2. **Vacuous assertion.** With a realistic peer, the original
+   `remaining >= LOGIN_LIMIT - 1` (i.e. `>= 9`) **passes on base commit `402672f`, which has no
+   account protection at all** — the loop bound (15) never reaches the account threshold (20),
+   so `remaining` is always 15. It could not fail for an account-level reason.
+
+The repair gives each request its own peer *and* pins the exact
+number of attempts a cleared account admits (`== threshold`), a value only a build that both
+counts and resets can produce. Verified both ways: **passes on this branch**; on base
+`402672f` with the account constants stubbed so the module still imports, it fails with
+`25 further attempts were allowed, expected exactly 20`.
+
+**No test was deleted, skipped, or weakened.** `test_12`'s assertion was strengthened from
+`>= 9` (satisfiable by nothing) to `== 20` (satisfiable only by a working reset).
+
+### 6.7 Totals
+
+| Scope | Collection | Result |
+|---|---|---|
+| Full suite, SQLite | 275 | **267 passed, 8 skipped, 0 failed** |
+| Full suite, PG 16 + Redis | 275 | **274 passed, 1 skipped, 0 failed** |
+
+The single PG-mode skip is pre-existing and unrelated: `test_stage_b_regressions.py` skips when
+`ALLOWED_ORIGINS` is unset. SQLite's 8 skips are the Redis- and PG-requiring tests plus the
+same `ALLOWED_ORIGINS` case. Phase 2/3 and E-01 are unchanged and green in both engines.
+
 ## 7. HTTP evidence
 
 Real uvicorn, real sockets, no TestClient.
@@ -313,6 +513,15 @@ Real uvicorn, real sockets, no TestClient.
 | trusted peer, 2 distinct forwarded clients | separate counters, 10 each |
 | 2 trusted hops, 12 spoofed prefixes | one counter, 10 accepted then blocked |
 | 429 response | `Retry-After: 60` |
+| **Phase 4:** 2 workers + Redis, 26 failures on ONE account from 26 rotating **real TCP peers** (127.0.0.x) | 20 accepted, then **429 at attempt 21**, `Retry-After: 900` |
+| **Phase 4:** same account, one peer, rotating `X-Forwarded-For` while throttled | 429, 429, 429 — the account layer is independent of the IP layer |
+| **Phase 4:** a second account from another peer | 200 — accounts isolated |
+| **Phase 4:** Redis key written | `ratelimit:auth_account:7d91ec73dbc3af26059b99c7cd2a00e6`, TTL 899 — no identifier |
+| **Phase 4:** 2 concurrent processes × 25 attempts on a second account | 10 accepted, 40 IP-blocked; account counter **exactly 10** for 10 accepted — no lost increments across two workers |
+
+The two workers were confirmed to *serve* traffic, not merely to boot: a PID probe returned two
+distinct worker pids (`39162`, `39163`). Full transcript in
+`docs/audit/evidence/e02_phase4_live_2worker_redis.txt`.
 
 ## 8. Remaining risks
 
@@ -323,9 +532,12 @@ identity is correct in every worker — but it means **Phase 3 alone does not cl
 14/14 scenario on a multi-worker deployment without Redis**. With Redis configured (as
 `docker-compose.prod.yml` does) the bypass is closed. Recorded rather than glossed over.
 
-**R2 — E-02 is not finished.** Account-level protection does not exist. Rotating the source
-address still allows unlimited attempts *per account*, bounded only by the per-IP limit.
-The Phase 2 tests 8, 9, 10, 15, 17, 19 still fail, and SEC-07 remains **FAIL**.
+**R2 — closed by Phase 4, with two residual limits.** Account-level protection now exists and
+is independent of the source address. Residual limits:
+(a) with no Redis each worker keeps its own account counter, so the effective limit is
+`threshold × workers` — cross-worker enforcement needs Redis (see §4.2E); and
+(b) a throttled account refuses the owner's correct password until the window expires. This is
+inherent to the mechanism (see §4.2C) and bounded at 15 minutes.
 
 **R3 — `X-Real-IP` and `Forwarded` are unsupported.** If a future proxy sends only those,
 every request will look like it came from the proxy and users will share one budget.
@@ -339,8 +551,19 @@ changing `.env` requires a restart. `refresh_trusted_proxies()` exists for tests
 right-to-left walk, a correct chain resolves without naming a hop count. Requiring an
 operator to also state the hop count adds a way to misconfigure it.
 
-**R6 — account enumeration is still trivial** (Phase 4), and Redis outage still fails open
-(E-03). Neither is changed here.
+**R6 — account enumeration closed in Phase 4.** Both the message oracle and the 6× timing
+oracle are fixed and covered by `test_53`–`test_56`. Residual: a Redis outage still fails
+open, which is E-03 scope and unchanged here.
+
+**R7 — the account secret is not hot-reloadable in a running worker.** `refresh_account_key_secret()`
+exists and is called at startup and by tests, but a running deployment picks up a rotated
+secret only on restart. Because rotation self-heals (orphaned counters expire), the practical
+impact is that rotation is effective at the next deploy rather than instantly.
+
+**R8 — the account counter is checked before the admin branch is reached only for
+`client`/`magic`.** The shared admin password has its own path and is protected by the IP limit
+alone. Giving the admin login an account dimension would be a behaviour change beyond this
+phase's scope, and is noted rather than done.
 
 ## 9. Deployment configuration
 
