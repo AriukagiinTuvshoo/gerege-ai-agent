@@ -31,6 +31,7 @@ import executive_bot_service
 import retention_service
 import appointment_service
 from core import security as core_security
+from core import rate_limit as core_rate_limit
 from core.monitoring import telemetry
 from routers import system_router, automation_router
 
@@ -168,7 +169,9 @@ TELEGRAM_MANAGER_CHAT_ID = os.getenv("TELEGRAM_MANAGER_CHAT_ID", "")
 #: delivery for up to ~7 days; 14 days is safely beyond that and keeps the table bounded
 #: because `claim_notification_lock()` deletes expired rows as it goes.
 _WEBHOOK_DEDUP_TTL_SECONDS = 14 * 24 * 60 * 60
-_LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
+# SEC-07: login attempts are counted in a shared store (Redis when configured), not in
+# a process-local dict, so `--workers 2` no longer doubles the effective limit and a
+# deploy no longer resets it. See `core/rate_limit.py`.
 
 # -------------------------------------------------------------
 # 1. ТУСЛАХ ИЛГЭЭГЧҮҮД (Meta, Telegram, Manager Notification)
@@ -296,12 +299,15 @@ async def get_current_user(
 @app.post("/api/auth/login")
 async def auth_login(payload: Dict[str, Any], request: Request, response: Response):
     client_ip = (request.client.host if request.client else "unknown")
-    now_ts = time.time()
-    attempts = [t for t in _LOGIN_ATTEMPTS.get(client_ip, []) if now_ts - t < 60.0]
-    if len(attempts) >= 10:
+    limiter = core_rate_limit.get_limiter()
+    limit_hit = limiter.check(
+        "auth_login", core_rate_limit.client_identity(request), *core_rate_limit.DEFAULT_LIMITS["auth_login"]
+    )
+    if not limit_hit["allowed"]:
         return JSONResponse(
             {"success": False, "error": "Хэт олон удаа буруу оролдлого хийлээ. 1 минутын дараа дахин оролдоно уу."},
-            status_code=429
+            status_code=429,
+            headers={"Retry-After": str(limit_hit["retry_after"])},
         )
 
     login_type = payload.get("type", "admin")  # 'admin', 'client', 'magic'
@@ -309,7 +315,6 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
     if login_type == "admin":
         password = str(payload.get("password", "")).strip()
         if database.authenticate_admin(password):
-            _LOGIN_ATTEMPTS.pop(client_ip, None)
             token = database.create_session(role="admin", page_id=None, ip_address=client_ip)
             response.set_cookie(
                 key="session_token",
@@ -327,8 +332,6 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
                 "page_id": None,
                 "page_name": "👑 Супер Админ"
             }
-        attempts.append(now_ts)
-        _LOGIN_ATTEMPTS[client_ip] = attempts
         database.record_audit_log("auth.login.failed", actor_role="admin", ip_address=client_ip)
         return JSONResponse({"success": False, "error": "Админы нууц үг буруу байна!"}, status_code=401)
 
@@ -337,7 +340,6 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
         password = payload.get("password")
         client_page, err_msg = database.authenticate_client_detailed(identifier, password)
         if client_page:
-            _LOGIN_ATTEMPTS.pop(client_ip, None)
             page_id = client_page["page_id"]
             # P0 Fix: Server-authoritative role resolution. User payload 'role' is never trusted.
             resolved_role = core_security.resolve_tenant_login_role(
@@ -365,8 +367,6 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
                 "tokens_used": client_page.get("tokens_used", 0),
                 "monthly_token_limit": client_page.get("monthly_token_limit", 100000)
             }
-        attempts.append(now_ts)
-        _LOGIN_ATTEMPTS[client_ip] = attempts
         database.record_audit_log("auth.login.failed", actor_role="client", actor_id=identifier, ip_address=client_ip)
         return JSONResponse({"success": False, "error": err_msg or "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"}, status_code=401)
 
@@ -651,8 +651,15 @@ async def process_meta_comment_event(target_page_id: str, change: Dict[str, Any]
 
 
 @app.get("/r/{code}")
-async def redirect_tracked_link(code: str):
+async def redirect_tracked_link(code: str, request: Request):
     """CTR хяналттай богино холбоос (/r/{code}) — нээлттэй redirect хамгаалалттай"""
+    _limit_hit = core_rate_limit.check_request_limit(request, "tracked_redirect")
+    if _limit_hit:
+        return JSONResponse(
+            {"detail": "Хэт олон хүсэлт илгээлээ. Түр хүлээнэ үү."},
+            status_code=429,
+            headers={"Retry-After": str(_limit_hit["retry_after"])},
+        )
     link_data = database.resolve_and_increment_tracked_link(code)
     if not link_data:
         raise HTTPException(status_code=404, detail="Холбоос олдсонгүй")
@@ -739,6 +746,13 @@ async def get_widget_js():
 
 @app.post("/api/chat")
 async def web_chat_endpoint(payload: Dict[str, Any], request: Request, background_tasks: BackgroundTasks):
+    _limit_hit = core_rate_limit.check_request_limit(request, "api_chat")
+    if _limit_hit:
+        return JSONResponse(
+            {"detail": "Хэт олон хүсэлт илгээлээ. Түр хүлээнэ үү."},
+            status_code=429,
+            headers={"Retry-After": str(_limit_hit["retry_after"])},
+        )
     message = payload.get("message", "").strip()
     sender_id = payload.get("sender_id", "web_user")
     
@@ -835,6 +849,13 @@ async def upload_receipt_endpoint(
     page_id: Optional[str] = Form(database.DEFAULT_PAGE_ID)
 ):
     """Дашбоардын Чат Симулятораас гүйлгээний баримт (Screenshot) шалгах"""
+    _limit_hit = core_rate_limit.check_request_limit(request, "api_upload_receipt")
+    if _limit_hit:
+        return JSONResponse(
+            {"detail": "Хэт олон хүсэлт илгээлээ. Түр хүлээнэ үү."},
+            status_code=429,
+            headers={"Retry-After": str(_limit_hit["retry_after"])},
+        )
     user = await core_security.resolve_current_user(request)
     if user and not core_security.is_admin_role(user.get("role")):
         target_page_id = user["page_id"]
@@ -1430,6 +1451,10 @@ async def health_check():
         "status": "healthy",
         "gemini_ready": agent.is_gemini_ready(),
         "model": agent.get_model_name(),
+        # SEC-07: lets an operator confirm limits are actually shared across workers
+        # rather than silently per-process.
+        "rate_limit_backend": core_rate_limit.get_limiter().backend(),
+        "rate_limits_shared_across_workers": core_rate_limit.get_limiter().is_shared(),
         "meta_token_configured": bool(os.getenv("META_PAGE_ACCESS_TOKEN", "").strip()),
         "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip()),
         "total_pages": len(pages),

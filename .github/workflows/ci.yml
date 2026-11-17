@@ -103,9 +103,16 @@ jobs:
           python -c "import database; print('DB_PATH =', database.DB_PATH)"
           pytest tests/test_stage_c_schema.py -v --tb=short -p no:cacheprovider
 
+      - name: Verify rate limits are shared across workers (SEC-07, live Redis)
+        run: |
+          # The rest of the SQLite-mode suite runs without REDIS_URL, so the two
+          # shared-store assertions skip there. This step is the one that actually proves
+          # the guarantee: two separate interpreter processes against one Redis.
+          REDIS_URL="redis://127.0.0.1:6379/0" pytest tests/test_sec_07_rate_limits.py -v --tb=short
+
       - name: Run Pytest Regression, Enterprise, AI Eval & Failure Suites (SQLite mode)
         run: |
-          pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py tests/test_stage_b_regressions.py tests/test_p1_06_foreign_keys.py tests/test_sec_04_webhook_dedup.py tests/test_sec_03_security_headers.py -v
+          pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py tests/test_stage_b_regressions.py tests/test_p1_06_foreign_keys.py tests/test_sec_04_webhook_dedup.py tests/test_sec_03_security_headers.py tests/test_sec_07_rate_limits.py -v
 
       - name: Run SQLite-to-PostgreSQL Dry-Run Verification
         if: ${{ !cancelled() }}
