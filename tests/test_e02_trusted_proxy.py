@@ -513,3 +513,122 @@ def test_25_real_uvicorn_rotating_headers_never_change_identity(real_server):
     """End-to-end at the resolver: 20 rotations, one identity."""
     seen = {real_server({"X-Forwarded-For": f"10.9.{i}.{i}"})["resolved"] for i in range(20)}
     assert seen == {"127.0.0.1"}, f"identity rotated with the header: {seen}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.1 — strict X-Forwarded-For validation
+# ---------------------------------------------------------------------------
+# The documented policy is: every entry must be a valid IP address, and any malformed
+# entry aborts the walk and returns the socket peer. The Phase 3 implementation did not
+# honour that — it contained `if not hop: continue`, silently skipping empty entries and
+# then trusting the rest of the chain. A header the operator's proxy would never emit could
+# therefore still influence the identity.
+#
+# These tests assert the policy as documented, not as implemented.
+@pytest.mark.parametrize(
+    "label,xff",
+    [
+        ("leading comma", ", 198.51.100.9"),
+        ("trailing comma", "198.51.100.9, "),
+        ("doubled comma mid-chain", "198.51.100.9,,10.1.2.3"),
+        ("whitespace-only first hop", "   , 198.51.100.9"),
+    ],
+)
+def test_26_empty_hop_aborts_to_the_socket_peer(trusted, label, xff):
+    """
+    Phase 3.1, the four mandated examples.
+
+    Each contains an empty/whitespace-only entry, which is NOT a valid IP address. The
+    resolver must abort and return the peer rather than skip the empty slot and trust the
+    remaining addresses.
+    """
+    trusted("10.1.2.3")
+    got = rate_limit.resolve_client_ip(_request("10.1.2.3", {"X-Forwarded-For": xff}))
+    assert got == "10.1.2.3", (
+        f"E-02: {label} ({xff!r}) resolved to {got!r}. An empty hop is malformed and must "
+        "abort the walk to the socket peer, not be skipped."
+    )
+
+
+def test_27_empty_hop_cannot_be_used_to_choose_a_budget(trusted):
+    """
+    Why the skip matters rather than being cosmetic.
+
+    Without the fix, an attacker prepending `,` to a chain keeps a header they control from
+    becoming the identity — but the *rest* of the chain is still trusted. Here two different
+    forged chains must not produce two different identities; both must collapse to the peer.
+    """
+    trusted("10.1.2.3")
+    first = rate_limit.resolve_client_ip(
+        _request("10.1.2.3", {"X-Forwarded-For": ", 203.0.113.10"})
+    )
+    second = rate_limit.resolve_client_ip(
+        _request("10.1.2.3", {"X-Forwarded-For": ", 203.0.113.11"})
+    )
+    assert first == second == "10.1.2.3", (
+        f"malformed chains produced distinct identities ({first!r}, {second!r}), so an "
+        "attacker still controls the rate-limit key"
+    )
+
+
+def test_28_leading_empty_hop_does_not_bypass_a_trusted_proxy_entry(trusted):
+    """
+    A single leading comma must not turn a valid one-hop chain into a two-hop one.
+
+    `", 203.0.113.10"` is malformed, so the peer is the answer. If the parser instead
+    counted the empty slot as a hop, the trusted-proxy walk would behave differently again —
+    both readings are wrong, and only the peer fallback is safe.
+    """
+    trusted("10.1.2.3")
+    assert rate_limit.resolve_client_ip(
+        _request("10.1.2.3", {"X-Forwarded-For": ", 203.0.113.10, 10.1.2.3"})
+    ) == "10.1.2.3"
+
+
+def test_29_malformed_entry_aborts_even_in_the_all_trusted_fallback(trusted):
+    """
+    The all-trusted fallback loop is a second code path, and it had its own
+    `except ValueError: continue` — it skipped a malformed hop and returned a later valid
+    address. Measured on the Phase 3 code with `TRUSTED_PROXIES=10.1.2.3,10.9.9.9`:
+
+        X-Forwarded-For: ", 10.9.9.9"  ->  "10.9.9.9"
+
+    i.e. a header-derived identity produced from a malformed chain. Malformed must abort on
+    every path, not just the first one.
+    """
+    trusted("10.1.2.3", "10.9.9.9")
+    for xff in (", 10.9.9.9", "not-an-ip, 10.9.9.9"):
+        got = rate_limit.resolve_client_ip(
+            _request("10.1.2.3", {"X-Forwarded-For": xff})
+        )
+        assert got == "10.1.2.3", (
+            f"the all-trusted fallback skipped a malformed entry in {xff!r} and returned "
+            f"{got!r}"
+        )
+
+
+def test_30_strict_validation_does_not_break_valid_chains(trusted):
+    """
+    Guard against over-correction: strictness must not reject well-formed input.
+
+    A resolver that fell back on *every* chain would pass the tests above and fail this one.
+    """
+    trusted("10.1.2.3")
+    cases = {
+        "198.51.100.9": "198.51.100.9",                       # IPv4, single hop
+        "198.51.100.9, 10.1.2.3": "198.51.100.9",             # IPv4 + trusted proxy
+        "2001:db8::9": "2001:db8::9",                         # IPv6, single hop
+        "2001:db8::9, 10.1.2.3": "2001:db8::9",               # IPv6 + IPv4 proxy
+        # Mixed family. The walk is RIGHT-to-left and returns the first untrusted address,
+        # so the right-most entry is the closest hop and is the correct answer. My first
+        # draft asserted 198.51.100.9 here, which contradicted the documented direction —
+        # the test was wrong, not the code.
+        "198.51.100.9, 2001:db8::7": "2001:db8::7",
+        # Three hops, right-to-left: 10.1.2.3 is the trusted proxy we already trust,
+        # 198.51.100.9 is the first untrusted address, so it IS the client. 203.0.113.5 has
+        # no authenticated meaning here.
+        "203.0.113.5, 198.51.100.9, 10.1.2.3": "198.51.100.9",
+    }
+    for xff, expected in cases.items():
+        got = rate_limit.resolve_client_ip(_request("10.1.2.3", {"X-Forwarded-For": xff}))
+        assert got == expected, f"valid chain {xff!r} resolved to {got!r}, expected {expected!r}"

@@ -48,6 +48,9 @@ Rules enforced in code:
   becomes bypassable again.
 * Headers over 1 KB or beyond 15 hops are rejected and the socket peer is used.
 * Every hop must parse as an IP address; otherwise the walk aborts and the peer is used.
+* An empty or whitespace-only entry counts as malformed, exactly like `not-an-ip`. A chain
+  such as `", 1.2.3.4"`, `"1.2.3.4, "` or `"1.2.3.4,,10.0.0.1"` is rejected outright and
+  the socket peer becomes the identity. Malformed entries are never skipped.
 
 **If you add a proxy, list the proxy's addresses — never the clients'.** Listing clients
 would let them rotate their own budget; listing nothing would collapse all users onto the

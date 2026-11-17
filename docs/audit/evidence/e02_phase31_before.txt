@@ -1,0 +1,21 @@
+E   AssertionError: E-02: leading comma (', 198.51.100.9') resolved to '198.51.100.9'. An empty hop is malformed and must abort the walk to the socket peer, not be skipped.
+    assert '198.51.100.9' == '10.1.2.3'
+/home/user/gerege-ai-agent/tests/test_e02_trusted_proxy.py:547: AssertionError: E-02: leading comma (', 198.51.100.9') resolved to '198.51.100.9'. An empty hop is malformed and must abort th
+E   AssertionError: E-02: trailing comma ('198.51.100.9, ') resolved to '198.51.100.9'. An empty hop is malformed and must abort the walk to the socket peer, not be skipped.
+    assert '198.51.100.9' == '10.1.2.3'
+/home/user/gerege-ai-agent/tests/test_e02_trusted_proxy.py:547: AssertionError: E-02: trailing comma ('198.51.100.9, ') resolved to '198.51.100.9'. An empty hop is malformed and must abort t
+E   AssertionError: E-02: doubled comma mid-chain ('198.51.100.9,,10.1.2.3') resolved to '198.51.100.9'. An empty hop is malformed and must abort the walk to the socket peer, not be skipped.
+    assert '198.51.100.9' == '10.1.2.3'
+/home/user/gerege-ai-agent/tests/test_e02_trusted_proxy.py:547: AssertionError: E-02: doubled comma mid-chain ('198.51.100.9,,10.1.2.3') resolved to '198.51.100.9'. An empty hop is malformed
+E   AssertionError: E-02: whitespace-only first hop ('   , 198.51.100.9') resolved to '198.51.100.9'. An empty hop is malformed and must abort the walk to the socket peer, not be skipped.
+    assert '198.51.100.9' == '10.1.2.3'
+/home/user/gerege-ai-agent/tests/test_e02_trusted_proxy.py:547: AssertionError: E-02: whitespace-only first hop ('   , 198.51.100.9') resolved to '198.51.100.9'. An empty hop is malformed an
+E   AssertionError: malformed chains produced distinct identities ('203.0.113.10', '203.0.113.11'), so an attacker still controls the rate-limit key
+    assert '203.0.113.10' == '203.0.113.11'
+/home/user/gerege-ai-agent/tests/test_e02_trusted_proxy.py:568: AssertionError: malformed chains produced distinct identities ('203.0.113.10', '203.0.113.11'), so an attacker still controls 
+E   AssertionError: assert '203.0.113.10' == '10.1.2.3'
+/home/user/gerege-ai-agent/tests/test_e02_trusted_proxy.py:583: AssertionError: assert '203.0.113.10' == '10.1.2.3'
+E   AssertionError: the all-trusted fallback skipped a malformed entry in ', 10.9.9.9' and returned '10.9.9.9'
+    assert '10.9.9.9' == '10.1.2.3'
+/home/user/gerege-ai-agent/tests/test_e02_trusted_proxy.py:604: AssertionError: the all-trusted fallback skipped a malformed entry in ', 10.9.9.9' and returned '10.9.9.9'
+7 failed, 1 passed, 34 deselected in 0.03s

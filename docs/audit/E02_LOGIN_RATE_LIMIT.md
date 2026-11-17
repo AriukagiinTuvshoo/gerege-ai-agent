@@ -98,8 +98,10 @@ Resolution rules, implemented once in `core/rate_limit.py::resolve_client_ip()`:
 2. Peer not trusted → ignore **every** forwarding header.
 3. Peer trusted → take `X-Forwarded-For` and walk it **right-to-left**, skipping addresses
    that are themselves trusted proxies; the first untrusted address is the client.
-4. Every entry must parse as an IP address. An unparseable entry aborts the walk and the
-   socket peer is used — a value the parser cannot understand never becomes an identity.
+4. **Every** entry must parse as an IP address. An empty or whitespace-only entry is
+   malformed, exactly like `not-an-ip` is. One bad entry anywhere in the chain — including
+   a position the walk would never have reached — aborts resolution and returns the socket
+   peer. Malformed entries are never skipped.
 5. Bounded: at most 15 hops and 1 KB of header. Beyond either, the peer is used.
 6. `X-Real-IP` and RFC 7239 `Forwarded` are **not** supported and are never consulted.
 
@@ -137,6 +139,79 @@ proxy's addresses.
 `TRUSTED_PROXIES` is documented in `.env.example`, wired into `docker-compose.prod.yml`
 (defaulting empty, with a comment saying why), and described in
 `docs/deployment/PRODUCTION_DEPLOYMENT.md` §1.1.
+
+## 4.1 Phase 3.1 — strict chain validation
+
+A review found the code did not implement the policy documented above.
+
+### Root cause
+
+`resolve_client_ip()` contained `if not hop: continue` inside the right-to-left walk. An
+empty entry was therefore treated as "nothing to see" and the walk carried on to the next
+entry, so a malformed chain still produced a header-derived identity:
+
+| `X-Forwarded-For` | Phase 3 result | Correct result |
+|---|---|---|
+| `", 198.51.100.9"` | `198.51.100.9` | peer |
+| `"198.51.100.9, "` | `198.51.100.9` | peer |
+| `"198.51.100.9,,10.1.2.3"` | `198.51.100.9` | peer |
+| `"   , 198.51.100.9"` | `198.51.100.9` | peer |
+
+### A second, unreported instance
+
+The same leniency existed in the **all-trusted fallback loop**, which is a separate code
+path and had its own `except ValueError: continue`. Measured with
+`TRUSTED_PROXIES=10.1.2.3,10.9.9.9`:
+
+```
+X-Forwarded-For: ", 10.9.9.9"  ->  "10.9.9.9"
+```
+
+A header-derived identity produced from a malformed chain. The review named one `continue`;
+there were two.
+
+### Fix
+
+Validation was moved **before** the walk: the whole chain is parsed up front, and any
+invalid entry returns the socket peer immediately. Because the address list is fully
+validated before selection, the second loop is no longer needed at all — it was removed
+rather than patched, which eliminates the class of bug instead of the instance.
+
+```python
+addresses = []
+for hop in hops:
+    if not hop:                      # empty / whitespace-only
+        logger.warning("Empty X-Forwarded-For entry ...; aborting the walk and using the socket peer")
+        return peer_text
+    try:
+        addresses.append(ipaddress.ip_address(hop))
+    except ValueError:
+        logger.warning("Unparseable X-Forwarded-For entry ...; aborting the walk ...")
+        return peer_text
+
+for address in reversed(addresses):
+    if not _is_trusted_proxy(address, trusted_list):
+        return str(address)
+return str(addresses[0]) if addresses else peer_text
+```
+
+### Preserved behaviour
+
+Valid IPv4 chains, IPv6 chains, mixed families, trusted multi-hop chains, untrusted peers,
+empty `TRUSTED_PROXIES`, the 15-hop cap and the 1 KB cap are all unchanged — `test_30`
+exists specifically to fail if strictness is over-applied and every chain starts falling
+back to the peer.
+
+### Two test bugs found while writing this
+
+Both were mine, and both were caught before the fix landed:
+
+* `test_30` first asserted that `198.51.100.9, 2001:db8::7` resolves to `198.51.100.9`.
+  That contradicts the documented right-to-left walk: the right-most entry is the closest
+  hop. The code was right and the expectation was wrong.
+* `test_29` was written to reach the second loop but used a chain with an untrusted first
+  hop, so it exited via the first loop and proved nothing. Corrected to use an
+  all-trusted chain, which is what actually reaches that path.
 
 ## 5. Storage and concurrency
 
@@ -189,7 +264,7 @@ failure counter** survives a worker restart, not merely that an arbitrary key do
 store mechanism it proves today is still the precondition for that, which is why it was not
 rewritten.
 
-### 6.3 Phase 3 suite — `tests/test_e02_trusted_proxy.py` (34 tests)
+### 6.3 Phase 3 suite — `tests/test_e02_trusted_proxy.py` (31 test functions, 42 collected cases)
 
 Written before the implementation. Pre-fix: **24 failed, 2 passed, 25 errors**.
 
@@ -203,6 +278,14 @@ Written before the implementation. Pre-fix: **24 failed, 2 passed, 25 errors**.
 | trust list | 17 (default empty), 18 (`*`, `0.0.0.0/0`, `::/0`, `all` rejected), 19 (typo not widened) |
 | integration | 20 (`client_identity` delegates), 21 (uvicorn agreement), 22 (Dockerfile/compose), 23 (no shared store still reported) |
 | real uvicorn HTTP | 24 (peer unchanged with header), 25 (20 rotations → 1 identity) |
+| **Phase 3.1 strict validation** | **26** (4 parametrised mandated examples), **27** (malformed chains cannot pick a budget), **28** (leading comma does not change hop counting), **29** (all-trusted fallback also aborts), **30** (valid chains still resolve — over-correction guard) |
+
+Counting: **31 test functions** expand to **42 collected cases**, because `test_11` is
+parametrised over 6 malformed headers, `test_18` over 4 rejected trust entries, and
+`test_26` over the 4 mandated empty-hop examples. The Phase 3 report said "34 tests"; that
+was the collected-case count, not the function count. Pre-fix, the 34-case file was
+"24 failed / 2 passed / 25 errors"; the 5 new Phase 3.1 functions contributed 7 failures and
+1 pass (the over-correction guard) before the fix.
 
 The 2 pre-fix passes were observations, not policy assertions: test 21 read uvicorn's
 `Config` defaults, and test 23 checked the memory backend reports itself honestly. Neither

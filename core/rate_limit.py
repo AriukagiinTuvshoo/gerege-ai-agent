@@ -379,8 +379,12 @@ def resolve_client_ip(request) -> str:
     The one place that decides "who is this client".
 
     Returns a string suitable for use as a rate-limit key. Never returns a value taken
-    from a header unless the socket peer is a configured trusted proxy AND every hop that
-    was walked parsed as an IP address.
+    from a header unless the socket peer is a configured trusted proxy AND **every** entry
+    of the chain parsed as an IP address.
+
+    Strictness (Phase 3.1): an empty or whitespace-only entry is malformed, exactly like
+    `not-an-ip` is. One bad entry anywhere in the chain — including one that the walk would
+    never have reached — collapses the identity to the socket peer.
     """
     peer = _peer_address(request)
     peer_text = str(peer) if peer is not None else None
@@ -409,30 +413,43 @@ def resolve_client_ip(request) -> str:
         )
         return peer_text
 
-    # Right-to-left: the last entry was appended by the proxy we already trust, so it is
-    # the closest hop. Return the first address that is not itself a trusted proxy.
-    for hop in reversed(hops):
+    # E-02 Phase 3.1: strict validation. EVERY entry must parse as an IP address.
+    #
+    # Phase 3 had `if not hop: continue`, which silently skipped empty entries and then
+    # trusted the rest of the chain, so `", 198.51.100.9"` resolved to `198.51.100.9`
+    # instead of the socket peer. An empty or whitespace-only slot is not a valid IP
+    # address and must abort the walk, exactly like `not-an-ip` does.
+    #
+    # Validating the whole chain up front, rather than aborting mid-walk, also removes the
+    # second lenient loop that Phase 3 needed for the all-trusted case: if every entry is
+    # known to be an address before the walk starts, no path can skip a malformed one.
+    addresses = []
+    for hop in hops:
         if not hop:
-            continue
+            logger.warning(
+                "Empty X-Forwarded-For entry (leading, trailing or doubled comma); "
+                "aborting the walk and using the socket peer"
+            )
+            return peer_text
         try:
-            address = ipaddress.ip_address(hop)
+            addresses.append(ipaddress.ip_address(hop))
         except ValueError:
             logger.warning(
                 f"Unparseable X-Forwarded-For entry {hop[:64]!r}; aborting the walk and "
                 "using the socket peer"
             )
             return peer_text
+
+    # Right-to-left: the last entry was appended by the proxy we already trust, so it is
+    # the closest hop. Return the first address that is not itself a trusted proxy.
+    for address in reversed(addresses):
         if not _is_trusted_proxy(address, trusted_list):
             return str(address)
 
-    # Every hop was a trusted proxy (e.g. a proxy calling itself). The left-most address
-    # is the best available answer and is still a trusted-proxy address.
-    for hop in hops:
-        try:
-            return str(ipaddress.ip_address(hop))
-        except ValueError:
-            continue
-    return peer_text
+    # Every hop is a trusted proxy (e.g. a proxy calling itself). The left-most address is
+    # the best available answer, and it is still a trusted-proxy address — never a value
+    # that failed validation.
+    return str(addresses[0]) if addresses else peer_text
 
 
 def client_identity(request) -> str:

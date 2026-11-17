@@ -14,7 +14,7 @@ Strictly sequential. Parallelising these would make each failure ambiguous.
 | Step | Priority | Subject | Status |
 |---|---|---|---|
 | **E-01** | P0 | Tenant isolation of session state, messages and PII | **FIXED — verified** |
-| **E-02** | P0 | Login rate limit, trusted proxy, account-level lockout | **Phase 3 done** · Phase 4 not started |
+| **E-02** | P0 | Login rate limit, trusted proxy, account-level lockout | **Phase 3 + 3.1 done** · Phase 4 not started |
 | **E-03** | P1 | Redis outage truthfulness in health; per-endpoint fail policy | Not started |
 | **E-04** | P1 | Durable webhook processing: lease, retry, idempotency | Not started |
 
@@ -130,7 +130,7 @@ bytes, junk aborts to the peer).
 | Trusted chain resolved correctly, incl. multi-hop and spoofed prefix | **PASS** |
 | uvicorn and app follow one policy | **PASS** |
 | IPv4 / IPv6 | **PASS** |
-| Malformed headers | **PASS** |
+| Malformed headers | **PASS** (strict from Phase 3.1: empty hops abort to the peer) |
 | Real uvicorn HTTP | **PASS** with Redis; **FAIL** without (R1, E-03) |
 | SQLite / PostgreSQL regression | **PASS** |
 | E-01 regression | **PASS** 12/12 |
