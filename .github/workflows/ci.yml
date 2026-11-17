@@ -376,7 +376,13 @@ jobs:
       - name: E-02 Phase 8 — username uniqueness (R10) on PostgreSQL
         if: ${{ !cancelled() }}
         env:
-          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          # A DEDICATED database, not gerege_crm_test. This suite seeds and deletes rows, and
+          # it runs init_db(); doing that to the shared database corrupts the later
+          # "SQLite-to-PostgreSQL Migration & Checksum Verification" step, which requires a
+          # pristine target — it compares source and target checksums row by row and fails on
+          # any target-only row. Measured: running against gerege_crm_test left a seeded page
+          # and produced status CONFLICT_DETECTED in that step.
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_phase8_test"
           # Turn a silent SQLite fallback into a hard failure: a "PostgreSQL pass" reported for
           # a run that actually used SQLite is exactly the false evidence this gate exists to stop.
           R10_REQUIRE_POSTGRES: "1"
@@ -390,6 +396,11 @@ jobs:
           #
           # These tests must run on PostgreSQL: the SQLite fallback would not prove the
           # concurrency behaviour, hence R10_REQUIRE_POSTGRES=1 above.
+          #
+          # Fresh database every run, so the run cannot depend on state a previous step left.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_phase8_test 2>/dev/null || true
+          alembic upgrade head
+
           pytest tests/test_e02_phase8_username_uniqueness.py -v --tb=short | tee /tmp/p8.log
 
           # No skip is legitimate here. Every case can run against PostgreSQL, and a skip would
