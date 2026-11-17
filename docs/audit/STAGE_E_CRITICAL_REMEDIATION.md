@@ -26,7 +26,7 @@ remediated. Creating them now would imply findings that do not exist.
 
 ---
 
-## E-01 — Tenant isolation (P0) · `dfeaef3`
+## E-01 — Tenant isolation (P0) · `dfeaef3` + `d96d3cb`
 
 ### What was wrong
 
@@ -65,7 +65,7 @@ Sender `PSID_PII_1` gives Acme their name and phone, then messages Globex.
 | PostgreSQL PASS | **PASS** | 171 passed, 3 skipped |
 | Migration verified on both engines | **PASS** | Upgrade, downgrade, refusal, round trip |
 | Real-HTTP regression tests, no manual-SQL fixtures | **PASS** | 8 tests, bearer tokens, `/api/chat` + `/api/sessions` |
-| CI PASS | **PASS** | [`43991938565`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43991938565) on `dfeaef3`, all steps green incl. Docker build |
+| CI PASS | **PASS** | [`43992507126`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43992507126) on `d96d3cb` — all steps green incl. Docker build; earlier [`43991938565`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43991938565) on `dfeaef3` also green |
 | 12 mandated regression tests | **PASS — 12 of 12 implemented** | `tests/test_e01_tenant_isolation.py` |
 
 ### The 12 regression tests

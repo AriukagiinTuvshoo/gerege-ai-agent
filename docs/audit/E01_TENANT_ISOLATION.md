@@ -2,7 +2,7 @@
 
 **Status:** FIXED — verified on SQLite and PostgreSQL 16, regression suite green.
 **Severity:** P0 (cross-tenant disclosure of customer name, phone number and message counts).
-**Commit:** `dfeaef3` on `arena/d78ebf88-gerege-ai-agent`.
+**Commits:** `dfeaef3` (fix) and `d96d3cb` (tests + reports) on `arena/d78ebf88-gerege-ai-agent`.
 **Engineer roles:** Principal Security Engineer, Senior Backend, DB Architect, QA.
 
 ---
@@ -201,9 +201,12 @@ passes.
 
 ### CI evidence
 
-* Run: [`43991938565`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43991938565)
-* Commit: `dfeaef3c7cf628149d1922a442a373cb92693b50`
-* Conclusion: **success**
+Two runs, both green:
+
+* [`43992507126`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43992507126)
+  on `d96d3cb0d17336a0c81bef772aba4600605a6def` — final, all 12 tests. **success**
+* [`43991938565`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43991938565)
+  on `dfeaef3c7cf628149d1922a442a373cb92693b50` — first E-01 commit, 8 tests. **success**
 * Steps, all `success`: dependency vulnerability audit · Pytest regression, enterprise,
   AI-eval and failure suites (SQLite mode) · Postgres connectivity and drivers · SQLAlchemy
   Postgres engine connection · production Docker image build.
