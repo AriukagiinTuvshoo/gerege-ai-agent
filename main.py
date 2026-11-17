@@ -120,9 +120,10 @@ async def telemetry_and_error_tracking_middleware(request: Request, call_next):
         dur = (time.perf_counter() - t0) * 1000.0
         telemetry.record_request(request.url.path, request.method, resp.status_code, dur, request_id=req_id)
         resp.headers["X-Request-ID"] = req_id
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["X-Frame-Options"] = "DENY"
-        resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        # SEC-03: one source of truth for the header set, shared with the error path below
+        # so the two cannot drift apart.
+        for header, value in core_security.build_security_headers().items():
+            resp.headers[header] = value
         return resp
     except Exception as exc:
         dur = (time.perf_counter() - t0) * 1000.0
@@ -132,9 +133,7 @@ async def telemetry_and_error_tracking_middleware(request: Request, call_next):
             content={"detail": "Internal server error", "request_id": req_id},
             headers={
                 "X-Request-ID": req_id,
-                "X-Content-Type-Options": "nosniff",
-                "X-Frame-Options": "DENY",
-                "Referrer-Policy": "strict-origin-when-cross-origin",
+                **core_security.build_security_headers(),
             },
         )
 
