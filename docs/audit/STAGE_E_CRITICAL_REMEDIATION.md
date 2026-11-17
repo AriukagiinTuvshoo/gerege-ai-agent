@@ -134,7 +134,7 @@ bytes, junk aborts to the peer).
 | Real uvicorn HTTP | **PASS** with Redis; **FAIL** without (R1, E-03) |
 | SQLite / PostgreSQL regression | **PASS** |
 | E-01 regression | **PASS** 12/12 |
-| CI | recorded in the E-02 report |
+| CI | **PASS** — [`44000307785`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44000307785) on `d39fac6`, all steps green incl. Docker build (step conclusions only; log text unreachable) |
 | Account-level protection | **NOT IMPLEMENTED** — Phase 4 |
 
 **E-02 is NOT complete and SEC-07 remains FAIL.**

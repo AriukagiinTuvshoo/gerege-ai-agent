@@ -294,3 +294,30 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", 
 | SEC-07 overall | **FAIL** — E-02 Phase 4 and E-03 both outstanding |
 
 **Phase 3 is complete. E-02 is not. SEC-07 must not be reported as PASS.**
+
+## 11. CI evidence
+
+* Run: [`44000307785`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44000307785)
+* Commit: `d39fac616bacac205575d39da48efd37303ee1cf`
+* Conclusion: **success**
+
+Steps reported by the API, all `success` including the two added in this phase:
+
+| Step | Result |
+|---|---|
+| Initialize SQLite schema & verify zero schema drift | success |
+| Migration integrity (0001 → 0002 → 0001 → 0002) | success |
+| **Run E-02 trusted-proxy & login rate-limit suite (SQLite + live Redis)** | **success** |
+| Run Pytest Regression, Enterprise, AI Eval & Failure Suites | success |
+| Run Alembic Migration on PostgreSQL 16 | success |
+| SQLite-to-PostgreSQL migration & checksum | success |
+| Verify zero schema drift on Live PostgreSQL 16 | success |
+| **Build Production Docker Image** | **success** |
+
+**Limitation, stated plainly:** the per-step *log text* could not be downloaded. GitHub
+serves action logs from `results-receiver.actions.githubusercontent.com`, which this
+sandbox cannot reach, so `gh run view --log` fails with an EOF on the signed URL. What is
+recorded above is the job/step conclusion from the API. It confirms the E-02 step ran and
+exited 0, but it does **not** independently confirm the number of tests executed inside
+it. The local runs in §6 are the evidence for the test counts.
+
