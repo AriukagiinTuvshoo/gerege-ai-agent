@@ -607,6 +607,120 @@ lookup), `main.py` (passes the token), `.github/workflows/ci.yml`, and this docu
    the counter at 10"). The assertion was replaced with the correct invariant plus an isolated
    single-refund arm; the implementation was not changed.
 
+## 4.5 Phase 4.3 — memory expiry parity and durable single-use refunds
+
+### Defect 1 — the memory store ignored expiry when refunding — CONFIRMED
+
+Redis deletes an expired counter key by itself, so a refund after the TTL finds nothing and is
+refused. The memory store kept the expired entry until something replaced it, and
+`refund_admission()` checked only the generation and the count. Reproduced with an injected
+clock, no replacement window created:
+
+| | |
+|---|---|
+| admit A in W1 | count 1 |
+| advance past W1 | `peek` correctly reports 0 |
+| refund A | **True** — Redis returns False for the same sequence |
+
+Severity, measured rather than assumed: this **cannot** corrupt a live later window, because
+the generation check still refuses a stale token against a newer generation (asserted in
+`test_306`). What it did was report success for a budget that expiry had already restored, and
+populate claim state for a dead generation. It is a memory/Redis behavioural divergence, which
+is the thing a fallback store must not have.
+
+**Fix.** `_live_entry()` is now the single way any memory-store method obtains a counter: it
+returns the entry only if it is still live, and **reclaims it on sight** when it is not. Every
+method — increment, read, refund, legacy decrement — therefore sees the same "expired means
+absent" state Redis presents. The check is inside the store lock, in the same critical section
+as the generation and count checks.
+
+### Defect 2 — live claims could be evicted — CONFIRMED, and worse than reported
+
+`_refunded` was **one process-wide set** bounded to `_MAX_TRACKED_IDENTITIES` (10,000) and
+evicted with `set.pop()`, which removes an arbitrary element. Because it was global, *other
+tenants'* refunds consumed the budget. Measured at the real bound:
+
+    3 admissions for "victim", one refunded -> claim recorded, count 2, window still live
+    23,417 refunds by unrelated accounts
+    replay the victim's token -> True, count 2 -> 1
+
+So a live admission could be refunded **twice** by pressure a third party can generate. This is
+reachable without knowing any secret, which is what makes it more than a theoretical bound.
+
+### Design — claims live inside the counter they belong to
+
+`_counters` now maps a key to a `_MemoryCounter`, one object per counter incarnation holding
+`started`, `count`, `generation`, `window_seconds`, and a `claims` set.
+
+This makes the required guarantees structural rather than policed:
+
+| requirement | how it holds |
+|---|---|
+| refunded at most once | `admission_id` membership is tested and inserted in the same critical section as the decrement |
+| claims expire with their generation | they *are* the generation; the object's lifetime is the window's lifetime |
+| expired claims are reclaimed | `_live_entry()` drops the whole object when the window passes |
+| no unbounded growth | only admitted attempts get a token, every admitted attempt increments `count`, so `len(claims) <= peak(count) <= threshold`; there is no separate bound to tune or drift |
+| no cross-account collision | there is no shared structure to collide in |
+| memory/Redis equivalence | Redis already scoped claims to `<key>:gen:refunded:<generation>:<admission>` with the counter's TTL; memory now scopes them to the same generation |
+
+Nothing is ever evicted, so no live claim can be forgotten. `_evict_if_needed()` still bounds
+the *counter* dict, but only removes entries whose window has certainly expired.
+
+### Token integrity audit — results
+
+| check | result |
+|---|---|
+| generation / admission id entropy | 16 hex chars (8 random bytes) each; admission ids unique across 50 admissions |
+| generations identical within one window | yes, by design — `admission_id` is what distinguishes admissions |
+| identity binding | enforced against the **resolved** identity, so an alias refunds its own account and nothing else |
+| cross-account token | refused; other account's counter untouched |
+| cross-generation token | refused |
+| cross-admission token | refused; refunding one token leaves the others intact |
+| token after window rollover | refused |
+| refused attempt receives a token | no — a throttled attempt has no slot to give back |
+| counter zeroed | entry deleted, exactly as Redis deletes at zero; the next admission mints a new generation on **both** backends |
+| TTL preservation | a refund never extends or removes the window |
+
+### One behaviour change found during the audit
+
+`clear_account_failures_on_success()` compared the token's identity against the caller's **raw**
+argument. Since tokens carry the canonicalised identity, refunding via a non-canonical alias was
+rejected. `main.py` passes `account_hit["identity"]`, so the login path was never affected, but
+the public function accepted aliases before and would have silently under-refunded after. It now
+resolves the identity first and compares canonical to canonical.
+
+### Token now carries its own window
+
+`AdmissionToken.window_seconds` records the window the admission was taken with, and the memory
+refund judges expiry against that rather than the current policy value. Without it, a token
+admitted under a 5-second window would be honoured for 900 seconds if the policy changed
+underneath it — a divergence Redis does not have, because its key's TTL was fixed at INCR time.
+
+### Files and tests
+
+New: `tests/test_e02_phase43_memory_claim_durability.py` — **23 functions → 23 cases**, no
+parametrisation. Every case runs on both backends when `REDIS_URL` is live, and the CI guard
+fails on any skip.
+
+Modified: `core/rate_limit.py` (`_MemoryCounter`, `_live_entry`, rewritten memory store,
+`AdmissionToken.window_seconds`, canonical identity comparison), `.github/workflows/ci.yml`,
+and this document.
+
+### Three defects in my own tests, recorded rather than quietly fixed
+
+1. **`test_317` was defective.** It requested 50 admissions at the default limit of 20, so
+   everything past the twentieth was refused and `token` was `None`. Fixed by raising the limit
+   for that case — the entropy question is independent of the throttling policy.
+2. **`test_307`/`test_308` did not discriminate.** They passed against the buggy design, so
+   they proved nothing. Two causes: the victim's counter was driven to zero (an emptied counter
+   is deleted, so the replay was refused by "no counter", not by the claim), and the pressure
+   loop counted refused admissions as claims, applying almost no pressure. Both fixed, and the
+   tests were then run against the original store to confirm they fail there. That comparison is
+   recorded in `docs/audit/evidence/e02_phase43_before.txt` §5.
+3. **The live simulation's "login still works" arm was defective.** It ran after the arm that
+   deliberately exhausts the budget, so it received the correct 429 and reported it as a
+   failure. The budget is now reset first; the 429 was right.
+
 ## 5. Storage and concurrency
 
 Phase 3 changed *what* the IP key is. Phase 4 added a second scope (`auth_account`) sharing the
@@ -616,6 +730,25 @@ same store abstraction. Phase 4.1 makes the account scope's increment atomic wit
 §8 R9 because fixing it is a change to the IP layer rather than the account layer.
 
 Both scopes are subject to the per-process memory fallback described in §4.2E.
+
+### 5.1 The account counter's representation, after Phase 4.3
+
+| | Redis | memory |
+|---|---|---|
+| counter | `ratelimit:auth_account:<digest>` — plain integer | `_MemoryCounter.count` |
+| generation | `…:<digest>:gen`, same TTL as the counter | `_MemoryCounter.generation` |
+| refund claim | `…:<digest>:gen:refunded:<generation>:<admission>`, same TTL | `_MemoryCounter.claims` |
+| window | the counter key's TTL | `_MemoryCounter.started` + `window_seconds` |
+| expiry | Redis deletes the key | `_live_entry()` drops the object on sight |
+
+The asymmetry that remains is intentional and unchanged: Redis expiry is enforced by the server,
+memory expiry is enforced by `_live_entry()` under the store lock. Phase 4.3 made the *decisions*
+identical (§4.5); it did not try to make the mechanisms identical, because they cannot be.
+
+Phase 4.2 stored the counter as the bare tuple `(started, count, generation)` with claims in a
+separate process-wide set. Anything reading `_counters` for diagnostics should now expect
+`_MemoryCounter` objects; the store exposes `__repr__` for that purpose. No production code reads
+the attribute directly.
 
 ## 6. Test matrix
 
@@ -831,7 +964,22 @@ that deletes only the counter would leave a marker behind for at most one TTL.
 admission.** These carry the counter's TTL and so expire with the window, but inside a very
 large window a busy account creates one small key per successful login. Measured cost is one
 key per success, bounded by the window length; deleting them early would weaken single-use, so
-they are left to expire.
+they are left to expire. In memory the equivalent claims are held on the `_MemoryCounter`
+object and cost nothing beyond the set itself (R13).
+
+**R13 — the memory counter dict can still lose a live counter under a hostile flood.** The dict
+is bounded by `_MAX_TRACKED_IDENTITIES`, and `_evict_if_needed()` first reclaims every expired
+entry. If more than that many *simultaneously live* counters exist, the oldest insertion order
+is dropped. That is a deliberate availability trade, unchanged in kind from Phase 4.2 — but note
+its consequence now: dropping a live counter also drops its claims, so a token for it would be
+refused rather than double-refunded (fail-closed). Reaching it requires more than 10,000 distinct
+live identities inside one window, which in production means Redis should be in use anyway.
+
+**R14 — the memory store's LOWER/window bookkeeping is per process.** Unchanged from §4.2E and
+restated because Phase 4.3 sharpened the expiry semantics: memory now refuses expired refunds
+exactly as Redis does, but a process-local counter still gives each worker its own budget
+(`limit × workers`). This is why the deployment guidance keeps memory as a fallback rather than
+a supported production mode.
 
 **R9 — the IP counter still uses `INCR` then `EXPIRE` (Phase 4.1 scope note).** The account
 scope's increment is now atomic (§4.3B) but the IP scope's is not: a crash between the two
