@@ -134,6 +134,14 @@ def ensure_schema(stamp_only: bool = False) -> Dict[str, Any]:
     target = head_revision()
 
     if before == target:
+        # E-02 Phase 8 (R10). Being at the head revision is not the same as holding the
+        # security invariants that revision creates. The R10 uniqueness index can be missing
+        # for reasons Alembic cannot see: someone dropped it, `downgrade()` removed it, or a
+        # pre-Phase-8 `_sync_indexes()` created a non-unique look-alike under the same name.
+        # In every one of those cases the database would happily run on and concurrent
+        # tenants could claim one username again — silently. So the invariant is checked on
+        # every boot, not just the boot that applies the migration.
+        assert_security_invariants(engine)
         return {"from": before, "to": target, "upgraded": False, "dialect": engine.dialect.name}
 
     cfg = _alembic_config()
@@ -165,7 +173,50 @@ def ensure_schema(stamp_only: bool = False) -> Dict[str, Any]:
         raise RuntimeError(
             f"Schema migration failed: expected head '{target}', database is at '{after}'"
         )
+    assert_security_invariants(engine)
     return {"from": before, "to": after, "upgraded": True, "dialect": engine.dialect.name}
+
+
+def assert_security_invariants(engine=None) -> None:
+    """
+    Refuse to run on a database that is missing a database-enforced security invariant.
+
+    Currently one invariant: the unique username index from revision `0005` (finding R10).
+
+    This is checked on every schema bring-up, including the "already at head" fast path,
+    because the failure mode it prevents is silent. Without this, a deployment whose index
+    was dropped — or replaced by the non-unique look-alike that the pre-Phase-8
+    `_sync_indexes()` produced under the same name — boots normally, reports healthy, and
+    permits exactly the concurrent cross-tenant username claim that Phase 7 reproduced
+    12/12 times on both engines.
+
+    Raising here turns that into a loud startup failure that names the remedy.
+    """
+    from core import username_uniqueness
+
+    engine = engine or _engine_for()
+    with engine.connect() as conn:
+        if username_uniqueness.index_is_correct(conn):
+            return
+        found = username_uniqueness.describe_index(conn)
+    raise RuntimeError(
+        "Missing database-enforced security invariant: the unique index "
+        f"'{username_uniqueness.USERNAME_UNIQUE_INDEX}' on LOWER(TRIM(client_username)) is "
+        f"not in force (found: {found!r}).\n"
+        "Without it, concurrent tenants can claim the same normalized username, which makes "
+        "login identity ambiguous and shares one failed-login budget between two tenants "
+        "(finding R10).\n"
+        "Refusing to serve.\n"
+        "Repair, in order of preference:\n"
+        "  1. python scripts/repair_username_uniqueness.py --check   (safe, read-only)\n"
+        "  2. python scripts/repair_username_uniqueness.py           (re-creates the index)\n"
+        "  3. alembic upgrade head   (only works if this database is BELOW revision "
+        "'0005_username_uniqueness'; it is a no-op when already stamped at head, which is "
+        "why step 1 exists)\n"
+        "If step 1 reports duplicate usernames, the index cannot be installed until those "
+        "collisions are resolved deliberately with the tenant owners. Procedure: "
+        "docs/operations/USERNAME_UNIQUENESS_MIGRATION.md"
+    )
 
 
 def _assert_migrations_available() -> None:

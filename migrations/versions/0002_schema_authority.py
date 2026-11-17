@@ -781,19 +781,42 @@ def _sync_indexes() -> None:
     """
     from core.models import Base
 
-    wanted: dict[str, tuple[str, list[str]]] = {}
+    # E-02 Phase 8 (R10). Only *plain column* indexes may be created here.
+    #
+    # This loop used to flatten every model index to `[c.name for c in index.columns]` and
+    # create it with `unique=False`, which silently destroyed the semantics of any index
+    # that is not a plain column list. `Index("uq_...", func.lower(func.trim(col)))` still
+    # reports `index.columns == ['client_username']`, so it was created as a NON-unique
+    # index on the raw column under the unique index's name. The result was worse than no
+    # index at all: a look-alike named `uq_pages_client_username_norm` that enforces
+    # nothing, and which later `CREATE ... IF NOT EXISTS` statements would skip.
+    #
+    # Functional/partial/unique indexes carry semantics this helper cannot express, so each
+    # is created by its own dedicated revision (0005 for the username invariant). Skipping
+    # them here leaves that revision as the single authority for their definition.
+    def _is_plain_column_index(index) -> bool:
+        exprs = list(getattr(index, "expressions", []) or [])
+        if not exprs:
+            return False
+        return all(getattr(e, "name", None) and e.__class__.__name__ == "Column" for e in exprs)
+
+    wanted: dict[str, tuple[str, list[str], bool]] = {}
     for table in Base.metadata.sorted_tables:
         for index in table.indexes:
-            wanted[index.name] = (table.name, [c.name for c in index.columns])
+            if not _is_plain_column_index(index):
+                continue
+            wanted[index.name] = (table.name, [c.name for c in index.columns], bool(index.unique))
 
     # Legacy indexes that no longer exist in the models (kept for rollback symmetry).
     for name, table in INDEXES_TO_DROP_UPGRADE:
         if name in _existing_indexes(table) and name not in wanted:
             op.drop_index(name, table_name=table)
 
-    for name, (table, columns) in wanted.items():
+    for name, (table, columns, is_unique) in wanted.items():
         if name not in _existing_indexes(table):
-            op.create_index(name, table, columns, unique=False)
+            # `unique` is honoured rather than forced to False, so a plain unique index in
+            # models.py is not silently weakened here either.
+            op.create_index(name, table, columns, unique=is_unique)
 
     # Unique-constraint name must match models.py (`uq_user_memories_page_user`).
     _rename_user_memories_unique("uq_user_memories_page_user")

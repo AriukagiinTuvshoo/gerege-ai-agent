@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     Integer,
     func,
+    text,
     String,
     Text,
     Float,
@@ -79,6 +80,32 @@ class PageModel(Base):
     knowledge_json = Column(Text, default="{}")
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
+
+    __table_args__ = (
+        # E-02 Phase 8 (R10). The database-enforced username uniqueness invariant.
+        #
+        # `LOWER(TRIM(client_username))` is the identity the login path, the account
+        # failed-login throttle and `resolve_canonical_account()` all use, so the index
+        # must be on that exact expression — a unique index on the raw column would allow
+        # `alice` and `  ALICE  ` to coexist while login treats them as one identity.
+        #
+        # The partial predicate excludes NULL / empty / whitespace-only usernames: pages
+        # without a client login are not identities and may be arbitrarily many.
+        #
+        # Declared here as well as in migration `0005` so `core/models.py` stays the single
+        # schema authority and drift detection can see that this index is expected.
+        Index(
+            "uq_pages_client_username_norm",
+            func.lower(func.trim(client_username)),
+            unique=True,
+            postgresql_where=text(
+                "client_username IS NOT NULL AND TRIM(client_username) <> ''"
+            ),
+            sqlite_where=text(
+                "client_username IS NOT NULL AND TRIM(client_username) <> ''"
+            ),
+        ),
+    )
 
 
 class RegistrationModel(Base):
