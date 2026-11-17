@@ -485,16 +485,39 @@ class _RedisStore:
     def delete_counter(self, key: str) -> None:
         self._client.delete(key)
 
+    #: Dedicated key for the readiness write probe. Namespaced under `ratelimit:` so it is
+    #: covered by the same ACL/prefix as the counters, and distinct from every application
+    #: key so the probe can never overwrite a live counter or marker.
+    PROBE_KEY = "ratelimit:__readiness_probe__"
+
     def ping(self) -> bool:
         """
-        Live liveness probe for readiness (E-02 Phase 6, R11).
+        Whether this store can actually **write**, not merely answer.
 
-        The client is built once at startup and never rebuilt, so this is the only way to
-        notice a Redis that died *after* startup. It raises nothing itself: the caller maps a
-        failure to "store not ok" and logs the exception class only.
+        E-02 Phase 6 introduced a bare `PING` here. Phase 7 proved that is not sufficient:
+        under `maxmemory-policy noeviction` at the memory limit, Redis answers `PING`
+        normally, `CONFIG GET` works, and every *write* fails with `OOM command not
+        allowed`. Reading is unaffected. So a `PING`-only probe reports a healthy store
+        while the account limiter is failing closed and every client login is being denied —
+        and `Dockerfile`'s HEALTHCHECK trusts `/api/ready`, so the container would stay
+        "healthy" and keep receiving traffic.
+
+        The probe is deliberately bounded and side-effect free:
+
+          * one `SET key <ts> EX 10` — a real write through the same path a counter uses;
+          * one `GET` — proves the value round-trips;
+          * one `DELETE` — cleanup, so nothing accumulates;
+          * a 10s TTL as a backstop in case the process dies between SET and DELETE;
+          * a dedicated key, so it can never touch a counter, generation or refund marker.
+
+        Never raises: the caller maps `False` to "store not ok" and the exception class is
+        logged without the URL or any credential.
         """
         self._client.ping()
-        return True
+        self._client.set(self.PROBE_KEY, "1", ex=10)
+        value = self._client.get(self.PROBE_KEY)
+        self._client.delete(self.PROBE_KEY)
+        return value is not None
 
     #: Generation-checked, single-use refund, in one round-trip.
     #:
