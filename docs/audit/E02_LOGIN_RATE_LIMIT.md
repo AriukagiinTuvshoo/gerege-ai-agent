@@ -1304,3 +1304,22 @@ steps ran and passed:
 The Phase 4.2 step and its guard are unchanged. The Phase 4.3 guard is the same shape and was
 verified not to be a no-op: silent with `REDIS_URL` live (0 skips, 23 passed) and tripping
 without it (4 skips → failure).
+
+### 11.6 Phase 4.4 CI run
+
+Run [`44024588832`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44024588832),
+head `0c61253aedb969393d1bc421f6f9711759501182`, conclusion **success**.
+
+Step-level result from the API: 42 steps, **42 success, 0 failed, 0 skipped**. The four E-02
+gates all ran and passed:
+
+    Run E-02 trusted-proxy & login rate-limit suite (SQLite + live Redis)  success
+    E-02 Phase 4.2 — admission ownership & window-bound refunds           success (preserved)
+    E-02 Phase 4.3 — memory expiry parity & durable single-use refunds    success (preserved)
+    E-02 Phase 4.4 — window consistency & memory capacity security        success (new)
+
+Phase 4.1's assertions run inside the first step and are unchanged. The Phase 4.4 guard is
+stricter than its predecessors in one respect: besides failing on any skip it requires the
+passing-case count to be exactly 17, so a renamed, deselected or silently dropped test cannot
+pass it. Verified not to be a no-op — silent with `REDIS_URL` live (0 skips, 17 passed) and
+tripping without it (6 skips → failure).
