@@ -589,10 +589,26 @@ def authenticate_client_detailed(identifier: str, password: Optional[str] = None
         return dict(row), None
 
     # 2. Username эсвэл Page ID-аар хайх (Case-insensitive)
+    #
+    # E-02 Phase 4.2, audit B. `pages.client_username` has only a non-unique index, so the
+    # schema permits two tenants sharing one login name. Without an ORDER BY this `fetchone()`
+    # returned whichever row the engine produced first — in practice rowid order — while
+    # `resolve_canonical_account()` (which the account throttle keys on) deliberately picks
+    # the LOWEST page_id. The two could therefore disagree: the throttle charged one tenant
+    # while another tenant authenticated. Measured before the fix: the account the throttle
+    # charged could not log in with its own correct password.
+    #
+    # The ORDER BY makes authentication select exactly what the resolver selects, so the
+    # counter and the authenticated identity are the same account by construction. Which of
+    # two colliding tenants wins is still arbitrary from a product standpoint — that needs a
+    # schema decision (a unique constraint) and is not made here; the point is that the
+    # choice is deterministic and identical in both places.
     cursor.execute("""
         SELECT * FROM pages 
         WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?)) 
           AND is_active = 1
+        ORDER BY page_id
+        LIMIT 1
     """, (ident, ident))
     row = cursor.fetchone()
     if not row:

@@ -44,14 +44,59 @@ against one Redis, which is exactly what two worker processes are.
 import ipaddress
 import logging
 import os
+import secrets
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("core.rate_limit")
 
 #: Bounded so a hostile client cannot grow the fallback dict without limit.
 _MAX_TRACKED_IDENTITIES = 10_000
+
+
+@dataclass(frozen=True)
+class AdmissionToken:
+    """
+    Proof of one admitted login attempt, and of the counter generation it consumed.
+
+    E-02 Phase 4.2. A refund is only valid for *this* admission: `generation` names the exact
+    counter incarnation the admission incremented, and `identity` names the counter it belongs
+    to. Without both, a success that finished late would decrement whatever counter happened to
+    exist at refund time — which is how one request's success erased another request's failure
+    after the window rolled over.
+
+    `generation` is opaque and unguessable; it carries no account identifier, so it can be
+    logged or returned without widening the enumeration surface.
+
+    `admission_id` is unique *per admitted request*, which `generation` alone cannot be: every
+    admission inside one window shares a generation. Without a per-request id, replaying one
+    successful login would cancel N failures instead of one. It is what makes a refund
+    single-use. Tokens are minted and consumed inside one process; they are never returned to
+    the client.
+    """
+
+    identity: str
+    generation: str
+    admission_id: str
+
+
+def _new_generation() -> str:
+    """A fresh, unguessable generation marker for one counter incarnation."""
+    return secrets.token_hex(8)
+
+
+def _generation_key(counter_key: str) -> str:
+    """
+    Companion key holding the generation marker for a counter.
+
+    Kept beside the counter rather than inside its value so the counter stays a plain integer:
+    existing tooling, `peek()`, and `TTL` reporting are unchanged, and no script has to parse a
+    composite value. The marker is written with the counter's own TTL, so it expires with the
+    window it identifies.
+    """
+    return f"{counter_key}:gen"
 
 
 class _MemoryStore:
@@ -62,30 +107,45 @@ class _MemoryStore:
     def __init__(self, clock: Callable[[], float]):
         self._clock = clock
         self._lock = threading.Lock()
-        #: key -> (window_started_at, count)
-        self._counters: Dict[str, Tuple[float, int]] = {}
+        #: key -> (window_started_at, count, generation)
+        self._counters: Dict[str, Tuple[float, int, str]] = {}
+        #: (generation, admission_id) pairs already refunded; enforces single use.
+        self._refunded: set = set()
 
     def incr_in_window(self, key: str, window_seconds: int) -> int:
+        return self.incr_in_window_detailed(key, window_seconds)["count"]
+
+    def incr_in_window_detailed(self, key: str, window_seconds: int) -> Dict[str, Any]:
+        """
+        Admit one attempt and return its count, remaining window, and generation.
+
+        E-02 Phase 4.2. The generation is minted here, under the same lock acquisition that
+        creates or advances the counter, so "which incarnation did this admission increment?"
+        is answered atomically. A new window gets a new generation; an increment inside an
+        existing window inherits it. Minting outside the lock would let two threads disagree
+        about which window they joined.
+        """
         now = self._clock()
         with self._lock:
-            started, count = self._counters.get(key, (now, 0))
-            if now - started >= window_seconds:
-                # New window.
-                started, count = now, 0
+            started, count, generation = self._counters.get(key, (now, 0, ""))
+            if now - started >= window_seconds or not generation:
+                # New window (or a legacy entry with no generation marker).
+                started, count, generation = now, 0, _new_generation()
             count += 1
-            self._counters[key] = (started, count)
+            self._counters[key] = (started, count, generation)
+            remaining = max(1, int(window_seconds - (now - started)))
             if len(self._counters) > _MAX_TRACKED_IDENTITIES:
                 # Evict entries whose window has certainly expired, then, if still too
                 # large, the oldest insertion order (dicts preserve it).
                 stale = [
-                    k for k, (s, _c) in self._counters.items()
+                    k for k, (s, _c, _g) in self._counters.items()
                     if now - s >= window_seconds
                 ]
                 for k in stale:
                     self._counters.pop(k, None)
                 while len(self._counters) > _MAX_TRACKED_IDENTITIES:
                     self._counters.pop(next(iter(self._counters)))
-            return count
+            return {"count": count, "ttl": remaining, "generation": generation}
 
     def read_counter(self, key: str, window_seconds: Optional[int] = None) -> int:
         """
@@ -100,7 +160,7 @@ class _MemoryStore:
             entry = self._counters.get(key)
             if entry is None:
                 return 0
-            started, count = entry
+            started, count, _generation = entry
             if window_seconds is not None and now - started >= window_seconds:
                 return 0
             return count
@@ -109,19 +169,67 @@ class _MemoryStore:
         with self._lock:
             self._counters.pop(key, None)
 
+    def refund_admission(self, key: str, token: AdmissionToken) -> bool:
+        """
+        Reverse exactly one admission, iff it belongs to the live generation.
+
+        E-02 Phase 4.2. Three conditions, all evaluated under the store lock, in one critical
+        section, so no admission can interleave between them:
+
+          1. the counter exists (a missing counter means its window already expired);
+          2. the live generation equals the token's generation — this is what stops a refund
+             from a rolled-over window from touching the newer window's failures;
+          3. the counter is above zero (clamped, so a refund can never mint budget).
+
+        Condition 2 is deliberately checked *inside* the lock. Comparing a timestamp before
+        taking the lock would be check-then-act: another thread could roll the window between
+        the comparison and the decrement, which is the same defect in a new costume.
+
+        Returns True only when a slot was actually given back.
+        """
+        with self._lock:
+            entry = self._counters.get(key)
+            if entry is None:
+                return False
+            started, count, generation = entry
+            if not token.generation or generation != token.generation:
+                # The admission belongs to a generation that no longer exists.
+                return False
+            if count <= 0:
+                return False
+            # Single use, enforced in the same critical section as the checks above. Keyed by
+            # generation as well, so a stale admission id can never collide with a new window.
+            claim = (generation, token.admission_id)
+            if not token.admission_id or claim in self._refunded:
+                return False
+            self._refunded.add(claim)
+            if len(self._refunded) > _MAX_TRACKED_IDENTITIES:
+                # Bounded like the counters: dropping the oldest claim can at worst allow a
+                # very old admission id to be refunded twice, which requires knowing a value
+                # that is never disclosed to a client.
+                self._refunded.pop()
+            new_count = count - 1
+            if new_count == 0:
+                self._counters.pop(key, None)
+            else:
+                self._counters[key] = (started, new_count, generation)
+            return True
+
     def decrement_floor_zero(self, key: str, window_seconds: Optional[int] = None) -> int:
         """
-        Subtract one from the counter, never below zero, under the store lock.
+        Unconditional clamped decrement. Retained for the IP/scope limiter's bookkeeping.
 
-        Used to refund the slot a successful login consumed. Clamping at zero matters: without
-        it, repeated successes would drive the counter negative and hand out free budget.
+        Not used for account refunds any more: it has no notion of which admission it is
+        reversing, which is precisely the E-02 Phase 4.2 defect. Account refunds go through
+        `refund_admission()`.
         """
+
         now = self._clock()
         with self._lock:
             entry = self._counters.get(key)
             if entry is None:
                 return 0
-            started, count = entry
+            started, count, generation = entry
             if window_seconds is not None and now - started >= window_seconds:
                 self._counters.pop(key, None)
                 return 0
@@ -129,7 +237,7 @@ class _MemoryStore:
             if new_count == 0:
                 self._counters.pop(key, None)
             else:
-                self._counters[key] = (started, new_count)
+                self._counters[key] = (started, new_count, generation)
             return new_count
 
 
@@ -164,7 +272,14 @@ class _RedisStore:
     local current = redis.call('INCR', KEYS[1])
     if current == 1 then
         redis.call('EXPIRE', KEYS[1], ARGV[1])
-        return {current, tonumber(ARGV[1])}
+        -- E-02 Phase 4.2: mint the generation for this counter incarnation, inside the same
+        -- script that created the counter, and hand it to the admitted request. The marker
+        -- lives in its own key so the counter stays a plain integer: no script parsing, no
+        -- change to what `peek`/`ttl`/operator tooling sees. Same TTL as the counter, so it
+        -- cannot outlive the window it names.
+        local gen = ARGV[2]
+        redis.call('SET', KEYS[2], gen, 'EX', ARGV[1])
+        return {current, tonumber(ARGV[1]), gen}
     end
     local ttl = redis.call('TTL', KEYS[1])
     if ttl < 0 then
@@ -173,7 +288,15 @@ class _RedisStore:
         redis.call('EXPIRE', KEYS[1], ARGV[1])
         ttl = tonumber(ARGV[1])
     end
-    return {current, ttl}
+    -- A counter that predates this build has no marker. Mint one for the window it is
+    -- already in, so admissions from here on are refundable and the stale-window case is
+    -- closed on upgrade rather than only for windows created afterwards.
+    local gen = redis.call('GET', KEYS[2])
+    if not gen then
+        gen = ARGV[2]
+        redis.call('SET', KEYS[2], gen, 'EX', ttl)
+    end
+    return {current, ttl, gen}
     """
 
     def __init__(self, url: str, clock: Callable[[], float]):
@@ -183,21 +306,31 @@ class _RedisStore:
         self._client = redis.from_url(url, decode_responses=True, socket_timeout=3.0)
         self._client.ping()
         self._incr_script = self._client.register_script(self._INCR_SCRIPT_SOURCE)
+        self._refund_script = self._client.register_script(self._REFUND_SCRIPT_SOURCE)
         self._decr_script = self._client.register_script(self._DECR_SCRIPT_SOURCE)
 
     def increment_is_atomic(self) -> bool:
         """True when increment and expiry happen in one round-trip. Asserted by the tests."""
         return getattr(self, "_incr_script", None) is not None
 
-    def incr_in_window_detailed(self, key: str, window_seconds: int) -> Dict[str, int]:
+    def incr_in_window_detailed(self, key: str, window_seconds: int) -> Dict[str, Any]:
         """
-        Atomically increment and return ``{"count", "ttl"}``.
+        Atomically increment and return ``{"count", "ttl", "generation"}``.
 
-        The count and the remaining window come from the same script execution, so the two can
-        never disagree.
+        The count, the remaining window, and the generation all come from the same script
+        execution, so they can never disagree about which counter incarnation was incremented.
         """
-        count, ttl = self._incr_script(keys=[key], args=[int(window_seconds)])
-        return {"count": int(count), "ttl": int(ttl)}
+        generation = _new_generation()
+        count, ttl, gen = self._incr_script(
+            keys=[key, _generation_key(key)], args=[int(window_seconds), generation]
+        )
+        return {
+            "count": int(count),
+            "ttl": int(ttl),
+            # The script echoes back the generation actually in force, which for a brand-new
+            # counter is the one we proposed and for an existing window is the stored one.
+            "generation": gen.decode() if isinstance(gen, bytes) else str(gen),
+        }
 
     def incr_in_window(self, key: str, window_seconds: int) -> int:
         return self.incr_in_window_detailed(key, window_seconds)["count"]
@@ -209,8 +342,68 @@ class _RedisStore:
     def delete_counter(self, key: str) -> None:
         self._client.delete(key)
 
-    #: Clamped decrement in one round-trip. Deleting at zero keeps "no counter" and "zero
-    #: failures" the same state, so a fresh window cannot inherit a stale value.
+    #: Generation-checked, single-use refund, in one round-trip.
+    #:
+    #: E-02 Phase 4.2. The old script was a bare clamped `DECR`: it reversed whatever counter
+    #: happened to exist at refund time. This one refuses unless the admission's generation is
+    #: still the live generation, which is what binds a refund to the window it was admitted
+    #: in. Redis executes the whole body atomically, so the check and the decrement cannot be
+    #: separated by another request — the same guarantee the memory store gets from its lock.
+    #:
+    #: Single use is enforced by the `:refunded` key, claimed with `SET NX`: the first refund
+    #: of a token wins, a replay loses. It carries the counter's TTL so it cannot accumulate,
+    #: and it is scoped to the generation so a new window cannot collide with a stale marker.
+    #:
+    #: Deleting at zero keeps "no counter" and "zero failures" the same state, so a fresh
+    #: window cannot inherit a stale value.
+    #:
+    #: KEYS: 1 counter, 2 generation marker, 3 refund-claimed marker
+    #: ARGV: 1 token generation
+    #: Returns 1 when a slot was refunded, 0 when the refund is not valid.
+    _REFUND_SCRIPT_SOURCE = """
+    local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+    if current <= 0 then
+        return 0
+    end
+    local gen = redis.call('GET', KEYS[2])
+    if not gen or gen ~= ARGV[1] then
+        -- The admission belongs to a window that has already rolled over.
+        return 0
+    end
+    local ttl = redis.call('TTL', KEYS[1])
+    if ttl <= 0 then
+        return 0
+    end
+    local claimed = redis.call('SET', KEYS[3], '1', 'EX', ttl, 'NX')
+    if not claimed then
+        -- This admission was already refunded.
+        return 0
+    end
+    local updated = redis.call('DECR', KEYS[1])
+    if updated <= 0 then
+        redis.call('DEL', KEYS[1])
+        return 1
+    end
+    return 1
+    """
+
+    def refund_admission(self, key: str, token: AdmissionToken) -> bool:
+        """Atomically reverse one admission iff it belongs to the live generation."""
+        if not token.generation:
+            return False
+        refunded = self._refund_script(
+            keys=[
+                key,
+                _generation_key(key),
+                f"{_generation_key(key)}:refunded:{token.generation}:{token.admission_id}",
+            ],
+            args=[token.generation],
+        )
+        return bool(int(refunded))
+
+    #: Retained for API compatibility only. This is the Phase 4.1 primitive that had no notion
+    #: of which admission it reversed; nothing in the account path calls it any more. See
+    #: `_REFUND_SCRIPT_SOURCE` for the refund that replaced it.
     _DECR_SCRIPT_SOURCE = """
     local current = tonumber(redis.call('GET', KEYS[1]) or '0')
     if current <= 0 then
@@ -726,16 +919,31 @@ def resolve_account_identity(identifier: str) -> Tuple[str, bool]:
     identifier is normalized on a best-effort basis; the throttle then keys on the submitted
     value, which is weaker (aliases get separate budgets) but never weaker than Phase 4.
     """
-    try:
-        import database
+    import database
 
-        canonical = database.resolve_canonical_account(identifier)
+    raw = str(identifier or "")
+    try:
+        canonical = database.resolve_canonical_account(raw)
         if canonical:
             return canonical, True
-        return database.sql_lower_trim(str(identifier or "")), False
+    except Exception as exc:  # the lookup itself failed — fall through to normalization
+        logger.error(f"Account identity lookup failed ({exc}); normalizing without it")
+    try:
+        # Normalize with the engine's own comparison wherever possible, even when the lookup
+        # above failed: `LOWER(TRIM(?))` needs no account to exist.
+        return database.sql_lower_trim(raw), False
     except Exception as exc:  # pragma: no cover - depends on a live database
-        logger.error(f"Account identity resolution failed ({exc}); keying on the raw identifier")
-        return str(identifier or "").strip().casefold(), False
+        # E-02 Phase 4.2, audit A. The previous fallback was `str.casefold()`, which is NOT the
+        # database's comparison: it folds `ß` to `ss`, which neither SQLite nor PostgreSQL
+        # does, so during an outage two identifiers the database keeps distinct would share a
+        # counter — silently merging unrelated accounts, which Phase 4.1 specifically ruled
+        # out. `str.strip()` is the only safe degradation: it can collapse fewer identifiers,
+        # never more, so the worst case is an account temporarily getting more than one budget
+        # (never less, and never another tenant's counter).
+        logger.error(
+            f"Account identity normalization failed ({exc}); keying on the trimmed identifier"
+        )
+        return raw.strip(), False
 
 
 def account_canonical_key(identifier: str, canonical: Optional[str] = None) -> Optional[str]:
@@ -818,24 +1026,23 @@ def check_account_login_allowed(
     if key is None:
         return {
             "allowed": True, "count": 0, "limit": 0, "retry_after": 0,
-            "identity": identity, "canonical": canonical,
+            "identity": identity, "canonical": canonical, "token": None,
         }
 
     limiter = get_limiter()
     try:
-        if hasattr(limiter._store, "incr_in_window_detailed"):
-            result = limiter._store.incr_in_window_detailed(key, effective_window)
-            count, remaining = result["count"], result["ttl"]
-        else:  # memory store: expiry is evaluated against its injected clock
-            count = limiter._store.incr_in_window(key, effective_window)
-            remaining = effective_window
+        # Both stores now report the generation they incremented, so the token below names the
+        # exact counter incarnation this admission consumed. The memory store implements the
+        # same `incr_in_window_detailed` contract under its lock.
+        result = limiter._store.incr_in_window_detailed(key, effective_window)
+        count, remaining, generation = result["count"], result["ttl"], result["generation"]
     except Exception as exc:  # pragma: no cover - depends on a live server
         # Same posture as the IP limiter: a store outage must not take login down. It is also
         # not silent — E-03 owns the general fail-open/fail-closed policy.
         logger.error(f"Account throttle store failed for {ACCOUNT_SCOPE} ({exc}); allowing request")
         return {
             "allowed": True, "count": 0, "limit": effective_limit, "retry_after": 0,
-            "identity": identity, "canonical": canonical,
+            "identity": identity, "canonical": canonical, "token": None,
         }
 
     allowed = count <= effective_limit
@@ -847,6 +1054,18 @@ def check_account_login_allowed(
         "retry_after": max(1, int(remaining)) if not allowed else 0,
         "identity": identity,
         "canonical": canonical,
+        # Present only for an admitted attempt: there is no slot to give back when the
+        # attempt was refused, and returning a token for it would let a refused attempt
+        # cancel a real failure.
+        "token": (
+            AdmissionToken(
+                identity=identity,
+                generation=generation,
+                admission_id=_new_generation(),
+            )
+            if allowed
+            else None
+        ),
     }
 
 
@@ -862,7 +1081,11 @@ def record_account_failure(identity: str) -> None:
     return None
 
 
-def clear_account_failures_on_success(identity: str, canonical: bool = True) -> bool:
+def clear_account_failures_on_success(
+    identity: str,
+    canonical: bool = True,
+    token: Optional[AdmissionToken] = None,
+) -> bool:
     """
     Reverse the slot consumed by a *successful* login.
 
@@ -890,8 +1113,21 @@ def clear_account_failures_on_success(identity: str, canonical: bool = True) -> 
     if not digest:
         return False
     key = f"ratelimit:{ACCOUNT_SCOPE}:{digest}"
+    if token is None:
+        # E-02 Phase 4.2. Without the admission, there is nothing to identify what to refund.
+        # Refusing is the safe direction: the cost is a residual failure that expires with its
+        # window, whereas guessing would risk erasing someone else's failure.
+        logger.error(
+            f"Account refund called without an admission token for {ACCOUNT_SCOPE}; refusing"
+        )
+        return False
+    # The token must have been minted for this counter. Without this, a token issued for
+    # account A could be replayed against account B whenever the two generations coincided.
+    if not token.identity or token.identity != identity:
+        logger.error(f"Account refund token identity mismatch for {ACCOUNT_SCOPE}; refusing")
+        return False
     try:
-        return get_limiter()._store.decrement_floor_zero(key, ACCOUNT_FAILURE_WINDOW) > 0
+        return bool(get_limiter()._store.refund_admission(key, token))
     except Exception as exc:  # pragma: no cover - depends on a live server
         logger.error(f"Account counter refund failed for {ACCOUNT_SCOPE} ({exc})")
         return False

@@ -379,8 +379,14 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
             # Refund only the slot this successful login consumed. The IP counter is
             # deliberately untouched, and residual failures from earlier mistyping remain
             # until the window expires — see clear_account_failures_on_success.
+            # The admission token is passed back so the refund can prove it is reversing the
+            # exact slot this request consumed, in the exact window it consumed it. E-02
+            # Phase 4.2: without it, a login whose password check outlived its window would
+            # decrement the *next* window's counter and erase someone else's failure.
             core_rate_limit.clear_account_failures_on_success(
-                account_hit["identity"], canonical=account_hit["canonical"]
+                account_hit["identity"],
+                canonical=account_hit["canonical"],
+                token=account_hit.get("token"),
             )
             page_id = client_page["page_id"]
             # P0 Fix: Server-authoritative role resolution. User payload 'role' is never trusted.

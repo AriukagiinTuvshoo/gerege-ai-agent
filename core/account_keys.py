@@ -173,7 +173,22 @@ def normalize_identifier(identifier: Optional[str]) -> str:
         return ""
     import database
 
-    return database.sql_lower_trim(raw)
+    try:
+        return database.sql_lower_trim(raw)
+    except Exception as exc:  # pragma: no cover - depends on a live database
+        # E-02 Phase 4.2, audit A. `resolve_account_identity` has a documented fallback for a
+        # database outage, but the fallback was unreachable: deriving the key re-entered the
+        # database here, so the original exception escaped and the account throttle failed
+        # open instead of degrading. Degrade to trimming only. That collapses strictly fewer
+        # identifiers than the engine's own comparison, so the worst case during an outage is
+        # one account temporarily getting more than one budget — never two unrelated accounts
+        # sharing a counter, which is the failure Phase 4.1 ruled out.
+        import logging
+
+        logging.getLogger("core.account_keys").error(
+            f"Identifier normalization failed ({exc}); using the trimmed identifier"
+        )
+        return raw
 
 
 def account_key(identifier: Optional[str]) -> Optional[str]:

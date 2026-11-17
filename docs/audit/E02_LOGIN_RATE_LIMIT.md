@@ -487,6 +487,126 @@ results for several runs: `_validate()` returned the validator instead of callin
 `with pytest.raises(...): _validate()` asserted that *constructing a bound method* raises. It
 passed for the wrong reason in one direction and failed in the other. Fixed to call.
 
+## 4.4 Phase 4.2 — admission ownership and window-bound refunds
+
+### The reported race — CONFIRMED, on both backends
+
+Phase 4.1 replaced whole-key reset with "refund exactly the slot this success consumed", and
+that fixed erasure of *concurrent* failures inside one window. It did not bind the refund to the
+window the admission happened in:
+
+| | event | counter |
+|---|---|---|
+| W1 | A admitted | 1 |
+| W1 end | counter expires and is deleted | — |
+| W2 | B admitted and fails | 1 |
+| W2 | A finally authenticates and refunds | **0** |
+
+A's refund decremented a counter belonging to a window A was never part of, erasing B's failure.
+Reproduced **before any change**, deterministically, on both stores
+(`docs/audit/evidence/e02_phase42_before.txt`):
+
+* memory, injected clock — `stored` went `1 → 0` after the stale refund;
+* real Redis, 1-second TTL — `stored` went `1 → 0` after the stale refund.
+
+Root cause, precisely: `clear_account_failures_on_success()` re-derived the counter key from the
+identity and called a decrement primitive that had **no notion of which counter incarnation it
+was modifying**. On Redis `_DECR_SCRIPT_SOURCE` was a bare clamped `GET`/`DECR`/`DEL` with no TTL
+or generation predicate. On memory `decrement_floor_zero()` did check `now - started >=
+window_seconds`, but that check cannot help: once W2 recreates the key, `started` is W2's, so the
+stale refund passes the check and decrements W2. **The memory window check was never a
+mitigation** — it only made the two backends differ.
+
+### Design — an admission token naming its generation
+
+Admission now returns an `AdmissionToken(identity, generation, admission_id)`:
+
+* `generation` is minted by the **same atomic operation** that creates the counter (inside the
+  Redis Lua INCR script; under the memory store's lock). It is opaque, 8 random bytes, and
+  carries no account identifier.
+* `admission_id` is unique **per admitted request**. A generation alone cannot enforce
+  single-use, because every admission in one window shares it — this was caught by `test_204`
+  during implementation, when replaying one learned token cancelled several failures.
+* The token is returned only for an *admitted* attempt. A refused attempt has no slot to give
+  back, and issuing a token for one would let a throttled attacker cancel a real failure.
+
+`clear_account_failures_on_success(identity, token=...)` now refuses unless all of:
+
+1. a token was supplied (no token → no refund, logged);
+2. `token.identity == identity` — a token minted for A cannot refund B;
+3. the counter exists and its live generation equals `token.generation`;
+4. this `(generation, admission_id)` has not already been refunded;
+5. the counter is above zero.
+
+On Redis these are one Lua script (`_REFUND_SCRIPT_SOURCE`), so Redis's single-threaded script
+execution makes them atomic. On memory they are one critical section under the store lock.
+
+### Linearization points
+
+* **Admission** linearizes at the INCR script execution (Redis) or at the lock acquisition that
+  reads-or-creates the counter (memory). The generation the caller receives is the generation
+  that was in force at that instant.
+* **Refund** linearizes at the script execution / lock critical section. Because the generation
+  comparison and the decrement are in the *same* atomic unit, there is no window in which a
+  caller could observe a matching generation and then decrement a different one.
+* **Window rollover** linearizes at the INCR that finds the counter absent or expired; that same
+  operation mints the new generation.
+
+Condition 3 is checked **inside** the store operation. A timestamp comparison taken before the
+call would be check-then-act: another request could roll the window between the comparison and
+the decrement — the same defect in a new costume, which is why it is not done that way.
+
+### Failure behaviour
+
+| situation | outcome | why |
+|---|---|---|
+| token absent (caller forgot) | refund refused, error logged | safe direction: one residual failure expires with its window; guessing could erase another's |
+| store raises | refund refused, error logged | a failed refund under-counts nothing, so it cannot hand out budget |
+| generation mismatch | refused | the admission's window is gone; its slot expired with it |
+| already refunded | refused | single use |
+| counter absent | refused | window expired |
+| counter at zero | refused | clamping; a refund never mints budget |
+| counter without a marker (pre-4.2 build) | INCR mints one for the live window | closes the stale-window case on upgrade, not only for new windows |
+
+### Why not a timestamp on the value
+
+Storing the admission time inside the counter value and comparing it at refund time was
+considered and rejected: it changes what the key holds (breaking `peek`, `TTL`, and operator
+tooling), it cannot distinguish two admissions with the same second, and it still needs the
+comparison to happen atomically with the decrement to be correct — at which point the generation
+marker is strictly simpler and does not require the value to be parsed.
+
+### Cost
+
+One extra Redis key per live counter (`<key>:gen`, same TTL) and one small key per refunded
+admission (`<key>:gen:refunded:<generation>:<admission>`, same TTL). Both expire with the window.
+See R11/R12.
+
+### Files and tests
+
+New: `tests/test_e02_phase42_admission_ownership.py` (**28 functions → 28 cases**, no
+parametrisation; every case runs on both backends when `REDIS_URL` is live, and the CI guard
+fails on any skip).
+
+Modified: `core/rate_limit.py` (token, generation minting, `refund_admission` on both stores,
+refund acceptance rules, resolution fallback), `core/account_keys.py` (normalization fallback no
+longer re-enters the database unguarded), `database.py` (`ORDER BY page_id LIMIT 1` on the login
+lookup), `main.py` (passes the token), `.github/workflows/ci.yml`, and this document.
+
+### Two defects found in my own work, recorded rather than quietly fixed
+
+1. **`test_214`/`test_215` were defective.** Both requested the memory and Redis fixtures,
+   assuming two live limiters. `rate_limit.get_limiter()` is a single module global, so the
+   second fixture's `set_limiter()` won and the "memory" arm actually ran against Redis. The
+   assertion compared Redis with Redis. Fixed by re-installing each limiter immediately before
+   its own arm and asserting `backend()`. The implementation was not changed for this.
+2. **The live simulation's section E assertion was defective.** It asserted that a successful
+   login leaves the counter at `pre - 1`. That contradicts the documented counting model: a
+   success *admits* (+1) and then refunds that same admission (−1), so the net change across one
+   success is **zero** — which is what Phase 4.1's own live evidence already showed ("success left
+   the counter at 10"). The assertion was replaced with the correct invariant plus an isolated
+   single-refund arm; the implementation was not changed.
+
 ## 5. Storage and concurrency
 
 Phase 3 changed *what* the IP key is. Phase 4 added a second scope (`auth_account`) sharing the
@@ -699,6 +819,20 @@ exists and is called at startup and by tests, but a running deployment picks up 
 secret only on restart. Because rotation self-heals (orphaned counters expire), the practical
 impact is that rotation is effective at the next deploy rather than instantly.
 
+**R11 — the generation marker is a second key, so the pair is not written atomically as one
+unit.** Both are written inside one Lua script (Redis) or one critical section (memory), so they
+cannot disagree in practice; but a marker deleted by hand, or a counter left over from a build
+before Phase 4.2, has no marker. Both cases are handled: the INCR script mints a marker for an
+existing counter on first use, and a refund without a matching marker is refused (fail-closed,
+costing one residual failure that expires with its window). Recorded because operator tooling
+that deletes only the counter would leave a marker behind for at most one TTL.
+
+**R12 — a refund is claimed by a `:refunded:<generation>:<admission>` key per refunded
+admission.** These carry the counter's TTL and so expire with the window, but inside a very
+large window a busy account creates one small key per successful login. Measured cost is one
+key per success, bounded by the window length; deleting them early would weaken single-use, so
+they are left to expire.
+
 **R9 — the IP counter still uses `INCR` then `EXPIRE` (Phase 4.1 scope note).** The account
 scope's increment is now atomic (§4.3B) but the IP scope's is not: a crash between the two
 commands there can still leave an IP counter with no TTL. Left alone deliberately — changing the
@@ -706,10 +840,19 @@ IP layer's storage is outside the account-hardening scope the review authorised,
 consequence (one source permanently rate-limited until an operator deletes the key) is less
 severe than the account case. Fixing it is a small, isolated change whenever it is in scope.
 
-**R10 — duplicate `client_username` values are still permitted by the schema.** Phase 4.1 makes
-the ambiguity deterministic and visible rather than silent, but two tenants sharing a login name
-is a real operational hazard that only a migration (a unique index) would remove. Out of scope
-here; recorded so it is not mistaken for solved.
+**R10 — duplicate `client_username` values are still permitted by the schema.** Phase 4.1 made
+the *resolver* deterministic (lowest `page_id`). Phase 4.2 found that the *login query* was not:
+it used `fetchone()` with no `ORDER BY`, so it followed rowid order and could select a different
+tenant from the one the throttle charged. Measured before the fix: the account being charged
+could not log in with its own correct password, while the other tenant authenticated
+(`test_221`). `authenticate_client_detailed()` now carries `ORDER BY page_id LIMIT 1`, matching
+`resolve_canonical_account()`, so authentication and the counter always name the same account.
+
+This does **not** make two tenants sharing a login name safe: which of the two wins is still
+arbitrary from a product standpoint, and only a migration (a unique index on
+`LOWER(TRIM(client_username))`) would remove the hazard. No migration was attempted — it needs
+explicit approval — so it remains an open operational risk rather than a solved one.
+`canonical_resolution_is_ambiguous()` reports the condition for operators.
 
 **R8 — the account counter is checked before the admin branch is reached only for
 `client`/`magic`.** The shared admin password has its own path and is protected by the IP limit
