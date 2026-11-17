@@ -645,3 +645,26 @@ Per-step log text is still unreachable from this environment
 (`results-receiver.actions.githubusercontent.com` is outside the sandbox's egress
 allowlist), so the conclusions above come from the API. The local runs in §6 and §7 are
 the evidence for the counts.
+
+### 11.2 Phase 4 CI run
+
+| Field | Value |
+|---|---|
+| Run | [`44006527984`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44006527984) |
+| Head SHA | `299c54b15cfc220c2b4a43a1cd1ae07adf5ecca3` |
+| Conclusion | **success** — 39/39 steps, zero failed, zero skipped |
+| E-02 step | `Run E-02 trusted-proxy & login rate-limit suite (SQLite + live Redis)` — **success** |
+
+That step now runs three things, all against the live Redis service:
+
+1. `tests/test_e02_trusted_proxy.py` — unchanged.
+2. `tests/test_e02_login_rate_limit.py` — **the whole file**. The `-k` subset that excluded
+   `test_11`, `test_11b` and `test_12` is gone because those tests now pass.
+3. `tests/test_e02_phase4_account_protection.py` — with a guard that **fails the build if any
+   test skips**, because three of them need a shared store and "skipped" is not "passed".
+   Verified locally in both directions: 34 passed with `REDIS_URL` (guard silent), and with
+   `REDIS_URL` absent the guard trips on `3 skipped`.
+
+The Docker image build also passed with the new module in the image. Log text is still not
+retrievable from this sandbox (egress to the log-results host is blocked), so the table above
+reports step conclusions, which is what the API exposes.
