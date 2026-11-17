@@ -986,3 +986,17 @@ with a guard that differs from Phase 4's on purpose:
 Neither guard uses `|| true`, and neither hides a failure. Log text remains unretrievable from
 this sandbox (egress to the log-results host is blocked), so this reports step conclusions,
 which is what the API exposes.
+
+### 11.4 Phase 4.2 CI run
+
+Run [`44015598884`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44015598884),
+head `3321aaf1343f00c6db4280d8c9b427c89b6961e2`, conclusion **success**.
+
+Step-level result from the API: 38 steps, **38 success, 0 failed, 0 skipped**. The new
+
+    E-02 Phase 4.2 — admission ownership & window-bound refunds
+
+step ran and passed with `REDIS_URL` live. Its guard is stricter than the Phase 4.1 guard: any
+`SKIPPED` line fails the job, because every case in this suite is expected to run on both
+backends. Verified locally that the guard is silent with `REDIS_URL` set and trips without it
+(7 skips → failure), so it is not a no-op.
