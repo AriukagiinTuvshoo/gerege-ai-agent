@@ -819,3 +819,27 @@ That step now runs three things, all against the live Redis service:
 The Docker image build also passed with the new module in the image. Log text is still not
 retrievable from this sandbox (egress to the log-results host is blocked), so the table above
 reports step conclusions, which is what the API exposes.
+
+### 11.3 Phase 4.1 CI run
+
+| Field | Value |
+|---|---|
+| Run | [`44011261364`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44011261364) |
+| Head SHA | `279b1ec10857b74a2fa7a5a3e2ddff8429932e21` |
+| Conclusion | **success** — zero failed steps, zero skipped steps |
+| E-02 step | `Run E-02 trusted-proxy & login rate-limit suite (SQLite + live Redis)` — **success** |
+
+That step now also runs `tests/test_e02_phase41_hardening.py` against the live Redis service,
+with a guard that differs from Phase 4's on purpose:
+
+* Phase 4's suite must run with **no skip at all** (its three shared-store tests are the only
+  reason to skip, and Redis is present).
+* Phase 4.1 allows exactly one skip — `test_141`, because SQLite's `LOWER()` legitimately does
+  not fold `Ø`. Rather than forbid skips, the step asserts that the four Redis-dependent tests
+  (`test_113`, `test_114`, `test_115`, `test_118`) appear as **PASSED**, and fails if any
+  *other* skip appears. Verified locally in both directions: with `REDIS_URL` set the guard is
+  silent; without it, all four show as skipped and the guard trips.
+
+Neither guard uses `|| true`, and neither hides a failure. Log text remains unretrievable from
+this sandbox (egress to the log-results host is blocked), so this reports step conclusions,
+which is what the API exposes.
