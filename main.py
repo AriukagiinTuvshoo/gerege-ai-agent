@@ -165,7 +165,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_MANAGER_CHAT_ID = os.getenv("TELEGRAM_MANAGER_CHAT_ID", "")
 
 # Webhook deduplication & Login rate-limiting state
-_PROCESSED_MIDS: List[str] = []
+#: How long a processed Meta `mid` is remembered (SEC-04). Meta retries a failed
+#: delivery for up to ~7 days; 14 days is safely beyond that and keeps the table bounded
+#: because `claim_notification_lock()` deletes expired rows as it goes.
+_WEBHOOK_DEDUP_TTL_SECONDS = 14 * 24 * 60 * 60
 _LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
 
 # -------------------------------------------------------------
@@ -440,19 +443,57 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
                 if not message or message.get("is_echo"):
                     continue
 
-                # Meta webhook retry deduplication by mid
-                mid = message.get("mid")
-                if mid:
-                    if mid in _PROCESSED_MIDS:
-                        continue
-                    _PROCESSED_MIDS.append(mid)
-                    if len(_PROCESSED_MIDS) > 2000:
-                        del _PROCESSED_MIDS[:500]
-                
                 # Тухайн чат аль Facebook Page рүү ирснийг олох
                 target_page_id = str(recipient_id or entry_page_id or database.DEFAULT_PAGE_ID)
                 page_obj = database.get_page(target_page_id)
-                page_token = page_obj.get("page_access_token") if page_obj else os.getenv("META_PAGE_ACCESS_TOKEN", "")
+
+                # The tenant must exist before anything is written against it.
+                #
+                # `messages.page_id`, `session_states.page_id` and the other tenant columns
+                # are now foreign keys (P1-06), so an unknown page would fail the whole
+                # webhook with a 500 and Meta would retry for days. It must not be created
+                # implicitly either: the page access token is not verified yet, so letting
+                # an arbitrary sender conjure a tenant row would be a tenant-isolation hole.
+                # Unknown pages are dropped with a warning; onboarding goes through the
+                # authenticated admin flow.
+                if not page_obj:
+                    logger.warning(
+                        f"Meta webhook for unregistered page {target_page_id!r}; ignoring event"
+                    )
+                    continue
+
+                page_token = page_obj.get("page_access_token") or os.getenv("META_PAGE_ACCESS_TOKEN", "")
+
+                # Meta webhook retry deduplication by `mid` (SEC-04).
+                #
+                # This used to be a process-local list. Production runs `--workers 2`
+                # plus a separate worker process, so a Meta retry landing on another
+                # process was processed twice and the customer got a duplicate reply.
+                # The list also evicted the oldest 500 entries once it passed 2 000, so a
+                # delayed retry could be re-processed.
+                #
+                # `claim_notification_lock()` is an atomic INSERT against the
+                # `notification_locks` primary key, which works across processes and
+                # survives a restart. A TTL bounds growth; Meta retries for up to ~7 days,
+                # so the window is set well beyond that.
+                mid = message.get("mid")
+                if mid:
+                    dedup_key = f"meta_mid:{mid}"
+                    try:
+                        if not database.claim_notification_lock(
+                            dedup_key, channel="meta_webhook", ttl_seconds=_WEBHOOK_DEDUP_TTL_SECONDS
+                        ):
+                            logger.info(f"Duplicate Meta webhook delivery ignored (mid={mid})")
+                            continue
+                    except Exception:
+                        # Fail *open* for availability: a dedup-store outage must not stop
+                        # every inbound message. The failure is logged with a traceback so
+                        # it is visible, and a duplicate reply is strictly less harmful than
+                        # silently dropping a customer's message.
+                        logger.exception(
+                            f"Webhook dedup unavailable for mid={mid}; processing without dedup"
+                        )
+
 
                 user_text = message.get("text", "")
                 attachments = message.get("attachments", [])

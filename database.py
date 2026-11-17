@@ -256,6 +256,34 @@ def authenticate_admin(password: str) -> bool:
     return secrets.compare_digest(p, DEFAULT_ADMIN_PASSWORD) or secrets.compare_digest(p.lower(), DEFAULT_ADMIN_PASSWORD.lower())
 
 
+def _lock_already_held_exceptions() -> tuple:
+    """
+    Exception types raised when the `notification_locks` primary key rejects a duplicate.
+
+    SQLite raises `sqlite3.IntegrityError`; psycopg2 raises `errors.UniqueViolation`
+    (which is *not* a subclass of the DB-API `IntegrityError` alias). Both are matched so
+    the duplicate path behaves identically on the two dialects. Resolved lazily so
+    psycopg2 stays an optional import on SQLite-only deployments.
+    """
+    types: list[type] = [sqlite3.IntegrityError]
+    try:
+        from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+        types.append(SAIntegrityError)
+    except Exception:  # pragma: no cover - sqlalchemy is a hard dependency in practice
+        pass
+    try:
+        import psycopg2.errors
+
+        types.append(psycopg2.errors.UniqueViolation)
+    except Exception:
+        pass
+    return tuple(types)
+
+
+_LOCK_ALREADY_HELD = _lock_already_held_exceptions()
+
+
 def claim_notification_lock(
     idempotency_key: str,
     channel: str = "any",
@@ -287,8 +315,18 @@ def claim_notification_lock(
         )
         conn.commit()
         return True
-    except Exception:
+    except _LOCK_ALREADY_HELD:
+        # The primary key rejected the insert: another caller already holds the lock.
+        # This is the *expected* duplicate path, not an error.
+        conn.rollback()
         return False
+    except Exception as exc:
+        # Anything else (connection lost, schema missing, disk full) must not be reported
+        # as "already claimed" — that would silently drop a notification the caller
+        # believed was handled. Surface it so the caller can decide, and log loudly.
+        conn.rollback()
+        logger.error(f"claim_notification_lock failed for {key_clean!r}: {exc}")
+        raise
     finally:
         conn.close()
 
