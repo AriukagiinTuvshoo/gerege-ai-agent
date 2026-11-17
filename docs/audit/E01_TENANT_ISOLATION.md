@@ -201,10 +201,12 @@ passes.
 
 ### CI evidence
 
-Two runs, both green:
+Three runs, all green, each on the commit it describes:
 
+* [`43992977010`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43992977010)
+  on `eacffbd` (docs-only). **success**
 * [`43992507126`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43992507126)
-  on `d96d3cb0d17336a0c81bef772aba4600605a6def` — final, all 12 tests. **success**
+  on `d96d3cb0d17336a0c81bef772aba4600605a6def` — code final, all 12 tests. **success**
 * [`43991938565`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/43991938565)
   on `dfeaef3c7cf628149d1922a442a373cb92693b50` — first E-01 commit, 8 tests. **success**
 * Steps, all `success`: dependency vulnerability audit · Pytest regression, enterprise,
