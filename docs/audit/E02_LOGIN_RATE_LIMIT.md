@@ -1470,3 +1470,18 @@ behaviour is unchanged by rollback — the write path refuses conflicts independ
 **Blocker recorded:** reconciliation policy is an owner decision, so this portion is
 documented rather than implemented, per the Phase 6 instruction to stop at unresolved business
 rules and continue with the independent remediations.
+
+### 12.6 Phase 6 CI evidence
+
+Run [`44031882964`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44031882964),
+head `b59386c7d1d31366589d3b19fb0fc562b7982883`, conclusion **success**.
+
+Step-level result from the API: 43 steps, **43 success, 0 failed, 0 skipped**. The Phase 6
+gate ran and passed:
+
+    E-02 Phase 6 — R14/R11/R10/R15 remediation security   success (new)
+
+It reported **60 passed, 0 skipped** — the exact count the guard requires, so no case was
+silently dropped and no Redis-dependent case skipped. The four predecessor gates (Phases 4.2,
+4.3, 4.4 and the trusted-proxy/login suite that carries 4.1) all remained green, so none of
+the Phase 6 changes regressed an earlier guarantee.
