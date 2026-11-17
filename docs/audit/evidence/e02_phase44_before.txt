@@ -1,0 +1,90 @@
+===============================================================================
+E-02 Phase 4.4 — RED evidence: mixed-window parity & memory capacity eviction
+Recorded against the UNMODIFIED tree at:
+505184e8cf710479e3493d7e042f2f6406c9e5c6
+  505184e docs(E-02): record Phase 4.3 CI run 44019451880 (success, 41/41 steps, zero skipped)
+===============================================================================
+
+## 1. Defect 1 — one generation, two lifetimes (mixed windows)
+
+### Scenario A: admit 5s, then admit 900s, advance past 5s but inside 900s
+
+  MEMORY A 5s   count=1 token.window=5 store.window=5
+  MEMORY B 900s count=2 token.window=900 store.window=900  <- WIDENED
+  same generation? True
+  advance +6s -> peek=2
+  MEMORY refund of B -> True
+  REDIS  A 5s   count=1 ttl=5
+  REDIS  B 900s count=2 ttl=5  <- TTL NOT extended
+  after real 5.4s: key exists? 0  peek=0
+  REDIS refund of B -> False
+
+  EXPECTED: both refuse B (the generation died with its 5s window)
+  ACTUAL  : memory True / redis False
+  RESULT  : BACKEND DIVERGENCE REPRODUCED on scenario A
+
+### Scenario B: admit 900s, then admit 5s, advance past 5s but inside 900s
+
+  MEMORY A 900s count=1 store.window=900
+  MEMORY B 5s   count=2 store.window=900 (max kept 900)
+  advance +6s -> peek=2
+  MEMORY refund A (900s token) -> True
+  MEMORY refund B (5s   token) -> False
+  REDIS  A 900s count=1 ttl=900
+  REDIS  B 5s   count=2 ttl=900  <- TTL NOT shortened
+  REDIS token windows: A=900 B=5
+  REDIS refund A -> True
+  REDIS refund B -> True
+
+  EXPECTED: both tokens refundable while the 900s generation is live
+  ACTUAL  : memory refuses the 5s token, redis accepts it
+  RESULT  : SAME TOKEN TREATED DIFFERENTLY PER BACKEND — reproduced on scenario B
+
+## 2. Defect 2 — capacity pressure erases a live failure budget
+
+  cap = 10000
+  victim count = 19 of 20 (window LIVE)
+  victim key present = True
+  store size = 10000
+  victim key still present = False
+  victim count after pressure = 0
+  victim's next attempt -> allowed=True count=1
+
+  EXPECTED: victim still at 19/20, next attempt the 20th
+  ACTUAL  : budget erased, next attempt started a fresh window at count=1
+  RESULT  : LIVE-BUDGET EVICTION REPRODUCED
+
+## 3. Root causes at this commit
+   _MemoryCounter.window_seconds is mutated by max(...) on every admission, so a later
+   admission redefines an existing generation's lifetime. Redis writes the TTL once, in
+   the script that creates the counter, and never revisits it.
+   AdmissionToken.window_seconds carries the caller's requested window, not the
+   generation's actual window, and _MemoryStore.refund_admission judges expiry by it.
+   _MemoryStore._evict_if_needed() reclaims expired entries and then drops the oldest
+   LIVE counter when still over cap, despite its docstring claiming the opposite.
+
+## 4. New suite status at this commit (RED)
+
+FFFFF...FFFFFFFF.                                                        [100%]
+=========================== short test summary info ============================
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_401_a_later_longer_window_does_not_extend_the_generation
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_402_scenario_a_refunds_agree_across_backends
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_403_a_later_shorter_window_does_not_shorten_the_generation
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_404_scenario_b_refunds_agree_across_backends
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_405_the_token_reports_the_generations_effective_expiry
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_409_a_live_victim_counter_survives_capacity_pressure
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_410_no_token_is_issued_when_capacity_blocks_a_safe_admission
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_411_expired_entries_are_reclaimed_so_capacity_becomes_usable
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_412_concurrent_capacity_pressure_cannot_erase_active_counters
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_413_existing_account_limits_remain_enforced_after_pressure
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_414_a_capacity_refusal_touches_no_other_counter
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_415_the_victim_survives_at_any_insertion_order
+FAILED tests/test_e02_phase44_window_and_capacity.py::test_416_expired_entries_only_are_reclaimed_never_live_ones
+13 failed, 4 passed in 7.11s
+
+   13 failed / 4 passed / 0 skipped / 17 collected
+
+   The 4 passing cases are deliberate: test_406/test_407 pin Redis's already-correct
+   TTL behaviour, test_408 re-pins the Phase 4.3 expired-generation guarantee, and
+   test_417 asserts the capacity policy is a memory-store concern only. They are
+   regression guards, not evidence of a fixed defect.

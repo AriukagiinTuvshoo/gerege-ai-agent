@@ -721,6 +721,135 @@ and this document.
    deliberately exhausts the budget, so it received the correct 429 and reported it as a
    failure. The budget is now reset first; the 429 was right.
 
+## 4.6 Phase 4.4 — window consistency and memory capacity security
+
+### Defect 1 — one generation, two lifetimes — CONFIRMED, both directions
+
+A counter's window was not fixed when its generation was created. `_MemoryCounter.window_seconds`
+was widened with `max(...)` on every admission while Redis writes its TTL once, inside the script
+that creates the counter, and never revisits it. Separately, `AdmissionToken.window_seconds`
+carried the window the *caller* asked for and `_MemoryStore.refund_admission()` judged expiry by
+it. Measured (`docs/audit/evidence/e02_phase44_before.txt`):
+
+**Scenario A** — admit 5s, then 900s for the same account, advance 6s:
+
+| | memory | Redis |
+|---|---|---|
+| store window after the 900s admission | 900s (widened) | 5s TTL (unchanged) |
+| `peek` after 6s | 2 | 0 |
+| refund of the 900s token | **True** | **False** |
+
+**Scenario B** — admit 900s, then 5s, advance 6s:
+
+| | memory | Redis |
+|---|---|---|
+| store/TTL window | 900s (max kept) | 900s TTL |
+| refund of the 900s token | True | True |
+| refund of the 5s token | **False** | **True** |
+
+Scenario B is the sharper failure: the *same token* was refused on one backend and accepted on
+the other, because each token judged itself by the window its own caller had requested.
+
+**Chosen policy: a counter's window is fixed when its generation is created; later admissions
+inherit it and cannot change it.** This is what Redis has always done and what the fixed-window
+model requires — a window any caller can widen is not a window. Implementation:
+
+* `_MemoryStore.incr_in_window_detailed()` no longer touches `entry.window_seconds` for an
+  existing generation; the caller's value is used only when a generation is created.
+* `_MemoryStore.refund_admission()` judges expiry by the **counter's** own window, never the
+  token's.
+* `AdmissionToken.window_seconds` reports the generation's remaining window, so a token can
+  never claim more or less life than the counter it belongs to.
+* Redis needed no change for this defect; `test_406`/`test_407` pin its already-correct
+  behaviour so the memory fix cannot be "matched" by breaking Redis.
+
+The rejected alternative was to *reject* a mismatched window for an existing generation. It was
+not chosen because a mixed-window call is legitimate (different call sites may pass different
+policy values) and rejecting it would turn a naming disagreement into a login outage. Inheriting
+is both safe and available.
+
+### Defect 2 — capacity pressure erased live budgets — CONFIRMED
+
+`_evict_if_needed()` reclaimed expired entries and then, while still over the cap, dropped the
+oldest **live** counter — despite its own docstring claiming an eviction "can never remove a live
+generation". Measured at the real 10,000 cap:
+
+    victim at 19 of 20 failures, window live
+    10,200 distinct live filler identities
+    victim counter evicted -> next attempt allowed=True, count=1
+
+An attacker could reset any account's failure budget by filling the store, then log in freely.
+
+**Chosen policy: expired entries are reclaimed; a live counter is never evicted. When the store
+is full of live counters, a *new* identity is refused and account admission fails closed.**
+
+* `_reclaim_expired()` removes only entries whose window has passed.
+* `_make_room()` returns a slot if one is free after reclamation, else refuses.
+* The memory store raises `StoreAtCapacityError`, which `check_account_login_allowed()` catches
+  **separately** from the generic store-failure handler and turns into `allowed=False`,
+  `token=None`. This distinction matters: the generic handler fails *open*, and failing open here
+  would hand an untracked account an unlimited budget.
+* Identities that already hold a live counter are always served, so no active limit is ever
+  weakened by the capacity path.
+* The IP scope is unchanged: it keeps its fail-open posture, because there the alternative to
+  admitting is a limiter outage that logs everyone out.
+
+### Backend parity guarantees after this phase
+
+| guarantee | Redis | memory | test |
+|---|---|---|---|
+| a generation has exactly one effective expiry | TTL written once at creation | window fixed at creation | 401, 403, 406, 407 |
+| a token cannot extend or shorten it | script ignores caller window | caller window ignored | 405, 406, 407 |
+| expired admission refused | key gone | `_live_entry`/`refund` reclaim | 408 |
+| stale token cannot touch a newer generation | generation key | generation field | 4.2 suite |
+| refund applies at most once | `SET NX` claim key | per-generation claim set | 4.3 suite |
+| cross-account token rejected | identity binding | identity binding | 4.3 suite |
+| capacity cannot reset a live budget | n/a — no local cap | refuse, never evict | 409, 412, 413 |
+| refused admission gets no token | n/a | `token=None` + `at_capacity` | 410, 415 |
+| claim keys carry a bounded TTL | same TTL as counter | set dies with entry | 4.3 suite |
+
+No change was made to the 20-failure / 900-second production policy.
+
+### Files and tests
+
+New: `tests/test_e02_phase44_window_and_capacity.py` — **17 functions → 17 cases**, no
+parametrisation. Every case runs on both backends when `REDIS_URL` is live; the CI guard fails on
+any skip *and* on any deviation from 17 passing cases, so a silently dropped test cannot pass.
+
+Modified: `core/rate_limit.py` (`StoreAtCapacityError`, `_reclaim_expired`, `_make_room`,
+fixed-window inheritance, token window, capacity-refusal branch), `.github/workflows/ci.yml`, and
+this document.
+
+### Discrimination evidence
+
+The suite was run against the **old** implementation with the fix stashed:
+
+    FAILED 401, 402, 403, 404, 405                                  (5 window cases)
+    FAILED 409, 410, 411, 412, 413, 414, 415, 416                   (8 capacity cases)
+    13 failed, 4 passed
+
+The 4 that passed against the old code are deliberate regression guards, not evidence of a
+fixed defect: `test_406`/`test_407` pin Redis's already-correct TTL behaviour, `test_408` re-pins
+the Phase 4.3 expiry guarantee, and `test_417` asserts the capacity policy is a memory-store
+concern only. Against the fix all 17 pass.
+
+### Three defects in my own tests, recorded rather than quietly fixed
+
+1. **`test_409`/`test_413` were vacuous.** The fill loop raises `limit` to 1000 so admissions keep
+   succeeding, and the threshold assertions then used that same raised limit — so "still blocked"
+   was tested against a limit of 1000. Fixed to assert at the production limit of 20.
+2. **`test_415` inherited state between arms.** `get_limiter()` is a module global and the
+   `memory` fixture yields one limiter per test, so the second and third arms inherited the first
+   arm's counters (the victim read 4 instead of 2). Fixed by building a fresh store per arm.
+3. **`test_415`'s third arm asserted the wrong thing.** An identity inserted *after* the store is
+   full never had a budget to preserve; the correct behaviour is refusal. The assertion was
+   rewritten to check exactly that. During triage I first suspected an implementation bug here;
+   the debug run showed the admission was already being refused correctly.
+
+The live simulation had one equivalent harness defect: it asserted the second account's counter
+was 1 when section E had legitimately left it at 2. The expectation was corrected, not the
+implementation.
+
 ## 5. Storage and concurrency
 
 Phase 3 changed *what* the IP key is. Phase 4 added a second scope (`auth_account`) sharing the
@@ -738,8 +867,11 @@ Both scopes are subject to the per-process memory fallback described in §4.2E.
 | counter | `ratelimit:auth_account:<digest>` — plain integer | `_MemoryCounter.count` |
 | generation | `…:<digest>:gen`, same TTL as the counter | `_MemoryCounter.generation` |
 | refund claim | `…:<digest>:gen:refunded:<generation>:<admission>`, same TTL | `_MemoryCounter.claims` |
-| window | the counter key's TTL | `_MemoryCounter.started` + `window_seconds` |
+| window | the counter key's TTL, written once at creation | `_MemoryCounter.window_seconds`, fixed at creation (Phase 4.4) |
 | expiry | Redis deletes the key | `_live_entry()` drops the object on sight |
+
+Phase 4.4 added one more parity rule to this table: **a generation's window is fixed when it is
+created on both backends**, and neither a later admission nor a token may redefine it.
 
 The asymmetry that remains is intentional and unchanged: Redis expiry is enforced by the server,
 memory expiry is enforced by `_live_entry()` under the store lock. Phase 4.3 made the *decisions*
@@ -967,13 +1099,22 @@ key per success, bounded by the window length; deleting them early would weaken 
 they are left to expire. In memory the equivalent claims are held on the `_MemoryCounter`
 object and cost nothing beyond the set itself (R13).
 
-**R13 — the memory counter dict can still lose a live counter under a hostile flood.** The dict
-is bounded by `_MAX_TRACKED_IDENTITIES`, and `_evict_if_needed()` first reclaims every expired
-entry. If more than that many *simultaneously live* counters exist, the oldest insertion order
-is dropped. That is a deliberate availability trade, unchanged in kind from Phase 4.2 — but note
-its consequence now: dropping a live counter also drops its claims, so a token for it would be
-refused rather than double-refunded (fail-closed). Reaching it requires more than 10,000 distinct
-live identities inside one window, which in production means Redis should be in use anyway.
+**R13 — capacity exhaustion denies admission to new identities (Phase 4.4, replaces the former
+"live counter eviction").** The memory store is bounded at `_MAX_TRACKED_IDENTITIES` (10,000).
+Expired entries are reclaimed; a live counter is now **never** evicted (Phase 4.3's behaviour of
+dropping the oldest live counter was a security defect, fixed in §4.6). The cost is availability:
+a client able to mint 10,000 distinct live identities can cause *new* identities in that process
+to be refused admission until those windows lapse. This is accepted deliberately, because the
+alternative — admitting an account whose failures cannot be recorded — grants an unlimited
+budget. It is bounded (the windows expire), self-healing, and only affects identities that do not
+already hold a live counter. In production Redis should be in use, where no such cap exists.
+
+**R15 — a mixed-window call is silently served with the generation's window.** Phase 4.4 chose
+inheritance over rejection (§4.6). A caller passing 900s to an account whose live generation was
+created with 5s gets 5s, with no signal. This is correct for the counter (one generation, one
+expiry) and matches Redis, but a future caller that *needs* a different window must wait for the
+generation to lapse. Documented rather than surfaced as an error, because a policy disagreement
+between call sites should not become a login outage.
 
 **R14 — the memory store's LOWER/window bookkeeping is per process.** Unchanged from §4.2E and
 restated because Phase 4.3 sharpened the expiry semantics: memory now refuses expired refunds
