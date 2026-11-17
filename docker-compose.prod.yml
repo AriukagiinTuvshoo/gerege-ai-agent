@@ -36,15 +36,28 @@ services:
     #     Do NOT switch to allkeys-lru "to avoid errors"; it converts this into a bypass.
     #
     #   --maxmemory 400mb
-    #     Derived from measurement, not guessed. Two keys are written per admitted account and
-    #     a measured 20,000-account fill used ~389 bytes/account (7.4 MiB, 40,000 keys), so 400mb
-    #     holds roughly 1,000,000 concurrently-throttled accounts — well beyond any realistic
-    #     login working set, while staying inside the 512M container limit below (Redis's own
-    #     overhead, AOF buffers and fragmentation need headroom, which is why the container
-    #     limit stays above maxmemory).
+    #     Derived from measurement, not guessed. Two keys are written per admitted account
+    #     (`ratelimit:auth_account:<digest>` and its lockout sibling), both with a TTL equal to
+    #     the 900 s window. A measured 20,000-account fill (40,000 keys) used
+    #     292.5 bytes/account = 5.6 MiB, so on logical `used_memory` 400mb holds roughly
+    #     1.4 million concurrently-throttled accounts — far beyond any realistic login working
+    #     set. (Phase 7 reported ~339 B/account; the difference is measurement conditions, not
+    #     a regression. Both are recorded rather than silently reconciled.)
+    #
+    #     MEASURED: used_memory only. NOT measured: peak RSS under a real workload in this
+    #     container, allocator behaviour across a fork/AOF-rewrite, and the actual cgroup limit
+    #     at deploy time. `maxmemory` bounds logical memory, not RSS, and Redis can exceed
+    #     maxmemory transiently while freeing. So "400mb fits in a 512M container" is an
+    #     assumption with a thin margin, not a verified fact — see docs/audit §13.7.
+    #
+    #     ACTION REQUIRED before relying on this in production: confirm the deployment's
+    #     container memory limit (status: UNVERIFIED in the audited environment — no container
+    #     runtime was available to inspect), and keep at least ~25% headroom between
+    #     maxmemory and that limit. With --appendonly yes, the AOF rewrite buffer and COW
+    #     during a background rewrite add to RSS on top of used_memory.
     #
     # Review point: if the account-key namespace or per-account key count changes, re-measure
-    # and re-derive this number. If the deployment grows past ~1M live counters in one window,
+    # and re-derive this number. If the deployment approaches ~1M live counters in one window,
     # raise maxmemory and the container limit together.
     command:
       - "redis-server"

@@ -1485,3 +1485,116 @@ It reported **60 passed, 0 skipped** — the exact count the guard requires, so 
 silently dropped and no Redis-dependent case skipped. The four predecessor gates (Phases 4.2,
 4.3, 4.4 and the trusted-proxy/login suite that carries 4.1) all remained green, so none of
 the Phase 6 changes regressed an earlier guarantee.
+
+---
+
+## 13. Phase 8 — the R10 race is closed at the database
+
+Phase 7 confirmed that the Phase 6 `409` was only a **sequential** guard. Under genuine
+concurrency the check-then-write in `set_client_credentials` still let two tenants both
+commit the same name. This section records the remediation and supersedes the R10 portion of
+§12.
+
+### 13.1 The defect as measured
+
+`.scratch/p8/repro.py`, barrier-synchronised claims, 3 trials per case, PostgreSQL 16.2 at
+READ COMMITTED and SQLite 3.40.1:
+
+| Case | Description | Before | After |
+|---|---|---|---|
+| 1 | 2 tenants, same name | written=2, dup=2, ambiguous=True | written=1, dup=1, **ambiguous=False** |
+| 2 | 4 tenants, same name | written=4, dup=4, ambiguous=True | written=1, dup=1 |
+| 3 | `CaseAlice` vs `CASEALICE` | written=2, dup=2, ambiguous=True | written=1, dup=1 |
+| 4 | ` wsAlice ` vs `wsAlice` | written=2, dup=2, ambiguous=True | written=1, dup=1 |
+| 5 | sequential second claimant | 1 WRITTEN + 1 CONFLICT | unchanged (still 409) |
+| 6 | 2 tenants, distinct names | both WRITTEN | unchanged (both succeed) |
+
+The losing tenant's row shows **`changed columns = none`** on both engines: the rollback
+leaves no partial credential update behind. This was the specific risk of catching the
+violation *after* writing — the write must be atomic with its failure handling.
+
+### 13.2 The fix
+
+`CREATE UNIQUE INDEX uq_pages_client_username_norm ON pages (LOWER(TRIM(client_username)))
+WHERE client_username IS NOT NULL AND TRIM(client_username) <> ''`, installed by migration
+`0005_username_uniqueness`.
+
+The important properties, each of which was a deliberate decision:
+
+* **The expression matches the read path exactly.** Login, the throttle key, and
+  `resolve_canonical_account` normalize identically. An index on a different expression
+  would protect a name nobody queries.
+* **Partial, not full.** `NULL`, `''`, and whitespace-only usernames are outside the
+  predicate; unlimited credential-less pages coexist. Counting blanks as one identity would
+  deny service to every page that has no login yet.
+* **Not `CONCURRENTLY`.** `migrations/env.py` runs inside `begin_transaction()`. The `SHARE`
+  lock and the maintenance-window trade-off are documented in the operator procedure rather
+  than hidden.
+* **Shape-checked, not name-checked.** The pre-Phase-8 `_sync_indexes()` reduced the
+  expression index to `['client_username']` and created it `unique=False`; because it used
+  `IF NOT EXISTS`, the impostor survived with the right name and enforced nothing. The
+  migration now drops a wrongly-shaped index and verifies the created shape. `index_is_correct()`
+  requires unique + `lower` + `trim` + `where` in the engine's own definition text.
+* **Enforced at startup.** `assert_security_invariants()` runs on every schema bring-up,
+  including the already-at-head fast path, and refuses to serve if the index is missing or
+  is an impostor. Without it the failure is silent: the app boots, reports healthy, and
+  permits exactly the Phase 7 race.
+
+### 13.3 Error mapping is narrow
+
+Only the username-index violation becomes `CredentialConflictError` → `409`. The matcher
+(`database._is_username_uniqueness_violation`) is verified against the real engine messages:
+
+| Engine | Message | Mapped |
+|---|---|---|
+| PG | `UniqueViolation` `23505` `duplicate key value violates unique constraint "uq_pages_client_username_norm"` | yes |
+| SQLite | `IntegrityError` `UNIQUE constraint failed: index 'uq_pages_client_username_norm'` | yes |
+| PG | FK `23503` | **no** — propagates |
+| PG | `pages.page_id` unique | **no** — propagates |
+| PG/SQLite | NOT NULL | **no** — propagates |
+
+A broad `except IntegrityError → 409` would have turned a broken foreign key into a message
+telling a user their username was taken. Tests 860–862 pin the narrow behaviour.
+
+### 13.4 The remedy in the startup error had to be corrected
+
+The guard first advised "run the migration to revision `0005`". During migration validation
+this was measured to be **insufficient**: Alembic is a no-op when the database is already
+stamped at head, so a database whose index was dropped after the stamp cannot be repaired by
+following that instruction — it prints success and the index stays missing.
+
+`scripts/repair_username_uniqueness.py` was added to close that gap. It is
+revision-independent, idempotent, `--check`-able, and refuses to touch a collision. The
+startup message now names it first and states explicitly that `alembic upgrade head` only
+works below the revision.
+
+### 13.5 Migration and rollback validation
+
+Run on disposable PostgreSQL 16 and SQLite databases, first-hand:
+
+| Case | Result |
+|---|---|
+| Clean database | migrates to `0005`, index correct, `index_is_correct=True` |
+| Repeated run | `ensure_schema` reports `upgraded: False`; index unchanged |
+| Below revision with collisions | **stops** (`UsernameUniquenessBlocked`), names the group, rows unchanged, **no partial index** |
+| Interrupted (stamped at head, index absent) | startup **refuses**; names the remedy; repair tool restores it |
+| Operator resolves, then upgrades | succeeds, index correct |
+| Downgrade to `0004` | index removed — **verified to re-permit duplicates**, i.e. a security downgrade |
+
+No case chose a winner, rewrote a credential, or deleted a row. That is asserted, not
+assumed: the validation printed the before/after `client_username` values.
+
+### 13.6 Test integrity
+
+* Concurrency tests open an **independent connection per thread** and use both barrier and
+  natural-arrival styles.
+* The phase 8 suite runs on SQLite **and** real PostgreSQL; `R10_REQUIRE_POSTGRES=1` turns a
+  silent SQLite fallback into a hard failure, so a "PostgreSQL pass" cannot be reported for
+  a run that used SQLite.
+* `test_802`/`test_870`–`873` cover the index rejection, the repair tool, its refusal to
+  touch collisions, and that the advertised remedy is not a no-op.
+* Legacy-duplicate tests (Phase 4.1, 4.2) keep asserting the read path on a database that
+  predates the index. They suspend the index through `tests/_username_uniqueness_support.py`,
+  which **restores it and asserts the restoration** — a test can no longer silently leave
+  the suite running without the guarantee.
+* Run order independence was verified by running the suite twice against the same database.
