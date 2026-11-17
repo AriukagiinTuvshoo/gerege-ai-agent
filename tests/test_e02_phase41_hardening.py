@@ -234,40 +234,61 @@ def test_108_database_does_not_allow_duplicate_usernames(app, monkeypatch):
     with pytest.raises(database.CredentialConflictError):
         database.set_client_credentials(page_id="page-dup-02", username="shared_name", password="Dup-Pw-2")
 
-    # Fabricate the duplicate directly, to prove the read path stays safe on legacy data.
-    conn = sqlite3.connect(database.DB_PATH)
-    try:
-        pw_hash, salt = database.hash_password("Dup-Pw-2")
-        conn.execute(
-            "UPDATE pages SET client_username = 'shared_name', client_password_hash = ?, "
-            "client_salt = ? WHERE page_id = 'page-dup-02'",
-            (pw_hash, salt),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    # Fabricate the duplicate to prove the read path stays safe on *legacy* data — a
+    # database that predates the Phase 8 unique index. `legacy_duplicates_allowed()` removes
+    # the index for exactly this block and restores it afterwards, asserting that it did.
+    from _username_uniqueness_support import legacy_duplicates_allowed
 
-    resolve = getattr(database, "resolve_canonical_account", None)
-    assert resolve is not None, "no canonical resolver"
-    # Whatever it returns, it must be ONE deterministic account, and the same both times.
-    first = resolve("shared_name")
-    second = resolve("shared_name")
-    assert first == second, "the resolver is not deterministic for an ambiguous username"
-    # And the ambiguity must not be silent.
-    report = getattr(database, "canonical_resolution_is_ambiguous", None)
-    assert report is not None, (
-        "a schema without a unique username constraint can produce duplicates; the resolver "
-        "must expose whether an identifier is ambiguous instead of silently picking one"
+    from _username_uniqueness_support import (
+        clear_legacy_duplicates,
+        legacy_duplicates_allowed,
     )
-    assert report("shared_name") is True, "duplicate usernames were not reported as ambiguous"
+
+    with legacy_duplicates_allowed():
+        conn = database.get_connection()
+        try:
+            cur = conn.cursor()
+            pw_hash, salt = database.hash_password("Dup-Pw-2")
+            cur.execute(
+                "UPDATE pages SET client_username = 'shared_name', client_password_hash = ?, "
+                "client_salt = ? WHERE page_id = 'page-dup-02'",
+                (pw_hash, salt),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Assertions run HERE, while the legacy duplicate still exists: that is the state
+        # being described. Cleanup happens before leaving the context because the index
+        # cannot be restored over a live collision.
+        resolve = getattr(database, "resolve_canonical_account", None)
+        assert resolve is not None, "no canonical resolver"
+        # Whatever it returns, it must be ONE deterministic account, the same both times.
+        first = resolve("shared_name")
+        second = resolve("shared_name")
+        assert first == second, "the resolver is not deterministic for an ambiguous username"
+        # And the ambiguity must not be silent.
+        report = getattr(database, "canonical_resolution_is_ambiguous", None)
+        assert report is not None, (
+            "a schema without a unique username constraint can produce duplicates; the "
+            "resolver must expose whether an identifier is ambiguous instead of silently "
+            "picking one"
+        )
+        assert report("shared_name") is True, "duplicate usernames were not reported as ambiguous"
+
+        clear_legacy_duplicates()
+
+    # The invariant must be back, and the ambiguity gone with the data.
+    assert report("shared_name") is False
 
 
 def test_109_ambiguity_does_not_leak_through_the_login_response(app):
     """
     Two accounts sharing a username must still be indistinguishable from outside.
 
-    E-02 Phase 6, R10: the duplicate is fabricated with direct SQL. The write path refuses to
-    create it (see `test_108`), but a database that already contains one must stay safe.
+    E-02 Phase 6/8, R10: the duplicate is fabricated with direct SQL against a simulated
+    legacy database (the Phase 8 unique index forbids it otherwise). The write path refuses
+    to create it (see `test_108`), but a database that already contains one must stay safe.
     """
     import sqlite3
 
@@ -276,21 +297,32 @@ def test_109_ambiguity_does_not_leak_through_the_login_response(app):
     database.save_page(page_id="page-dup-b", name="db", category="general")
     with pytest.raises(database.CredentialConflictError):
         database.set_client_credentials(page_id="page-dup-b", username="ambiguous_x", password="Bb-2")
-    conn = sqlite3.connect(database.DB_PATH)
-    try:
-        pw_hash, salt = database.hash_password("Bb-2")
-        conn.execute(
-            "UPDATE pages SET client_username = 'ambiguous_x', client_password_hash = ?, "
-            "client_salt = ? WHERE page_id = 'page-dup-b'",
-            (pw_hash, salt),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    from _username_uniqueness_support import (
+        clear_legacy_duplicates,
+        legacy_duplicates_allowed,
+    )
 
-    r = _login(app, "ambiguous_x", "wrong", ip="203.0.113.5")
-    assert r.status_code == 401, f"ambiguous identifier answered {r.status_code}"
-    assert set(r.json()) == {"success", "error"}
+    with legacy_duplicates_allowed():
+        conn = database.get_connection()
+        try:
+            cur = conn.cursor()
+            pw_hash, salt = database.hash_password("Bb-2")
+            cur.execute(
+                "UPDATE pages SET client_username = 'ambiguous_x', client_password_hash = ?, "
+                "client_salt = ? WHERE page_id = 'page-dup-b'",
+                (pw_hash, salt),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # The login is issued while the legacy duplicate exists — that is the state whose
+        # exterior behaviour is being asserted.
+        r = _login(app, "ambiguous_x", "wrong", ip="203.0.113.5")
+        assert r.status_code == 401, f"ambiguous identifier answered {r.status_code}"
+        assert set(r.json()) == {"success", "error"}
+
+        clear_legacy_duplicates()
 
 
 def test_110_no_plaintext_identifier_in_account_keys(app):

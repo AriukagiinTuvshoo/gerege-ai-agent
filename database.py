@@ -826,6 +826,30 @@ def set_client_credentials(page_id: str, username: str, password: Optional[str] 
             return {"username": u_clean, "magic_token": magic_token}
 
         conn.commit()
+    except Exception as exc:
+        # E-02 Phase 8 (R10). The SELECT checks above are an optimisation, not the guarantee:
+        # they run under READ COMMITTED (PostgreSQL) or per-connection deferred transactions
+        # (SQLite), so two concurrent claimants can both pass them. The unique index
+        # `uq_pages_client_username_norm` is what actually decides the winner, and this is
+        # where its verdict is translated back into the same controlled conflict the
+        # sequential path returns.
+        #
+        # Roll back first, unconditionally: a losing claimant may already have written part
+        # of its own row (the UPDATE sets username, hash, salt and magic token), and leaving
+        # that half-applied would mutate a tenant's credentials on a rejected operation.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if _is_username_uniqueness_violation(exc):
+            raise CredentialConflictError(
+                "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу.",
+                username=u_clean,
+            ) from exc
+        # Anything else is a real database failure. It must not be disguised as a 409: a
+        # caller told "someone else owns that name" would retry with a different name and
+        # never learn the database is broken.
+        raise
     finally:
         conn.close()
 
@@ -836,6 +860,38 @@ def set_client_credentials(page_id: str, username: str, password: Optional[str] 
     except Exception:
         pass
     return {"username": u_clean, "magic_token": magic_token}
+
+
+def _is_username_uniqueness_violation(exc: BaseException) -> bool:
+    """
+    True only for a uniqueness violation on the username index.
+
+    Narrow on purpose, in both directions:
+
+      * it must not catch an unrelated `IntegrityError` (foreign key, NOT NULL, another
+        unique constraint) — mapping those to "username taken" would hide a real defect and
+        send the caller down the wrong path;
+      * it must recognise the violation through whichever adapter is in play, which is why
+        the index name is matched in the error text as well as the SQLSTATE. PostgreSQL
+        reports 23505 on `uq_pages_client_username_norm`; SQLite reports a plain
+        `sqlite3.IntegrityError` naming the index as `UNIQUE constraint failed: index
+        'uq_pages_client_username_norm'`.
+
+    `core.db_engine.PostgresCompatCursor` re-raises psycopg2 errors unwrapped, so the
+    SQLSTATE is available; the class-name check keeps this working if a future adapter
+    wraps them instead.
+    """
+    from core.username_uniqueness import USERNAME_UNIQUE_INDEX
+
+    text = str(exc)
+    if USERNAME_UNIQUE_INDEX not in text:
+        return False
+    sqlstate = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+    if sqlstate:
+        return sqlstate == "23505"
+    # No SQLSTATE (SQLite, or a wrapped driver error): the index name is the discriminator,
+    # and it is only ever raised by this one constraint.
+    return "unique" in text.lower() or "duplicate key" in text.lower()
 
 
 def update_page_google_sheets(page_id: str, sheets_url: str) -> bool:

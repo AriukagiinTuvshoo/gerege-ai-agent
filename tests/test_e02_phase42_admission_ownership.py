@@ -556,11 +556,24 @@ def dup_db(tmp_path, monkeypatch):
     for page_id in ("page-dup-b", "page-dup-a"):
         database.save_page(page_id=page_id, name=page_id, category="general")
 
-    conn = sqlite3.connect(database.DB_PATH)
+    # E-02 Phase 8: the unique index from revision 0005 forbids this state, which is the
+    # remediation's whole point. These tests still matter — a database upgraded from an older
+    # build can already contain duplicates, and the read path must behave safely on it — so
+    # the index is suspended for the duration of the test and restored (with an assertion)
+    # at teardown. The duplicate must stay alive while the test body runs, which is why this
+    # is a fixture rather than a `with` block.
+    from _username_uniqueness_support import (
+        restore_username_uniqueness,
+        suspend_username_uniqueness,
+    )
+
+    dialect = suspend_username_uniqueness()
+    conn = database.get_connection()
     try:
+        cur = conn.cursor()
         for page_id, password in (("page-dup-b", "pw-b"), ("page-dup-a", "pw-a")):
             pw_hash, salt = database.hash_password(password)
-            conn.execute(
+            cur.execute(
                 "UPDATE pages SET client_username = 'shared_login', "
                 "client_password_hash = ?, client_salt = ? WHERE page_id = ?",
                 (pw_hash, salt, page_id),
@@ -569,7 +582,10 @@ def dup_db(tmp_path, monkeypatch):
     finally:
         conn.close()
 
-    yield database
+    try:
+        yield database
+    finally:
+        restore_username_uniqueness(dialect)
 
 
 def test_221_resolver_and_authentication_select_the_same_account(dup_db):
