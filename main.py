@@ -89,6 +89,10 @@ async def lifespan(app: FastAPI):
     # unaffected. The secret value is never logged.
     core_rate_limit.validate_account_key_secret()
     core_rate_limit.refresh_account_key_secret()
+    # E-02 Phase 6, R11: a production process must not serve with a per-process counter.
+    # Raises RateLimitStoreUnavailable, which aborts startup (uvicorn exits non-zero) rather
+    # than degrading to `limit x workers`. Development/tests are unaffected.
+    core_rate_limit.validate_store_for_startup()
 
     scheduler_task = None
     if os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1":
@@ -365,9 +369,18 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
         #     concurrently with a success is never erased.
         account_hit = core_rate_limit.check_account_login_allowed(identifier)
         if not account_hit["allowed"]:
-            database.record_audit_log(
-                "auth.login.account_throttled", actor_role="client", ip_address=client_ip
-            )
+            # E-02 Phase 6, R14: distinguish "throttled" from "throttle could not be enforced"
+            # in the audit trail, but NOT in the response. Both are 429 with Retry-After and the
+            # same body, so an attacker cannot learn whether the store is down — that knowledge
+            # would be an invitation to attack during an outage.
+            if account_hit.get("store_failed"):
+                database.record_audit_log(
+                    "auth.login.throttle_store_failed", actor_role="client", ip_address=client_ip
+                )
+            else:
+                database.record_audit_log(
+                    "auth.login.account_throttled", actor_role="client", ip_address=client_ip
+                )
             return JSONResponse(
                 {"success": False, "error": core_rate_limit.ACCOUNT_THROTTLE_MESSAGE},
                 status_code=429,
@@ -1065,7 +1078,23 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
     if not username:
         return JSONResponse({"error": "Хэрэглэгчийн нэр оруулна уу"}, status_code=400)
 
-    res = database.set_client_credentials(str(target_page_id), username, password)
+    # E-02 Phase 6, R10: a username owned by another tenant is a conflict, not an update.
+    # Previously this silently rewrote the other tenant's row (cross-tenant takeover). It is
+    # now refused with 409. Only the conflict is reported — never which tenant holds the name,
+    # because that would turn the endpoint into a cross-tenant username oracle.
+    try:
+        res = database.set_client_credentials(str(target_page_id), username, password)
+    except database.CredentialConflictError:
+        database.record_audit_log(
+            "page.credentials.conflict", page_id=str(target_page_id), actor_role="admin",
+            target_type="page", target_id=str(target_page_id),
+        )
+        return JSONResponse(
+            {"error": "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу."},
+            status_code=409,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     database.record_audit_log("page.credentials.updated", page_id=str(target_page_id), actor_role="admin", target_type="page", target_id=str(target_page_id))
     return {"status": "success", "data": res}
 
@@ -1622,14 +1651,39 @@ async def readiness_check():
     except Exception as qe:
         logger.warning(f"Readiness queue stats fallback: {qe}")
         q_stats = {"backend": "unavailable"}
-    status_code = 200 if db_ok else 503
+
+    # E-02 Phase 6, R11. Readiness must not report healthy while the account limiter cannot
+    # enforce its policy: in production that limiter is the shared store, so a Redis outage
+    # means logins are refused (R14 fail-closed) *and* the IP limit is dead. "Healthy" there
+    # would be false in both directions — it would hide an outage, and it would let a load
+    # balancer keep sending traffic to a deployment that cannot authenticate anybody.
+    #
+    # Deliberately NOT in liveness: restarts cannot fix Redis, so making liveness depend on it
+    # would produce a crash-loop during an outage and turn a partial failure into a total one.
+    # Outside production the shared store is optional (the documented memory fallback), so the
+    # check is informational only and never fails readiness.
+    limiter = core_rate_limit.get_limiter()
+    shared_store_required = core_rate_limit.shared_store_required()
+    if shared_store_required:
+        store_ok = limiter.ping()
+    else:
+        store_ok = True
+    store_backend = limiter.backend()
+
+    ready = db_ok and store_ok
+    status_code = 200 if ready else 503
     return JSONResponse(
         status_code=status_code,
         content={
-            "ready": db_ok,
-            "status": "ready" if db_ok else "not_ready",
+            "ready": ready,
+            "status": "ready" if ready else "not_ready",
             "database": "ok" if db_ok else "failed",
             "engine": "postgresql" if db_engine.is_postgres() else "sqlite",
+            # Backend *kind*, never the URL, and no exception text: this endpoint is
+            # unauthenticated and its output is readable by anyone who can reach it.
+            "rate_limit_store": store_backend,
+            "rate_limit_store_required": shared_store_required,
+            "rate_limit_store_ok": store_ok,
             "queue_backend": q_stats.get("backend", "sqlite"),
             "queue_stats": q_stats,
         },

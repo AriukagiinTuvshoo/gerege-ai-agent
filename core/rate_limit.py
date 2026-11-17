@@ -99,6 +99,43 @@ class StoreAtCapacityError(RuntimeError):
     """
 
 
+class RateLimitStoreUnavailable(RuntimeError):
+    """
+    A shared store is mandatory in this environment and could not be built.
+
+    E-02 Phase 6, R11. Raised at limiter-construction time in production when `REDIS_URL` is
+    missing, blank, or unreachable. It is deliberately *not* caught anywhere: it must abort
+    startup, because a process that serves traffic with a private in-memory counter enforces
+    `limit x workers` while reporting `limit`.
+
+    It carries no connection string or credential — only the exception *class* of the backend
+    error — so it is safe to log and to surface as a startup failure.
+    """
+
+
+def shared_store_required() -> bool:
+    """
+    Whether a shared (non-memory) store is mandatory in this environment.
+
+    Public name for `_redis_is_required()`, used by readiness to decide whether a store outage
+    should make the deployment "not ready". True in production and under `STRICT_SECURITY=1`.
+    """
+    return _redis_is_required()
+
+
+def _redis_is_required() -> bool:
+    """
+    Whether a shared Redis store is mandatory in this environment.
+
+    Production (and `STRICT_SECURITY=1`) must never run the per-process fallback: the whole
+    point of SEC-07 was that N processes must not mean N times the limit. Development and
+    tests are explicitly allowed to run without Redis, which is the documented fallback.
+    """
+    from core.security import is_production_mode
+
+    return is_production_mode()
+
+
 def _new_generation() -> str:
     """A fresh, unguessable generation marker for one counter incarnation."""
     return secrets.token_hex(8)
@@ -273,6 +310,10 @@ class _MemoryStore:
         with self._lock:
             self._counters.pop(key, None)
 
+    def ping(self) -> bool:
+        """A process-local store is always reachable; readiness uses this for parity."""
+        return True
+
     def refund_admission(self, key: str, token: AdmissionToken) -> bool:
         """
         Reverse exactly one admission, iff it belongs to the live generation.
@@ -444,6 +485,17 @@ class _RedisStore:
     def delete_counter(self, key: str) -> None:
         self._client.delete(key)
 
+    def ping(self) -> bool:
+        """
+        Live liveness probe for readiness (E-02 Phase 6, R11).
+
+        The client is built once at startup and never rebuilt, so this is the only way to
+        notice a Redis that died *after* startup. It raises nothing itself: the caller maps a
+        failure to "store not ok" and logs the exception class only.
+        """
+        self._client.ping()
+        return True
+
     #: Generation-checked, single-use refund, in one round-trip.
     #:
     #: E-02 Phase 4.2. The old script was a bare clamped `DECR`: it reversed whatever counter
@@ -549,15 +601,52 @@ class RateLimiter:
         if self._redis_url:
             try:
                 return _RedisStore(self._redis_url, self._clock)
-            except Exception as exc:  # pragma: no cover - depends on a live server
+            except Exception as exc:
+                # E-02 Phase 6, R11. The silent memory fallback is what made a per-process
+                # counter able to stand in for a shared one without anyone noticing: N workers
+                # meant N × the limit. In production there is no acceptable fallback, so the
+                # error is re-raised and the process fails to start. Development and tests keep
+                # the fallback — an absent Redis there is a supported configuration.
+                if _redis_is_required():
+                    raise RateLimitStoreUnavailable(
+                        "Redis could not be initialised in production. A per-process counter "
+                        "would multiply the effective limit by the worker count, so the "
+                        "limiter refuses to start instead of silently weakening itself. "
+                        f"Backend error: {type(exc).__name__}."
+                    ) from exc
                 logger.warning(
                     f"Rate limiter could not reach Redis ({exc}); falling back to a "
-                    "per-process counter. Limits will be weaker than configured."
+                    "per-process counter. Limits will be weaker than configured. "
+                    "This fallback is development-only and is refused in production."
                 )
+        elif _redis_is_required():
+            raise RateLimitStoreUnavailable(
+                "REDIS_URL is required when running in production: account and IP counters "
+                "must be shared across workers. Without it each worker keeps a private "
+                "counter and the effective limit becomes N x the configured limit."
+            )
         return _MemoryStore(self._clock)
 
     def backend(self) -> str:
         return getattr(self._store, "backend_name", "unknown")
+
+    def ping(self) -> bool:
+        """
+        Whether the configured store answers right now.
+
+        E-02 Phase 6, R11. Used by readiness only. A memory store is process-local and always
+        "answers"; a Redis store answers only if the server does. Never raises, and never
+        returns or logs the URL or any exception text beyond its class — the caller is an
+        unauthenticated endpoint.
+        """
+        probe = getattr(self._store, "ping", None)
+        if probe is None:
+            return True
+        try:
+            return bool(probe())
+        except Exception as exc:
+            logger.error(f"Rate limiter store ping failed ({type(exc).__name__})")
+            return False
 
     def peek(self, key: str, window_seconds: Optional[int] = None) -> int:
         """
@@ -997,6 +1086,61 @@ def validate_account_key_secret() -> None:
     account_keys.validate_secret_for_startup()
 
 
+def validate_store_for_startup(probe: bool = True) -> None:
+    """
+    Fail closed in production when no shared rate-limit store can be established.
+
+    E-02 Phase 6, R11. Phase 4 and earlier logged a warning and silently used a per-process
+    dict, which multiplied the effective limit by the worker count. This makes the deployment
+    contract explicit and checks it *before* the app serves a single request:
+
+      1. `REDIS_URL` must be set and non-blank;
+      2. Redis must actually answer a `PING` (so an unreachable host fails startup, not the
+         first login);
+      3. the limiter must have selected the shared backend.
+
+    Development and tests: returns immediately, keeping the documented memory fallback.
+
+    Args:
+        probe: perform the live `PING`. Tests disable it only to prove the URL/shape checks
+            in isolation; startup always probes.
+
+    Raises:
+        RateLimitStoreUnavailable: in production, with no credentials in the message.
+    """
+    if not _redis_is_required():
+        return
+
+    if not str(os.getenv("REDIS_URL", "")).strip():
+        raise RateLimitStoreUnavailable(
+            "REDIS_URL is required when running in production: account and IP rate-limit "
+            "counters must be shared across workers. Without it each uvicorn worker keeps a "
+            "private counter and the effective login limit becomes workers x the configured "
+            "limit. Set REDIS_URL (see docker-compose.prod.yml) and restart."
+        )
+
+    if probe:
+        try:
+            _RedisStore(str(os.getenv("REDIS_URL", "")).strip(), time.time)
+        except RateLimitStoreUnavailable:
+            raise
+        except Exception as exc:
+            # Class name only: a redis exception can embed the host and, for a malformed URL,
+            # the credentials. Neither belongs in a startup log.
+            raise RateLimitStoreUnavailable(
+                "REDIS_URL is set but Redis did not answer a PING at startup. Refusing to "
+                "serve: a per-process counter would multiply the effective limit by the worker "
+                f"count. Backend error: {type(exc).__name__}."
+            ) from exc
+
+    limiter = get_limiter()
+    if not limiter.is_shared():
+        raise RateLimitStoreUnavailable(
+            "The rate limiter selected a non-shared backend in production, which multiplies "
+            "the effective limit by the worker count. Refusing to serve."
+        )
+
+
 def resolve_account_identity(identifier: str) -> Tuple[str, bool]:
     """
     Resolve a submitted login identifier to the value the account counter is keyed on.
@@ -1087,19 +1231,31 @@ def get_account_failure_count(identifier: str) -> int:
 
     Accepts any alias of the account; resolution happens first, so the username and page_id
     aliases report the same value. Returns 0 when account throttling is not configured.
+
+    E-02 Phase 6, R15. This used to pass `ACCOUNT_FAILURE_WINDOW` (the *policy* window) to
+    `peek`, which overrode the generation's own window in the memory store. A generation
+    created with a shorter window was therefore reported as live by this function long after
+    admission and refund had both started treating it as expired — and because Redis's `GET`
+    ignores the argument, the two backends disagreed. Passing `None` means "use the entry's own
+    window", which is exactly the rule admission and refund already apply.
     """
     key = account_store_key(identifier)
     if key is None:
         return 0
-    return get_limiter().peek(key, ACCOUNT_FAILURE_WINDOW)
+    return get_limiter().peek(key)
 
 
 def get_account_failure_count_by_identity(identity: str) -> int:
-    """Count for an already-resolved canonical identity. No database access."""
+    """
+    Count for an already-resolved canonical identity. No database access.
+
+    Uses the generation's own window, for the same reason as
+    `get_account_failure_count` (E-02 Phase 6, R15).
+    """
     key = _account_store_key_for_identity(identity)
     if key is None:
         return 0
-    return get_limiter().peek(key, ACCOUNT_FAILURE_WINDOW)
+    return get_limiter().peek(key)
 
 
 def check_account_login_allowed(
@@ -1149,13 +1305,32 @@ def check_account_login_allowed(
             "retry_after": effective_window, "identity": identity, "canonical": canonical,
             "token": None, "at_capacity": True,
         }
-    except Exception as exc:  # pragma: no cover - depends on a live server
-        # Same posture as the IP limiter: a store outage must not take login down. It is also
-        # not silent — E-03 owns the general fail-open/fail-closed policy.
-        logger.error(f"Account throttle store failed for {ACCOUNT_SCOPE} ({exc}); allowing request")
+    except Exception as exc:
+        # E-02 Phase 6, R14. Phase 4 copied the IP limiter's fail-open posture here. That is
+        # wrong for this scope, and the reason is a difference in what the two limits protect:
+        #
+        #   * The IP limit is a volume control. Failing it open costs a weaker limit on a
+        #     shared address, and the account limit still bounds an attack per account.
+        #   * The account limit is the *last* line for a single account. Failing it open does
+        #     not weaken it, it removes it: with no counter to increment, nothing bounds how
+        #     many passwords can be tried against one account. An attacker who can make the
+        #     store fail (or who waits for it to) gets an unlimited budget.
+        #
+        # The IP limit deliberately keeps its fail-open posture; this branch is not a policy
+        # change for it, and it is not reachable from this code path.
+        #
+        # Fail CLOSED: refuse the attempt, record a security event, and hand the client the
+        # same 429 + Retry-After it would receive if the account were genuinely throttled.
+        # The exception text is logged server-side only — it can carry a host or a URL, so it
+        # must never reach the response body.
+        logger.error(
+            f"Account throttle store failed for {ACCOUNT_SCOPE} ({exc}); refusing login "
+            "(fail-closed policy: an unrecorded attempt would be an unbounded attempt)"
+        )
         return {
-            "allowed": True, "count": 0, "limit": effective_limit, "retry_after": 0,
-            "identity": identity, "canonical": canonical, "token": None,
+            "allowed": False, "count": 0, "limit": effective_limit,
+            "retry_after": effective_window, "identity": identity, "canonical": canonical,
+            "token": None, "store_failed": True,
         }
 
     allowed = count <= effective_limit
