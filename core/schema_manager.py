@@ -281,7 +281,47 @@ def compare_with_models(
         opts["compare_server_default"] = True
     with eng.connect() as conn:
         ctx = MigrationContext.configure(conn, opts=opts)
-        return compare_metadata(ctx, Base.metadata)
+        diffs = compare_metadata(ctx, Base.metadata)
+
+        # E-02 Phase 8 (R10). Alembic cannot compare a FUNCTIONAL index it read back from
+        # the database (as a `_textual_index_element` parsed from the DDL) against the
+        # SQLAlchemy expression in `core/models.py` (`func.lower(func.trim(col))`). It
+        # therefore always reports the username invariant as one `remove_index` plus one
+        # `add_index`, even when the two are semantically identical — a false positive that
+        # would fail every deployment gate.
+        #
+        # Rather than blanket-ignoring the name (which would also hide a REAL problem), the
+        # pair is dropped only when `index_is_correct()` confirms the live index has all four
+        # required properties. That check is strictly stronger than the autogenerate
+        # comparison it replaces: it verifies UNIQUE, the `lower` expression, the `TRIM`
+        # expression, and the partial predicate against the engine's own definition text. If
+        # anything about the invariant is wrong, this filter does not apply and the drift is
+        # reported as normal.
+        diffs = _drop_verified_functional_index_noise(eng, diffs)
+        return diffs
+
+
+def _drop_verified_functional_index_noise(eng, diffs: list) -> list:
+    """Remove the username-index add/remove pair when the live index is verified correct."""
+    from core import username_uniqueness
+
+    name = username_uniqueness.USERNAME_UNIQUE_INDEX
+    relevant = [
+        d for d in diffs
+        if isinstance(d, tuple) and d and name in str(d)
+    ]
+    if not relevant:
+        return diffs
+    # Only these two shapes are the known functional-index artefact.
+    if not all(isinstance(d, tuple) and d[0] in ("add_index", "remove_index") for d in relevant):
+        return diffs
+    try:
+        with eng.connect() as conn:
+            if not username_uniqueness.index_is_correct(conn):
+                return diffs
+    except Exception:
+        return diffs
+    return [d for d in diffs if not (isinstance(d, tuple) and d and name in str(d))]
 
 
 def drift_report(engine=None) -> Dict[str, Any]:
