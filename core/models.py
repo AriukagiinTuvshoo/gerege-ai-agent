@@ -13,6 +13,7 @@ from sqlalchemy import (
     DateTime,
     UniqueConstraint,
     Index,
+    ForeignKey,
 )
 from sqlalchemy.orm import declarative_base
 
@@ -27,6 +28,27 @@ Base = declarative_base()
 #: sort and render as "unknown time". Declaring the default on the model keeps both
 #: insert paths — ORM and raw SQL — producing a timestamp.
 TS_DEFAULT = func.current_timestamp()
+
+#: Referential integrity (P1-06).
+#:
+#: Every tenant-scoped table references ``pages.page_id``. Before this existed the
+#: relations were enforced only by application code: ``database.delete_page()`` walks a
+#: hand-maintained list of 12 tables and had already drifted — ``comment_automations``,
+#: ``tracked_links``, ``audit_logs`` and ``task_jobs`` rows were never removed, so deleting
+#: a tenant stranded them permanently.
+#:
+#: Delete policy, chosen deliberately:
+#:
+#: * ``ON DELETE CASCADE`` for ordinary tenant data — deleting a tenant should remove its
+#:   messages, invoices, jobs and so on, which is what ``delete_page()`` always intended.
+#: * ``audit_logs.page_id`` is ``ON DELETE SET NULL``. The audit trail must outlive the
+#:   tenant it describes; cascading it would let anyone erase their own audit history by
+#:   deleting a page. The column is already nullable for this reason.
+# A ForeignKey object can only be attached to one column, so these are type aliases
+# resolved by `_page_fk()` / `_page_fk_nullable()` rather than shared instances.
+PageFK = lambda: ForeignKey("pages.page_id", ondelete="CASCADE")          # noqa: E731
+PageFKNullable = lambda: ForeignKey("pages.page_id", ondelete="SET NULL")  # noqa: E731
+
 
 
 class PageModel(Base):
@@ -63,7 +85,7 @@ class RegistrationModel(Base):
     __tablename__ = "registrations"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), default="100799479495809", index=True)
+    page_id = Column(String(128), PageFK(), default="100799479495809", index=True)
     name = Column(String(255), nullable=False)
     phone = Column(String(64), nullable=False)
     service = Column(String(255), nullable=True)
@@ -83,7 +105,7 @@ class MessageModel(Base):
     __tablename__ = "messages"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), default="100799479495809", index=True)
+    page_id = Column(String(128), PageFK(), default="100799479495809", index=True)
     sender_id = Column(String(255), nullable=False)
     channel = Column(String(64), default="web")
     sender_type = Column(String(32), nullable=False)
@@ -100,7 +122,7 @@ class SessionStateModel(Base):
     __tablename__ = "session_states"
 
     sender_id = Column(String(255), primary_key=True)
-    page_id = Column(String(128), default="100799479495809")
+    page_id = Column(String(128), PageFK(), default="100799479495809")
     channel = Column(String(64), default="web")
     is_human_takeover = Column(Integer, default=0)
     customer_name = Column(String(255), nullable=True)
@@ -113,7 +135,7 @@ class AuthSessionModel(Base):
 
     session_token = Column(String(255), primary_key=True)
     role = Column(String(32), nullable=False)
-    page_id = Column(String(128), nullable=True)
+    page_id = Column(String(128), PageFK(), nullable=True)
     revoked = Column(Integer, default=0)
     revoked_at = Column(DateTime, nullable=True)
     ip_address = Column(String(64), nullable=True)
@@ -125,7 +147,7 @@ class UserMemoryModel(Base):
     __tablename__ = "user_memories"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), nullable=False)
+    page_id = Column(String(128), PageFK(), nullable=False)
     user_id = Column(String(255), nullable=False)
     customer_name = Column(String(255), nullable=True)
     phone = Column(String(64), nullable=True)
@@ -145,7 +167,7 @@ class PaymentInvoiceModel(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     invoice_id = Column(String(128), unique=True, nullable=False)
-    page_id = Column(String(128), nullable=False)
+    page_id = Column(String(128), PageFK(), nullable=False)
     sender_id = Column(String(255), nullable=True)
     channel = Column(String(64), default="web")
     amount = Column(Integer, nullable=False)
@@ -173,7 +195,7 @@ class CargoPackageModel(Base):
     __tablename__ = "cargo_packages"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), nullable=False)
+    page_id = Column(String(128), PageFK(), nullable=False)
     tracking_code = Column(String(128), nullable=False)
     customer_name = Column(String(255), nullable=True)
     customer_phone = Column(String(64), nullable=True)
@@ -183,7 +205,9 @@ class CargoPackageModel(Base):
     price_amount = Column(Integer, default=0)
     status = Column(String(64), default="REGISTERED")
     warehouse_location = Column(String(255), default="УБ Агуулах")
-    invoice_id = Column(String(128), nullable=True)
+    invoice_id = Column(
+        String(128), ForeignKey("invoices.invoice_id", ondelete="SET NULL"), nullable=True
+    )
     notified_at = Column(DateTime, nullable=True)
     arrived_at = Column(DateTime, nullable=True)
     delivered_at = Column(DateTime, nullable=True)
@@ -202,7 +226,7 @@ class AutomatedRuleModel(Base):
     __tablename__ = "automated_rules"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), nullable=False)
+    page_id = Column(String(128), PageFK(), nullable=False)
     rule_type = Column(String(64), nullable=False)
     delay_hours = Column(Integer, default=2)
     message_template = Column(Text, nullable=False)
@@ -219,7 +243,7 @@ class MarketingCampaignModel(Base):
     __tablename__ = "marketing_campaigns"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), nullable=False)
+    page_id = Column(String(128), PageFK(), nullable=False)
     title = Column(String(255), nullable=False)
     message = Column(Text, nullable=False)
     target_segment = Column(String(64), default="all")
@@ -237,7 +261,7 @@ class SentFollowupModel(Base):
     __tablename__ = "sent_followups"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), nullable=False)
+    page_id = Column(String(128), PageFK(), nullable=False)
     rule_type = Column(String(64), nullable=False)
     sender_id = Column(String(255), nullable=False)
     channel = Column(String(64), default="web")
@@ -253,7 +277,7 @@ class AppointmentModel(Base):
     __tablename__ = "appointments"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), nullable=False)
+    page_id = Column(String(128), PageFK(), nullable=False)
     customer_name = Column(String(255), nullable=False)
     customer_phone = Column(String(64), nullable=False)
     service_name = Column(String(255), nullable=False)
@@ -315,7 +339,7 @@ class AuditLogModel(Base):
     __tablename__ = "audit_logs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), nullable=True, index=True)
+    page_id = Column(String(128), PageFKNullable(), nullable=True, index=True)
     actor_role = Column(String(64), nullable=True)
     actor_id = Column(String(255), nullable=True)
     action = Column(String(128), nullable=False)
@@ -334,7 +358,7 @@ class CommentAutomationModel(Base):
     __tablename__ = "comment_automations"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), nullable=False, index=True)
+    page_id = Column(String(128), PageFK(), nullable=False, index=True)
     name = Column(String(255), nullable=False)
     post_id = Column(String(255), default="*")
     keyword_pattern = Column(String(500), default="*")
@@ -356,8 +380,10 @@ class TrackedLinkModel(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     code = Column(String(64), unique=True, nullable=False)
-    page_id = Column(String(128), nullable=False, index=True)
-    automation_id = Column(Integer, nullable=True)
+    page_id = Column(String(128), PageFK(), nullable=False, index=True)
+    automation_id = Column(
+        Integer, ForeignKey("comment_automations.id", ondelete="SET NULL"), nullable=True
+    )
     title = Column(String(255), default="")
     target_url = Column(Text, nullable=False)
     clicks_count = Column(Integer, default=0)

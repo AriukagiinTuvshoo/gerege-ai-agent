@@ -623,25 +623,24 @@ def save_page(
     return True
 
 def delete_page(page_id: str) -> bool:
+    """
+    Delete a tenant and everything that belongs to it.
+
+    The child rows are removed by the database, not by this function: every tenant-scoped
+    table has ``page_id ... ON DELETE CASCADE`` (P1-06, revision `0003_foreign_keys`), so
+    deleting the `pages` row is the whole operation. This used to walk a hand-maintained
+    list of twelve table names, and that list had already drifted — it never deleted
+    `comment_automations`, `tracked_links`, `audit_logs` or `task_jobs`, so deleting a
+    tenant stranded those rows permanently.
+
+    `audit_logs` is deliberately *not* deleted: its foreign key is `ON DELETE SET NULL`,
+    so the audit trail outlives the tenant it describes.
+    """
     if page_id == DEFAULT_PAGE_ID:
         return False  # Үндсэн хуудсыг устгахгүй
     conn = get_connection()
     cursor = conn.cursor()
-    for tbl in (
-        "pages",
-        "registrations",
-        "messages",
-        "session_states",
-        "sessions",
-        "user_memories",
-        "invoices",
-        "cargo_packages",
-        "automated_rules",
-        "marketing_campaigns",
-        "sent_followups",
-        "appointments",
-    ):
-        cursor.execute(f"DELETE FROM {tbl} WHERE page_id = ?", (page_id,))
+    cursor.execute("DELETE FROM pages WHERE page_id = ?", (page_id,))
     conn.commit()
     conn.close()
     return True

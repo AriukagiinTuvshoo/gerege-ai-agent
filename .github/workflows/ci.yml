@@ -105,7 +105,7 @@ jobs:
 
       - name: Run Pytest Regression, Enterprise, AI Eval & Failure Suites (SQLite mode)
         run: |
-          pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py tests/test_stage_b_regressions.py -v
+          pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py tests/test_stage_b_regressions.py tests/test_p1_06_foreign_keys.py -v
 
       - name: Run SQLite-to-PostgreSQL Dry-Run Verification
         if: ${{ !cancelled() }}
@@ -236,6 +236,29 @@ jobs:
         run: |
           # Type-aware drift check against the live PostgreSQL schema.
           python scripts/migrate.py --verify --no-backup
+
+      - name: Verify foreign keys exist (Live PostgreSQL 16) — P1-06
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          python -c "
+          import os, sqlalchemy as sa
+          from core.models import Base
+          from core.schema_manager import compare_with_models
+          e = sa.create_engine(os.environ['DATABASE_URL'])
+          with e.connect() as c:
+              n = c.execute(sa.text(
+                  \"select count(*) from information_schema.table_constraints \"
+                  \"where constraint_type='FOREIGN KEY' and table_schema='public'\"
+              )).scalar()
+          expected = sum(len(col.foreign_keys) for t in Base.metadata.tables.values() for col in t.columns)
+          print(f'foreign keys in database: {n} (models declare {expected})')
+          assert n >= expected, f'expected at least {expected} foreign keys, found {n}'
+          diffs = compare_with_models()
+          assert not diffs, diffs[:5]
+          print('schema still matches models after adding constraints')
+          "
 
       - name: Run Stage C schema authority suite (Live PostgreSQL 16)
         if: ${{ !cancelled() }}

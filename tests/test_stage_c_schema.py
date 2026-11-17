@@ -190,6 +190,12 @@ def test_string_timestamp_sentinel_becomes_null_not_garbage(tmp_path, monkeypatc
 
     conn = sqlite3.connect(db_path)
     try:
+        # The tenant must exist: from `0003` onwards `invoices.page_id` is a foreign key
+        # to `pages.page_id`, and the migration refuses to add it over orphan rows.
+        conn.execute(
+            "INSERT INTO pages (page_id, name, created_at)"
+            " VALUES ('t1','Tenant One','2026-11-16 06:00:00')"
+        )
         conn.execute(
             "INSERT INTO invoices (invoice_id, page_id, amount, status, description,"
             " paid_at, created_at) VALUES ('INV-EMPTY','t1',1000,'PAID','d','',"
