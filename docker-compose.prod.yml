@@ -24,7 +24,36 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    # E-02 Phase 6, R11 + R14. The eviction policy and the memory cap are security settings
+    # here, not tuning:
+    #
+    #   --maxmemory-policy noeviction  (Redis's default, now explicit)
+    #     A rate-limit counter must never be evicted to make room for another one. Evicting a
+    #     live counter silently hands that account a fresh budget — the same bug as the memory
+    #     store's capacity handling, which refuses rather than displaces a live counter. Under
+    #     pressure Redis refuses writes instead, the account limiter fails closed (R14), and
+    #     readiness turns 503. That is the intended failure: loud and closed, not quiet and open.
+    #     Do NOT switch to allkeys-lru "to avoid errors"; it converts this into a bypass.
+    #
+    #   --maxmemory 400mb
+    #     Derived from measurement, not guessed. Two keys are written per admitted account and
+    #     a measured 20,000-account fill used ~389 bytes/account (7.4 MiB, 40,000 keys), so 400mb
+    #     holds roughly 1,000,000 concurrently-throttled accounts — well beyond any realistic
+    #     login working set, while staying inside the 512M container limit below (Redis's own
+    #     overhead, AOF buffers and fragmentation need headroom, which is why the container
+    #     limit stays above maxmemory).
+    #
+    # Review point: if the account-key namespace or per-account key count changes, re-measure
+    # and re-derive this number. If the deployment grows past ~1M live counters in one window,
+    # raise maxmemory and the container limit together.
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "400mb"
+      - "--maxmemory-policy"
+      - "noeviction"
     volumes:
       - redisdata:/data
     healthcheck:
