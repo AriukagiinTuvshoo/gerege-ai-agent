@@ -258,7 +258,13 @@ def test_07_malformed_forwarding_headers_are_handled_safely(fresh_limiter):
             ("whitespace", "   ", "10.1.2.3"),
             ("commas", ",,,", "10.1.2.3"),
             ("junk", "not-an-ip", "10.1.2.3"),
-            ("over-long", "1.1.1.1, " * 500 + "203.0.113.5", "203.0.113.5"),
+            # Over-long input is REJECTED, not parsed. Phase 3 bounds the header at
+            # _MAX_FORWARDED_HEADER_BYTES precisely so a multi-kilobyte value cannot be
+            # walked; falling back to the peer is the safe answer, and asserting
+            # "203.0.113.5" here would have required raising the bound for no reason.
+            ("over-long", "1.1.1.1, " * 500 + "203.0.113.5", "10.1.2.3"),
+            # A chain within the byte budget but beyond the hop budget is also rejected.
+            ("too-many-hops", ", ".join(["10.0.0.1"] * 20), "10.1.2.3"),
         ]
         for label, xff, expected in cases:
             got = _identity(peer="10.1.2.3", xff=xff)
@@ -666,27 +672,36 @@ class _AdvanceableClock:
         self.now += seconds
 
 
+_ORIGINAL_TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
+
+
 def _apply_trusted_proxy_config(proxy_count: int, peer: str) -> None:
     """
-    Configure the trusted-proxy policy the fix is expected to expose.
+    Configure the trusted-proxy policy.
 
-    Kept in one place so the tests fail with a clear message (no such thing exists yet)
-    rather than an AttributeError scattered across six call sites.
+    Phase 3 implemented this as `TRUSTED_PROXIES` (environment-only, per the strict scope),
+    so the helper drives that. It is kept in one place so a future change to the
+    configuration surface fails once, clearly, instead of across six call sites.
     """
-    configure = getattr(rate_limit, "configure_trusted_proxies", None)
-    assert configure is not None, (
+    refresh = getattr(rate_limit, "refresh_trusted_proxies", None)
+    assert refresh is not None, (
         "E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no "
         "way to express 'trust X-Forwarded-For only from these peers' today, which is why "
         "the header is believed unconditionally."
     )
-    configure(trusted_proxies=["10.1.2.3", "10.0.0.5"][:1] if proxy_count == 1 else ["10.1.2.3"],
-              trusted_proxy_count=proxy_count)
+    if proxy_count == 1:
+        os.environ[_ORIGINAL_TRUSTED_PROXIES_ENV] = "10.1.2.3"
+    else:
+        # Two hops: the peer that talks to us plus the inner proxy it forwards for.
+        os.environ[_ORIGINAL_TRUSTED_PROXIES_ENV] = "10.0.0.9,10.0.0.5"
+    refresh()
 
 
 def _clear_trusted_proxy_config() -> None:
-    configure = getattr(rate_limit, "configure_trusted_proxies", None)
-    if configure is not None:
-        configure(trusted_proxies=[], trusted_proxy_count=0)
+    os.environ.pop(_ORIGINAL_TRUSTED_PROXIES_ENV, None)
+    refresh = getattr(rate_limit, "refresh_trusted_proxies", None)
+    if refresh is not None:
+        refresh()
 
 
 def _identity(peer: str, xff: str) -> str:

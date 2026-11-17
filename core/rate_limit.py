@@ -41,11 +41,12 @@ and the counter logic are tested without sleeping and without a live Redis. The
 "shared across workers" guarantee is tested with two separate `RateLimiter` *instances*
 against one Redis, which is exactly what two worker processes are.
 """
+import ipaddress
 import logging
 import os
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("core.rate_limit")
 
@@ -232,24 +233,217 @@ def set_limiter(limiter: Optional[RateLimiter]) -> None:
     _shared_limiter = limiter
 
 
+# =============================================================================
+# E-02 Phase 3 — trusted-proxy client-IP policy
+# =============================================================================
+# Why this is not three lines of header parsing
+# ---------------------------------------------
+# `request.client.host` is NOT the TCP peer on this stack. uvicorn defaults to
+# `proxy_headers=True` with `forwarded_allow_ips="127.0.0.1,::1"`, and when the peer is
+# trusted it overwrites `scope["client"]` from `X-Forwarded-For` (measured on 0.54.0:
+# `1.1.1.1, 2.2.2.2` becomes `2.2.2.2`, the port is forced to 0, and `not-an-ip` is
+# accepted verbatim with no validation). The production command therefore passes
+# `--no-proxy-headers`, which makes `scope["client"]` the real socket peer, and the rules
+# below become the single authority on forwarding.
+#
+# Policy
+# ------
+# 1. Start from the socket peer.
+# 2. If the peer is not a trusted proxy, ignore every forwarding header.
+# 3. Otherwise walk `X-Forwarded-For` right-to-left, skipping addresses that are
+#    themselves trusted proxies, and return the first untrusted address.
+# 4. Every entry must parse as an IP address; anything else aborts the walk and the peer
+#    is returned. A value that cannot be parsed must never become an identity.
+# 5. Bounded: at most `_MAX_FORWARDED_HOPS` entries and `_MAX_FORWARDED_HEADER_BYTES` bytes.
+# 6. `X-Real-IP` and RFC 7239 `Forwarded` are deliberately NOT supported. Supporting them
+#    needs its own trust validation and tests; silently falling back to them is how a
+#    "hardened" resolver ends up bypassable again.
+#
+# Configuration is environment-only: `TRUSTED_PROXIES`, comma separated, IPv4/IPv6/CIDR.
+# Empty or unset means trust nothing. `*`, `0.0.0.0/0` and `::/0` are rejected: they would
+# disable the policy, so a misconfiguration fails closed rather than open.
+
+#: Requests deeper than this are treated as hostile and fall back to the peer.
+_MAX_FORWARDED_HOPS = 15
+
+#: A header longer than this is not inspected at all (it is ~57 KB of addresses).
+_MAX_FORWARDED_HEADER_BYTES = 1024
+
+#: Trust entries that would grant universal trust and are therefore refused.
+_UNIVERSAL_TRUST_LITERALS = {"*", "all", "any", "0.0.0.0/0", "::/0"}
+
+_trusted_proxy_lock = threading.Lock()
+#: Parsed trust list: IPv4Address/IPv6Address/IPv4Network/IPv6Network instances.
+_trusted_proxies: List[Any] = []
+_trusted_proxies_loaded = False
+
+
+def _parse_trusted_proxy(entry: str):
+    """
+    One `TRUSTED_PROXIES` entry -> an address or network object, or None to reject it.
+
+    Both `ip_address` and `ip_network` are used so matching is structural: `2001:db8::1`
+    and `2001:0db8:0:0::1` are the same host, and a textual comparison would miss that.
+    """
+    raw = (entry or "").strip()
+    if not raw or raw.lower() in _UNIVERSAL_TRUST_LITERALS:
+        return None
+    try:
+        if "/" in raw:
+            network = ipaddress.ip_network(raw, strict=False)
+            # /0 is every address; refused above by literal, but catch other spellings.
+            if network.prefixlen == 0:
+                logger.error(
+                    f"TRUSTED_PROXIES entry {raw!r} covers the whole address space and is "
+                    "ignored; universal trust would disable the policy"
+                )
+                return None
+            return network
+        return ipaddress.ip_address(raw)
+    except ValueError:
+        logger.warning(
+            f"TRUSTED_PROXIES entry {raw!r} is not an IP address or CIDR network and is "
+            "ignored. Trust is never widened to compensate."
+        )
+        return None
+
+
+def _load_trusted_proxies() -> List[Any]:
+    """Parse `TRUSTED_PROXIES` into address/network objects."""
+    raw = os.getenv("TRUSTED_PROXIES", "")
+    parsed = []
+    for entry in raw.split(","):
+        parsed_entry = _parse_trusted_proxy(entry)
+        if parsed_entry is not None:
+            parsed.append(parsed_entry)
+    return parsed
+
+
+def get_trusted_proxies() -> List[Any]:
+    """The active trust list. Loaded once per process on first use."""
+    global _trusted_proxies, _trusted_proxies_loaded
+    if not _trusted_proxies_loaded:
+        with _trusted_proxy_lock:
+            if not _trusted_proxies_loaded:
+                _trusted_proxies = _load_trusted_proxies()
+                _trusted_proxies_loaded = True
+                if _trusted_proxies:
+                    logger.info(
+                        "Trusted proxies configured: "
+                        + ", ".join(str(p) for p in _trusted_proxies)
+                    )
+                else:
+                    logger.info(
+                        "No trusted proxies configured; forwarding headers are ignored. "
+                        "Set TRUSTED_PROXIES only if this app runs behind a proxy you control."
+                    )
+    return list(_trusted_proxies)
+
+
+def refresh_trusted_proxies() -> List[Any]:
+    """Re-read `TRUSTED_PROXIES`. For tests and for a deliberate config reload."""
+    global _trusted_proxies, _trusted_proxies_loaded
+    with _trusted_proxy_lock:
+        _trusted_proxies = _load_trusted_proxies()
+        _trusted_proxies_loaded = True
+    return list(_trusted_proxies)
+
+
+def _is_trusted_proxy(address, trusted_list: List[Any]) -> bool:
+    """Membership test for an already-parsed address."""
+    if address is None:
+        return False
+    for entry in trusted_list:
+        if isinstance(entry, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            if address.version == entry.version and address in entry:
+                return True
+        elif address == entry:
+            return True
+    return False
+
+
+def _peer_address(request):
+    """The socket peer as an address object, or None if unusable."""
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None) if client else None
+    if not host:
+        return None
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0])  # strip an IPv6 zone id
+    except ValueError:
+        return None
+
+
+def resolve_client_ip(request) -> str:
+    """
+    The one place that decides "who is this client".
+
+    Returns a string suitable for use as a rate-limit key. Never returns a value taken
+    from a header unless the socket peer is a configured trusted proxy AND every hop that
+    was walked parsed as an IP address.
+    """
+    peer = _peer_address(request)
+    peer_text = str(peer) if peer is not None else None
+
+    trusted_list = get_trusted_proxies()
+    if not trusted_list or peer is None or not _is_trusted_proxy(peer, trusted_list):
+        # No policy, or the peer is not a proxy we trust. Forwarding headers are ignored.
+        return peer_text or "unknown"
+
+    raw = request.headers.get("x-forwarded-for")
+    if not raw:
+        return peer_text
+
+    if len(raw) > _MAX_FORWARDED_HEADER_BYTES:
+        logger.warning(
+            f"Ignoring X-Forwarded-For of {len(raw)} bytes (limit "
+            f"{_MAX_FORWARDED_HEADER_BYTES}); using the socket peer"
+        )
+        return peer_text
+
+    hops = [h.strip() for h in raw.split(",")]
+    if len(hops) > _MAX_FORWARDED_HOPS:
+        logger.warning(
+            f"Ignoring X-Forwarded-For with {len(hops)} hops (limit "
+            f"{_MAX_FORWARDED_HOPS}); using the socket peer"
+        )
+        return peer_text
+
+    # Right-to-left: the last entry was appended by the proxy we already trust, so it is
+    # the closest hop. Return the first address that is not itself a trusted proxy.
+    for hop in reversed(hops):
+        if not hop:
+            continue
+        try:
+            address = ipaddress.ip_address(hop)
+        except ValueError:
+            logger.warning(
+                f"Unparseable X-Forwarded-For entry {hop[:64]!r}; aborting the walk and "
+                "using the socket peer"
+            )
+            return peer_text
+        if not _is_trusted_proxy(address, trusted_list):
+            return str(address)
+
+    # Every hop was a trusted proxy (e.g. a proxy calling itself). The left-most address
+    # is the best available answer and is still a trusted-proxy address.
+    for hop in hops:
+        try:
+            return str(ipaddress.ip_address(hop))
+        except ValueError:
+            continue
+    return peer_text
+
+
 def client_identity(request) -> str:
     """
-    Best-effort client identity for rate limiting.
+    The rate-limiting identity for a request.
 
-    Uses the left-most `X-Forwarded-For` entry when present, because the app runs behind
-    Vercel's proxy and would otherwise see every request as one address. That header is
-    client-controlled, so it is a rate-limiting key only — it must never be used for
-    authentication or authorisation decisions.
+    Phase 3: this delegates entirely to `resolve_client_ip()`. It deliberately does not
+    parse headers itself — a second code path is a second policy, and that is how the
+    original bypass existed.
     """
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
-    real_ip = request.headers.get("x-real-ip", "").strip()
-    if real_ip:
-        return real_ip
-    return request.client.host if request.client else "unknown"
+    return resolve_client_ip(request)
 
 
 def check_request_limit(request, scope: str) -> Optional[Dict[str, object]]:

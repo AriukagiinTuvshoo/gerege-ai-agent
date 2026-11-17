@@ -54,6 +54,13 @@ services:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
       REDIS_URL: redis://redis:6379/0
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      # E-02 Phase 3: there is no reverse proxy in this topology, so nothing is trusted
+      # and the default stays empty on purpose. `web` publishes port 8000 directly, so
+      # every TCP peer is the real client. Set this ONLY when a fronting proxy is added,
+      # and then list the proxy's addresses — never the clients'.
+      # uvicorn runs with --no-proxy-headers (see Dockerfile), so this is the single
+      # authority on forwarding.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       META_APP_SECRET: ${META_APP_SECRET:-}
       META_VERIFY_TOKEN: ${META_VERIFY_TOKEN:-}

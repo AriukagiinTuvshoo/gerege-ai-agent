@@ -298,10 +298,14 @@ async def get_current_user(
 # -------------------------------------------------------------
 @app.post("/api/auth/login")
 async def auth_login(payload: Dict[str, Any], request: Request, response: Response):
-    client_ip = (request.client.host if request.client else "unknown")
+    # E-02 Phase 3: one resolver decides the client IP. `client_ip` is what gets stored in
+    # audit logs and on the session row, so it must be the same value the limiter keys on —
+    # previously it was `request.client.host` while the limiter used a different header
+    # parse, so an attacker could appear as two different clients in one request.
+    client_ip = core_rate_limit.resolve_client_ip(request)
     limiter = core_rate_limit.get_limiter()
     limit_hit = limiter.check(
-        "auth_login", core_rate_limit.client_identity(request), *core_rate_limit.DEFAULT_LIMITS["auth_login"]
+        "auth_login", client_ip, *core_rate_limit.DEFAULT_LIMITS["auth_login"]
     )
     if not limit_hit["allowed"]:
         return JSONResponse(

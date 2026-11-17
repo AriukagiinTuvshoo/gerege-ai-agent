@@ -14,15 +14,15 @@ Strictly sequential. Parallelising these would make each failure ambiguous.
 | Step | Priority | Subject | Status |
 |---|---|---|---|
 | **E-01** | P0 | Tenant isolation of session state, messages and PII | **FIXED — verified** |
-| **E-02** | P0 | Login rate limit, trusted proxy, account-level lockout | Not started |
+| **E-02** | P0 | Login rate limit, trusted proxy, account-level lockout | **Phase 3 done** · Phase 4 not started |
 | **E-03** | P1 | Redis outage truthfulness in health; per-endpoint fail policy | Not started |
 | **E-04** | P1 | Durable webhook processing: lease, retry, idempotency | Not started |
 
-Reports: [`E01_TENANT_ISOLATION.md`](E01_TENANT_ISOLATION.md).
+Reports: [`E01_TENANT_ISOLATION.md`](E01_TENANT_ISOLATION.md) ·
+[`E02_LOGIN_RATE_LIMIT.md`](E02_LOGIN_RATE_LIMIT.md) (Phase 3 of 4).
 
-`E02_LOGIN_RATE_LIMIT.md`, `E03_REDIS_RESILIENCE.md` and `E04_WEBHOOK_RELIABILITY.md` are
-deliberately **not written yet** — they are authored only once their Step is actually
-remediated. Creating them now would imply findings that do not exist.
+`E03_REDIS_RESILIENCE.md` and `E04_WEBHOOK_RELIABILITY.md` are deliberately **not written
+yet** — they are authored only once their Step is actually remediated.
 
 ---
 
@@ -102,6 +102,52 @@ explicit per-tenant aggregate.
 `git revert dfeaef3`, or restore the pre-migration backup. Full detail in the E-01 report.
 
 ---
+
+## E-02 Phase 3 — trusted-proxy client IP (P0, partial)
+
+### What was wrong
+
+`client_identity()` returned the left-most `X-Forwarded-For` with no trust check. Worse,
+`request.client.host` was **not** the TCP peer: uvicorn's default
+`forwarded_allow_ips="127.0.0.1,::1"` rewrote `scope["client"]` from the same header,
+taking the right-most entry without validating it. Two parsers, two answers, both
+attacker-influenced.
+
+### What was fixed
+
+`--no-proxy-headers` on the production command, so `scope["client"]` is the real socket
+peer; and `resolve_client_ip()` as the single authority, driven by `TRUSTED_PROXIES`
+(empty = trust nothing, `*` and `0.0.0.0/0` rejected, IPv4/IPv6/CIDR, bounded hops and
+bytes, junk aborts to the peer).
+
+### Acceptance criteria — Phase 3 only
+
+| Criterion | Result |
+|---|---|
+| Environment-variable configuration only | **PASS** |
+| Default trusts nothing | **PASS** |
+| Direct XFF / X-Real-IP / Forwarded spoofing cannot change identity | **PASS** |
+| Trusted chain resolved correctly, incl. multi-hop and spoofed prefix | **PASS** |
+| uvicorn and app follow one policy | **PASS** |
+| IPv4 / IPv6 | **PASS** |
+| Malformed headers | **PASS** |
+| Real uvicorn HTTP | **PASS** with Redis; **FAIL** without (R1, E-03) |
+| SQLite / PostgreSQL regression | **PASS** |
+| E-01 regression | **PASS** 12/12 |
+| CI | recorded in the E-02 report |
+| Account-level protection | **NOT IMPLEMENTED** — Phase 4 |
+
+**E-02 is NOT complete and SEC-07 remains FAIL.**
+
+### Corrected test count
+
+The Phase 2 report said "20 tests". The file defines **21** test functions (mandated case 11
+was split into `test_11` and `test_11b`). Both environment totals — SQLite 15+4+2,
+PostgreSQL 16+5 — equal 21 and were correct. Full per-test table in the E-02 report.
+
+`test_20` passes pre-fix because Redis already shares whatever is counted; it is left
+passing deliberately. After Phase 4 it keeps its green result but asserts that the
+*account* counter survives a restart rather than an arbitrary key.
 
 ## Outstanding across Stage E
 
