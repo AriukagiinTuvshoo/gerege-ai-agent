@@ -1031,49 +1031,105 @@ async def get_active_sessions(
     return JSONResponse({"total": len(sessions), "limit": limit, "offset": offset, "data": sliced})
 
 @app.get("/api/sessions/{sender_id}/messages")
-async def get_session_messages(sender_id: str, request: Request):
-    user = await core_security.require_permission(request, "sessions:read")
-    msgs = database.get_conversation_history(sender_id)
-    if msgs:
-        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
+async def get_session_messages(sender_id: str, request: Request, page_id: Optional[str] = Query(None)):
+    """
+    One customer's messages inside ONE tenant.
 
-    is_takeover = database.is_session_human_takeover(sender_id)
-    return JSONResponse({"sender_id": sender_id, "is_human_takeover": is_takeover, "messages": msgs})
+    E-01: tenancy comes from the authenticated context (`enforce_tenant_scope`), never from
+    `msgs[0]` (the oldest message, which may belong to any tenant) and never from the
+    client-supplied `page_id`. The history query is tenant-scoped before any row is read,
+    so a caller cannot even learn whether another tenant has that sender.
+    """
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=False,
+        permission="sessions:read",
+    )
+    if not target_page:
+        raise HTTPException(status_code=403, detail="Салбар тодорхойгүй байна! (Tenant scope required)")
+    msgs = database.get_conversation_history(sender_id, page_id=target_page)
+    is_takeover = database.is_session_human_takeover(sender_id, page_id=target_page)
+    return JSONResponse({"sender_id": sender_id, "page_id": str(target_page), "is_human_takeover": is_takeover, "messages": msgs})
+
 
 @app.post("/api/sessions/{sender_id}/takeover")
-async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool], request: Request):
-    user = await core_security.require_permission(request, "sessions:write")
-    msgs = database.get_conversation_history(sender_id, limit=5)
-    if msgs:
-        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
+async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool], request: Request, page_id: Optional[str] = Query(None)):
+    """
+    E-01: the tenant is resolved from the auth context and must own the session row.
+    Previously ownership was read from the OLDEST message, so a sender who first talked to
+    tenant A let tenant A flip takeover on tenant B's live conversation. A session that
+    does not exist for the caller's tenant is 404, never a silent cross-tenant write.
+    """
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=False,
+        permission="sessions:write",
+    )
+    if not target_page:
+        raise HTTPException(status_code=403, detail="Салбар тодорхойгүй байна! (Tenant scope required)")
+
+    owns_session = database.session_belongs_to_page(sender_id, page_id=target_page)
+    has_history = bool(database.get_conversation_history(sender_id, limit=1, page_id=target_page))
+    if not (owns_session or has_history):
+        raise HTTPException(status_code=404, detail="Сесс олдсонгүй! (Session not found in this tenant)")
+
     takeover = payload.get("takeover", False)
-    database.set_human_takeover(sender_id, takeover)
-    return {"status": "success", "is_human_takeover": takeover}
+    database.set_human_takeover(sender_id, takeover, page_id=target_page)
+    database.record_audit_log(
+        "session.takeover.changed",
+        page_id=str(target_page),
+        resource_type="session",
+        resource_id=str(sender_id),
+    )
+    return {"status": "success", "page_id": str(target_page), "is_human_takeover": takeover}
+
 
 @app.post("/api/sessions/{sender_id}/send")
-async def manager_send_message(sender_id: str, payload: Dict[str, str], request: Request, background_tasks: BackgroundTasks):
+async def manager_send_message(sender_id: str, payload: Dict[str, str], request: Request, background_tasks: BackgroundTasks, page_id: Optional[str] = Query(None)):
+    """
+    E-01: the outbound message is written to, and the conversation read from, the tenant
+    that owns the authenticated session. `payload["page_id"]` is no longer trusted.
+    """
     text = payload.get("message", "").strip()
-    user = await core_security.require_permission(request, "sessions:write")
-    msgs = database.get_conversation_history(sender_id, limit=5)
-    if msgs:
-        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
-    target_page_id = user["page_id"] if not core_security.is_admin_role(user.get("role")) else payload.get("page_id", database.DEFAULT_PAGE_ID)
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=False,
+        permission="sessions:write",
+    )
+    if not target_page:
+        raise HTTPException(status_code=403, detail="Салбар тодорхойгүй байна! (Tenant scope required)")
+
+    owns_session = database.session_belongs_to_page(sender_id, page_id=target_page)
+    has_history = bool(database.get_conversation_history(sender_id, limit=1, page_id=target_page))
+    if not (owns_session or has_history):
+        raise HTTPException(status_code=404, detail="Сесс олдсонгүй! (Session not found in this tenant)")
 
     if not text:
         return JSONResponse({"error": "Empty message"}, status_code=400)
 
-    database.log_message(sender_id=sender_id, channel="omni", sender_type="agent", content=text, page_id=target_page_id)
+    # E-01: the message is stored under the AUTHENTICATED tenant, not the request body.
+    database.log_message(sender_id=sender_id, channel="omni", sender_type="agent", content=text, page_id=target_page)
+    database.record_audit_log(
+        "session.message.sent",
+        page_id=str(target_page),
+        resource_type="session",
+        resource_id=str(sender_id),
+    )
 
+    page_obj = database.get_page(target_page)
+    page_token = page_obj.get("page_access_token") if page_obj else None
     if sender_id.startswith("meta_"):
-        meta_id = sender_id.replace("meta_", "")
-        page_obj = database.get_page(target_page_id)
-        page_token = page_obj.get("page_access_token") if page_obj else None
-        background_tasks.add_task(send_meta_message, meta_id, text, page_token)
+        background_tasks.add_task(send_meta_message, sender_id.replace("meta_", ""), text, page_token)
     elif sender_id.startswith("tg_"):
-        tg_id = sender_id.replace("tg_", "")
-        background_tasks.add_task(send_telegram_message, tg_id, text, page_id=target_page_id)
+        background_tasks.add_task(send_telegram_message, sender_id.replace("tg_", ""), text, page_id=target_page)
 
-    return {"status": "sent", "sender_id": sender_id, "message": text}
+    return {"status": "sent", "sender_id": sender_id, "page_id": str(target_page), "message": text}
 
 # -------------------------------------------------------------
 # 9. CRM & LEADS PIPELINE (Client Isolation — P0-3)
@@ -1445,8 +1501,10 @@ async def update_knowledge(payload: Dict[str, Any], request: Request, page_id: O
 async def health_check():
     load_dotenv(override=True)
     rows = database.get_all_registrations()
-    sessions = database.get_active_sessions()
     pages = database.get_all_pages()
+    # E-01: `get_active_sessions` is tenant-scoped, so the cross-tenant total is an
+    # explicit per-tenant aggregate instead of an unscoped "give me everything" call.
+    sessions = [s for p in pages for s in database.get_active_sessions(page_id=p["page_id"])]
     return JSONResponse({
         "status": "healthy",
         "gemini_ready": agent.is_gemini_ready(),

@@ -119,10 +119,21 @@ class MessageModel(Base):
 
 
 class SessionStateModel(Base):
+    """
+    Conversation state for one customer **within one tenant**.
+
+    Identity is `(page_id, sender_id)`, not `sender_id` alone (finding E-01).
+
+    A single person reaching two businesses produces the same sender ID in both, so keying
+    on `sender_id` alone let one tenant's row overwrite the other's — disclosing the customer
+    phone and name the first tenant collected, and removing the conversation from the tenant
+    that owned it. The composite primary key makes that impossible at the storage layer, so a
+    future query cannot reintroduce the leak by forgetting a `WHERE page_id = ?`.
+    """
     __tablename__ = "session_states"
 
+    page_id = Column(String(128), PageFK(), primary_key=True)
     sender_id = Column(String(255), primary_key=True)
-    page_id = Column(String(128), PageFK(), default="100799479495809")
     channel = Column(String(64), default="web")
     is_human_takeover = Column(Integer, default=0)
     customer_name = Column(String(255), nullable=True)

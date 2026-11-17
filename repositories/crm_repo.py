@@ -22,8 +22,8 @@ class CRMRepository:
         return database.get_active_sessions(page_id=page_id)
 
     @staticmethod
-    def get_messages(sender_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        return database.get_conversation_history(sender_id=sender_id, limit=limit)
+    def get_messages(sender_id: str, page_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return database.get_conversation_history(sender_id=sender_id, limit=limit, page_id=page_id)
 
     @staticmethod
     def list_appointments(

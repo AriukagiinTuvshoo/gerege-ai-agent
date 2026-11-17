@@ -53,7 +53,8 @@ MIGRATION_TABLES: List[Dict[str, Any]] = [
     {"table": "pages", "pk_cols": ["page_id"]},
     {"table": "registrations", "pk_cols": ["id"], "has_serial_id": True},
     {"table": "messages", "pk_cols": ["id"], "has_serial_id": True},
-    {"table": "session_states", "pk_cols": ["sender_id"]},
+    # E-01: session identity is tenant-scoped; the ETL must upsert on the real key.
+    {"table": "session_states", "pk_cols": ["page_id", "sender_id"]},
     {"table": "sessions", "pk_cols": ["session_token"]},
     {"table": "user_memories", "pk_cols": ["page_id", "user_id"], "has_serial_id": True},
     {"table": "invoices", "pk_cols": ["invoice_id"], "has_serial_id": True},

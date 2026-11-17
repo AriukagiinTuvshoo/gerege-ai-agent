@@ -159,7 +159,19 @@ def init_db():
                 cursor.execute("UPDATE OR IGNORE pages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
                 cursor.execute("UPDATE OR IGNORE registrations SET page_id = ? WHERE page_id = ?", (new_id, old_id))
                 cursor.execute("UPDATE OR IGNORE messages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                # E-01: `UPDATE OR IGNORE` silently skips a row when the rewritten
+                # (page_id, sender_id) already exists, which would leave that customer's
+                # session behind on the old page_id. Report instead of silently dropping.
+                cursor.execute("SELECT COUNT(*) FROM session_states WHERE page_id = ?", (old_id,))
+                pending = cursor.fetchone()[0]
                 cursor.execute("UPDATE OR IGNORE session_states SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                cursor.execute("SELECT COUNT(*) FROM session_states WHERE page_id = ?", (old_id,))
+                left = cursor.fetchone()[0]
+                if left:
+                    logger.warning(
+                        f"page_id sanitisation left {left} of {pending} session rows on {old_id!r}: "
+                        f"the rewritten identity already exists on {new_id!r}. Review manually."
+                    )
     except Exception as e:
         logger.error(f"Migration page_id sanitization error: {e}")
 
@@ -704,15 +716,16 @@ def save_registration(
 
     if sender_id:
         display_name = name if name and name != "Баримт баталгаажсан" else None
+        # E-01: tenant-scoped. The old `page_id = COALESCE(?, page_id)` always took the
+        # NEW page_id, which reassigned the row to the most recent tenant.
         cursor.execute("""
             INSERT INTO session_states (sender_id, page_id, channel, customer_name, customer_phone, updated_at)
             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(sender_id) DO UPDATE SET
-                page_id = COALESCE(?, session_states.page_id),
+            ON CONFLICT(page_id, sender_id) DO UPDATE SET
                 customer_name = COALESCE(?, session_states.customer_name, ?),
                 customer_phone = COALESCE(?, session_states.customer_phone),
                 updated_at = CURRENT_TIMESTAMP
-        """, (sender_id, page_id, channel, display_name or name, phone, page_id, display_name, name, phone))
+        """, (sender_id, page_id, channel, display_name or name, phone, display_name, name, phone))
 
     conn.commit()
     conn.close()
@@ -901,13 +914,14 @@ def log_message(sender_id: str, channel: str, sender_type: str, content: str, pa
         VALUES (?, ?, ?, ?, ?)
     """, (page_id, sender_id, channel, sender_type, content))
     
+    # E-01: the session identity is (page_id, sender_id). Conflict target and update are
+    # both tenant-scoped, so one tenant's traffic can never move or overwrite another's row.
     cursor.execute("""
         INSERT INTO session_states (sender_id, page_id, channel, updated_at)
         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(sender_id) DO UPDATE SET 
-            page_id = COALESCE(?, session_states.page_id),
+        ON CONFLICT(page_id, sender_id) DO UPDATE SET
             updated_at = CURRENT_TIMESTAMP
-    """, (sender_id, page_id, channel, page_id))
+    """, (sender_id, page_id, channel))
 
     conn.commit()
     conn.close()
@@ -915,62 +929,100 @@ def log_message(sender_id: str, channel: str, sender_type: str, content: str, pa
 def save_chat_message(page_id: str, sender_id: str, channel: str, sender_type: str, content: str):
     return log_message(sender_id=sender_id, channel=channel, sender_type=sender_type, content=content, page_id=page_id)
 
-def get_conversation_history(sender_id: str, limit: int = 50) -> List[Dict]:
+def get_conversation_history(sender_id: str, limit: int = 50, page_id: Optional[str] = None) -> List[Dict]:
+    """
+    Conversation history for one customer.
+
+    E-01: `page_id` is required in practice — without it this returns every tenant's
+    messages for that sender. It stays keyword-optional only so old call sites fail loudly
+    (they are audited) rather than silently; all in-repo callers pass it.
+    """
+    if not page_id:
+        raise ValueError("get_conversation_history requires page_id (tenant scope, E-01)")
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT * FROM messages 
-        WHERE sender_id = ? 
-        ORDER BY created_at ASC 
+        SELECT * FROM messages
+        WHERE sender_id = ? AND page_id = ?
+        ORDER BY created_at ASC
         LIMIT ?
-    """, (sender_id, limit))
+    """, (sender_id, str(page_id), limit))
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
 def get_active_sessions(page_id: Optional[str] = None) -> List[Dict]:
+    """
+    Active sessions, tenant-scoped.
+
+    E-01: the correlated subqueries used to filter on `sender_id` alone, so each row's
+    `last_message`, `last_sender_type` and `message_count` were computed across EVERY
+    tenant that had ever seen that sender — a count and content leak even when the outer
+    query was scoped. Every subquery now repeats `page_id`.
+    """
+    if not page_id:
+        raise ValueError("get_active_sessions requires page_id (tenant scope, E-01)")
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    if page_id:
-        cursor.execute("""
-            SELECT s.sender_id, s.page_id, s.channel, s.is_human_takeover, s.customer_name, s.customer_phone, s.updated_at,
-                   (SELECT content FROM messages WHERE sender_id = s.sender_id ORDER BY id DESC LIMIT 1) as last_message,
-                   (SELECT sender_type FROM messages WHERE sender_id = s.sender_id ORDER BY id DESC LIMIT 1) as last_sender_type,
-                   (SELECT COUNT(*) FROM messages WHERE sender_id = s.sender_id) as message_count
-            FROM session_states s
-            WHERE s.page_id = ?
-            ORDER BY s.updated_at DESC
-        """, (page_id,))
-    else:
-        cursor.execute("""
-            SELECT s.sender_id, s.page_id, s.channel, s.is_human_takeover, s.customer_name, s.customer_phone, s.updated_at,
-                   (SELECT content FROM messages WHERE sender_id = s.sender_id ORDER BY id DESC LIMIT 1) as last_message,
-                   (SELECT sender_type FROM messages WHERE sender_id = s.sender_id ORDER BY id DESC LIMIT 1) as last_sender_type,
-                   (SELECT COUNT(*) FROM messages WHERE sender_id = s.sender_id) as message_count
-            FROM session_states s
-            ORDER BY s.updated_at DESC
-        """)
+    cursor.execute("""
+        SELECT s.sender_id, s.page_id, s.channel, s.is_human_takeover, s.customer_name, s.customer_phone, s.updated_at,
+               (SELECT content FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id ORDER BY id DESC LIMIT 1) as last_message,
+               (SELECT sender_type FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id ORDER BY id DESC LIMIT 1) as last_sender_type,
+               (SELECT COUNT(*) FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id) as message_count
+        FROM session_states s
+        WHERE s.page_id = ?
+        ORDER BY s.updated_at DESC
+    """, (str(page_id),))
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
-def set_human_takeover(sender_id: str, is_takeover: bool):
+def session_belongs_to_page(sender_id: str, page_id: Optional[str] = None) -> bool:
+    """
+    True when THIS tenant has a session row for that sender.
+
+    E-01: the positive tenancy check for takeover/send. Deliberately a row-existence test
+    rather than "does any tenant know this sender" — the latter is the leak we removed.
+    """
+    if not page_id:
+        raise ValueError("session_belongs_to_page requires page_id (tenant scope, E-01)")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM session_states WHERE sender_id = ? AND page_id = ? LIMIT 1",
+        (str(sender_id), str(page_id)),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def set_human_takeover(sender_id: str, is_takeover: bool, page_id: Optional[str] = None):
+    """E-01: takeover state belongs to one tenant's session, never to the sender globally."""
+    if not page_id:
+        raise ValueError("set_human_takeover requires page_id (tenant scope, E-01)")
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        UPDATE session_states 
-        SET is_human_takeover = ? 
-        WHERE sender_id = ?
-    """, (1 if is_takeover else 0, sender_id))
+        UPDATE session_states
+        SET is_human_takeover = ?
+        WHERE sender_id = ? AND page_id = ?
+    """, (1 if is_takeover else 0, str(sender_id), str(page_id)))
     conn.commit()
     conn.close()
 
-def is_session_human_takeover(sender_id: str) -> bool:
+def is_session_human_takeover(sender_id: str, page_id: Optional[str] = None) -> bool:
+    """E-01: another tenant's takeover must not silence this tenant's bot."""
+    if not page_id:
+        raise ValueError("is_session_human_takeover requires page_id (tenant scope, E-01)")
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT is_human_takeover FROM session_states WHERE sender_id = ?", (sender_id,))
+    cursor.execute(
+        "SELECT is_human_takeover FROM session_states WHERE sender_id = ? AND page_id = ?",
+        (str(sender_id), str(page_id)),
+    )
     row = cursor.fetchone()
     conn.close()
     return bool(row and row[0] == 1)
