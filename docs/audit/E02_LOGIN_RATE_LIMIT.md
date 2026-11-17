@@ -1148,3 +1148,18 @@ step ran and passed with `REDIS_URL` live. Its guard is stricter than the Phase 
 `SKIPPED` line fails the job, because every case in this suite is expected to run on both
 backends. Verified locally that the guard is silent with `REDIS_URL` set and trips without it
 (7 skips → failure), so it is not a no-op.
+
+### 11.5 Phase 4.3 CI run
+
+Run [`44019451880`](https://github.com/AriukagiinTuvshoo/gerege-ai-agent/actions/runs/44019451880),
+head `2403f883d02513f463766893aeb18fdea4acfbb7`, conclusion **success**.
+
+Step-level result from the API: 41 steps, **41 success, 0 failed, 0 skipped**. Both relevant
+steps ran and passed:
+
+    E-02 Phase 4.2 — admission ownership & window-bound refunds        success (preserved)
+    E-02 Phase 4.3 — memory expiry parity & durable single-use refunds success (new)
+
+The Phase 4.2 step and its guard are unchanged. The Phase 4.3 guard is the same shape and was
+verified not to be a no-op: silent with `REDIS_URL` live (0 skips, 23 passed) and tripping
+without it (4 skips → failure).
