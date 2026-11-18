@@ -938,8 +938,8 @@ jobs:
           fi
 
           collected=$(grep -oE "[0-9]+ passed" /tmp/e05.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 41 ]; then
-            echo "::error::Phase 14 expected at least 41 passing cases, saw ${collected:-none}"
+          if [ "${collected:-0}" -lt 42 ]; then
+            echo "::error::Phase 14 expected at least 42 passing cases, saw ${collected:-none}"
             exit 1
           fi
 
@@ -953,6 +953,7 @@ jobs:
                    test_e05_21_backup_refuses_app_and_accepts_owner \
                    test_e05_22_startup_refuses_owner_and_superuser_but_accepts_app \
                    test_e05_23_out_of_band_grant_is_detected_and_converge_removes_it \
+                   test_e05_23b_backup_guard_asks_what_the_role_can_do \
                    test_e05_24_verify_exits_nonzero_when_the_runtime_role_is_missing; do
             grep -qE "$t .*PASSED" /tmp/e05.log || {
               echo "::error::Phase 14: $t did not pass"

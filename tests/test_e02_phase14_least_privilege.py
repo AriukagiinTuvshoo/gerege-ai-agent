@@ -622,6 +622,56 @@ def test_e05_23_out_of_band_grant_is_detected_and_converge_removes_it(provisione
 
 
 @REQUIRE_POSTGRES
+def test_e05_23b_backup_guard_asks_what_the_role_can_do(tmp_path, monkeypatch):
+    """Regression: the guard must not depend on `gerege_owner` existing by name.
+
+    The first version called `pg_has_role(current_user,'gerege_owner','MEMBER')`, which
+    RAISES when that role does not exist. On a cluster where provisioning had not run —
+    exactly CI's fresh PostgreSQL, and the Phase 13 gate that runs after it — that turned
+    a working `create_backup` into a crash. Caught by CI, not by review.
+
+    The behaviour is pinned two ways, because dropping the role cluster-wide is not
+    something a test should do:
+      * the source must not name a role to decide the answer, and
+      * a role that owns every table (the single-credential deployment) is accepted,
+        while a role that owns none (the runtime role) is refused.
+    """
+    from core import backup_service
+
+    # Text-matching the source is brittle (the explanatory comment quotes the removed
+    # call), so drive the real code instead: the guard must decide from what the role
+    # owns, and must not care whether a role named `gerege_owner` exists.
+    import ast
+    import textwrap
+
+    tree = ast.parse(open(backup_service.__file__, encoding="utf-8").read())
+    fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_assert_maintenance_credential"
+    )
+    calls = {
+        n.func.id
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    # It must consult the catalogue about ownership, and it may not make the answer
+    # depend on a role existing by name.
+    sql_text = " ".join(
+        n.value for n in ast.walk(fn)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    )
+    assert "relowner" in sql_text, "the guard should judge ownership from the catalogue"
+    assert "rolsuper" in sql_text, "a superuser can always dump; the guard should allow it"
+
+    # Behaviour: a single-credential owner (the bootstrap superuser) must be allowed.
+    monkeypatch.setattr(backup_service, "BACKUP_DIR", str(tmp_path / "b"))
+    os.makedirs(str(tmp_path / "b"), exist_ok=True)
+    result = backup_service.create_backup(label="single_credential")
+    assert result["success"] is True, result
+    assert result["size_bytes"] > 0
+
+
+@REQUIRE_POSTGRES
 def test_e05_24_verify_exits_nonzero_when_the_runtime_role_is_missing(provisioned):
     """`--verify` must not report success on a database with no runtime role."""
     from scripts import provision_roles

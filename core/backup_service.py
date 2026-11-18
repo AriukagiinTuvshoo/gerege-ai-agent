@@ -54,11 +54,27 @@ def _assert_maintenance_credential() -> None:
         ) from None
     try:
         cur = conn.cursor()
+        # Ask what the role can DO, not what it is called.
+        #
+        # An earlier version tested `pg_has_role(current_user, 'gerege_owner', 'MEMBER')`.
+        # That is wrong twice over: it RAISES when the role does not exist (crashing a
+        # cluster where provisioning has not run), and it would refuse a perfectly valid
+        # single-credential deployment whose role simply has a different name.
+        #
+        # `pg_dump` requirement, measured: it needs `LOCK TABLE ... ACCESS SHARE` on
+        # every table, which in practice means being the owner (or a superuser). So that
+        # is the question asked here.
         cur.execute(
             """
-            SELECT current_user,
-                   (SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user),
-                   pg_has_role(current_user, 'gerege_owner', 'MEMBER')
+            SELECT current_user, r.rolsuper,
+                   (SELECT COUNT(*) FROM pg_class c
+                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = current_schema() AND c.relkind IN ('r','p')
+                       AND pg_get_userbyid(c.relowner) = current_user),
+                   (SELECT COUNT(*) FROM pg_class c
+                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = current_schema() AND c.relkind IN ('r','p'))
+              FROM pg_roles r WHERE r.rolname = current_user
             """
         )
         row = cur.fetchone()
@@ -71,18 +87,21 @@ def _assert_maintenance_credential() -> None:
 
     if not row:
         raise MaintenanceCredentialRequired("could not determine the current database role")
-    user, _, is_owner = (row[0], row[1], row[2])
-    if not is_owner:
-        raise MaintenanceCredentialRequired(
-            f"role '{user}' cannot create a trustworthy backup or restore: it does not own "
-            "the schema, so pg_dump fails with 'permission denied' and produces an empty "
-            "archive, and restore cannot drop/recreate tables.\n"
-            "Run backup/restore as the maintenance role instead:\n"
-            "  docker compose -f docker-compose.prod.yml run --rm maintenance "
-            "python scripts/maintenance.py backup\n"
-            "  python scripts/maintenance.py backup     (host, DATABASE_OWNER_URL set)\n"
-            "See docs/operations/BACKUP_RESTORE.md."
-        )
+    user, is_superuser, owned, total = row
+    # A superuser can always dump. Otherwise every table must be owned by this role;
+    # owning *some* is not enough, because pg_dump locks all of them.
+    if is_superuser or (total > 0 and owned == total):
+        return
+    raise MaintenanceCredentialRequired(
+        f"role '{user}' cannot create a trustworthy backup or restore: it owns {owned} of "
+        f"{total} table(s) in this schema, and pg_dump needs LOCK TABLE on all of them. "
+        "It fails with 'permission denied' and leaves an empty archive.\n"
+        "Run backup/restore as the maintenance role instead:\n"
+        "  docker compose -f docker-compose.prod.yml run --rm maintenance "
+        "python scripts/maintenance.py backup\n"
+        "  python scripts/maintenance.py backup     (host, DATABASE_OWNER_URL set)\n"
+        "See docs/operations/BACKUP_RESTORE.md."
+    )
 
 
 def _compute_sha256(filepath: str) -> str:
