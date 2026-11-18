@@ -61,9 +61,10 @@ def db(tmp_path, monkeypatch):
 
     conn = database.get_connection()
     try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM audit_logs")
-        conn.commit()
+        # Phase 13: append-only table; clear through the test-only helper.
+        from conftest import clear_audit_logs_for_test
+
+        clear_audit_logs_for_test(conn)
     finally:
         conn.close()
     return database

@@ -758,6 +758,151 @@ jobs:
           print("E-03: acquisition, payment signal and rotation contracts verified on PostgreSQL.")
           PY
 
+      - name: "Phase 13 — audit_logs must be append-only (finding F-D)"
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_p13_test"
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-p13-account-key-secret-0123456789abcdef"
+        run: |
+          # Phase 13 (finding F-D). `audit_logs` had no tamper protection: zero triggers
+          # on either engine, and an application-level UPDATE or DELETE succeeded on both.
+          # Revision 0007 installs rejection triggers; a startup guard now refuses to boot
+          # a database where they are missing or mis-wired.
+          #
+          # The threat model is deliberately NOT overstated here. This is tamper
+          # RESISTANCE, not tamper evidence: a database owner or superuser can
+          # DISABLE TRIGGER ALL, SET session_replication_role = replica, or DROP TRIGGER.
+          # All three were measured to bypass it. Closing that needs a non-owner runtime
+          # role plus external anchoring, which is a separate design.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_p13_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase13_audit_append_only.py -v --tb=short | tee /tmp/p13.log
+
+          if grep -qE "SKIPPED" /tmp/p13.log; then
+            echo "::error::Phase 13 skipped a case; every case must run on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/p13.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p13.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 21 ]; then
+            echo "::error::Phase 13 expected at least 21 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          for t in test_1301_the_guard_is_installed_with_the_expected_shape \
+                   test_1302_the_update_guard_is_narrowed_to_the_retention_action_only \
+                   test_1311_insert_succeeds \
+                   test_1312_select_succeeds \
+                   test_1321_update_is_rejected_and_the_row_is_unchanged \
+                   test_1322_delete_is_rejected_and_the_rows_survive \
+                   test_1323_truncate_is_rejected_on_postgresql \
+                   test_1324_targeted_delete_cannot_erase_one_incriminating_row \
+                   test_1331_tenant_deletion_still_succeeds_under_the_guard \
+                   test_1332_the_audit_row_survives_with_its_resource_id_intact \
+                   test_1333_the_retention_permission_cannot_be_borrowed_to_rewrite_history \
+                   test_1341_startup_guard_passes_when_the_guard_is_installed \
+                   test_1342_startup_guard_detects_a_missing_trigger \
+                   test_1343_startup_guard_detects_a_wrongly_wired_trigger \
+                   test_1344_the_test_helper_never_leaks_out_of_tests \
+                   test_1351_downgrade_removes_the_guard_and_upgrade_restores_it \
+                   test_1352_backup_and_restore_keep_the_guard_installed; do
+            grep -qE "$t .*PASSED" /tmp/p13.log || {
+              echo "::error::Phase 13: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertions that the protection is live, rather than a restatement
+          # of a test PASS. Each one tries to tamper for real.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import database
+          from core import audit_integrity
+          from core.db_engine import is_postgres
+          from core.schema_manager import assert_security_invariants
+
+          if not is_postgres():
+              sys.exit("::error::Phase 13 gate is not running on PostgreSQL")
+
+          database.init_db()
+
+          conn = database.get_connection()
+          try:
+              if not audit_integrity.guard_is_correct(conn):
+                  sys.exit("::error::the audit append-only guard is not correctly installed")
+              if not audit_integrity.update_guard_allows_only_retention(conn):
+                  sys.exit("::error::the UPDATE guard is not narrowed to the retention action")
+          finally:
+              conn.close()
+
+          database.record_audit_log("ci.p13", page_id=None, actor_role="system",
+                                    resource_type="probe", resource_id="gate", details={})
+
+          def must_fail(sql, what):
+              c = database.get_connection()
+              try:
+                  cur = c.cursor()
+                  cur.execute(sql)
+                  c.commit()
+                  sys.exit(f"::error::{what} was PERMITTED; the audit trail is not append-only")
+              except SystemExit:
+                  raise
+              except Exception:
+                  try:
+                      c.rollback()
+                  except Exception:
+                      pass
+              finally:
+                  c.close()
+
+          must_fail("UPDATE audit_logs SET action='TAMPERED'", "UPDATE")
+          must_fail("DELETE FROM audit_logs", "DELETE")
+          must_fail("TRUNCATE audit_logs", "TRUNCATE")
+
+          # The startup guard must accept this database and reject a damaged one.
+          assert_security_invariants()
+
+          print("Phase 13: audit_logs is append-only — UPDATE, DELETE and TRUNCATE all refused.")
+          PY
+
+          # The startup guard must actually FAIL when the guard is missing, or it is
+          # decoration. Prove that by dropping one trigger and expecting a refusal.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import database
+          from core import audit_integrity
+          from core.schema_manager import assert_security_invariants
+
+          conn = database.get_connection()
+          try:
+              audit_integrity._exec(conn, f"DROP TRIGGER {audit_integrity.PG_TRIGGER_DELETE} ON audit_logs")
+          finally:
+              conn.close()
+
+          try:
+              assert_security_invariants()
+          except RuntimeError as exc:
+              if "append-only" not in str(exc):
+                  sys.exit(f"::error::startup guard failed for the wrong reason: {exc}")
+              print("Phase 13: startup guard correctly refused a database with no DELETE guard.")
+          else:
+              sys.exit("::error::startup guard accepted a database with no DELETE guard")
+
+          # ...and repair restores it, which is the remedy the message names.
+          import subprocess
+          result = subprocess.run([sys.executable, "scripts/repair_audit_integrity.py"],
+                                  capture_output=True, text=True)
+          if result.returncode != 0:
+              sys.exit("::error::repair_audit_integrity.py could not restore the guard:\n" + result.stdout + result.stderr)
+          assert_security_invariants()
+          print("Phase 13: repair script restored the guard; startup guard passes again.")
+          PY
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:

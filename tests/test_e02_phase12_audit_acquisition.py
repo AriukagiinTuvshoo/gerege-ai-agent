@@ -98,8 +98,14 @@ def _delete_all():
     """Clear test-owned rows; keep the seeded default page (sessions reference it)."""
     conn = database.get_connection()
     try:
+        # Phase 13: `audit_logs` is append-only now, so clearing it goes through the
+        # sanctioned test-only helper, which lifts the guard, clears, and verifies the
+        # guard is back before returning. Same rows cleared as before; no assertion in
+        # this file is weakened by it.
+        from conftest import clear_audit_logs_for_test
+
+        clear_audit_logs_for_test(conn)
         cur = conn.cursor()
-        cur.execute("DELETE FROM audit_logs")
         cur.execute("DELETE FROM pages WHERE page_id <> ?", (database.DEFAULT_PAGE_ID,))
         conn.commit()
     finally:

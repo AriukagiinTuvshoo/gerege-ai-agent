@@ -181,7 +181,13 @@ def assert_security_invariants(engine=None) -> None:
     """
     Refuse to run on a database that is missing a database-enforced security invariant.
 
-    Currently one invariant: the unique username index from revision `0005` (finding R10).
+    Three invariants:
+      * the unique username index from revision `0005` (finding R10),
+      * the cross-column login-identity namespace from `0006` (finding R16),
+      * the `audit_logs` append-only guard from `0007` (finding F-D, Phase 13).
+
+    They are checked in dependency order: the namespace is meaningless without the
+    index, and the audit question is only asked once identity is sound.
 
     This is checked on every schema bring-up, including the "already at head" fast path,
     because the failure mode it prevents is silent. Without this, a deployment whose index
@@ -192,7 +198,7 @@ def assert_security_invariants(engine=None) -> None:
 
     Raising here turns that into a loud startup failure that names the remedy.
     """
-    from core import login_identity, username_uniqueness
+    from core import audit_integrity, login_identity, username_uniqueness
 
     engine = engine or _engine_for()
     with engine.connect() as conn:
@@ -205,12 +211,34 @@ def assert_security_invariants(engine=None) -> None:
         # projected namespace table whose PRIMARY KEY is the identifier. That table is
         # only enforcement while its triggers exist — without them it is a stale
         # snapshot that *looks* enforced, which is worse than absent.
+        identity_ok = False
         if username_ok:
             identity_ok = login_identity.namespace_is_correct(
                 conn
             ) and login_identity.trigger_present(conn)
-            if identity_ok:
-                return
+
+        # Phase 13 (finding F-D). `audit_logs` must be append-only. Checked by SHAPE,
+        # not by name: a trigger can exist under the expected name while wired to the
+        # wrong event or the wrong row/statement level, which protects nothing. The
+        # specific defect this catches is a silently dropped guard — the table looks
+        # exactly like one that is protected, and nothing re-checks it otherwise.
+        audit_ok = False
+        audit_problem = ""
+        if username_ok and identity_ok:
+            try:
+                audit_ok = audit_integrity.guard_is_correct(conn)
+                if not audit_ok:
+                    missing = audit_integrity.missing_triggers(conn)
+                    wrong = audit_integrity.wrongly_defined_triggers(conn)
+                    audit_problem = (
+                        f"missing: {missing or 'none'}; "
+                        f"present but wrongly defined: {wrong or 'none'}"
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                audit_problem = f"could not be inspected: {type(exc).__name__}: {exc}"
+
+        if username_ok and identity_ok and audit_ok:
+            return
     if not username_ok:
         raise RuntimeError(
         "Missing database-enforced security invariant: the unique index "
@@ -230,6 +258,25 @@ def assert_security_invariants(engine=None) -> None:
         "collisions are resolved deliberately with the tenant owners. Procedure: "
         "docs/operations/USERNAME_UNIQUENESS_MIGRATION.md"
     )
+    if identity_ok and not audit_ok:
+        raise RuntimeError(
+            "Missing database-enforced security invariant: the audit trail is not "
+            f"append-only (finding F-D). `audit_integrity` requires every guard trigger "
+            f"on '{audit_integrity.AUDIT_TABLE}' to exist and to be wired to the right "
+            f"event ({audit_problem}).\n"
+            "Without it, an application-level UPDATE, DELETE or TRUNCATE silently "
+            "rewrites or erases audit history. That history is the only durable record "
+            "that a payment was confirmed, a credential was rotated, or a tenant was "
+            "deleted.\n"
+            "Refusing to serve.\n"
+            "Repair, in order of preference:\n"
+            "  1. python scripts/repair_audit_integrity.py --check   (safe, read-only)\n"
+            "  2. python scripts/repair_audit_integrity.py           (re-installs the guard)\n"
+            "  3. alembic upgrade head   (only below revision '0007_audit_append_only')\n"
+            "NOTE: this guard is tamper *resistance*, not tamper evidence. A database "
+            "owner or superuser can DISABLE the triggers or DROP them; nothing inside "
+            "the database can prevent that."
+        )
     raise RuntimeError(
         "Missing database-enforced security invariant: cross-column login-identity "
         f"uniqueness (finding R16) is not in force. The '{login_identity.NAMESPACE_TABLE}' "

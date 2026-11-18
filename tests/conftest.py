@@ -76,3 +76,50 @@ def _reset_rate_limits():
         rate_limit.get_limiter().reset()
     except Exception:
         pass
+
+
+# ===========================================================================
+# Audit-trail append-only guard: the ONLY sanctioned test reset
+# ===========================================================================
+# Phase 13 (finding F-D) made `audit_logs` append-only at the database level. Several
+# suites legitimately clear that table between cases to make audit counts attributable
+# to the test that produced them, and those fixtures now hit the guard — correctly.
+#
+# The alternative to this helper would be to weaken the assertions, or to skip the
+# guard in production, and both are worse. So the bypass lives *here*, in test
+# infrastructure, and nowhere else:
+#
+#   * it is not imported by any application module, and no production code path can
+#     reach it — `tests/test_e02_phase13_audit_append_only.py` asserts that by
+#     scanning the tree for callers outside `tests/`;
+#   * restoration runs in a `finally` and is *verified*: if the guard is not correctly
+#     back in place afterwards, the helper raises rather than leaving an unprotected
+#     table for the next test.
+#
+# Prefer a fresh database per test where practical; use this only where a suite needs
+# to clear history inside an existing one.
+def clear_audit_logs_for_test(conn=None):
+    """Delete every audit row with the guard temporarily lifted, then restore it.
+
+    Test infrastructure only. Do not call from application code.
+    """
+    from core import audit_integrity
+    import database as _database
+
+    own = conn is None
+    if own:
+        conn = _database.get_connection()
+    try:
+        with audit_integrity.temporarily_unguarded(conn):
+            cursor = conn.cursor()
+            try:
+                cursor.execute("DELETE FROM audit_logs")
+            finally:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            conn.commit()
+    finally:
+        if own:
+            conn.close()
