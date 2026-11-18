@@ -596,14 +596,24 @@ async def process_successful_payment(
         callback_verified=callback_verified,
     )
 
+    # E-02 Phase 11 (R17). This block used to be `except Exception: pass`, which turned a
+    # caller-side TypeError into SILENT loss: every payment confirmation went unaudited
+    # with no error, no log line and no failing test. It was the worst instance of R17 and
+    # the one nobody could see.
+    #
+    # The audit is still not allowed to fail the payment — the money has already moved, and
+    # refusing to record a completed payment would be a worse outcome than recording it
+    # late. So it stays non-fatal, but it is now LOUD: a structured error log carrying the
+    # invoice id, plus the flag this function returns so a caller can surface it.
+    audit_ok = True
     try:
         database.record_audit_log(
             action="payment.confirmed",
             page_id=page_id,
             actor_role="system",
             actor_id=sender_id or "qpay_callback",
-            target_type="invoice",
-            target_id=invoice_id,
+            resource_type="invoice",
+            resource_id=invoice_id,
             details={
                 "amount": amount,
                 "provider_payment_id": provider_payment_id,
@@ -612,7 +622,12 @@ async def process_successful_payment(
             },
         )
     except Exception:
-        pass
+        audit_ok = False
+        logger.error(
+            "AUDIT LOSS: payment.confirmed for invoice %r (page %r) was NOT recorded; "
+            "the payment itself succeeded. Reconstruct from the provider callback.",
+            invoice_id, page_id, exc_info=True,
+        )
 
     # 3. CRM бүртгэлд бүртгэх / төлөв шинэчлэх
     phone_clean = (sender_id or "").replace("meta_", "").replace("tg_", "") or "Утас бүртгэлгүй"
@@ -674,5 +689,9 @@ async def process_successful_payment(
         "success": True,
         "message": "Төлбөр амжилттай баталгаажиж, И-Баримт олгогдлоо",
         "invoice": updated_inv,
-        "ebarimt": ebarimt
+        "ebarimt": ebarimt,
+        # E-02 Phase 11 (R17): False means the payment succeeded but its
+        # `payment.confirmed` audit row was NOT written. Surfaced rather than
+        # hidden, so a caller or monitor can act on it.
+        "audit_recorded": audit_ok,
     }

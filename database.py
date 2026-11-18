@@ -369,6 +369,28 @@ def claim_notification_lock(
         conn.close()
 
 
+class AuditLogWriteError(RuntimeError):
+    """A mandated audit event could not be persisted.
+
+    E-02 Phase 11 (R17). Before this existed, audit failures were indistinguishable
+    from a bug in the endpoint: a caller that had already committed its business
+    write would surface the raw exception, and the HTTP layer would answer 500
+    "Internal server error" — which says the *operation* failed when in fact it
+    succeeded and only its audit record was lost. That is the worst of both worlds:
+    a false failure report and a missing audit trail.
+
+    This exception carries the action and the fact that the write already
+    committed, so callers can report precisely that.
+    """
+
+    def __init__(self, action: str, original: BaseException):
+        self.action = action
+        self.original = original
+        super().__init__(
+            f"audit event {action!r} could not be recorded: {type(original).__name__}: {original}"
+        )
+
+
 def record_audit_log(
     action: str,
     page_id: Optional[str] = None,
@@ -379,21 +401,44 @@ def record_audit_log(
     details: Optional[Dict[str, Any]] = None,
     ip_address: Optional[str] = None,
 ) -> int:
-    """Аюулгүй байдал, эрхийн өөрчлөлт болон AI Tool дуудлагын аудит лог бичих"""
+    """Аюулгүй байдал, эрхийн өөрчлөлт болон AI Tool дуудлагын аудит лог бичих
+
+    The parameter names are `resource_type`/`resource_id`. They match the columns of
+    `audit_logs` and the other eight call sites in this codebase; `target_type`/
+    `target_id` were never accepted by this function (E-02 Phase 11, R17).
+
+    Raises `AuditLogWriteError` — never a bare driver exception — so a caller can
+    tell "the audit write failed" apart from every other failure, and the connection
+    is always closed.
+    """
     conn = get_connection()
-    cursor = conn.cursor()
-    details_str = json.dumps(details or {}, ensure_ascii=False)
-    cursor.execute(
-        """
-        INSERT INTO audit_logs (page_id, actor_role, actor_id, action, resource_type, resource_id, details_json, ip_address)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (page_id, actor_role, actor_id, action, resource_type, str(resource_id) if resource_id is not None else None, details_str, ip_address),
-    )
-    log_id = cursor.lastrowid or 0
-    conn.commit()
-    conn.close()
-    return log_id
+    try:
+        cursor = conn.cursor()
+        details_str = json.dumps(details or {}, ensure_ascii=False)
+        cursor.execute(
+            """
+            INSERT INTO audit_logs (page_id, actor_role, actor_id, action, resource_type, resource_id, details_json, ip_address)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (page_id, actor_role, actor_id, action, resource_type, str(resource_id) if resource_id is not None else None, details_str, ip_address),
+        )
+        log_id = cursor.lastrowid or 0
+        conn.commit()
+        return log_id
+    except Exception as exc:
+        # Roll back and surface a typed failure. `close()` releases the write lock, but
+        # an explicit rollback is cheap and does not depend on that (measured in Phase 10:
+        # an *unclosed* connection blocks every later SQLite writer).
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise AuditLogWriteError(action, exc) from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def list_audit_logs(page_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:

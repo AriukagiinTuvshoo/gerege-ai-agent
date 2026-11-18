@@ -988,6 +988,43 @@ async def get_page_detail(request: Request, page_id: Optional[str] = None):
         return JSONResponse({"error": "Page not found"}, status_code=404)
     return JSONResponse(p)
 
+def _audit_or_report(action: str, *, operation: str, **fields) -> Optional[JSONResponse]:
+    """Write a mandated audit event, or return the response that says it was not written.
+
+    E-02 Phase 11 (R17). The business write has ALREADY COMMITTED by the time this is
+    called — `save_page`, `delete_page` and `set_client_credentials` each own their
+    transaction. So the one thing the response must never do is imply that the
+    operation failed. Before R17 was fixed, a caller-side TypeError turned a
+    successful create into a bare 500 "Internal server error": the page existed, the
+    caller was told it did not, and no audit row was written.
+
+    Returns None on success (the caller carries on), or a JSONResponse with status
+    500 that states the truth. Auditing is *not* atomic with the business write —
+    that would require threading one connection through three write paths — so this
+    reports the gap instead of pretending it cannot happen.
+    """
+    try:
+        database.record_audit_log(action, **fields)
+        return None
+    except database.AuditLogWriteError as exc:
+        logger.error(
+            "audit write failed for %s after %s had already committed: %s",
+            action, operation, exc,
+        )
+        return JSONResponse(
+            {
+                "error": (
+                    f"{operation} хийгдсэн боловч аудит лог бичигдсэнгүй. "
+                    f"Энэ үйлдлийг гараар шалгана уу."
+                ),
+                "code": "audit_write_failed",
+                "operation_completed": True,
+                "audit_action": action,
+            },
+            status_code=500,
+        )
+
+
 @app.post("/api/pages")
 async def create_or_update_page(payload: Dict[str, Any], request: Request):
     """Шинэ хуудас нэмэх (Зөвхөн Админ эрхтэй — P0-2)"""
@@ -1033,7 +1070,19 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
                 status_code=409,
             )
         raise
-    database.record_audit_log("page.upsert", page_id=page_id, actor_role="admin", target_type="page", target_id=page_id)
+    audit_error = _audit_or_report(
+        "page.upsert",
+        operation=f"Хуудас ({page_id}) хадгалах",
+        page_id=page_id,
+        actor_role="admin",
+        resource_type="page",
+        resource_id=page_id,
+        # Explicitly enumerated, and deliberately excluding `token`, `verify_token` and
+        # `gemini_key`: an audit log that records secrets is itself a disclosure.
+        details={"name": name, "category": category, "is_active": True},
+    )
+    if audit_error is not None:
+        return audit_error
     agent.reset_sessions(page_id)
     return {"status": "success", "message": f"{name} хуудас амжилттай хадгалагдлаа!", "page_id": page_id}
 
@@ -1050,7 +1099,23 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
     success = database.delete_page(str(target_id))
     if not success:
         return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
-    database.record_audit_log("page.delete", page_id=str(target_id), actor_role="admin", target_type="page", target_id=str(target_id))
+    audit_error = _audit_or_report(
+        "page.delete",
+        operation=f"Хуудас ({target_id}) устгах",
+        # page_id is deliberately None here (E-02 Phase 11, R18). `audit_logs.page_id`
+        # is `ON DELETE SET NULL` so history outlives the tenant it describes, which
+        # means a row may not reference a page that no longer exists. Passing the just-
+        # deleted id made every deletion audit fail with `FOREIGN KEY constraint failed`
+        # -- and R17's TypeError had been masking it, because the request died one line
+        # earlier. The deleted page is still recorded, in `resource_id`.
+        page_id=None,
+        actor_role="admin",
+        resource_type="page",
+        resource_id=str(target_id),
+        details={"deleted_page_id": str(target_id)},
+    )
+    if audit_error is not None:
+        return audit_error
     agent.reset_sessions(str(target_id))
     return {"status": "deleted", "page_id": target_id}
 
@@ -1101,17 +1166,44 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
     try:
         res = database.set_client_credentials(str(target_page_id), username, password)
     except database.CredentialConflictError:
-        database.record_audit_log(
-            "page.credentials.conflict", page_id=str(target_page_id), actor_role="admin",
-            target_type="page", target_id=str(target_page_id),
-        )
+        # BEST-EFFORT audit, and it must never mask the 409. A refusal is a security
+        # event worth recording, but the caller's correct answer is the 409 from the
+        # Phase 4.1/`0005` non-disclosure contract. Before R17 was fixed the audit call
+        # raised here, so the client saw 500 "Internal server error" instead — the
+        # contract was silently broken and the refusal went unaudited anyway.
+        try:
+            database.record_audit_log(
+                "page.credentials.conflict",
+                page_id=str(target_page_id),
+                actor_role="admin",
+                resource_type="page",
+                resource_id=str(target_page_id),
+                details={"username_length": len(username)},
+            )
+        except database.AuditLogWriteError:
+            logger.error(
+                "audit write failed for page.credentials.conflict; returning 409 anyway",
+                exc_info=True,
+            )
         return JSONResponse(
             {"error": "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу."},
             status_code=409,
         )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
-    database.record_audit_log("page.credentials.updated", page_id=str(target_page_id), actor_role="admin", target_type="page", target_id=str(target_page_id))
+    audit_error = _audit_or_report(
+        "page.credentials.updated",
+        operation=f"Хуудас ({target_page_id}) нэвтрэх эрх шинэчлэх",
+        page_id=str(target_page_id),
+        actor_role="admin",
+        resource_type="page",
+        resource_id=str(target_page_id),
+        # The username may be a phone number or an email, so only its length is
+        # recorded. The password is never touched: it is not in scope here at all.
+        details={"username_length": len(username)},
+    )
+    if audit_error is not None:
+        return audit_error
     return {"status": "success", "data": res}
 
 # -------------------------------------------------------------
