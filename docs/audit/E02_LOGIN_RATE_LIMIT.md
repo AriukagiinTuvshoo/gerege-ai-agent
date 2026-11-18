@@ -1141,10 +1141,18 @@ could not log in with its own correct password, while the other tenant authentic
 `resolve_canonical_account()`, so authentication and the counter always name the same account.
 
 This does **not** make two tenants sharing a login name safe: which of the two wins is still
-arbitrary from a product standpoint, and only a migration (a unique index on
-`LOWER(TRIM(client_username))`) would remove the hazard. No migration was attempted — it needs
-explicit approval — so it remains an open operational risk rather than a solved one.
+arbitrary from a product standpoint, and only a database constraint would remove the hazard.
 `canonical_resolution_is_ambiguous()` reports the condition for operators.
+
+> **Status update (E-02 Phase 8 and Phase 10).** The two paragraphs above describe the state
+> at the end of Phase 4.2 and the *first* sentence of this note is now out of date. Phase 8
+> shipped the migration this note said had not been attempted: revision `0005` installs the
+> unique index `uq_pages_client_username_norm` on `LOWER(TRIM(client_username))`, and the
+> startup guard refuses to serve without it. Two tenants can therefore no longer share a
+> normalized *username*. Phase 10 closed the remaining half — a username colliding with
+> another tenant's `page_id`, and `page_id`s differing only by case (finding R16) — with
+> revision `0006`. See §14. The note is retained rather than rewritten because the reasoning
+> it records (why `ORDER BY` alone was not a fix) is still the reason the constraint exists.
 
 **R8 — the account counter is checked before the admin branch is reached only for
 `client`/`magic`.** The shared admin password has its own path and is protected by the IP limit
@@ -1598,3 +1606,237 @@ assumed: the validation printed the before/after `client_username` values.
   which **restores it and asserts the restoration** — a test can no longer silently leave
   the suite running without the guarantee.
 * Run order independence was verified by running the suite twice against the same database.
+
+### 13.7 Redis capacity under `noeviction` (what is measured, and what is not)
+
+`docker-compose.prod.yml` sets `maxmemory 400mb` with `maxmemory-policy noeviction`, and
+cites this section. This section did not previously exist; the reference is now backed by
+a measurement, and the parts that were never measured are marked as such.
+
+**Measured.** One account's counter is a single string key. `account_rate_limit_key()`
+produces a 32-character hex digest with no prefix, and the value is a small integer, so
+the per-account cost is dominated by Redis's own per-key overhead rather than by the
+payload. Measured on Redis 6.2.14 by inserting 300 probe keys through the production code
+path (`_RedisStore.incr_in_window`) and reading `used_memory` before and after:
+
+| quantity | value |
+| --- | --- |
+| probe accounts | 300 |
+| `used_memory` delta | 86440 B |
+| **per account** | **288.1 B** |
+
+That reproduces the Phase 8 figure (292.5 B) within measurement noise, on a different
+probe size and a fresh Redis instance. All probe keys were deleted and `KEYS
+*sizing_probe*` returned 0 afterwards.
+
+**Not measured, and deliberately not guessed:**
+
+* the peak RSS of a real workload inside the production container;
+* allocator behaviour across a fork or an AOF rewrite;
+* the container's actual cgroup memory limit at deploy time.
+
+`maxmemory` bounds Redis's account of logical memory, not RSS, and Redis can exceed
+`maxmemory` transiently while freeing. So **"400 MB is enough for N tenants" is an
+assumption with a thin margin, not a verified fact.** Status: **UNVERIFIED**, with the
+per-account constant above as the only input that is actually known.
+
+**What follows arithmetically, for planning only.** At 288.1 B/account, 400 MB is on the
+order of 1.4 million counters ignoring all overhead outside the counters — a number large
+enough that the account namespace is not the binding constraint. This is *not* a capacity
+claim; it is an indication that the per-account footprint is not the risk, whereas RSS,
+fragmentation and the AOF rewrite buffer are.
+
+**The failure mode is contained by design.** `noeviction` is retained deliberately. Under
+memory pressure Redis rejects writes, `_RedisStore` surfaces the failure, `RateLimiter`
+fails **closed** for the account dimension (Phase 6, R14), and `/api/ready` reports 503
+while `/api/health` stays 200 (Phase 8, R11). The operator consequence is that logins are
+refused rather than brute-force protection being silently dropped.
+
+**Action required before relying on this in production:** confirm the deployment's
+container memory limit (status: **UNVERIFIED** — no container runtime was available in the
+audited environment), and keep at least ~25% headroom between `maxmemory` and that limit.
+
+## 14. Phase 10 — cross-column login identity (R16)
+
+Phase 9 reported that a normalized login identifier can name more than one tenant. Phase 10
+was authorised to verify that against the implementation before remediating it. **The
+severity classification in the Phase 9 report was too broad; the defect is real.** Both
+statements are recorded here because only correcting one of them would be misleading.
+
+### 14.1 What the implementation actually does
+
+`database.authenticate_client_detailed()` resolves a login identifier with
+
+```sql
+LOWER(TRIM(client_username)) = ? OR LOWER(TRIM(page_id)) = ?
+```
+
+plus `AND is_active = 1` and `ORDER BY page_id LIMIT 1`. One identifier can therefore be
+claimed through **either** column, and both are normalized by lower-casing and trimming.
+
+The R10 control (revision `0005`) is a unique index on `LOWER(TRIM(client_username))`. It
+covers one column, so it cannot see:
+
+* **R16a** — a `client_username` equal to another row's `page_id`, in either direction;
+* **R16b** — two `page_id`s differing only by case or surrounding whitespace. These are
+  distinct PRIMARY KEYs and one login identifier. **This was not in the Phase 9 report.**
+  Measured pre-fix: `Alice` and `alice` coexisted as two rows, and the identifier `alice`
+  resolved to `Alice`.
+
+### 14.2 Why it is *not* remote takeover
+
+Measured, not argued, against a running application:
+
+| probe | result |
+| --- | --- |
+| `POST /api/pages` as an unauthenticated caller | **401** — `require_admin` (`main.py:1032`) |
+| `POST /api/pages` as a `client` session | **403** |
+| `POST /api/pages/credentials` as a `client` session | **403** (`main.py:1070`) |
+| `POST /api/knowledge` for another tenant | **403**; for its own tenant it re-saves an **existing** id, so it cannot mint a colliding `page_id` |
+| login response for an existing vs an unknown identifier | identical `401`, identical body |
+
+The collision is therefore reachable only by an **admin** (or by direct SQL). The impact is
+also bounded by measurement: the shadowed tenant loses its *`page_id`* login
+(`page_id` + own password returned `None`), the attacker's own password returns the
+attacker's own row (**no privilege escalation**), `get_page` is primary-key-only so there is
+no cross-tenant read, and the victim always retains a working username login.
+
+**Classification: privileged provisioning defect / operational misconfiguration.** It is a
+real finding with a real refusal-of-service edge for one tenant, and it is fixed as such. It
+is not an unauthenticated cross-tenant takeover, and the Phase 9 report's framing overstated
+it.
+
+### 14.3 The fix
+
+Revision `0006_login_identity` adds `page_login_namespace`, whose **PRIMARY KEY** is the
+normalized identifier:
+
+```sql
+normalized_identifier VARCHAR(255) PRIMARY KEY NOT NULL,
+page_id             VARCHAR(128) NOT NULL,
+FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE
+```
+
+Maintained by triggers on `pages` (one function covering `INSERT`/`UPDATE`/`DELETE` on
+PostgreSQL; three triggers on SQLite). Because the identifier is the primary key, **the
+engine** serialises concurrent claimants — there is no pre-SELECT to race, no advisory lock
+and no `SERIALIZABLE` requirement. Identifiers are inserted in sorted order to avoid a
+deadlock between two writers claiming different keys in opposite order. Blank usernames
+contribute nothing.
+
+The foreign key is not decoration: `tests/test_p1_06_foreign_keys.py` requires every table
+with a `page_id` to reference `pages`, and that rule is what stops a deleted tenant stranding
+child rows. It was satisfied rather than exempted.
+
+### 14.4 The trap that nearly made this a false pass
+
+The first SQLite implementation used `INSERT OR IGNORE` in the trigger. Every collision was
+**silently accepted**, and `namespace_is_correct()` and `trigger_present()` both returned
+`True`, because the table and triggers were exactly where they should be. Only a test that
+asserted *rejection* caught it. This is the same shape as the R10 impostor index: a control
+that looks present and enforces nothing. Every enforcement test in
+`tests/test_e02_phase10_login_identity.py` therefore asserts that the second write is
+refused, and a separate set of tests asserts that legitimate writes still succeed — a filter
+that rejects everything would also pass the first half.
+
+### 14.5 Measured results
+
+Enforcement matrix, both engines, through the real write path:
+
+| case | SQLite | PostgreSQL 16 |
+| --- | --- | --- |
+| `username` == existing `page_id` | refused (`CredentialConflictError`) | same |
+| new `page_id` == existing `username` | refused (`IntegrityError`) | refused (`UniqueViolation`) |
+| `page_id` differing only by case (R16b) | refused (`IntegrityError`) | refused (`UniqueViolation`) |
+| distinct names / self-update / blank usernames | still succeed | still succeed |
+
+Concurrency, 12 trials each with a barrier, independent connection per thread:
+
+| race | SQLite | PostgreSQL 16 |
+| --- | --- | --- |
+| opposite-column claims | 0 collisions, 0 both-won | 0 / 0 |
+| 4 writers, mixed columns | 0 collisions | 0 collisions |
+| concurrent case collision | 0 both-won | 0 both-won |
+| concurrent identical usernames (R10 regression) | 0 both-won | 0 both-won |
+
+Discrimination — the same assertions run against the **pre-fix** worktree at `653d01d`:
+
+| case | pre-fix | fixed |
+| --- | --- | --- |
+| `page_id` == existing username | **ACCEPTED (defect)** | refused |
+| reverse order (claim username, then create the page) | **ACCEPTED (defect)** | refused |
+| `page_id`s differing only by case | **ACCEPTED (defect)**; `Alice` and `alice` both existed | refused |
+| identifier `alice` | resolved to `Alice` (ambiguous) | cannot be constructed |
+
+Identical on both engines. The tests fail on the old code for the reason they claim to.
+
+### 14.6 Recovery, and why `alembic upgrade head` is not a remedy
+
+A database already stamped at `0006` whose projection or triggers were dropped is **not**
+repaired by `alembic upgrade head` — it is a silent no-op that prints success. This is the
+same gap as R10, and the startup error names a tool for it:
+
+| state | `scripts/repair_login_identity.py --check` | repair |
+| --- | --- | --- |
+| healthy | exit 0 | no-op, idempotent |
+| triggers dropped, projection present | exit 1 | re-creates triggers, exit 0 |
+| stale projection (page written while triggers were gone) | exit 1 | re-derives from `pages`, exit 0 |
+| projection and triggers both gone | exit 1 | rebuilds both, exit 0 |
+| collision present | exit 1 | **refuses**, exit 1, changes nothing |
+| no `pages` table at all | exit 2 | points at `alembic upgrade head` |
+
+Verified on both engines. The collision case was checked for side effects: both `pages` rows
+were byte-identical afterwards and no table was created — the tool does not choose a winner,
+rewrite a credential, or delete anything.
+
+**Maintenance fallback (approved, and verified to work).** If the tool cannot be run, the
+manual sequence is: drop the triggers, drop `page_login_namespace`, re-create it, re-derive
+from `pages`, re-create the triggers. Executed by hand on a database with the projection and
+triggers removed, the invariant was back and a colliding write was refused afterwards.
+
+**One behaviour worth knowing:** on PostgreSQL, dropping only the table leaves the triggers
+attached to `pages`, so the next write fails loudly with `UndefinedTable`. That is the
+correct failure mode — loud, not silent — and the repair tool handles that state.
+
+### 14.7 Harness defects found and fixed during this phase
+
+Recorded because each one would otherwise have been reported as a product regression.
+
+* **`database is locked`.** I initially attributed this to `save_page` closing a connection
+  while it still held the write lock, and added a rollback. Measurement showed the rollback
+  is not what fixes it: `close()` releases the lock anyway, with or without it. The real
+  cause was a **harness** connection left open — an open SQLite connection blocks every later
+  writer, even one that has only ever read, and this reproduced identically with the rollback
+  removed. The rollback is kept as defensive hygiene only, and both `database.py` and the test
+  docstring now say so instead of overclaiming. `test_1046` pins the real mechanism.
+* **`test_224` could never have run.** It needs a live request while the R10 index is
+  suspended, but `main.py` calls `database.init_db()` at import time and `init_db()` runs
+  `assert_security_invariants()`, which refuses without that index. This reproduces at
+  `2962cd5` — the commit that introduced the index and the guard — with **no Phase 10 code
+  involved**. It now drives the handler on a healthy database, and its docstring states
+  plainly that it no longer proves the ambiguous branch is quiet; `test_223` and `test_225`
+  cover that on the real duplicate.
+* **Five tests fabricated legacy duplicates with raw SQL** and began to fail because revision
+  `0006` also polices raw SQL. None were weakened: each now models a database that predates
+  **both** invariants, which is what a legacy installation actually is, via an explicit
+  suspend/restore pair whose restoration is asserted.
+
+### 14.8 Pre-existing defect reported, not fixed: R17
+
+`main.py` calls `record_audit_log(..., target_type=..., target_id=...)` while
+`database.record_audit_log` accepts `resource_type=`/`resource_id=`. Every such call raises
+`TypeError`, which is an HTTP 500, on:
+
+* `POST /api/pages`
+* `DELETE /api/pages`
+* `POST /api/pages/credentials`
+
+**Verified on unmodified `main` (`48e9c6f`) in a detached worktree**: the same 500, same
+`TypeError`. It was introduced by the base commit, not by Phase 10.
+
+Scope and why it is not fixed here: the write path commits *before* the audit call, so the
+page **is** created and R16 reachability is unaffected — the successful response is turned
+into a 500, and the audit row is never written. That is a real defect in its own right
+(lost audit trail, misleading status), but it is unrelated to login identity, it predates
+this branch's work, and folding an untested fix for it into this change would make both
+changes harder to review. It needs its own authorisation and its own test.

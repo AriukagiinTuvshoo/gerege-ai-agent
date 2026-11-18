@@ -29,6 +29,31 @@ predicate, so any number of credential-less pages can coexist. Blank usernames a
 identities, and treating them as one shared identity would be a denial of service against
 every page that has no login yet.
 
+### The second invariant: cross-column login identity (revision `0006`, R16)
+
+The unique index above covers **one column**. Login resolves an identifier with
+`LOWER(TRIM(client_username)) = ? OR LOWER(TRIM(page_id)) = ?`, so an identifier can also be
+claimed through `page_id`. The index cannot see:
+
+* a `client_username` that equals **another row's `page_id`**, in either direction;
+* two `page_id`s differing only by **case or surrounding whitespace** — these are distinct
+  primary keys and one login identifier.
+
+Revision `0006` adds a projection whose primary key *is* the normalized identifier:
+
+```sql
+CREATE TABLE page_login_namespace (
+    normalized_identifier VARCHAR(255) PRIMARY KEY NOT NULL,
+    page_id               VARCHAR(128) NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE
+);
+```
+
+It is maintained by triggers on `pages` (`INSERT`, `UPDATE`, `DELETE`). Because the
+identifier is a primary key, the database serialises concurrent claimants: this is an
+invariant, not a check. Application code must never write to this table — a manual `INSERT`
+desynchronises the projection from `pages`, and the startup guard will then refuse to boot.
+That refusal is the intended behaviour, not a bug.
+
 ### What it prevents
 
 Before this index, `set_client_credentials` checked-and-then-wrote. Two tenants could pass
@@ -239,6 +264,72 @@ behaviour.
 
 ---
 
+## 8b. Recovering the cross-column invariant (revision `0006`)
+
+`alembic upgrade head` is a **silent no-op** on a database already stamped at `0006`. If the
+projection or the triggers are missing there, it prints success and changes nothing. Use the
+dedicated tool.
+
+```bash
+python scripts/repair_login_identity.py --check    # read-only; exit 1 if not in force
+python scripts/repair_login_identity.py            # rebuild if it is safe
+python scripts/repair_login_identity.py --dry-run  # print the SQL only
+```
+
+What it does, by state (all verified on SQLite and PostgreSQL 16):
+
+| state | `--check` | repair |
+| --- | --- | --- |
+| healthy | exit 0 | no-op |
+| triggers dropped, table intact | exit 1 | re-creates triggers |
+| stale table (rows written while triggers were gone) | exit 1 | re-derives it from `pages` |
+| table and triggers both gone | exit 1 | rebuilds both |
+| collision present | exit 1 | **refuses**, exit 1, changes nothing |
+| no `pages` table (un-migrated database) | exit 2 | tells you to run `alembic upgrade head` |
+
+It never chooses a winner, merges accounts, clears a username, rewrites a `page_id`, or
+deletes a row. Resolve collisions in section 3 first; the rules are identical.
+
+### Maintenance fallback (when the tool cannot be run)
+
+Approved as a documented last resort, and verified by hand. On a database with the
+projection and triggers removed, this restores the invariant:
+
+```sql
+-- 1. remove any remaining triggers (PostgreSQL: also DROP FUNCTION ...)
+DROP TRIGGER IF EXISTS trg_page_login_ns_ai ON pages;
+DROP TRIGGER IF EXISTS trg_page_login_ns_au ON pages;
+DROP TRIGGER IF EXISTS trg_page_login_ns_ad ON pages;
+
+-- 2. discard the projection; `pages` is the only source of truth
+DROP TABLE IF EXISTS page_login_namespace;
+
+-- 3. re-create it (the FK matters: see tests/test_p1_06_foreign_keys.py)
+CREATE TABLE page_login_namespace (
+    normalized_identifier VARCHAR(255) PRIMARY KEY NOT NULL,
+    page_id               VARCHAR(128) NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE
+);
+
+-- 4. re-derive. INSERT ... ON CONFLICT DO NOTHING is NOT acceptable here: a collision must
+--    abort loudly, not be silently dropped.
+INSERT INTO page_login_namespace (normalized_identifier, page_id)
+SELECT k, p FROM (
+    SELECT LOWER(TRIM(page_id)) AS k, page_id AS p FROM pages WHERE TRIM(page_id) <> ''
+    UNION
+    SELECT LOWER(TRIM(client_username)) AS k, page_id AS p FROM pages
+     WHERE client_username IS NOT NULL AND TRIM(client_username) <> ''
+) AS keys ORDER BY k;
+
+-- 5. re-create the triggers. Copy the exact definitions from
+--    core/login_identity.py:create_triggers_sql() -- do not retype them from memory.
+```
+
+Then re-run `--check` and start the application: the startup guard is the verification.
+
+**One behaviour to expect.** On PostgreSQL, dropping only the table leaves the triggers
+attached to `pages`, so the next write fails loudly with `UndefinedTable`. That is correct —
+loud, never silent — and the repair tool handles that state.
+
 ## 9. Checklist
 
 ```
@@ -249,4 +340,7 @@ behaviour.
 [ ] Verify: --check exits 0
 [ ] Start the application; confirm it boots (the startup guard would refuse otherwise)
 [ ] Confirm a second concurrent claim now returns 409, not a duplicate row
+[ ] Confirm revision 0006 is applied: python scripts/repair_login_identity.py --check
+[ ] Confirm a page_id equal to another tenant's username is refused (409 identifier_conflict)
+[ ] Confirm two page_ids differing only by case cannot both exist
 ```
