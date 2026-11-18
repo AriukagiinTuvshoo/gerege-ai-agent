@@ -60,6 +60,14 @@ def legacy_duplicates_allowed():
     finally:
         conn.close()
 
+    # Revision `0006` (E-02 Phase 10, R16) polices this same state with a second,
+    # independent mechanism: the namespace triggers refuse a duplicate username no
+    # matter whether the R10 index exists. A "legacy" database therefore predates
+    # BOTH, so both have to go or the fabrication this context manager exists for is
+    # impossible. Suspending one and not the other would make this helper silently
+    # stop working rather than cleanly fail.
+    identity_dialect = suspend_login_identity()
+
     try:
         yield
     finally:
@@ -82,6 +90,8 @@ def legacy_duplicates_allowed():
                 )
         finally:
             conn.close()
+        # Restore R16 as well, in the same verified-not-assumed way.
+        restore_login_identity(identity_dialect)
 
 
 #: Page-id prefixes these legacy-data tests create. Cleanup is scoped to them so it can
@@ -177,6 +187,72 @@ def restore_username_uniqueness(dialect: str) -> None:
                 "restore_username_uniqueness() could not restore "
                 f"{uniq.USERNAME_UNIQUE_INDEX}: the suite would continue without the R10 "
                 "uniqueness invariant in force"
+            )
+    finally:
+        conn.close()
+
+
+# ===========================================================================
+# E-02 Phase 10: simulating a database that predates revision `0006` too
+# ===========================================================================
+# Revision `0006` adds a *second* database-enforced invariant: a normalized login
+# identifier (page_id or client_username, lower-cased and trimmed) names at most one
+# tenant. Its triggers police raw SQL as well as the ORM, so dropping only the R10
+# index is no longer enough to fabricate a "legacy" duplicate username — the trigger
+# refuses exactly the state the test is trying to create, with
+#   UNIQUE constraint failed: page_login_namespace.normalized_identifier
+#
+# That refusal is correct behaviour, not a regression. These helpers let a test say
+# "pretend this database predates 0006 as well", which is the honest shape of the
+# situation the migration actually faces: an installation upgrading from an older
+# build carries duplicates that were written before ANY constraint existed.
+#
+# Same guarantees as `suspend_username_uniqueness`: scoped, explicit, and restored
+# with a verification that raises if the invariant did not really come back.
+
+
+def suspend_login_identity() -> str:
+    """Drop the 0006 triggers and projection so pre-0006 state can be fabricated."""
+    from core import login_identity
+
+    dialect = _dialect()
+    conn = database.get_connection()
+    try:
+        cur = conn.cursor()
+        for stmt in login_identity.drop_triggers_sql(dialect):
+            cur.execute(stmt)
+        cur.execute(login_identity.drop_table_sql(dialect))
+        conn.commit()
+    finally:
+        conn.close()
+    return dialect
+
+
+def restore_login_identity(dialect: str) -> None:
+    """Re-create the projection and triggers, then assert they are really enforcing."""
+    from core import login_identity
+
+    conn = database.get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(login_identity.create_table_sql(dialect))
+        # Rebuild from `pages`, which is the only source of truth: a trigger that is
+        # created over a stale projection would pass `trigger_present()` while being
+        # wrong. Duplicates must already be gone by the caller.
+        login_identity.assert_no_identifier_collisions(conn)
+        cur.execute(login_identity.backfill_namespace_sql(dialect))
+        for stmt in login_identity.create_triggers_sql(dialect):
+            cur.execute(stmt)
+        conn.commit()
+        if not login_identity.namespace_is_correct(conn):
+            raise AssertionError(
+                "restore_login_identity() left a projection that does not match `pages`: "
+                "the suite would continue without the R16 cross-column invariant in force"
+            )
+        if not login_identity.trigger_present(conn):
+            raise AssertionError(
+                "restore_login_identity() could not re-create the namespace triggers: "
+                "the suite would continue without the R16 invariant in force"
             )
     finally:
         conn.close()

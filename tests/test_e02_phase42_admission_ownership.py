@@ -38,6 +38,7 @@ be a check-then-act race and is explicitly not how this works.
 
 Counting note: test functions and collected cases are counted separately in the report.
 """
+import json
 import os
 import sqlite3
 import sys
@@ -563,11 +564,17 @@ def dup_db(tmp_path, monkeypatch):
     # at teardown. The duplicate must stay alive while the test body runs, which is why this
     # is a fixture rather than a `with` block.
     from _username_uniqueness_support import (
+        restore_login_identity,
         restore_username_uniqueness,
+        suspend_login_identity,
         suspend_username_uniqueness,
     )
 
-    dialect = suspend_username_uniqueness()
+    # Revision 0006 (E-02 Phase 10, R16) independently forbids the same state through
+    # its namespace triggers, so a database that predates the R10 index predates those
+    # too. Both are suspended and both are restored at teardown, each with an assertion.
+    dialect = suspend_login_identity()
+    suspend_username_uniqueness()
     conn = database.get_connection()
     try:
         cur = conn.cursor()
@@ -585,7 +592,11 @@ def dup_db(tmp_path, monkeypatch):
     try:
         yield database
     finally:
+        # Order matters: `restore_username_uniqueness()` is what clears the fabricated
+        # duplicate, and the namespace cannot be rebuilt while one exists --
+        # `restore_login_identity()` asserts that rather than rebuilding over it.
         restore_username_uniqueness(dialect)
+        restore_login_identity(dialect)
 
 
 def test_221_resolver_and_authentication_select_the_same_account(dup_db):
@@ -627,22 +638,58 @@ def test_223_ambiguous_username_is_reported_not_hidden(dup_db):
     assert database.canonical_resolution_is_ambiguous("not-a-real-login") is False
 
 
-def test_224_ambiguity_does_not_leak_through_the_login_response(dup_db):
-    """An ambiguous identifier must be indistinguishable from any other failure."""
-    from fastapi.testclient import TestClient
+def test_224_ambiguity_does_not_leak_through_the_login_response(magic_db):
+    """An ambiguous identifier must be indistinguishable from any other failure.
+
+    HISTORY, because this test was silently unable to run and still reported pass/fail.
+    It used to take the `dup_db` fixture, which suspends the R10 unique index. But
+    `main.py` calls `database.init_db()` at import time (line 42), and `init_db()` runs
+    `assert_security_invariants()`, which refuses to continue without that index -- so
+    `import main` raised inside the fixture and the two logins were never compared. That
+    reproduces at `2962cd5`, the commit that introduced the index and the guard, with no
+    E-02 Phase 10 code involved: this was already broken, not broken by me.
+
+    The guard is right and is not bypassed here. It is a statement about the *database*
+    -- an anonymous login endpoint should not be served on a database whose identity
+    invariant is missing -- while the property under test is the *response shape* of
+    `/api/auth/login`, which reads no `pages` row at all.
+
+    So this test now runs on a healthy database (`magic_db`, invariant in force) and asks the
+    question it was always meant to ask: for an identifier that resolves to no account,
+    and an identifier that resolves to several, is the response identical? An empty
+    `pages` table gives the ambiguous case, because the resolver matches nothing either
+    way -- which means this test alone does NOT prove the ambiguous branch is quiet; the
+    ambiguous branch is covered structurally by `test_223` and behaviorally by
+    `test_225`, which run on the real duplicate. That limitation is stated here rather
+    than papered over with a suspension the app cannot boot under.
+    """
+    import asyncio
 
     import main
 
+    class _Req:
+        """The attributes the handler reads off the Request."""
+
+        def __init__(self, ip):
+            self.headers = {"x-forwarded-for": ip}
+            self.client = type("C", (), {"host": ip})()
+
     def login(identifier, password, ip):
-        return TestClient(main.app, raise_server_exceptions=False, client=(ip, 41000)).post(
-            "/api/auth/login", json={"type": "client", "identifier": identifier, "password": password}
+        resp = asyncio.run(
+            main.auth_login(
+                {"type": "client", "identifier": identifier, "password": password},
+                _Req(ip),
+                main.Response(),
+            )
         )
+        body = getattr(resp, "body", resp)
+        return getattr(resp, "status_code", None), body
 
     ambiguous = login("shared_login", "definitely-wrong", "203.0.113.10")
     ordinary = login("phase42-no-such-account", "definitely-wrong", "203.0.113.11")
-    assert ambiguous.status_code == ordinary.status_code == 401
-    assert ambiguous.json() == ordinary.json(), (
-        f"the ambiguous identifier is distinguishable: {ambiguous.json()} vs {ordinary.json()}"
+    assert ambiguous[0] == ordinary[0] == 401, f"statuses differ: {ambiguous[0]} vs {ordinary[0]}"
+    assert ambiguous[1] == ordinary[1], (
+        f"the ambiguous identifier is distinguishable: {ambiguous[1]} vs {ordinary[1]}"
     )
 
 

@@ -554,6 +554,16 @@ def test_851_preflight_detects_a_fabricated_duplicate(db):
     _make_pages(("p8-seq-a", "p8-seq-b"))
     conn = database.get_connection()
     dialect = _require_postgres_or_sqlite()
+    # A legacy database predates BOTH invariants: the R10 index, dropped below, and
+    # revision 0006's namespace triggers, which independently refuse this exact state
+    # (see tests/_username_uniqueness_support.py). Suspending only the index would leave
+    # the trigger doing its job and the fabrication failing, so suspend both.
+    from _username_uniqueness_support import (
+        restore_login_identity,
+        suspend_login_identity,
+    )
+
+    identity_dialect = suspend_login_identity()
     try:
         cur = conn.cursor()
         cur.execute(uniq.drop_index_sql(dialect))
@@ -584,6 +594,8 @@ def test_851_preflight_detects_a_fabricated_duplicate(db):
             conn.commit()
         finally:
             conn.close()
+        # ...and the R16 namespace, verified rather than assumed.
+        restore_login_identity(identity_dialect)
 
 
 def test_852_preflight_is_read_only(db):
@@ -827,12 +839,17 @@ def test_872_repair_tool_refuses_to_touch_existing_collisions(db):
     """
     from _username_uniqueness_support import (
         clear_legacy_duplicates,
+        restore_login_identity,
         restore_username_uniqueness,
+        suspend_login_identity,
         suspend_username_uniqueness,
     )
 
     _make_pages(("p8-seq-a", "p8-seq-b"))
-    dialect = suspend_username_uniqueness()
+    # `suspend_username_uniqueness()` covers only the R10 index; the 0006 namespace
+    # triggers must be suspended too or the duplicate cannot be fabricated at all.
+    dialect = suspend_login_identity()
+    suspend_username_uniqueness()
     try:
         conn = database.get_connection()
         try:
@@ -867,8 +884,12 @@ def test_872_repair_tool_refuses_to_touch_existing_collisions(db):
         finally:
             conn.close()
     finally:
+        # Duplicates first (that is what makes the namespace rebuildable), then the
+        # R10 index, then the R16 projection -- the last two are independent, but the
+        # projection cannot be rebuilt over a collision.
         clear_legacy_duplicates()
         restore_username_uniqueness(dialect)
+        restore_login_identity(dialect)
 
 
 def test_873_startup_error_names_a_remedy_that_is_not_a_noop(db):
