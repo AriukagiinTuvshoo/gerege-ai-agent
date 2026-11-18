@@ -1058,12 +1058,21 @@ def save_page(
         conn.commit()
     except Exception:
         # E-02 Phase 10 (R16). Since revision `0006` a rejected `page_id` can be
-        # refused by the namespace trigger, and SQLite leaves the write transaction
-        # OPEN when a trigger aborts a statement. Without this rollback the
-        # connection is closed with an uncommitted write lock, and the *next*
-        # legitimate write on the database fails with "database is locked" — a
-        # rejected name would take the whole application down until the process
-        # restarted. Roll back, then re-raise so the caller sees the real error.
+        # refused by the namespace trigger. SQLite leaves the write transaction OPEN
+        # when a statement is aborted, so this connection would be closed while still
+        # holding it.
+        #
+        # MEASURED, not assumed: `close()` below releases that lock anyway, so with or
+        # without this rollback the next writer succeeds (verified both ways against the
+        # committed code). This is therefore defensive hygiene, not a bug fix, and it is
+        # labelled as such. Relying on an implicit rollback inside `close()` to release a
+        # lock is a fragile property of the driver, and the explicit rollback costs
+        # nothing.
+        #
+        # The `database is locked` seen while developing this change was a *harness*
+        # defect: a script left its own connection open, and that blocks every later
+        # writer on SQLite whether or not this rollback exists. It was reproduced both
+        # ways. Do not cite this block as the cure for it.
         try:
             conn.rollback()
         except Exception:
