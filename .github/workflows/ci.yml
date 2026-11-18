@@ -554,6 +554,81 @@ jobs:
                 "startup guard satisfied.")
           PY
 
+      - name: E-02 Phase 11 — audit-logging contract (R17/R18) on PostgreSQL
+        if: ${{ !cancelled() }}
+        env:
+          # Dedicated database: this suite seeds and deletes rows and runs init_db(), which
+          # corrupts the checksum-verification step that needs a pristine target.
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_phase11_test"
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase11-account-key-secret-0123456789a"
+        run: |
+          # E-02 Phase 11. `record_audit_log` has always accepted resource_type/resource_id
+          # and never accepted target_type/target_id, yet five call sites used the latter.
+          # The business write committed first, so three admin endpoints answered 500 while
+          # the page was in fact created or deleted, and no audit row was written. One of the
+          # five sat inside `except Exception: pass`, so payment confirmations were silently
+          # unaudited with no error at all.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_phase11_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase11_audit_contract.py -v --tb=short | tee /tmp/p11.log
+
+          # No skip is legitimate here: every case can run on PostgreSQL.
+          if grep -qE "SKIPPED" /tmp/p11.log; then
+            echo "::error::E-02 Phase 11 skipped a case; every case must run on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/p11.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p11.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 22 ]; then
+            echo "::error::E-02 Phase 11 expected at least 22 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          # Named findings, so a rename or deletion cannot pass silently.
+          for t in test_1101_all_audit_callers_use_the_supported_keyword_names \
+                   test_1111_page_create_succeeds_and_writes_one_audit_row \
+                   test_1112_page_create_audit_details_contain_no_secrets \
+                   test_1121_page_delete_succeeds_and_writes_one_audit_row \
+                   test_1122_audit_row_survives_the_tenant_it_describes \
+                   test_1131_credentials_update_succeeds_and_writes_one_audit_row \
+                   test_1132_credentials_audit_contains_no_password \
+                   test_1133_credential_conflict_returns_409_and_audits_the_refusal \
+                   test_1134_credential_conflict_still_returns_409_when_auditing_fails \
+                   test_1142_record_audit_log_raises_a_typed_error_and_never_leaks_the_connection; do
+            grep -q "$t .*PASSED" /tmp/p11.log || {
+              echo "::error::E-02 Phase 11: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertion that the contract is live, not a restatement of a test PASS:
+          # the signature accepts the documented keywords and rejects the ones that caused R17.
+          python - <<'PY'
+          import inspect, sys
+          sys.path.insert(0, ".")
+          import database
+          from core.db_engine import is_postgres
+
+          if not is_postgres():
+              sys.exit("::error::Phase 11 gate is not running on PostgreSQL")
+
+          params = set(inspect.signature(database.record_audit_log).parameters)
+          for required in ("resource_type", "resource_id"):
+              if required not in params:
+                  sys.exit(f"::error::record_audit_log lost the documented parameter {required}")
+          for forbidden in ("target_type", "target_id"):
+              if forbidden in params:
+                  sys.exit(f"::error::record_audit_log gained {forbidden}; the call sites must not")
+
+          if not issubclass(database.AuditLogWriteError, RuntimeError):
+              sys.exit("::error::AuditLogWriteError is missing; audit failures would be untyped")
+
+          print("Phase 11: audit contract verified on PostgreSQL.")
+          PY
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:
