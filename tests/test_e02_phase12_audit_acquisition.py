@@ -364,11 +364,21 @@ def test_1210_get_connection_is_inside_record_audit_logs_protected_region():
     A behavioural test cannot distinguish 'inside the try' from 'wrapped in another
     try that re-raises the same type' — and the maintenance hazard is that someone
     moves the call back out for a trivial reason. This pins the structure directly.
+
+    The check is deliberately strict about *where*: an acquisition evaluated before
+    the try is the defect, even if an identical call also appears inside it. A first
+    draft of this test only asked "does `get_connection` appear anywhere under the
+    try", and it passed a hand-written regression of the form
+
+        conn = get_connection()
+        try:
+            conn = conn or get_connection()
+
+    which is exactly the shape F-A had. The assertion below rejects it.
     """
     import ast
 
     source = inspect.getsource(database.record_audit_log)
-    # De-duplicate the indentation so `ast.parse` sees a module-level function.
     tree = ast.parse(source.strip())
     func = tree.body[0]
     assert isinstance(func, ast.FunctionDef)
@@ -380,15 +390,30 @@ def test_1210_get_connection_is_inside_record_audit_logs_protected_region():
             break
     assert outer_try is not None, "record_audit_log no longer has a try block"
 
-    acquired_inside = False
-    for node in ast.walk(outer_try):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id == "get_connection":
-                acquired_inside = True
-    assert acquired_inside, (
-        "`get_connection()` must be called inside the try block of record_audit_log; "
-        "moving it out reintroduces finding F-A (untyped audit failures on a "
-        "committed business write)."
+    def acquires(node):
+        return any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "get_connection"
+            for n in ast.walk(node)
+        )
+
+    # Nothing may acquire the connection before the try is entered.
+    for node in func.body:
+        if node is outer_try:
+            break
+        if isinstance(node, ast.Assign) and acquires(node.value):
+            raise AssertionError(
+                "`get_connection()` is evaluated before the try block of "
+                "record_audit_log; that is finding F-A (an untyped audit failure "
+                "reported as a 500 after the business write committed)."
+            )
+
+    assert outer_try.body, "record_audit_log's try block is empty"
+    assert acquires(outer_try.body[0]), (
+        "the first statement of record_audit_log's try block must acquire the "
+        "connection, so that acquisition failures are converted into "
+        "AuditLogWriteError like every other audit failure."
     )
 
 

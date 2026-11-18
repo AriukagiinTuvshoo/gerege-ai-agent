@@ -629,6 +629,135 @@ jobs:
           print("Phase 11: audit contract verified on PostgreSQL.")
           PY
 
+      - name: "E-03 — audit failure contract: acquisition, payment signal, rotation"
+        if: ${{ !cancelled() }}
+        env:
+          # Dedicated database, same reason as the Phase 11 gate above: this suite seeds
+          # and deletes rows and runs init_db(), which corrupts the checksum step.
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e03_test"
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-e03-account-key-secret-0123456789abcdef"
+        run: |
+          # E-03. Three findings from the Phase 12 independent audit:
+          #
+          #   F-A  `get_connection()` sat outside `record_audit_log`'s try, so a failure to
+          #        ACQUIRE a connection escaped untyped and the endpoint answered the bare
+          #        500 "Internal server error" after the business write had committed.
+          #   F-B  `audit_recorded` was produced and read by nobody; both payment callers
+          #        discarded the result.
+          #   F-C  an audit failure on the credentials endpoint discarded a magic token that
+          #        had already been rotated and committed, leaving the caller with only a
+          #        dead one.
+          #
+          # Each suite is gated on PostgreSQL, and each is checked to fail without its fix.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_e03_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase12_audit_acquisition.py -v --tb=short | tee /tmp/e03a.log
+          pytest tests/test_e02_phase12_payment_audit_signal.py -v --tb=short | tee /tmp/e03b.log
+          pytest tests/test_e02_phase12_token_rotation.py -v --tb=short | tee /tmp/e03c.log
+
+          # No skip is legitimate: every case can run on PostgreSQL.
+          if grep -qE "SKIPPED" /tmp/e03a.log /tmp/e03b.log /tmp/e03c.log; then
+            echo "::error::E-03 skipped a case; every case must run on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/e03a.log /tmp/e03b.log /tmp/e03c.log
+            exit 1
+          fi
+
+          for pair in "a:11" "b:11" "c:11"; do
+            log="/tmp/e03${pair%%:*}.log"
+            want="${pair##*:}"
+            got=$(grep -oE "[0-9]+ passed" "$log" | head -1 | grep -oE "[0-9]+")
+            if [ "${got:-0}" -lt "$want" ]; then
+              echo "::error::E-03 expected at least $want passing cases in $log, saw ${got:-none}"
+              exit 1
+            fi
+          done
+
+          # Named findings, so a rename or deletion cannot pass silently.
+          for t in test_1201_acquisition_failure_is_converted_into_the_typed_audit_error \
+                   test_1202_acquisition_failure_preserves_the_original_exception_as_the_cause \
+                   test_1204_page_create_reports_completed_but_unaudited_when_acquisition_fails \
+                   test_1205_page_delete_reports_completed_but_unaudited_when_acquisition_fails \
+                   test_1206_credentials_report_completed_but_unaudited_when_acquisition_fails \
+                   test_1210_get_connection_is_inside_record_audit_logs_protected_region \
+                   test_2001_every_return_path_carries_audit_recorded \
+                   test_2012_settling_call_reports_false_when_the_audit_row_was_not_written \
+                   test_2023_qpay_callback_does_not_answer_non_200_when_the_audit_is_lost \
+                   test_3001_a_committed_rotation_is_delivered_even_when_the_audit_fails \
+                   test_3002_the_delivered_token_is_the_one_the_database_holds \
+                   test_3003_rotation_still_invalidates_the_previously_distributed_token \
+                   test_3004_repeated_retries_during_an_outage_always_hand_back_a_working_token; do
+            grep -qE "$t .*PASSED" /tmp/e03a.log /tmp/e03b.log /tmp/e03c.log || {
+              echo "::error::E-03: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertion that the fixes are live, not a restatement of a test PASS.
+          python - <<'PY'
+          import ast, inspect, sys
+          sys.path.insert(0, ".")
+          import database, fintech_service
+          from core.db_engine import is_postgres
+
+          if not is_postgres():
+              sys.exit("::error::E-03 gate is not running on PostgreSQL")
+
+          # F-A: acquisition must happen INSIDE the protected region, and not before it.
+          # "appears anywhere under the try" is too weak: a regression of the form
+          #     conn = get_connection()
+          #     try:
+          #         conn = conn or get_connection()
+          # satisfies it and is still the defect.
+          func = ast.parse(inspect.getsource(database.record_audit_log).strip()).body[0]
+          outer_try = next((n for n in ast.walk(func) if isinstance(n, ast.Try)), None)
+          if outer_try is None:
+              sys.exit("::error::record_audit_log has no try block")
+
+          def _acquires(node):
+              return any(
+                  isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id == "get_connection"
+                  for n in ast.walk(node)
+              )
+
+          for node in func.body:
+              if node is outer_try:
+                  break
+              if isinstance(node, ast.Assign) and _acquires(node.value):
+                  sys.exit("::error::get_connection() is evaluated before the try (F-A is back)")
+          if not outer_try.body or not _acquires(outer_try.body[0]):
+              sys.exit("::error::the try block does not begin by acquiring the connection (F-A is back)")
+
+          # F-B: the reporter exists and reports a lost audit.
+          captured = []
+
+          class H:
+              pass
+
+          import logging
+
+          logger = logging.getLogger("fintech_service")
+          prev_disabled, prev_level = logger.disabled, logger.level
+          logger.disabled = False
+          logger.setLevel(logging.ERROR)
+          original_error = logger.error
+          logger.error = lambda *a, **k: captured.append(a)
+          try:
+              ok = fintech_service.report_audit_outcome(
+                  {"audit_recorded": False, "invoice": {"invoice_id": "INV-GATE"}},
+                  caller="ci_gate",
+              )
+          finally:
+              logger.error = original_error
+              logger.disabled, logger.level = prev_disabled, prev_level
+          if ok is not False or not captured:
+              sys.exit("::error::a lost payment audit is not reported to its caller (F-B is back)")
+
+          print("E-03: acquisition, payment signal and rotation contracts verified on PostgreSQL.")
+          PY
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:
