@@ -1191,9 +1191,10 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
         )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+    operation_label = f"Хуудас ({target_page_id}) нэвтрэх эрх шинэчлэх"
     audit_error = _audit_or_report(
         "page.credentials.updated",
-        operation=f"Хуудас ({target_page_id}) нэвтрэх эрх шинэчлэх",
+        operation=operation_label,
         page_id=str(target_page_id),
         actor_role="admin",
         resource_type="page",
@@ -1203,7 +1204,45 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
         details={"username_length": len(username)},
     )
     if audit_error is not None:
-        return audit_error
+        # E-03 (Phase 12 finding F-C). This endpoint must NOT let the audit gate the
+        # response, and the reason is specific to what `set_client_credentials` does:
+        # it has already rotated `client_magic_token`, revoked every session for the
+        # page, and committed. Returning the audit error alone therefore tells the
+        # caller "nothing was delivered" about a rotation that destroyed the token
+        # they were still holding.
+        #
+        # Measured before this change: during an audit-store outage each retry rotated
+        # the token again and revoked the sessions again, the previously distributed
+        # token stopped working, the replacement was never returned, and only a
+        # password login got the operator back in. Recovery needed the *first*
+        # successful call, which had already happened and been discarded.
+        #
+        # So the new magic token is returned WITH the audit gap reported in the same
+        # body. The caller gets the credential that is now live, and sees the truth
+        # about the audit. Status stays 500 because an invariant genuinely was not
+        # met, and `operation_completed` stays true.
+        #
+        # This changes no token property: same generator, same lifetime, same
+        # revocation behaviour, same authentication path. It only stops discarding a
+        # committed secret because a log write failed.
+        body = {
+            "error": (
+                f"{operation_label} хийгдсэн боловч аудит лог бичигдсэнгүй. "
+                f"Энэ үйлдлийг гараар шалгана уу."
+            ),
+            "code": "audit_write_failed",
+            "operation_completed": True,
+            "audit_action": "page.credentials.updated",
+            # Delivered because it is already the live credential. The previous token
+            # is dead, so withholding this leaves the caller with no working one.
+            "data": res,
+        }
+        logger.error(
+            "audit write failed for page.credentials.updated after %s committed; "
+            "delivering the rotated magic token with the audit gap reported",
+            operation_label,
+        )
+        return JSONResponse(body, status_code=500)
     return {"status": "success", "data": res}
 
 # -------------------------------------------------------------
