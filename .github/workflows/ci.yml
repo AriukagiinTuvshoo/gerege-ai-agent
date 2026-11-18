@@ -463,6 +463,97 @@ jobs:
           print("Phase 8: index shape verified on PostgreSQL, no duplicates, startup guard satisfied.")
           PY
 
+      - name: E-02 Phase 10 — cross-column login identity (R16) on PostgreSQL
+        if: ${{ !cancelled() }}
+        env:
+          # Dedicated database for the same reason as the Phase 8 step: this suite seeds and
+          # deletes rows and runs init_db(), which corrupts the checksum-verification step
+          # that requires a pristine target.
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_phase10_test"
+          # A "PostgreSQL pass" reported for a run that used SQLite is exactly the false
+          # evidence this gate exists to stop.
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase10-account-key-secret-0123456789ab"
+        run: |
+          # E-02 Phase 10. Login resolves
+          #   LOWER(TRIM(client_username)) = ? OR LOWER(TRIM(page_id)) = ?
+          # so one identifier can be claimed through either column. The Phase 8 index covers
+          # one column, so it cannot see a username equal to another row's page_id, nor two
+          # page_ids differing only by case. Revision 0006 closes both with a projection whose
+          # PRIMARY KEY is the identifier; the engine serialises concurrent claimants.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_phase10_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase10_login_identity.py -v --tb=short | tee /tmp/p10.log
+
+          # One skip IS legitimate and expected on PostgreSQL: the SQLite locking-property
+          # test (test_1046) cannot meaningfully run there. Anything else skipped is a loss.
+          unexpected=$(grep -E "SKIPPED" /tmp/p10.log | grep -v "test_1046_an_unclosed_connection" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::E-02 Phase 10 skipped a case that must run on PostgreSQL:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p10.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 18 ]; then
+            echo "::error::E-02 Phase 10 expected at least 18 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          # Named findings, so a rename or deletion cannot pass silently. Every one of these
+          # asserts REJECTION: the first SQLite trigger used INSERT OR IGNORE and accepted
+          # every collision while the shape checks still passed.
+          for t in test_1001_page_id_equal_to_existing_username_is_refused \
+                   test_1003_username_equal_to_existing_page_id_is_refused \
+                   test_1004_username_equal_to_existing_page_id_reverse_order_is_refused \
+                   test_1011_page_ids_differing_only_by_case_are_refused \
+                   test_1022_a_page_can_update_itself_without_self_colliding \
+                   test_1024_deleting_a_page_releases_its_identifiers \
+                   test_1031_concurrent_opposite_column_claims_do_not_both_win \
+                   test_1032_concurrent_page_id_case_collision_does_not_both_win \
+                   test_1033_concurrent_identical_usernames_still_refused \
+                   test_1044_startup_refuses_a_missing_projection_or_triggers; do
+            grep -q "$t .*PASSED" /tmp/p10.log || {
+              echo "::error::E-02 Phase 10: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertions of the invariant, not a restatement of a test PASS. A suite
+          # that passes while the projection is absent, stale, or untriggered would be useless;
+          # this asks the database directly.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import database
+          from core import login_identity as li
+          from core.db_engine import is_postgres
+
+          if not is_postgres():
+              sys.exit("::error::Phase 10 gate is not running on PostgreSQL")
+
+          conn = database.get_connection()
+          try:
+              if not li.namespace_present(conn):
+                  sys.exit("::error::page_login_namespace is absent")
+              if not li.namespace_is_correct(conn):
+                  sys.exit("::error::the projection does not agree with `pages`")
+              if not li.trigger_present(conn):
+                  sys.exit("::error::the namespace triggers are absent: the projection will drift")
+              collisions = li.find_identifier_collisions(conn)
+              if collisions:
+                  sys.exit("::error::identifier collisions present: "
+                           + li.collision_report_text(collisions))
+          finally:
+              conn.close()
+
+          from core.schema_manager import assert_security_invariants
+          assert_security_invariants()
+          print("Phase 10: projection and triggers verified on PostgreSQL, no collisions, "
+                "startup guard satisfied.")
+          PY
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:
