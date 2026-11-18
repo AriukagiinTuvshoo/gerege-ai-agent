@@ -108,6 +108,32 @@ class PageModel(Base):
     )
 
 
+
+class PageLoginNamespaceModel(Base):
+    """E-02 Phase 10 (R16): one row per normalized login identifier.
+
+    `normalized_identifier` is the PRIMARY KEY, which is what makes the invariant
+    a database rule rather than an application convention: the engine refuses a
+    second tenant claiming the same identifier, including under concurrency, with
+    no pre-SELECT and no advisory lock. `page_id` records the current owner so the
+    projection can be verified against `pages` — not for authentication, which
+    still reads `pages` directly.
+
+    Maintained by triggers on `pages` (see `core/login_identity.py`). Never written
+    by application code: a manual INSERT here would desynchronise the projection
+    from the table it projects, and `namespace_is_correct()` would start refusing
+    startup, which is the intended failure mode rather than a bug.
+    """
+
+    __tablename__ = "page_login_namespace"
+
+    normalized_identifier = Column(String(255), primary_key=True)
+    page_id = Column(
+        String(128),
+        ForeignKey("pages.page_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
 class RegistrationModel(Base):
     __tablename__ = "registrations"
 

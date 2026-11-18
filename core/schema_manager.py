@@ -192,14 +192,27 @@ def assert_security_invariants(engine=None) -> None:
 
     Raising here turns that into a loud startup failure that names the remedy.
     """
-    from core import username_uniqueness
+    from core import login_identity, username_uniqueness
 
     engine = engine or _engine_for()
     with engine.connect() as conn:
-        if username_uniqueness.index_is_correct(conn):
-            return
-        found = username_uniqueness.describe_index(conn)
-    raise RuntimeError(
+        username_ok = username_uniqueness.index_is_correct(conn)
+        found = None if username_ok else username_uniqueness.describe_index(conn)
+
+        # E-02 Phase 10 (R16). The username index alone is not the whole identity
+        # invariant: it cannot see a username that equals another row's page_id, nor
+        # two page_ids differing only by case. Revision `0006` closes both with a
+        # projected namespace table whose PRIMARY KEY is the identifier. That table is
+        # only enforcement while its triggers exist — without them it is a stale
+        # snapshot that *looks* enforced, which is worse than absent.
+        if username_ok:
+            identity_ok = login_identity.namespace_is_correct(
+                conn
+            ) and login_identity.trigger_present(conn)
+            if identity_ok:
+                return
+    if not username_ok:
+        raise RuntimeError(
         "Missing database-enforced security invariant: the unique index "
         f"'{username_uniqueness.USERNAME_UNIQUE_INDEX}' on LOWER(TRIM(client_username)) is "
         f"not in force (found: {found!r}).\n"
@@ -216,6 +229,21 @@ def assert_security_invariants(engine=None) -> None:
         "If step 1 reports duplicate usernames, the index cannot be installed until those "
         "collisions are resolved deliberately with the tenant owners. Procedure: "
         "docs/operations/USERNAME_UNIQUENESS_MIGRATION.md"
+    )
+    raise RuntimeError(
+        "Missing database-enforced security invariant: cross-column login-identity "
+        f"uniqueness (finding R16) is not in force. The '{login_identity.NAMESPACE_TABLE}' "
+        "projection and its maintenance triggers on `pages` must BOTH exist.\n"
+        "Without them a username can equal another tenant's page_id, and two page_ids "
+        "differing only by case become one login identifier — both make login identity "
+        "ambiguous and can lock the shadowed tenant out of its own page_id login.\n"
+        "Refusing to serve.\n"
+        "Repair, in order of preference:\n"
+        "  1. python scripts/repair_login_identity.py --check   (safe, read-only)\n"
+        "  2. python scripts/repair_login_identity.py           (rebuilds the projection)\n"
+        "  3. alembic upgrade head   (only below revision '0006_login_identity')\n"
+        "If step 1 reports collisions, they must be resolved deliberately with the "
+        "tenant owners first. Procedure: docs/operations/USERNAME_UNIQUENESS_MIGRATION.md"
     )
 
 

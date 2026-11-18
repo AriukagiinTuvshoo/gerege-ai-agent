@@ -32,6 +32,7 @@ import retention_service
 import appointment_service
 from core import security as core_security
 from core import rate_limit as core_rate_limit
+from core import login_identity as core_login_identity
 from core.monitoring import telemetry
 from routers import system_router, automation_router
 
@@ -1007,16 +1008,31 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
     if not page_id or not name:
         return JSONResponse({"error": "Page ID болон Нэр шаардлагатай"}, status_code=400)
 
-    database.save_page(
-        page_id=page_id,
-        name=name,
-        category=category,
-        page_access_token=token,
-        verify_token=verify_token,
-        knowledge_json=k_json,
-        gemini_api_key=gemini_key,
-        monthly_token_limit=monthly_limit
-    )
+    try:
+        database.save_page(
+            page_id=page_id,
+            name=name,
+            category=category,
+            page_access_token=token,
+            verify_token=verify_token,
+            knowledge_json=k_json,
+            gemini_api_key=gemini_key,
+            monthly_token_limit=monthly_limit
+        )
+    except Exception as exc:
+        # E-02 Phase 10 (R16). A page_id must not equal any other tenant's login
+        # username or page_id, ignoring case and whitespace, and two page_ids that
+        # differ only by case are one login identifier. Revision `0006` enforces
+        # that in the database, so the refusal arrives as a driver IntegrityError.
+        # Translate it into a 409 that names the reason without revealing which
+        # other tenant holds the identifier (same non-disclosure rule as 0005).
+        if core_login_identity.is_identifier_violation(exc):
+            return JSONResponse(
+                {"error": "Энэ Page ID нь өөр салбарын нэвтрэх нэр эсвэл Page ID-тай давхцаж байна",
+                 "code": "identifier_conflict"},
+                status_code=409,
+            )
+        raise
     database.record_audit_log("page.upsert", page_id=page_id, actor_role="admin", target_type="page", target_id=page_id)
     agent.reset_sessions(page_id)
     return {"status": "success", "message": f"{name} хуудас амжилттай хадгалагдлаа!", "page_id": page_id}

@@ -1038,24 +1038,39 @@ def save_page(
     conn = get_connection()
     cursor = conn.cursor()
     magic = secrets.token_urlsafe(24)
-    cursor.execute("""
-        INSERT INTO pages (
-            page_id, name, category, page_access_token, verify_token, is_active, 
-            knowledge_json, gemini_api_key, monthly_token_limit, client_magic_token
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(page_id) DO UPDATE SET
-            name = excluded.name,
-            category = excluded.category,
-            page_access_token = COALESCE(NULLIF(excluded.page_access_token, ''), pages.page_access_token),
-            verify_token = excluded.verify_token,
-            is_active = excluded.is_active,
-            knowledge_json = excluded.knowledge_json,
-            gemini_api_key = COALESCE(NULLIF(excluded.gemini_api_key, ''), pages.gemini_api_key),
-            monthly_token_limit = COALESCE(excluded.monthly_token_limit, pages.monthly_token_limit)
-    """, (clean_id, name, category, page_access_token, verify_token, is_active, knowledge_json, gemini_api_key, monthly_token_limit, magic))
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute("""
+            INSERT INTO pages (
+                page_id, name, category, page_access_token, verify_token, is_active, 
+                knowledge_json, gemini_api_key, monthly_token_limit, client_magic_token
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(page_id) DO UPDATE SET
+                name = excluded.name,
+                category = excluded.category,
+                page_access_token = COALESCE(NULLIF(excluded.page_access_token, ''), pages.page_access_token),
+                verify_token = excluded.verify_token,
+                is_active = excluded.is_active,
+                knowledge_json = excluded.knowledge_json,
+                gemini_api_key = COALESCE(NULLIF(excluded.gemini_api_key, ''), pages.gemini_api_key),
+                monthly_token_limit = COALESCE(excluded.monthly_token_limit, pages.monthly_token_limit)
+        """, (clean_id, name, category, page_access_token, verify_token, is_active, knowledge_json, gemini_api_key, monthly_token_limit, magic))
+        conn.commit()
+    except Exception:
+        # E-02 Phase 10 (R16). Since revision `0006` a rejected `page_id` can be
+        # refused by the namespace trigger, and SQLite leaves the write transaction
+        # OPEN when a trigger aborts a statement. Without this rollback the
+        # connection is closed with an uncommitted write lock, and the *next*
+        # legitimate write on the database fails with "database is locked" — a
+        # rejected name would take the whole application down until the process
+        # restarted. Roll back, then re-raise so the caller sees the real error.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
     return True
 
 def delete_page(page_id: str) -> bool:
