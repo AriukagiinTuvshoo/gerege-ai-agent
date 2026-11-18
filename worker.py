@@ -16,7 +16,6 @@ import executive_bot_service
 import retention_service
 import appointment_service
 from core.task_queue import task_queue
-from core import backup_service
 
 load_dotenv(override=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -98,12 +97,17 @@ async def run_worker_tick(loop_count: int) -> dict:
     # 4. Цаг захиалгын 2 цагийн өмнөх сануулга
     stats["reminders_sent"] = await appointment_service.check_and_dispatch_appointment_reminders()
 
-    # 5. Өдөр бүр 03:00 цагт автомат Backup үүсгэх ба хуучин backup цэвэрлэх
-    if current_hm == "03:00":
-        backup_lock = f"daily_db_backup:{today_str}"
-        if database.claim_notification_lock(backup_lock, channel="system", ttl_seconds=86400):
-            backup_service.create_backup(label="daily_auto")
-            backup_service.prune_old_backups(keep_days=14)
+    # 5. Automatic daily backup REMOVED (E-05).
+    #
+    # The worker runs as `gerege_app`, which owns nothing. `pg_dump` needs
+    # `LOCK TABLE ... ACCESS SHARE` on all 18 tables and is refused for a non-owner, so
+    # this job could only ever have produced a 0-byte archive reported as a success.
+    # A scheduled backup now belongs to the maintenance plane, not the runtime:
+    #   docker compose -f docker-compose.prod.yml run --rm maintenance \
+    #       python scripts/maintenance.py backup --label daily_auto
+    # driven by cron/systemd on the host (docs/operations/BACKUP_RESTORE.md §6).
+    # Leaving the call here and letting it raise nightly would train operators to ignore
+    # worker errors, so it is gone rather than wrapped in a try/except.
 
     return stats
 

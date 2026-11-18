@@ -8,7 +8,7 @@
 ## 1. Recovery Objectives (RPO & RTO)
 
 - **Recovery Point Objective (RPO):** <= 24 hours via automated daily 03:00 AM snapshots (`worker.py`), or 0 minutes before any manual migration/restore (`pre_restore` automatic snapshot).
-- **Recovery Time Objective (RTO):** <= 5 minutes via `/api/admin/backups/restore` or CLI restore commands.
+- **Recovery Time Objective (RTO):** <= 5 minutes via `scripts/maintenance.py restore` (E-05: the restore HTTP endpoint was removed; restore requires the owner credential).
 - **Retention Policy:** 14 days rolling retention (`backup_service.prune_old_backups(keep_days=14)`).
 
 ---
@@ -34,23 +34,27 @@
 
 ## 3. Restore Runbook
 
-### 3.1 Via Admin API (Requires `super_admin` / `admin` Bearer Token)
+### 3.1 Via the Maintenance CLI (E-05: owner credential, explicit operator action)
 ```bash
-# 1. List available backups
+# 1. List available backups (read-only; this one is also available over HTTP)
+python scripts/maintenance.py list
 curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/api/admin/backups
 
 # 2. Verify backup integrity before restore
-curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"filename": "pg_backup_daily_auto_20261114_030000.sql.gz"}' \
-  http://localhost:8000/api/admin/backups/verify
+python scripts/maintenance.py verify <filename>
 
-# 3. Restore (automatically creates a pre_restore snapshot first)
-curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"filename": "pg_backup_daily_auto_20261114_030000.sql.gz"}' \
-  http://localhost:8000/api/admin/backups/restore
+# 3. Restore (verifies the archive, then creates a pre_restore snapshot)
+docker compose -f docker-compose.prod.yml run --rm maintenance \
+  python scripts/maintenance.py restore <filename>
+
+# 4. Confirm the runtime role is still least-privileged, then start the app
+python scripts/provision_roles.py --verify
 ```
+
+Restore requires the owner credential (`DATABASE_OWNER_URL`, or the `maintenance`
+service). It cannot be done as `gerege_app`: replaying a dump drops and recreates the
+schema, which needs ownership. The old `POST /api/admin/backups/restore` endpoint was
+removed for that reason — see [LEAST_PRIVILEGE_ROLES.md](LEAST_PRIVILEGE_ROLES.md).
 
 ### 3.2 Via CLI into an Isolated Target Database (Restore Drill)
 ```python

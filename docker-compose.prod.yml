@@ -1,5 +1,22 @@
 version: "3.9"
 
+# ---------------------------------------------------------------------------
+# E-05: two credentials, two planes.
+#
+# `gerege_app`   runtime   -> web, worker. Owns nothing, no DDL, audit_logs is
+#                             SELECT+INSERT only. This is the only DSN the
+#                             application containers receive.
+# `gerege_owner` maintenance -> migrate, maintenance. Runs Alembic, pg_dump and
+#                             restore. Never mounted into web or worker.
+#
+# The bootstrap superuser (`POSTGRES_USER`) is used by the `db` container to create
+# its own cluster and by `provision-roles` to create the two roles. It is not a
+# runtime credential any more.
+#
+# Provisioning runs from `migrate` (which depends on nothing else) so a fresh stack
+# comes up in one `docker compose up`: create roles -> migrate as owner -> start web.
+# ---------------------------------------------------------------------------
+
 services:
   db:
     image: postgres:16-alpine
@@ -93,7 +110,13 @@ services:
       DISABLE_INLINE_SCHEDULER: "1"
       # SEC-01/B-02: CORS allowlist is mandatory in production (no wildcard fallback).
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required (e.g. https://app.example.mn)}
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
+      # E-05: the runtime credential. NOT the bootstrap `POSTGRES_USER`.
+      # `POSTGRES_APP_PASSWORD` is required (`:?`) so a deployment cannot silently come up
+      # with a blank password, and so the failure is at `compose up` rather than at login.
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_APP_USER:-gerege_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_crm}
+      # The startup assertion is enforced by ENV=production alone; this makes the intent
+      # explicit and keeps the check on even if ENV were ever relaxed.
+      REQUIRE_LEAST_PRIVILEGE: "1"
       REDIS_URL: redis://redis:6379/0
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
       # E-02 Phase 3: there is no reverse proxy in this topology, so nothing is trusted
@@ -121,6 +144,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # E-05: roles must exist and be verified before the app connects. A failed
+      # provisioning or a failed `--verify` now stops `web` from starting at all.
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=4)"]
       interval: 20s
@@ -139,7 +166,10 @@ services:
     environment:
       ENV: production
       STRICT_SECURITY: "1"
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
+      # E-05: same runtime credential as `web`. The worker never needs DDL —
+      # `ensure_schema()` is a no-op at head and the tail of `init_db()` is data only.
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_APP_USER:-gerege_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_crm}
+      REQUIRE_LEAST_PRIVILEGE: "1"
       REDIS_URL: redis://redis:6379/0
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
@@ -150,11 +180,86 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 1024M
+
+  # -------------------------------------------------------------------------
+  # E-05: the owner plane. One-shot, no restart, no published port.
+  #
+  # `migrate` is the only service that holds `POSTGRES_OWNER_PASSWORD`, and it
+  # does the whole bring-up in order: create/refresh the two roles, then migrate
+  # as the owner. `web` and `worker` depend on it completing successfully, so an
+  # over-privileged or missing role stops the stack at start-up rather than at the
+  # first request.
+  #
+  # `depends_on` uses `service_completed_successfully`, so `docker compose up` on a
+  # fresh volume provisions roles and migrates before anything serves traffic.
+  # -------------------------------------------------------------------------
+  migrate:
+    build: .
+    restart: "no"
+    command:
+      - "sh"
+      - "-c"
+      - >-
+        python scripts/provision_roles.py --apply &&
+        python -m alembic upgrade head &&
+        python scripts/provision_roles.py --apply &&
+        python scripts/provision_roles.py --verify
+    environment:
+      ENV: production
+      # DSNs for the maintenance plane only. These are NOT passed to web/worker.
+      # The provisioning steps read ADMIN_DATABASE_URL; `alembic upgrade head` reads
+      # DATABASE_URL.
+      #
+      # Why `--apply` runs TWICE, and why both run as the bootstrap account:
+      #
+      #   pass 1 (before migration) creates the two roles. On a fresh volume there is
+      #     nothing else to do — no tables exist yet.
+      #   migration runs as the bootstrap account, which owns what it creates: 19 tables,
+      #     13 sequences and the two audit trigger functions.
+      #   pass 2 (after migration) is the one that matters on both fresh and existing
+      #     volumes: it transfers ownership of everything to `gerege_owner` and applies
+      #     the grants.
+      #
+      # `ALTER TABLE ... OWNER TO gerege_owner` requires the *current* user to be a member
+      # of the new owner, so it cannot be done by `gerege_owner` over objects it does not
+      # yet own. That is why this container holds the bootstrap credential, and why web
+      # and worker never do.
+      #
+      # Both passes are idempotent; `--verify` runs last and fails the container if the
+      # end state is wrong, which stops `web`/`worker` from starting.
+      ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
+      GEREGE_OWNER_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}
+      GEREGE_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
+    volumes:
+      - ./backups:/app/backups
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Operator-invoked, never started by `up` (profile-scoped and restart: "no").
+  #   docker compose -f docker-compose.prod.yml run --rm maintenance \
+  #       python scripts/maintenance.py backup --label daily_auto
+  maintenance:
+    build: .
+    restart: "no"
+    profiles: ["maintenance"]
+    entrypoint: ["python", "scripts/maintenance.py"]
+    environment:
+      ENV: production
+      DATABASE_OWNER_URL: postgresql://${POSTGRES_OWNER_USER:-gerege_owner}:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_crm}
+    volumes:
+      - ./backups:/app/backups
+    depends_on:
+      db:
+        condition: service_healthy
 
 volumes:
   pgdata:

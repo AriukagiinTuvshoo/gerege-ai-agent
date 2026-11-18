@@ -16,14 +16,23 @@ async def list_backups_endpoint(_admin: Dict[str, Any] = Depends(require_admin))
     return {"backups": backup_service.list_backups()}
 
 
-@router.post("/backups/create")
-async def create_backup_endpoint(
-    payload: Dict[str, Any] = {},
-    _admin: Dict[str, Any] = Depends(require_admin),
-):
-    """Өгөгдлийн сангийн шинэ backup үүсгэх (Зөвхөн Админ)"""
-    label = str(payload.get("label", "manual")).strip() or "manual"
-    return backup_service.create_backup(label=label)
+# E-05: `POST /backups/create` and `POST /backups/restore` were removed.
+#
+# They cannot be done correctly by the runtime credential. `pg_dump` needs
+# `LOCK TABLE ... ACCESS SHARE` on every table and restore needs `DROP`/`CREATE` on the
+# schema — ownership, which `gerege_app` deliberately does not have. Measured on
+# PostgreSQL 16: as a non-owner, `pg_dump` exits 1 with
+# "permission denied for table registrations" and the wrapper wrote its empty stdout to
+# gzip, so the API returned `success: true` for a **0-byte backup**.
+#
+# The alternative was to grant the runtime role the very privileges this phase exists to
+# remove, so the operations moved to `scripts/maintenance.py` (owner credential, explicit
+# operator action, pre-restore snapshot, verification) or the one-shot `maintenance`
+# Compose service. They are gone rather than left returning 503: an endpoint that exists
+# but cannot work invites retries and, worse, silently-successful no-ops.
+#
+# `GET /backups` and `POST /backups/verify` remain: they only read the backups
+# directory and a file's checksum, which the runtime role may do.
 
 
 @router.post("/backups/verify")
@@ -34,16 +43,6 @@ async def verify_backup_endpoint(
     """Backup файлын SHA-256 болон SQLite/PostgreSQL бүрэн бүтэн байдал шалгах"""
     filename = str(payload.get("filename", "")).strip()
     return backup_service.verify_backup(filename)
-
-
-@router.post("/backups/restore")
-async def restore_backup_endpoint(
-    payload: Dict[str, Any],
-    _admin: Dict[str, Any] = Depends(require_admin),
-):
-    """Backup-аас өгөгдлийн санг сэргээх (Pre-restore snapshot үүсгээд атомик сэргээнэ)"""
-    filename = str(payload.get("filename", "")).strip()
-    return backup_service.restore_backup(filename)
 
 
 @router.get("/metrics")

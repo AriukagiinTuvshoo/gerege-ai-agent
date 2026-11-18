@@ -903,6 +903,170 @@ jobs:
           print("Phase 13: repair script restored the guard; startup guard passes again.")
           PY
 
+      - name: "Phase 14 (E-05) — least-privilege runtime role separation"
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e05_test"
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-e05-account-key-secret-0123456789abcdef"
+        run: |
+          # E-05. Phase 13 made `audit_logs` append-only with triggers, and measured the
+          # limit honestly: the runtime credential was a superuser, so DROP TRIGGER,
+          # DISABLE TRIGGER and session_replication_role=replica all bypassed it. The
+          # guard was advisory against anyone holding DATABASE_URL.
+          #
+          # This gate proves the split: `gerege_app` owns nothing and runs the app;
+          # `gerege_owner` owns the schema and does maintenance. The adversarial matrix in
+          # the suite attacks the restricted role for real, and the assertions below
+          # re-run the same attacks outside pytest so the gate cannot pass on a
+          # restatement of a test name.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_e05_test 2>/dev/null || true
+
+          # Bring the database to head as the bootstrap account, which is exactly what the
+          # `migrate` service does in production. The gate must not assume a pre-migrated
+          # database: a fresh cluster is the case where provisioning is most likely wrong.
+          alembic upgrade head
+
+          pytest tests/test_e02_phase14_least_privilege.py -v --tb=short | tee /tmp/e05.log
+
+          # Every case must actually run. On SQLite 26 of them skip, which is correct for
+          # developers and unacceptable for this gate.
+          if grep -qE "SKIPPED" /tmp/e05.log; then
+            echo "::error::Phase 14 skipped a case; the role split must be verified on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/e05.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/e05.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 41 ]; then
+            echo "::error::Phase 14 expected at least 41 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          for t in test_e05_01_audit_logs_is_the_only_table_narrowed_to_select_insert \
+                   test_e05_11_backup_refuses_a_non_owner_credential_on_postgres \
+                   test_e05_12_destructive_backup_endpoints_are_gone \
+                   test_e05_16_app_role_can_do_every_required_operation \
+                   test_e05_18_self_grant_is_a_noop_not_an_escalation \
+                   test_e05_19_tenant_deletion_retains_audit_evidence \
+                   test_e05_20_owner_role_can_migrate_and_dump \
+                   test_e05_21_backup_refuses_app_and_accepts_owner \
+                   test_e05_22_startup_refuses_owner_and_superuser_but_accepts_app \
+                   test_e05_23_out_of_band_grant_is_detected_and_converge_removes_it \
+                   test_e05_24_verify_exits_nonzero_when_the_runtime_role_is_missing; do
+            grep -qE "$t .*PASSED" /tmp/e05.log || {
+              echo "::error::Phase 14: $t did not pass"
+              exit 1
+            }
+          done
+
+          python - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, ".")
+          import psycopg2
+          from core import db_privileges
+
+          DB = os.environ["DATABASE_URL"]
+          base = DB.rsplit("/", 1)[0]
+          _norm = lambda u: (u.replace("postgresql+psycopg2://", "postgresql://", 1)
+                              .replace("postgresql+psycopg://", "postgresql://", 1))
+          # Connected to the TARGET database, not /postgres: roles are cluster-wide so
+          # CREATE ROLE works from anywhere, but `ALTER TABLE audit_logs` is per-database
+          # and silently targeted the wrong one in the first version of this gate.
+          admin = psycopg2.connect(_norm(DB))
+          admin.autocommit = True
+          cur = admin.cursor()
+          # The provisioning script must reach least privilege from scratch, and its own
+          # verify must agree — a gate that only ran pytest could pass with a script that
+          # provisions nothing.
+          os.environ["ADMIN_DATABASE_URL"] = DB
+          os.environ["GEREGE_OWNER_PASSWORD"] = "ci_owner_pw_2026"
+          os.environ["GEREGE_APP_PASSWORD"] = "ci_app_pw_2026"
+          from scripts import provision_roles
+
+          if provision_roles.main(["--apply"]) != 0:
+              sys.exit("::error::provision_roles --apply failed")
+          if provision_roles.main(["--verify"]) != 0:
+              sys.exit("::error::provision_roles --verify reports the runtime role is not least-privileged")
+
+          # NEGATIVE CONTROL. Everything above would also pass if the assertion silently
+          # did nothing, so make it fail on purpose: provision a role that owns tables and
+          # confirm the assertion refuses it. Without this, a broken check reads as green.
+          # CLEANUP of a previous run. `DROP OWNED` is per-database, so a leftover grant
+          # in another database still blocks DROP ROLE; `REASSIGN OWNED` + `DROP OWNED` in
+          # each database is the documented sequence, and the drop must not be allowed to
+          # abort the gate before it has done any work.
+          for _db in ("postgres",):
+              try:
+                  _c = psycopg2.connect(_norm(base) + "/" + _db)
+                  _c.autocommit = True
+                  _k = _c.cursor()
+                  _k.execute("DROP OWNED BY e05_control_owner")
+                  _k.close()
+                  _c.close()
+              except Exception:
+                  pass
+          try:
+              cur.execute("DROP OWNED BY e05_control_owner")
+          except Exception:
+              pass
+          cur.execute("DROP ROLE IF EXISTS e05_control_owner")
+          cur.execute("CREATE ROLE e05_control_owner LOGIN PASSWORD 'control_pw_2026' NOINHERIT")
+          cur.execute("GRANT e05_control_owner TO gerege")
+          cur.execute("GRANT USAGE ON SCHEMA public TO e05_control_owner")
+          cur.execute("GRANT SELECT ON ALL TABLES IN SCHEMA public TO e05_control_owner")
+          cur.execute("ALTER TABLE audit_logs OWNER TO e05_control_owner")
+
+          ctl_dsn = (_norm(base) + "/" + DB.rsplit("/", 1)[1]).replace(
+              "gerege:ci_pg_password_2026@", "e05_control_owner:control_pw_2026@"
+          )
+          control = psycopg2.connect(ctl_dsn)
+          try:
+              report = db_privileges.collect_runtime_privileges(control)
+          finally:
+              control.close()
+          violations = db_privileges.evaluate_runtime_privileges(report)
+          if not any("owns" in v for v in violations):
+              sys.exit("::error::negative control failed: a table owner was not flagged")
+          print("Phase 14: negative control confirmed — a table owner is refused.")
+
+          # ...and the app role is accepted by the same evaluator, so the control proves
+          # discrimination rather than blanket rejection.
+          app_conn = psycopg2.connect(ctl_dsn.replace(
+              "e05_control_owner:control_pw_2026", "gerege_app:ci_app_pw_2026"))
+          try:
+              app_report = db_privileges.collect_runtime_privileges(app_conn)
+          finally:
+              app_conn.close()
+          if db_privileges.evaluate_runtime_privileges(app_report):
+              sys.exit("::error::gerege_app is not least-privileged: "
+                       + "; ".join(db_privileges.evaluate_runtime_privileges(app_report)))
+          print("Phase 14: gerege_app accepted by the same check that refuses an owner.")
+
+          # Restore ownership BEFORE dropping the control role. `DROP OWNED BY <role>`
+          # does not just revoke privileges: it DROPS every object that role owns. The
+          # negative control deliberately makes it own `audit_logs`, so skipping this
+          # line deletes the audit table from the test database (observed: alembic still
+          # reported 0007 while `audit_logs` was gone, which is a nasty state to debug).
+          cur.execute("ALTER TABLE audit_logs OWNER TO gerege_owner")
+          cur.execute("DROP OWNED BY e05_control_owner")
+          cur.execute("DROP ROLE IF EXISTS e05_control_owner")
+
+          # Prove the table survived the whole exercise, rather than reporting success
+          # from a database the negative control had already damaged.
+          cur.execute("SELECT to_regclass('public.audit_logs') IS NOT NULL")
+          if not cur.fetchone()[0]:
+              sys.exit("::error::audit_logs was destroyed by the negative control cleanup")
+          cur.execute("SELECT COUNT(*) FROM pg_trigger WHERE NOT tgisinternal "
+                      "AND tgrelid = 'audit_logs'::regclass")
+          if cur.fetchone()[0] < 3:
+              sys.exit("::error::the append-only triggers did not survive the gate")
+          print("Phase 14: audit_logs and its three guard triggers survived the gate.")
+          cur.close()
+          admin.close()
+          PY
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:

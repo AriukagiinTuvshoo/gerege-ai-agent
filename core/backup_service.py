@@ -19,6 +19,72 @@ BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
 SCHEMA_VERSION = "0001_initial_enterprise_schema"
 
 
+class MaintenanceCredentialRequired(RuntimeError):
+    """Backup/restore was attempted with a credential that cannot do it correctly.
+
+    ``pg_dump`` needs ``LOCK TABLE ... ACCESS SHARE`` on every table and restore needs
+    ``DROP``/``CREATE`` on the schema, which is ownership. The runtime role
+    (``gerege_app``) has neither by design (finding E-05).
+
+    Without this guard the failure is *silent and destructive*: ``pg_dump`` exits
+    non-zero with ``permission denied for table registrations``, and the code path
+    that writes its stdout to gzip produces a **0-byte backup that is then recorded as
+    a success** in the manifest. A restore point that does not exist is worse than no
+    restore point, because it is trusted. So the credential is checked before any
+    process is spawned.
+    """
+
+
+def _assert_maintenance_credential() -> None:
+    """Refuse to dump/restore as a role that cannot complete the operation.
+
+    Only meaningful on PostgreSQL; SQLite has no roles and its backup path copies a
+    file, so it is unaffected. Deliberately raises rather than returning a dict, and
+    deliberately does not echo the DSN.
+    """
+    from core.db_engine import get_db_connection, is_postgres
+
+    if not is_postgres():
+        return
+    try:
+        conn = get_db_connection()
+    except Exception as exc:  # pragma: no cover - connection failure is reported elsewhere
+        raise MaintenanceCredentialRequired(
+            f"cannot reach the database to check the backup credential: {type(exc).__name__}"
+        ) from None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT current_user,
+                   (SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user),
+                   pg_has_role(current_user, 'gerege_owner', 'MEMBER')
+            """
+        )
+        row = cur.fetchone()
+        cur.close()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not row:
+        raise MaintenanceCredentialRequired("could not determine the current database role")
+    user, _, is_owner = (row[0], row[1], row[2])
+    if not is_owner:
+        raise MaintenanceCredentialRequired(
+            f"role '{user}' cannot create a trustworthy backup or restore: it does not own "
+            "the schema, so pg_dump fails with 'permission denied' and produces an empty "
+            "archive, and restore cannot drop/recreate tables.\n"
+            "Run backup/restore as the maintenance role instead:\n"
+            "  docker compose -f docker-compose.prod.yml run --rm maintenance "
+            "python scripts/maintenance.py backup\n"
+            "  python scripts/maintenance.py backup     (host, DATABASE_OWNER_URL set)\n"
+            "See docs/operations/BACKUP_RESTORE.md."
+        )
+
+
 def _compute_sha256(filepath: str) -> str:
     h = hashlib.sha256()
     with open(filepath, "rb") as f:
@@ -71,6 +137,7 @@ def create_backup(label: str = "manual") -> Dict[str, Any]:
     болон метадата манифест (.meta.json) хадгалах.
     SQLite үед online backup API (`sqlite3.Connection.backup`), PostgreSQL үед `pg_dump` ашиглана.
     """
+    _assert_maintenance_credential()
     os.makedirs(BACKUP_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
     safe_label = "".join(c for c in label if c.isalnum() or c in ("_", "-")) or "backup"
@@ -432,6 +499,53 @@ def _apply_postgres_sql_file(sql_gz_path: str, pg_url: str, server_ver: int = 0)
                 pass
 
 
+def _reconverge_runtime_grants(pg_url: str) -> Tuple[bool, str]:
+    """Re-apply the least-privilege grant plan after a restore.
+
+    Runs as whoever is doing the restore — which must be the owner (the guard at the top
+    of ``restore_backup`` already established that). The grant plan needs only table
+    ownership, not ``CREATEROLE``, so it works from this process.
+
+    Returns ``(ok, note)``. A failure here does **not** fail the restore: the data is
+    already correct and verified, and refusing at this point would tempt an operator to
+    re-run a destructive operation. It is reported in the result and is caught by the
+    startup assertion on the next boot, which is the authoritative check.
+    """
+    try:
+        import psycopg2
+
+        from scripts.provision_roles import build_grant_plan
+
+        conn = psycopg2.connect(pg_url)
+        conn.autocommit = True
+        try:
+            plan = build_grant_plan(conn)
+            applied = 0
+            for statement in plan:
+                if statement.startswith("--"):
+                    continue
+                cur = conn.cursor()
+                try:
+                    cur.execute(statement)
+                    applied += 1
+                finally:
+                    cur.close()
+            return True, f"re-applied {applied} grant statement(s) to the runtime role"
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error(
+            "Could not re-converge runtime grants after restore (%s). The database is "
+            "restored but gerege_app's privileges may be broader than the model allows; "
+            "run `python scripts/provision_roles.py --apply` before starting the app.",
+            type(exc).__name__,
+        )
+        return False, (
+            f"grant re-convergence failed ({type(exc).__name__}); run "
+            "scripts/provision_roles.py --apply"
+        )
+
+
 def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[str, Any]:
     """
     Backup файлаас өгөгдлийн санг атомик байдлаар аюулгүй сэргээх (Recovery):
@@ -443,6 +557,7 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
        зорилтот PostgreSQL баазаас схем, хүснэгт болон мөрийн тоог бодитоор шалгана.
     4. Баталгаажуулалт унавал `pre_restore` snapshot-оос буцаан бодитоор сэргээнэ (P0 Rollback Fix).
     """
+    _assert_maintenance_credential()
     check = verify_backup(filename)
     if not check.get("valid"):
         return {"success": False, "error": check.get("error", "Invalid backup"), "post_restore_verified": False}
@@ -597,8 +712,20 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                 "pre_restore_snapshot": pre_name,
             }
 
-        # Step 2: psql committed. Now verify restored schema, tables, and row counts.
+        # Step 2: the dump committed. Re-converge the runtime grants BEFORE verifying.
+        #
+        # A replayed `pg_dump` recreates every table, and the schema's default privileges
+        # then hand `gerege_app` full CRUD — including UPDATE and DELETE on `audit_logs`.
+        # Measured: after one restore the runtime role could mutate audit history again,
+        # and the startup assertion (correctly) refused to boot. Leaving that to the
+        # operator's memory would mean "restore then remember to provision", and the
+        # failure mode of forgetting is a role that looks provisioned and is not.
+        grants_ok, grants_note = _reconverge_runtime_grants(pg_url)
+
+        # Step 2b: verify restored schema, tables, and row counts.
         pg_check = _verify_restored_postgres(pg_url, expected_counts)
+        if grants_note:
+            pg_check.setdefault("grant_note", grants_note)
         if not pg_check.get("verified"):
             # Post-restore verification failed! Must execute REAL ROLLBACK to pre-restore snapshot.
             ver_err = pg_check.get("error", "PostgreSQL post-restore verification failed")

@@ -142,6 +142,7 @@ def ensure_schema(stamp_only: bool = False) -> Dict[str, Any]:
         # tenants could claim one username again — silently. So the invariant is checked on
         # every boot, not just the boot that applies the migration.
         assert_security_invariants(engine)
+        _assert_least_privilege()
         return {"from": before, "to": target, "upgraded": False, "dialect": engine.dialect.name}
 
     cfg = _alembic_config()
@@ -174,7 +175,30 @@ def ensure_schema(stamp_only: bool = False) -> Dict[str, Any]:
             f"Schema migration failed: expected head '{target}', database is at '{after}'"
         )
     assert_security_invariants(engine)
+    _assert_least_privilege()
     return {"from": before, "to": after, "upgraded": True, "dialect": engine.dialect.name}
+
+
+def _assert_least_privilege() -> None:
+    """Refuse to serve on an over-privileged runtime credential (finding E-05).
+
+    Called from :func:`ensure_schema`, which is the one place both boot paths already
+    pass through: ``main.py`` at import time and ``worker.worker_main_loop``. Putting it
+    here rather than in each entry point is what stops the two from drifting apart —
+    a worker that skipped the check would still be able to ``DROP TRIGGER``.
+
+    Enforced only in production mode (or when ``REQUIRE_LEAST_PRIVILEGE=1``); see
+    :func:`core.db_privileges.enforcement_enabled`. It runs *after* the schema
+    invariants so that a database which is simply un-migrated still reports that,
+    rather than reporting a privilege problem it cannot have caused.
+
+    The import is local because ``core.db_privileges`` imports ``core.security``, and
+    ``core.security`` is imported by nearly everything; a module-level import here
+    would risk a cycle at start-up.
+    """
+    from core import db_privileges
+
+    db_privileges.assert_runtime_is_least_privileged()
 
 
 def assert_security_invariants(engine=None) -> None:
