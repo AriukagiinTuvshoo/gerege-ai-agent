@@ -410,9 +410,21 @@ def record_audit_log(
     Raises `AuditLogWriteError` — never a bare driver exception — so a caller can
     tell "the audit write failed" apart from every other failure, and the connection
     is always closed.
+
+    E-03 (Phase 12 finding F-A). `get_connection()` used to be called OUTSIDE this
+    try. When acquisition itself failed — PostgreSQL "too many clients", pool
+    exhaustion, a mid-failover refusal — the raw driver exception escaped untyped,
+    `_audit_or_report` caught only `AuditLogWriteError`, and the endpoint answered
+    the framework's bare 500 "Internal server error" *after the business write had
+    already committed*. That is the exact R17 signature this function exists to
+    prevent, so acquisition is now inside the protected region: every failure of
+    the audit path, including failing to reach the database at all, arrives at the
+    caller as the one explicit contract.
     """
-    conn = get_connection()
+    conn = None
     try:
+        # Inside the try on purpose — see the note above.
+        conn = get_connection()
         cursor = conn.cursor()
         details_str = json.dumps(details or {}, ensure_ascii=False)
         cursor.execute(
@@ -429,16 +441,23 @@ def record_audit_log(
         # Roll back and surface a typed failure. `close()` releases the write lock, but
         # an explicit rollback is cheap and does not depend on that (measured in Phase 10:
         # an *unclosed* connection blocks every later SQLite writer).
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        #
+        # `conn` may be None if acquisition itself failed; there is then nothing to roll
+        # back, and the original acquisition error is still the documented cause.
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise AuditLogWriteError(action, exc) from exc
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        # Cleanup must be unconditional *and* safe: a connection that was never acquired
+        # must not turn a typed audit failure into an AttributeError at this boundary.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def list_audit_logs(page_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
