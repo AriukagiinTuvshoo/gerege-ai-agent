@@ -521,6 +521,41 @@ def create_payment_order_sync(
 # -------------------------------------------------------------
 # 5. ТӨЛБӨРИЙГ 1 СЕКУНДЭД АВТОМАТААР БАТАЛГААЖУУЛАХ (WEBHOOK / CALLBACK)
 # -------------------------------------------------------------
+def report_audit_outcome(result: Dict[str, Any], *, caller: str) -> bool:
+    """Mount the payment result's audit outcome on the surface a monitor can see.
+
+    E-03 (Phase 12 finding F-B). `process_successful_payment()` has always returned
+    `audit_recorded`, but until now nothing read it: the only trace of a lost
+    `payment.confirmed` row was a log line written inside the function. A log line
+    that no alert watches is not a signal.
+
+    This turns the field into an explicit, greppable, one-line event per payment so
+    that "money moved, audit row did not" is visible at the point the response is
+    built, with the caller and the invoice in the same record.
+
+    Returns True when the caller should treat the payment as fully accounted for
+    (nothing to report, or the audit was recorded), False when an audit loss was
+    reported. It NEVER decides whether the payment succeeded — the money has already
+    moved by the time any of this runs, and refusing or retrying the payment because
+    a log write failed would be a worse outcome than recording it late.
+
+    `audit_recorded is None` means no audit was expected on that path (replay or
+    already-settled), so there is nothing to report and nothing to alarm on.
+    """
+    recorded = result.get("audit_recorded")
+    if recorded is None or recorded is True:
+        return True
+
+    logger.error(
+        "AUDIT LOSS (unreported to caller): payment %r settled successfully via %s "
+        "but its payment.confirmed audit row was NOT written. The invoice is PAID. "
+        "Reconstruct the audit from the provider callback.",
+        result.get("invoice", {}).get("invoice_id") if isinstance(result.get("invoice"), dict) else None,
+        caller,
+    )
+    return False
+
+
 async def process_successful_payment(
     invoice_id: str,
     callback_data: Optional[Dict[str, Any]] = None,
@@ -537,9 +572,21 @@ async def process_successful_payment(
     """
     inv = database.get_invoice(invoice_id)
     if not inv:
-        return {"success": False, "message": "Нэхэмжлэх олдсонгүй"}
+        return {"success": False, "message": "Нэхэмжлэх олдсонгүй", "audit_recorded": None}
 
     if inv.get("status") == "PAID":
+        # E-03 (Phase 12 finding F-B). `audit_recorded` is returned on EVERY path, so a
+        # caller never has to guess whether a missing key means "audited fine" or "we
+        # forgot". The three states are:
+        #
+        #   True  -> this call wrote its audit row
+        #   False -> this call tried and FAILED to write it (payment still succeeded)
+        #   None  -> no audit was expected: the payment was already settled and audited
+        #            by the call that settled it
+        #
+        # Here the invoice was already PAID before this call did anything, so there is
+        # nothing new to record and writing `payment.confirmed` again would fabricate a
+        # second confirmation for one payment.
         return {
             "success": True,
             "message": "Аль хэдийн төлөгдсөн байна",
@@ -547,7 +594,8 @@ async def process_successful_payment(
             "ebarimt": {
                 "lottery": inv.get("ebarimt_lottery"),
                 "qr_data": inv.get("ebarimt_qr")
-            }
+            },
+            "audit_recorded": None,
         }
 
     page_id = inv.get("page_id", database.DEFAULT_PAGE_ID)
@@ -559,6 +607,10 @@ async def process_successful_payment(
         channel="qpay",
     ):
         fresh_inv = database.get_invoice(invoice_id) or inv
+        # Same `None` policy as the already-PAID branch above, and for the same reason:
+        # the lock is held by the call that is doing the work, so this one settled
+        # nothing and must not claim an audit it did not write. Any other choice would
+        # make a duplicate provider callback look like a fresh confirmation.
         return {
             "success": True,
             "message": "Аль хэдийн боловсруулагдсан байна (Idempotent Replay Guard)",
@@ -567,6 +619,7 @@ async def process_successful_payment(
                 "lottery": fresh_inv.get("ebarimt_lottery"),
                 "qr_data": fresh_inv.get("ebarimt_qr"),
             },
+            "audit_recorded": None,
         }
 
     amount = inv.get("amount", 0)

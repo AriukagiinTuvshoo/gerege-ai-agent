@@ -2006,12 +2006,22 @@ async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Qu
         callback_verified = 1
 
     # 3. Only process payment once provider verification has genuinely passed
-    await fintech_service.process_successful_payment(
+    result = await fintech_service.process_successful_payment(
         inv_id,
         callback_data=body,
         provider_payment_id=provider_payment_id,
         callback_verified=callback_verified,
     )
+    # E-03 (Phase 12 finding F-B). This return value used to be discarded, so the
+    # `audit_recorded` flag Phase 11 added had no consumer at all: a payment could be
+    # settled with no `payment.confirmed` row and the only trace was a log line inside
+    # the service. Report it explicitly against this caller.
+    #
+    # The HTTP answer deliberately does NOT change. QPay retries any non-200, and the
+    # money has already moved; a retry cannot write an audit row that the audit store
+    # refused, and would only re-drive a settled payment. The audit gap is an
+    # operator-reconciliation problem, not a provider-retry problem.
+    fintech_service.report_audit_outcome(result, caller="qpay_callback")
     return Response(content="SUCCESS", media_type="text/plain", status_code=200)
 
 @app.post("/api/fintech/invoices/{invoice_id}/simulate-pay")
@@ -2069,6 +2079,12 @@ async def simulate_invoice_payment_api(invoice_id: str, request: Request):
         provider_payment_id=f"SIMULATED_{int(time.time())}",
         callback_verified=0,
     )
+    # E-03 (Phase 12 finding F-B). Same duty as the webhook caller above: this path
+    # returns the result to an authenticated admin, so the audit outcome is reported
+    # explicitly rather than left for the caller to notice a key it was never told to
+    # look for. `res["audit_recorded"]` is now present on every return path (True /
+    # False / None) instead of only the success path.
+    fintech_service.report_audit_outcome(res, caller="simulate_pay")
     return res
 
 @app.get("/api/fintech/summary")
