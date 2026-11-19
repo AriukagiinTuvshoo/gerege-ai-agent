@@ -31,7 +31,13 @@ echo "Restoring latest pre_deploy database backup if available..."
 if [ -n "${DATABASE_OWNER_URL:-}" ]; then
   # `maintenance.py list` prints one archive per line; the label filter keeps the newest
   # pre_deploy snapshot only.
-  PRE=$(python scripts/maintenance.py list | grep pre_deploy | head -1 | awk '{print $1}')
+  # Phase 18: this used to grep `maintenance.py list` for a `pre_deploy` archive and
+  # silently skip the restore when the result was empty. Since the deploy path encrypts
+  # the snapshot, `list` could not see it, so PRE was always empty and every rollback
+  # recovered code while leaving the database from the failed deploy in place -- while
+  # still printing "Completed". `list` now reports encrypted archives, and an empty
+  # result here is a hard failure rather than a quiet no-op.
+  PRE=$(python scripts/maintenance.py list | grep pre_deploy | head -1 | awk '{print $1}') || PRE=""
   if [ -n "${PRE:-}" ]; then
     # A restore recreates tables, so ownership and grants are re-converged afterwards.
     # `restore` fails closed (non-zero) rather than leaving a half-restored database.
@@ -51,10 +57,18 @@ if [ -n "${DATABASE_OWNER_URL:-}" ]; then
     }
     python scripts/provision_roles.py --verify
   else
-    echo "No pre_deploy backup found: database is NOT being rolled back."
+    echo "ERROR: no pre_deploy snapshot was found, so the database has NOT been rolled" >&2
+    echo "       back. The schema and data still come from the failed deploy. Starting the" >&2
+    echo "       previous release against it may fail or corrupt data." >&2
+    echo "       Inspect: python scripts/maintenance.py list" >&2
+    echo "       Then restore a known-good archive by hand before restarting anything." >&2
+    exit 1
   fi
 else
-  echo "DATABASE_OWNER_URL is not set: database is NOT being rolled back."
+  echo "WARNING: DATABASE_OWNER_URL is not set, so the database is NOT being rolled back." >&2
+  echo "         Only application code was reverted; the data still comes from the failed" >&2
+  echo "         deploy. Set DATABASE_OWNER_URL and re-run to restore a snapshot." >&2
+  exit 1
 fi
 
 if command -v docker >/dev/null 2>&1 && [ -f docker-compose.prod.yml ]; then

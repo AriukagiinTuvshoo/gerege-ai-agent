@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 import database
+from core import backup_archive
 from core.db_engine import is_postgres, get_database_url, dispose_shared_engine
 
 logger = logging.getLogger("core.backup_service")
@@ -35,12 +36,20 @@ class MaintenanceCredentialRequired(RuntimeError):
     """
 
 
-def _assert_maintenance_credential() -> None:
+def _assert_maintenance_credential(operation: str = "backup") -> None:
     """Refuse to dump/restore as a role that cannot complete the operation.
 
     Only meaningful on PostgreSQL; SQLite has no roles and its backup path copies a
     file, so it is unaffected. Deliberately raises rather than returning a dict, and
     deliberately does not echo the DSN.
+
+    Phase 18: ``operation`` splits one check into two, because the requirements differ
+    and conflating them broke disaster recovery. ``pg_dump`` needs ``LOCK TABLE`` on
+    every *existing* table, which means owning all of them — but a **restore into a
+    destroyed database has no tables to own**, and the single-condition version of this
+    guard therefore refused to restore in precisely the scenario backups exist for.
+    A restore instead needs to be able to ``DROP``/``CREATE`` inside the schema, which
+    is ownership of the schema (or superuser).
     """
     from core.db_engine import get_db_connection, is_postgres
 
@@ -60,20 +69,24 @@ def _assert_maintenance_credential() -> None:
         # That is wrong twice over: it RAISES when the role does not exist (crashing a
         # cluster where provisioning has not run), and it would refuse a perfectly valid
         # single-credential deployment whose role simply has a different name.
-        #
-        # `pg_dump` requirement, measured: it needs `LOCK TABLE ... ACCESS SHARE` on
-        # every table, which in practice means being the owner (or a superuser). So that
-        # is the question asked here.
+        # ``current_schema()`` is NULL when the search path has no existing schema
+        # (for example immediately after ``DROP SCHEMA public; CREATE SCHEMA public;``
+        # with a stale search_path). COALESCE keeps the guard from raising instead of
+        # reporting: a destroyed database must be reportable, not a crash.
         cur.execute(
             """
             SELECT current_user, r.rolsuper,
                    (SELECT COUNT(*) FROM pg_class c
                       JOIN pg_namespace n ON n.oid = c.relnamespace
-                     WHERE n.nspname = current_schema() AND c.relkind IN ('r','p')
+                     WHERE n.nspname = COALESCE(current_schema(), 'public') AND c.relkind IN ('r','p')
                        AND pg_get_userbyid(c.relowner) = current_user),
                    (SELECT COUNT(*) FROM pg_class c
                       JOIN pg_namespace n ON n.oid = c.relnamespace
-                     WHERE n.nspname = current_schema() AND c.relkind IN ('r','p'))
+                     WHERE n.nspname = COALESCE(current_schema(), 'public') AND c.relkind IN ('r','p')),
+                   (SELECT COUNT(*) FROM pg_namespace n
+                     WHERE n.nspname = COALESCE(current_schema(), 'public')
+                       AND pg_get_userbyid(n.nspowner) = current_user),
+                   COALESCE(has_schema_privilege(COALESCE(current_schema(), 'public')::text, 'CREATE'), false)
               FROM pg_roles r WHERE r.rolname = current_user
             """
         )
@@ -87,20 +100,45 @@ def _assert_maintenance_credential() -> None:
 
     if not row:
         raise MaintenanceCredentialRequired("could not determine the current database role")
-    user, is_superuser, owned, total = row
-    # A superuser can always dump. Otherwise every table must be owned by this role;
-    # owning *some* is not enough, because pg_dump locks all of them.
+    user, is_superuser, owned, total, owns_schema, can_create = row
+
+    if operation == "restore":
+        # Restoring replays DROP/CREATE. Owning the schema (or being able to CREATE in
+        # it) is the requirement; existing tables must also be ours, because the dump
+        # drops them. With zero tables the owned==total test is vacuously satisfied,
+        # which is what makes a destroyed-database restore possible.
+        if is_superuser or ((owns_schema or can_create) and owned == total):
+            return
+        raise MaintenanceCredentialRequired(
+            f"role '{user}' cannot restore into this database: it owns {owned} of {total} "
+            "table(s) and does not own the schema or hold CREATE on it. Restore replays "
+            "DROP/CREATE, so it would fail part-way.\n"
+            "Run restore as the maintenance role instead:\n"
+            "  docker compose -f docker-compose.prod.yml run --rm maintenance "
+            "python scripts/maintenance.py restore <archive> --yes\n"
+            "See docs/operations/BACKUP_ENCRYPTION.md."
+        )
+
+    # Backup: a superuser can always dump. Otherwise every table must be owned by this
+    # role; owning *some* is not enough, because pg_dump locks all of them.
     if is_superuser or (total > 0 and owned == total):
         return
+    if total == 0:
+        # An empty schema produces an empty archive. That is not a backup, and silently
+        # writing one is the "0-byte backup recorded as success" failure E-05 removed.
+        raise MaintenanceCredentialRequired(
+            f"role '{user}' cannot create a backup: this schema contains no tables, so the "
+            "dump would be empty. If you are recovering, run `restore` instead of `backup`."
+        )
     raise MaintenanceCredentialRequired(
-        f"role '{user}' cannot create a trustworthy backup or restore: it owns {owned} of "
+        f"role '{user}' cannot create a trustworthy backup: it owns {owned} of "
         f"{total} table(s) in this schema, and pg_dump needs LOCK TABLE on all of them. "
         "It fails with 'permission denied' and leaves an empty archive.\n"
         "Run backup/restore as the maintenance role instead:\n"
         "  docker compose -f docker-compose.prod.yml run --rm maintenance "
         "python scripts/maintenance.py backup\n"
         "  python scripts/maintenance.py backup     (host, DATABASE_OWNER_URL set)\n"
-        "See docs/operations/BACKUP_RESTORE.md."
+        "See docs/operations/BACKUP_ENCRYPTION.md."
     )
 
 
@@ -150,11 +188,16 @@ def _collect_db_table_counts() -> Dict[str, int]:
     return counts
 
 
-def create_backup(label: str = "manual") -> Dict[str, Any]:
+def create_backup(label: str = "manual", staging_dir: Optional[str] = None) -> Dict[str, Any]:
     """
-    Өгөгөгдлийн сангийн бүрэн нөөцлөлт (Backup) үүсгэж, gzip шахалт, SHA-256 checksum (.sha256),
+    Өгөгдлийн сангийн бүрэн нөөцлөлт (Backup) үүсгэж, gzip шахалт, SHA-256 checksum (.sha256),
     болон метадата манифест (.meta.json) хадгалах.
     SQLite үед online backup API (`sqlite3.Connection.backup`), PostgreSQL үед `pg_dump` ашиглана.
+
+    Phase 18: the dump is written into a private 0700 staging directory first, and only
+    moved into ``BACKUP_DIR`` once it is complete. When the caller supplies
+    ``staging_dir`` (as the scheduled path does) the plaintext never enters the backup
+    directory at all, so an encryption failure downstream cannot leave it behind.
     """
     _assert_maintenance_credential()
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -163,9 +206,15 @@ def create_backup(label: str = "manual") -> Dict[str, Any]:
     engine_name = "postgresql" if is_postgres() else "sqlite"
     table_counts = _collect_db_table_counts()
 
+    inner_name = (
+        f"pg_backup_{safe_label}_{ts}.sql.gz"
+        if is_postgres()
+        else f"sqlite_backup_{safe_label}_{ts}.db.gz"
+    )
+    filename = inner_name
+    dest_path = os.path.join(staging_dir, inner_name) if staging_dir else os.path.join(BACKUP_DIR, inner_name)
+
     if is_postgres():
-        filename = f"pg_backup_{safe_label}_{ts}.sql.gz"
-        dest_path = os.path.join(BACKUP_DIR, filename)
         pg_url = get_database_url().replace("postgresql+psycopg2://", "postgresql://")
         try:
             proc = subprocess.run(
@@ -180,9 +229,7 @@ def create_backup(label: str = "manual") -> Dict[str, Any]:
             logger.error(f"PostgreSQL pg_dump failed: {e}")
             return {"success": False, "error": str(e)}
     else:
-        filename = f"sqlite_backup_{safe_label}_{ts}.db.gz"
-        raw_temp = os.path.join(BACKUP_DIR, f".tmp_{ts}.db")
-        dest_path = os.path.join(BACKUP_DIR, filename)
+        raw_temp = dest_path + ".raw.tmp"
         try:
             src_conn = sqlite3.connect(database.DB_PATH)
             dst_conn = sqlite3.connect(raw_temp)
@@ -203,9 +250,20 @@ def create_backup(label: str = "manual") -> Dict[str, Any]:
                 except Exception:
                     pass
 
+    # Phase 18: a dump is tenant data; never let it be born world-readable.
+    for _p in (dest_path,):
+        try:
+            os.chmod(_p, 0o600)
+        except OSError:
+            pass
+
     sha256_hex = _compute_sha256(dest_path)
     with open(dest_path + ".sha256", "w", encoding="utf-8") as sf:
         sf.write(f"{sha256_hex}  {filename}\n")
+    try:
+        os.chmod(dest_path + ".sha256", 0o600)
+    except OSError:
+        pass
 
     size_bytes = os.path.getsize(dest_path)
     created_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -236,21 +294,36 @@ def create_backup(label: str = "manual") -> Dict[str, Any]:
 
 
 def list_backups() -> List[Dict[str, Any]]:
-    """Хадгалагдсан backup файлуудын жагсаалтыг буцаах"""
+    """Хадгалагдсан backup файлуудын жагсаалтыг буцаах.
+
+    Phase 18: encrypted archives (``.enc``) are listed too, with their encryption format
+    and whether the ciphertext is authenticated. Phase 17 found this function filtering
+    them out, which made ``maintenance.py list`` report "no backups" while a full set of
+    encrypted archives sat in the directory — and made ``rollback.sh`` resolve its
+    pre-deploy snapshot to the empty string.
+    """
     if not os.path.exists(BACKUP_DIR):
         return []
     items: List[Dict[str, Any]] = []
     for fname in sorted(os.listdir(BACKUP_DIR), reverse=True):
-        if not (fname.endswith(".db.gz") or fname.endswith(".sql.gz")):
+        if fname.startswith("."):
+            continue
+        if not backup_archive.is_archive_name(fname):
             continue
         fpath = os.path.join(BACKUP_DIR, fname)
-        sha_path = fpath + ".sha256"
-        meta_path = fpath + ".meta.json"
+        if not os.path.isfile(fpath):
+            continue
+        # Sidecars are named after the inner (plaintext) archive even when the ciphertext
+        # is what survives on disk; look both up.
+        inner = fname[: -len(backup_archive.ENCRYPTED_SUFFIX)] if backup_archive.is_encrypted_name(fname) else fname
+        sha_path = os.path.join(BACKUP_DIR, inner + ".sha256")
+        meta_path = os.path.join(BACKUP_DIR, inner + ".meta.json")
         sha_val = ""
         meta_obj: Dict[str, Any] = {}
         if os.path.exists(sha_path):
             try:
-                sha_val = open(sha_path, "r", encoding="utf-8").read().split()[0]
+                fields = open(sha_path, "r", encoding="utf-8").read().split()
+                sha_val = fields[0] if fields else ""
             except Exception:
                 sha_val = ""
         if os.path.exists(meta_path):
@@ -258,43 +331,112 @@ def list_backups() -> List[Dict[str, Any]]:
                 meta_obj = json.loads(open(meta_path, "r", encoding="utf-8").read())
             except Exception:
                 meta_obj = {}
-        items.append({
+        encrypted = backup_archive.is_encrypted_name(fname)
+        info = {
             "filename": fname,
             "size_bytes": os.path.getsize(fpath),
             "sha256": sha_val,
-            "engine": meta_obj.get("engine") or ("postgresql" if fname.endswith(".sql.gz") else "sqlite"),
+            "engine": meta_obj.get("engine") or ("postgresql" if inner.endswith(".sql.gz") else "sqlite"),
             "schema_version": meta_obj.get("schema_version", SCHEMA_VERSION),
             "table_counts": meta_obj.get("table_counts", {}),
             "modified_at": datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d %H:%M:%S"),
-        })
+            "encrypted": encrypted,
+            "label": meta_obj.get("label", ""),
+        }
+        if encrypted:
+            fmt = backup_archive.encryption_format(fpath)
+            info["encryption_format"] = fmt
+            # Only the authenticated format carries a cryptographic integrity guarantee.
+            info["authenticated"] = fmt == "authenticated"
+        else:
+            info["encryption_format"] = "none"
+            info["authenticated"] = False
+        items.append(info)
     return items
 
 
-def verify_backup(filename: str) -> Dict[str, Any]:
-    """
-    Backup файлын SHA-256 бүрэн бүтэн байдал, SQLite integrity_check + isolated table read test,
-    эсвэл PostgreSQL gzip stream & SQL dump structure шалгах.
+def _key_file() -> Optional[str]:
+    path = os.getenv("BACKUP_ENCRYPTION_KEY_FILE", "").strip()
+    return path or None
+
+
+def verify_backup(filename: str, key_file: Optional[str] = None) -> Dict[str, Any]:
+    """Verify one archive, decrypting it when it is encrypted.
+
+    Phase 18: an ``.enc`` archive is verified by *authenticating the ciphertext*, not by
+    checking a gzip CRC after a blind decryption. For the authenticated format a wrong
+    key, a flipped bit, a truncated file and a forged stream all fail here with a nonzero
+    result. ``valid`` is only ever True when the bytes decrypted were proven to be the
+    bytes that were encrypted.
     """
     clean_name = os.path.basename(filename)
     fpath = os.path.join(BACKUP_DIR, clean_name)
     if not os.path.exists(fpath):
         return {"valid": False, "error": "Backup file not found"}
-
+    if not backup_archive.is_archive_name(clean_name):
+        return {"valid": False, "error": "Unsupported backup file extension"}
     if os.path.getsize(fpath) == 0:
         return {"valid": False, "error": "Backup file is empty (0 bytes)"}
 
+    encrypted = backup_archive.is_encrypted_name(clean_name)
+
+    # Phase 18: checksum the file that is actually on disk. For a plaintext archive that
+    # is the dump itself; for an encrypted one it is the ciphertext, and the sidecar is
+    # rewritten to match after encryption so it can still be checked months later.
+    inner_name = clean_name[: -len(backup_archive.ENCRYPTED_SUFFIX)] if encrypted else clean_name
     actual_sha = _compute_sha256(fpath)
-    sha_path = fpath + ".sha256"
-    if os.path.exists(sha_path):
+    sha_candidates = [os.path.join(BACKUP_DIR, clean_name + ".sha256")]
+    if encrypted:
+        sha_candidates.append(os.path.join(BACKUP_DIR, inner_name + ".sha256"))
+    for sha_path in sha_candidates:
+        if not os.path.exists(sha_path):
+            continue
         try:
             expected_sha = open(sha_path, "r", encoding="utf-8").read().split()[0]
         except Exception:
             expected_sha = ""
-        if not expected_sha or actual_sha != expected_sha:
-            return {"valid": False, "error": "SHA-256 checksum mismatch"}
+        # A sidecar that hashes the *deleted plaintext* cannot validate ciphertext; the
+        # scheduled path rewrites it, so a stale one is a real integrity signal.
+        if expected_sha and expected_sha != actual_sha:
+            return {
+                "valid": False,
+                "error": "SHA-256 checksum mismatch (the archive on disk is not the one that was recorded)",
+            }
 
+    if encrypted:
+        key = key_file or _key_file()
+        try:
+            with backup_archive.resolve(BACKUP_DIR, clean_name, key) as resolved:
+                inner_check = _verify_plaintext_dump(resolved.plaintext_path, inner_name)
+                if not inner_check.get("valid"):
+                    return inner_check
+                result = {
+                    "valid": True,
+                    "filename": clean_name,
+                    "sha256": actual_sha,
+                    "encrypted": True,
+                    "encryption_format": resolved.format,
+                    "authenticated": resolved.authenticated,
+                }
+                if not resolved.authenticated:
+                    result["warning"] = (
+                        "legacy openssl format: the ciphertext carries no authentication tag; "
+                        "integrity rests on the SHA-256 sidecar and the gzip CRC only"
+                    )
+                return result
+        except backup_archive.ArchiveError as exc:
+            return {"valid": False, "error": str(exc)}
+
+    result = _verify_plaintext_dump(fpath, clean_name)
+    if result.get("valid"):
+        result.update(sha256=actual_sha, encrypted=False, encryption_format="none", authenticated=False)
+    return result
+
+
+def _verify_plaintext_dump(fpath: str, clean_name: str) -> Dict[str, Any]:
+    """Structure check for a plaintext dump (the part verify_backup always did)."""
     if clean_name.endswith(".db.gz"):
-        tmp_check = os.path.join(BACKUP_DIR, f".verify_{clean_name}.db")
+        tmp_check = os.path.join(BACKUP_DIR, f".verify_{os.path.basename(clean_name)}.db")
         try:
             with gzip.open(fpath, "rb") as f_in, open(tmp_check, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
@@ -317,7 +459,6 @@ def verify_backup(filename: str) -> Dict[str, Any]:
                     os.remove(tmp_check)
                 except Exception:
                     pass
-
     elif clean_name.endswith(".sql.gz"):
         try:
             with gzip.open(fpath, "rt", encoding="utf-8", errors="replace") as gz:
@@ -334,7 +475,7 @@ def verify_backup(filename: str) -> Dict[str, Any]:
     else:
         return {"valid": False, "error": "Unsupported backup file extension"}
 
-    return {"valid": True, "filename": clean_name, "sha256": actual_sha}
+    return {"valid": True, "filename": clean_name}
 
 
 _REQUIRED_RESTORE_TABLES = (
@@ -497,7 +638,19 @@ def _apply_postgres_sql_file(sql_gz_path: str, pg_url: str, server_ver: int = 0)
             for line in gz:
                 if server_ver and server_ver < 170000 and line.lstrip().startswith("SET transaction_timeout"):
                     continue
+                # `COMMENT ON SCHEMA public` is an ownership assertion, not data. Dropping
+                # it is what makes a restore-as-owner work on a normal cluster; the
+                # schema's own comment is cosmetic and is restored by nothing that matters.
+                if line.lstrip().upper().startswith("COMMENT ON SCHEMA PUBLIC"):
+                    continue
                 sql_out.write(line)
+        # Phase 18: `pg_dump` emits `COMMENT ON SCHEMA public IS ''`, and only the
+        # schema's owner may execute that. On a cluster where `public` belongs to the
+        # bootstrap account (the normal case — it is created by initdb/the first
+        # superuser), restoring as `gerege_owner` therefore failed with
+        # "must be owner of schema public" *on every restore into an existing database*,
+        # not just during rollback. The comment carries no data, so it is dropped along
+        # with the transaction_timeout line for older servers.
         proc = subprocess.run(
             ["psql", "--single-transaction", "-v", "ON_ERROR_STOP=1", "-f", tmp_path, pg_url],
             capture_output=True,
@@ -565,6 +718,36 @@ def _reconverge_runtime_grants(pg_url: str) -> Tuple[bool, str]:
         )
 
 
+def _database_is_empty() -> bool:
+    """True when the target schema holds no user tables (a destroyed or fresh database)."""
+    try:
+        from core.db_engine import is_postgres
+
+        if not is_postgres():
+            return not os.path.exists(database.DB_PATH) or os.path.getsize(database.DB_PATH) == 0
+        from core.db_engine import get_db_connection
+
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = COALESCE(current_schema(), 'public')
+                   AND c.relkind IN ('r','p')
+                """
+            )
+            total = cur.fetchone()[0]
+            cur.close()
+            return int(total) == 0
+        finally:
+            conn.close()
+    except Exception:
+        # If we cannot tell, assume non-empty so the snapshot is still attempted.
+        return False
+
+
 def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[str, Any]:
     """
     Backup файлаас өгөгдлийн санг атомик байдлаар аюулгүй сэргээх (Recovery):
@@ -576,28 +759,64 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
        зорилтот PostgreSQL баазаас схем, хүснэгт болон мөрийн тоог бодитоор шалгана.
     4. Баталгаажуулалт унавал `pre_restore` snapshot-оос буцаан бодитоор сэргээнэ (P0 Rollback Fix).
     """
-    _assert_maintenance_credential()
+    _assert_maintenance_credential("restore")
     check = verify_backup(filename)
     if not check.get("valid"):
         return {"success": False, "error": check.get("error", "Invalid backup"), "post_restore_verified": False}
 
     clean_name = os.path.basename(filename)
-    fpath = os.path.join(BACKUP_DIR, clean_name)
-    expected_counts = _load_expected_counts(fpath)
-
-    # Pre-restore safety snapshot
-    pre_snap = create_backup(label="pre_restore")
-    if not pre_snap.get("success"):
+    encrypted = backup_archive.is_encrypted_name(clean_name)
+    # Phase 18: encrypted archives are decrypted to a private temp file here and the
+    # existing (verified) restore machinery operates on that. The plaintext exists only
+    # inside a 0700 staging directory for the duration of the restore.
+    try:
+        resolved = backup_archive.resolve(BACKUP_DIR, clean_name, _key_file())
+        resolved.__enter__()
+    except backup_archive.ArchiveError as exc:
         return {
             "success": False,
-            "error": f"Failed to create pre-restore snapshot: {pre_snap.get('error')}",
+            "error": str(exc),
             "post_restore_verified": False,
             "rolled_back": False,
             "atomic_rollback": False,
         }
+    try:
+        return _restore_resolved(resolved, clean_name, encrypted, target_db_url, check)
+    finally:
+        resolved.__exit__(None, None, None)
 
-    if clean_name.endswith(".db.gz"):
-        tmp_restore = os.path.join(BACKUP_DIR, f".restore_{clean_name}.db")
+
+def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url, check) -> Dict[str, Any]:
+    """Restore from a resolved (already decrypted when needed) archive."""
+    fpath = resolved.plaintext_path
+    restore_name = os.path.basename(fpath)
+    expected_counts = _load_expected_counts(os.path.join(BACKUP_DIR, clean_name))
+    if not expected_counts and encrypted:
+        expected_counts = _load_expected_counts(fpath)
+
+    # Pre-restore safety snapshot.
+    #
+    # Phase 18: this is skipped when the target database is empty. A restore into a
+    # destroyed database is the primary disaster scenario -- there is nothing to snapshot,
+    # and treating "cannot snapshot" as fatal turned the recovery operation into a no-op
+    # in exactly the case it exists for. The snapshot still protects every restore onto a
+    # populated database, where pre-restore state is the thing worth preserving.
+    pre_snap: Dict[str, Any]
+    if _database_is_empty():
+        pre_snap = {"success": True, "skipped": True, "filename": None, "table_counts": {}}
+    else:
+        pre_snap = create_backup(label="pre_restore")
+        if not pre_snap.get("success"):
+            return {
+                "success": False,
+                "error": f"Failed to create pre-restore snapshot: {pre_snap.get('error')}",
+                "post_restore_verified": False,
+                "rolled_back": False,
+                "atomic_rollback": False,
+            }
+
+    if restore_name.endswith(".db.gz"):
+        tmp_restore = os.path.join(BACKUP_DIR, f".restore_{restore_name}.db")
         try:
             with gzip.open(fpath, "rb") as f_in, open(tmp_restore, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
@@ -667,9 +886,12 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
             "rolled_back": False,
             "atomic_rollback": False,
             "restored_table_counts": live_check.get("table_counts", {}),
+            "restored_from_encrypted": encrypted,
+            "archive_integrity": check.get("encryption_format", "none"),
+            "archive_authenticated": check.get("authenticated", False),
         }
 
-    if clean_name.endswith(".sql.gz"):
+    if restore_name.endswith(".sql.gz"):
         pg_url = (target_db_url or get_database_url()).replace("postgresql+psycopg2://", "postgresql://")
         if not pg_url.startswith(("postgresql://", "postgres://")):
             return {
@@ -785,7 +1007,13 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
                     "rollback_status": "ROLLBACK_FAILED",
                     "rolled_back": False,
                     "atomic_rollback": False,
-                    "recovery_instruction": f"CRITICAL: Automatic rollback failed. Manual recovery required: psql {pg_url} < {pre_name}",
+                    # Phase 18: never interpolate the DSN here. It carries the owner password,
+                    # and this string is printed, logged and returned to the CLI.
+                    "recovery_instruction": (
+                        "CRITICAL: Automatic rollback failed and manual recovery is required. "
+                        f"Snapshot: {pre_name}. Replay it with maintenance.py restore "
+                        "(the connection string is intentionally omitted from this message)."
+                    ),
                     "pre_restore_snapshot": pre_name,
                 }
 

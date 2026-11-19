@@ -51,6 +51,7 @@ EXIT_INTEGRITY_FAILED = 12
 EXIT_CREDENTIAL_INVALID = 13
 EXIT_OFFSITE_FAILED = 14
 EXIT_NOT_CONFIGURED = 15
+EXIT_LOCKED = 16
 
 ENCRYPTED_SUFFIX = ".enc"
 DEFAULT_RETENTION_DAYS = 14
@@ -78,7 +79,11 @@ def min_keep() -> int:
     A retention bug that deletes every backup is worse than a full disk, so the age
     rule is always bounded by a count floor.
     """
-    return _env_int("BACKUP_MIN_KEEP", DEFAULT_MIN_KEEP)
+    value = _env_int("BACKUP_MIN_KEEP", DEFAULT_MIN_KEEP)
+    # Phase 18: Phase 17 found that a negative floor deleted every archive. A retention
+    # floor exists to prevent exactly that, so an out-of-range value is corrected rather
+    # than honoured.
+    return max(1, value)
 
 
 def encryption_required() -> bool:
@@ -117,57 +122,38 @@ def _status_path() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _openssl() -> Optional[str]:
-    return shutil.which("openssl")
-
-
 def encrypt_file(src: str, dest: str, key_file: str) -> Tuple[bool, str]:
-    """Encrypt ``src`` to ``dest``. Returns ``(ok, error)`` and never echoes the key."""
-    openssl = _openssl()
-    if not openssl:
-        return False, "openssl is not installed; cannot encrypt the archive"
-    if not os.path.exists(key_file):
-        return False, f"encryption key file not found: {os.path.basename(key_file)}"
+    """Encrypt ``src`` to ``dest`` with authenticated AES-256-GCM.
+
+    Phase 18 replaced the Phase 16 ``openssl enc -aes-256-cbc`` call. CBC carries no MAC,
+    so a modified archive decrypted cleanly and the product could not tell a genuine
+    archive from a forged one; ``openssl enc`` in OpenSSL 3.0 cannot do AEAD at all.
+    See :mod:`core.backup_crypto` for the container format.
+    """
+    from core import backup_crypto
+
     try:
-        # -pass file: keeps the key out of argv (visible in `ps` to every local user).
-        proc = subprocess.run(
-            [
-                openssl, "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000",
-                "-salt", "-in", src, "-out", dest,
-                "-pass", f"file:{key_file}",
-            ],
-            capture_output=True,
-            timeout=1800,
-        )
-    except Exception as exc:  # pragma: no cover - subprocess failure
-        return False, f"openssl could not run: {type(exc).__name__}"
-    if proc.returncode != 0:
-        detail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
-        return False, f"openssl failed: {detail[-1][:200] if detail else 'no detail'}"
+        backup_crypto.encrypt_file(src, dest, key_file, original_name=os.path.basename(src))
+    except backup_crypto.EncryptionError as exc:
+        return False, str(exc)
+    except Exception as exc:  # pragma: no cover - unexpected I/O
+        return False, f"encryption failed: {type(exc).__name__}"
     return True, ""
 
 
 def decrypt_file(src: str, dest: str, key_file: str) -> Tuple[bool, str]:
-    """Reverse of :func:`encrypt_file`, used by the restore drill and by ``restore``."""
-    openssl = _openssl()
-    if not openssl:
-        return False, "openssl is not installed; cannot decrypt the archive"
+    """Authenticated decryption. Kept for the restore drill and for operator tooling."""
+    from core import backup_crypto
+
     try:
-        proc = subprocess.run(
-            [
-                openssl, "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000",
-                "-in", src, "-out", dest,
-                "-pass", f"file:{key_file}",
-            ],
-            capture_output=True,
-            timeout=1800,
-        )
+        if backup_crypto.is_authenticated_archive(src):
+            backup_crypto.decrypt_file(src, dest, key_file)
+        else:
+            backup_crypto.decrypt_legacy_openssl(src, dest, key_file)
+    except backup_crypto.EncryptionError as exc:
+        return False, str(exc)
     except Exception as exc:  # pragma: no cover
-        return False, f"openssl could not run: {type(exc).__name__}"
-    if proc.returncode != 0:
-        # A wrong key and a corrupt ciphertext are indistinguishable here, and saying
-        # which would leak whether a guessed key was close. Report both possibilities.
-        return False, "decryption failed (wrong key or corrupt archive)"
+        return False, f"decryption failed: {type(exc).__name__}"
     return True, ""
 
 
@@ -196,7 +182,17 @@ def prune(directory: str, days: int, keep_min: int, dry_run: bool = False) -> Li
     """Delete archives older than ``days``, never dropping below ``keep_min`` total.
 
     Both the age rule and the count floor apply; whichever is more conservative wins.
+    The floor is clamped to at least one archive, and a negative or zero configuration is
+    corrected rather than obeyed — Phase 17 found ``BACKUP_MIN_KEEP=-5`` silently deleted
+    every backup, which is the one outcome a retention floor exists to prevent.
+
+    Phase 18 also fixed sidecar orphaning: Phase 16 built ``<archive>.enc.json`` while the
+    real metadata file is ``<archive>.meta.json``, so every pruned archive left its
+    checksum and manifest behind forever.
     """
+    from core import backup_archive
+
+    keep_min = max(1, int(keep_min))
     cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
     items = _archives(directory)
     removed: List[str] = []
@@ -213,9 +209,13 @@ def prune(directory: str, days: int, keep_min: int, dry_run: bool = False) -> Li
         try:
             os.remove(path)
             removed.append(name)
-            for sidecar in (path + ".sha256", path + ".json"):
-                if os.path.exists(sidecar):
+            # One helper decides which files belong to this archive, so an encrypted
+            # archive also takes the sidecars named after its inner plaintext name.
+            for sidecar in backup_archive.sidecar_paths(directory, name).values():
+                try:
                     os.remove(sidecar)
+                except OSError:
+                    pass
         except OSError:
             continue
     return removed
@@ -277,14 +277,50 @@ def _write_status(payload: Dict[str, Any], directory: str) -> None:
         pass
 
 
+def _publish_ciphertext_checksum(directory: str, ciphertext_path: str) -> str:
+    """Hash the **ciphertext** and write a ``sha256sum``-compatible sidecar.
+
+    Phase 17: the sidecar hashed the plaintext, which encryption then deleted, so months
+    later the only checksum on disk referred to a file that no longer existed and could
+    not detect bit-rot in the archive that did. The plaintext-name sidecar is rewritten
+    to describe the ciphertext, and a second sidecar named after the ciphertext makes the
+    association obvious to anyone reading the directory.
+    """
+    from core.backup_service import _compute_sha256
+
+    digest = _compute_sha256(ciphertext_path)
+    name = os.path.basename(ciphertext_path)
+    inner = name[: -len(ENCRYPTED_SUFFIX)] if name.endswith(ENCRYPTED_SUFFIX) else name
+    targets = {
+        os.path.join(directory, name + ".sha256"),
+        os.path.join(directory, inner + ".sha256"),
+    }
+    for path in targets:
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f"{digest}  {name}\n")
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return digest
+
+
 def run_scheduled_backup(label: str = "scheduled") -> Dict[str, Any]:
     """One complete scheduled run: backup, encrypt, verify, retain, copy off, alert.
 
     Returns a result dict that is also written to ``<BACKUP_DIR>/.last_backup_status.json``
     so monitoring can read success/failure without parsing logs. ``exit_code`` is the
     value the process should exit with.
+
+    Phase 18 changed the *shape* of the run, not just its steps. Phase 16 wrote the
+    plaintext dump into ``BACKUP_DIR`` and encrypted it afterwards, so every failure
+    between those two points left a world-readable copy of every tenant's data behind.
+    The dump is now created inside a private 0700 staging directory and the only thing
+    that is ever published into ``BACKUP_DIR`` is the ciphertext (or, when encryption is
+    explicitly disabled, the dump — announced as a warning). The whole run is serialised
+    by an advisory lock so two timers cannot overlap or prune each other's work.
     """
-    from core import backup_service
+    from core import backup_service, backup_staging
 
     started = datetime.now(timezone.utc).isoformat()
     directory = backup_dir()
@@ -299,82 +335,132 @@ def run_scheduled_backup(label: str = "scheduled") -> Dict[str, Any]:
         "success": False,
     }
 
-    # 1. The backup itself, via the owner-credentialed guard.
+    os.makedirs(directory, exist_ok=True)
+    swept = backup_staging.sweep_stale_staging(directory)
+    if swept:
+        result["warnings"].append(f"removed {len(swept)} stale staging director(ies) from a previous crash")
+
     try:
-        created = backup_service.create_backup(label=label)
-    except Exception as exc:
+        lock = backup_staging.backup_lock(directory)
+        lock.__enter__()
+    except backup_staging.LockUnavailable as exc:
+        result.update(success=False, exit_code=EXIT_LOCKED, error=str(exc))
+        _finish(result, directory)
+        return result
+    except OSError as exc:
+        # An unwritable or missing backup directory. Phase 17 only exercised this through
+        # an uncaught traceback, which tells an operator nothing they can act on.
         result.update(
             success=False,
             exit_code=EXIT_BACKUP_FAILED,
-            error=f"{type(exc).__name__}: {exc}",
+            error=(
+                f"backup directory is not writable: {type(exc).__name__} "
+                f"({os.path.basename(directory) or directory}); check ownership and mode"
+            ),
         )
         _finish(result, directory)
         return result
 
-    if not created.get("success"):
-        result.update(
-            success=False,
-            exit_code=EXIT_BACKUP_FAILED,
-            error=str(created.get("error") or "backup failed"),
-        )
-        _finish(result, directory)
-        return result
+    try:
+        return _run_scheduled_backup_locked(label, directory, result)
+    finally:
+        lock.__exit__(None, None, None)
 
-    filename = created["filename"]
-    archive = os.path.join(directory, filename)
-    result.update(filename=filename, size_bytes=created.get("size_bytes"))
 
-    # 2. A backup that cannot be verified is not a backup.
-    check = backup_service.verify_backup(filename)
-    if not check.get("valid"):
-        result.update(
-            success=False,
-            exit_code=EXIT_INTEGRITY_FAILED,
-            error=f"verification failed: {check.get('error')}",
-        )
-        _finish(result, directory)
-        return result
+def _run_scheduled_backup_locked(label: str, directory: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    from core import backup_service, backup_staging
 
-    # 3. Encryption. Fatal when required and impossible — never downgrade silently.
-    if encryption_required():
-        key_file = _key_path()
-        if not key_file:
-            result.update(
-                success=False,
-                exit_code=EXIT_NOT_CONFIGURED,
-                error=(
-                    "BACKUP_ENCRYPTION_KEY_FILE is not set but encryption is required. "
-                    "Refusing to leave plaintext tenant data on disk. Set the key file "
-                    "(see docs/operations/BACKUP_RESTORE.md), or set BACKUP_ENCRYPTION=off "
-                    "for a non-production environment."
-                ),
-            )
+    encrypting = encryption_required()
+    key_file = _key_path()
+    staging = backup_staging.StagingDir(directory, prefix=".staging-")
+    staging.__enter__()
+
+    ciphertext_name: Optional[str] = None
+    try:
+        # 1. The dump, written into the private staging directory.
+        try:
+            created = backup_service.create_backup(label=label, staging_dir=staging.path_dir)
+        except Exception as exc:
+            result.update(success=False, exit_code=EXIT_BACKUP_FAILED,
+                          error=f"{type(exc).__name__}: {exc}")
             _finish(result, directory)
             return result
 
-        encrypted_path = archive + ENCRYPTED_SUFFIX
-        ok, error = encrypt_file(archive, encrypted_path, key_file)
-        if not ok:
-            result.update(
-                success=False, exit_code=EXIT_ENCRYPTION_FAILED, error=error
-            )
+        if not created.get("success"):
+            result.update(success=False, exit_code=EXIT_BACKUP_FAILED,
+                          error=str(created.get("error") or "backup failed"))
             _finish(result, directory)
             return result
-        # Only remove the plaintext once the ciphertext is on disk and non-empty.
-        if os.path.getsize(encrypted_path) > 0:
-            try:
-                os.remove(archive)
-                result["plaintext_removed"] = True
-            except OSError:
-                result["warnings"].append("could not remove the plaintext archive")
-        result["encrypted"] = True
-        result["filename"] = filename + ENCRYPTED_SUFFIX
-        result["size_bytes"] = os.path.getsize(encrypted_path)
-        archive = encrypted_path
-    else:
-        result["warnings"].append(
-            "BACKUP_ENCRYPTION is off: the archive is plaintext tenant data"
-        )
+
+        filename = created["filename"]
+        staged_path = os.path.join(staging.path_dir, filename)
+        result.update(filename=filename, size_bytes=created.get("size_bytes"))
+
+        # 2. A dump that cannot be verified is not a backup.
+        check = backup_service._verify_plaintext_dump(staged_path, filename)
+        if not check.get("valid"):
+            result.update(success=False, exit_code=EXIT_INTEGRITY_FAILED,
+                          error=f"verification failed: {check.get('error')}")
+            _finish(result, directory)
+            return result
+
+        # 3. Encryption. Fatal when required and impossible -- never downgrade silently.
+        if encrypting:
+            if not key_file:
+                result.update(
+                    success=False,
+                    exit_code=EXIT_NOT_CONFIGURED,
+                    error=(
+                        "BACKUP_ENCRYPTION_KEY_FILE is not set but encryption is required. "
+                        "No plaintext was written to the backup directory; set the key file "
+                        "(see docs/operations/BACKUP_ENCRYPTION.md), or set "
+                        "BACKUP_ENCRYPTION=off for a non-production environment."
+                    ),
+                )
+                _finish(result, directory)
+                return result
+
+            ciphertext_name = filename + ENCRYPTED_SUFFIX
+            staged_cipher = staging.path(ciphertext_name)
+            ok, error = encrypt_file(staged_path, staged_cipher, key_file)
+            if not ok:
+                # The staging directory is destroyed by the context manager; nothing
+                # reaches BACKUP_DIR, so there is no plaintext to leak.
+                result.update(success=False, exit_code=EXIT_ENCRYPTION_FAILED, error=error)
+                _finish(result, directory)
+                return result
+
+            # 3b. Prove the ciphertext authenticates before publishing it. A backup that
+            # cannot be decrypted by the key that made it is not a backup.
+            roundtrip = staging.path(filename + ".roundtrip")
+            ok, error = decrypt_file(staged_cipher, roundtrip, key_file)
+            if not ok:
+                result.update(success=False, exit_code=EXIT_ENCRYPTION_FAILED,
+                              error=f"ciphertext failed its own authentication check: {error}")
+                _finish(result, directory)
+                return result
+
+            publish_target = os.path.join(directory, ciphertext_name)
+            staging.publish(staged_cipher, publish_target)
+            os.chmod(publish_target, 0o600)
+            result["sha256"] = _publish_ciphertext_checksum(directory, publish_target)
+            result["encrypted"] = True
+            result["encryption_format"] = "authenticated"
+            result["filename"] = ciphertext_name
+            result["size_bytes"] = os.path.getsize(publish_target)
+            archive = publish_target
+        else:
+            publish_target = os.path.join(directory, filename)
+            staging.publish(staged_path, publish_target)
+            os.chmod(publish_target, 0o600)
+            result["encryption_format"] = "none"
+            result["warnings"].append(
+                "BACKUP_ENCRYPTION is off: the archive is plaintext tenant data"
+            )
+            archive = publish_target
+    finally:
+        # Destroying staging removes any plaintext that is still there, on every path.
+        staging.cleanup()
 
     # 4. Offsite / independent copy. Configured or explicitly absent; never assumed.
     target = offsite_target()

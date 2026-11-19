@@ -79,6 +79,8 @@ def _install_fake_backup_service(monkeypatch, tmp_path, *, payload=None,
     exercises the real database path — which is how an earlier version of these tests
     "passed" against the wrong object.
     """
+    import hashlib
+    import pathlib
     import sys
     import types
 
@@ -89,15 +91,28 @@ def _install_fake_backup_service(monkeypatch, tmp_path, *, payload=None,
         "MaintenanceCredentialRequired", (RuntimeError,), {}
     )
 
-    def _create_backup(label="x"):
+    def _create_backup(label="x", staging_dir=None):
         if create_result is not None:
             return dict(create_result)
-        path = tmp_path / filename
+        # Phase 18: the scheduled path now asks the dump to be written into a private
+        # staging directory. Honor that, so these tests keep exercising the real
+        # published-artifact logic instead of writing straight into BACKUP_DIR.
+        target_dir = pathlib.Path(staging_dir) if staging_dir else pathlib.Path(tmp_path)
+        path = target_dir / filename
         path.write_bytes(payload)
         return {"success": True, "filename": filename, "size_bytes": len(payload)}
 
     module.create_backup = _create_backup
-    module.verify_backup = lambda name: {"valid": True, "sha256": "0" * 64}
+    module.verify_backup = lambda name, key_file=None: {"valid": True, "sha256": "0" * 64}
+
+    def _verify_plaintext_dump(fpath, name):
+        # Phase 18 verifies the staged dump before publishing it.
+        return {"valid": True, "filename": name}
+
+    module._verify_plaintext_dump = _verify_plaintext_dump
+    module._compute_sha256 = lambda path: hashlib.sha256(
+        pathlib.Path(path).read_bytes()
+    ).hexdigest()
 
     monkeypatch.setattr(core, "backup_service", module, raising=False)
     monkeypatch.setitem(sys.modules, "core.backup_service", module)
