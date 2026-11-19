@@ -199,9 +199,157 @@ def create_backup(label: str = "manual", staging_dir: Optional[str] = None) -> D
     moved into ``BACKUP_DIR`` once it is complete. When the caller supplies
     ``staging_dir`` (as the scheduled path does) the plaintext never enters the backup
     directory at all, so an encryption failure downstream cannot leave it behind.
+
+    Phase 20 — the plaintext publication hole is closed *here*, not in the callers.
+    Phase 19 found that ``maintenance.py backup``, ``migrate.py``'s pre-migrate snapshot
+    and therefore ``deploy.sh``'s pre-deploy rollback point all called this function
+    without ``staging_dir``, which fell through to ``dest_path = BACKUP_DIR/...`` and
+    published a **plaintext** dump even with ``BACKUP_ENCRYPTION=on``. The policy was
+    enforced only in the scheduled caller, so the three commands an operator actually
+    types in an incident bypassed it.
+
+    Making callers responsible was rejected: it leaves the insecure default in place and
+    every future caller one forgotten argument away from re-opening the leak. Instead
+    this function now owns the boundary. When no ``staging_dir`` is supplied it creates
+    its own private staging directory, applies the same encryption policy the scheduled
+    path uses, and publishes only ciphertext. There is no code path that can publish a
+    plaintext archive into ``BACKUP_DIR`` while encryption is required.
+    """
+    if staging_dir is None:
+        return _create_backup_secured(label)
+    return _create_backup_dump(label, staging_dir)
+
+
+def _create_backup_secured(label: str) -> Dict[str, Any]:
+    """Run the full secure pipeline for a caller that did not provide staging.
+
+    Dump into private staging → verify → encrypt (policy-enforced) → prove the ciphertext
+    authenticates → atomically publish. Plaintext exists only inside a 0700 directory
+    that is destroyed on every exit path, so a crash or an encryption failure cannot
+    leave tenant data in ``BACKUP_DIR``.
+
+    When encryption is explicitly disabled (``BACKUP_ENCRYPTION=off``, a documented
+    non-production mode) the plaintext archive is published as before — but the result is
+    flagged ``encryption_format="none"`` and carries a warning, so it is never mistaken
+    for an encrypted restore point.
+    """
+    from core import backup_automation
+
+    encrypting = backup_automation.encryption_required()
+    key_file = backup_automation._key_path()
+
+    # Fail closed before any dump is taken: a policy that cannot be satisfied must not
+    # produce an artifact at all.
+    if encrypting and not key_file:
+        return {
+            "success": False,
+            "error": (
+                "encryption is required (BACKUP_ENCRYPTION=on) but BACKUP_ENCRYPTION_KEY_FILE "
+                "is not set. No backup was written and no plaintext was published; configure "
+                "the key file or explicitly set BACKUP_ENCRYPTION=off for a non-production "
+                "environment."
+            ),
+            "exit_code": 11,
+        }
+
+    staging = backup_staging.StagingDir(BACKUP_DIR)
+    try:
+        staging.__enter__()
+        created = _create_backup_dump(label, staging.path_dir)
+        if not created.get("success"):
+            created["exit_code"] = 10
+            return created
+
+        filename = created["filename"]
+        staged_path = os.path.join(staging.path_dir, filename)
+
+        if not encrypting:
+            target = os.path.join(BACKUP_DIR, filename)
+            staging.publish(staged_path, target)
+            # The dump writer creates its sidecars next to the dump, which here is the
+            # staging directory; publish them too or the archive arrives without a
+            # checksum or manifest.
+            for suffix in (".sha256", ".meta.json"):
+                staged_sidecar = os.path.join(staging.path_dir, filename + suffix)
+                if os.path.exists(staged_sidecar):
+                    staging.publish(staged_sidecar, os.path.join(BACKUP_DIR, filename + suffix))
+            for published in (target, target + ".sha256", target + ".meta.json"):
+                try:
+                    os.chmod(published, 0o600)
+                except OSError:
+                    pass
+            created.update(
+                path=target,
+                encrypted=False,
+                encryption_format="none",
+                warning="BACKUP_ENCRYPTION is off: the archive is plaintext tenant data",
+            )
+            return created
+
+        ciphertext_name = filename + backup_archive.ENCRYPTED_SUFFIX
+        staged_cipher = staging.path(ciphertext_name)
+        ok, error = backup_automation.encrypt_file(staged_path, staged_cipher, key_file)
+        if not ok:
+            return {"success": False, "error": error, "exit_code": 12, "encryption_failed": True}
+
+        # Prove it authenticates before publishing; an unreadable archive is not a backup.
+        roundtrip = staging.path(filename + ".roundtrip")
+        ok, error = backup_automation.decrypt_file(staged_cipher, roundtrip, key_file)
+        if not ok:
+            return {
+                "success": False,
+                "exit_code": 12,
+                "encryption_failed": True,
+                "error": f"ciphertext failed its own authentication check: {error}",
+            }
+
+        target = os.path.join(BACKUP_DIR, ciphertext_name)
+        staging.publish(staged_cipher, target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+
+        # Rewrite the sidecars so the checksum describes the ciphertext that now exists,
+        # not the plaintext that staging is about to destroy (Phase 17's orphaned-checksum
+        # bug). The plaintext-name sidecar is kept for compatibility with list/verify.
+        digest = _compute_sha256(target)
+        for sidecar in {target + ".sha256", os.path.join(BACKUP_DIR, filename + ".sha256")}:
+            try:
+                with open(sidecar, "w", encoding="utf-8") as handle:
+                    handle.write(f"{digest}  {ciphertext_name}\n")
+                os.chmod(sidecar, 0o600)
+            except OSError:
+                pass
+
+        created.update(
+            filename=ciphertext_name,
+            path=target,
+            inner_filename=filename,
+            size_bytes=os.path.getsize(target),
+            sha256=digest,
+            plaintext_sha256=created.get("sha256"),
+            encrypted=True,
+            encryption_format="authenticated",
+        )
+        return created
+    finally:
+        staging.cleanup()
+
+
+def _create_backup_dump(label: str, staging_dir: str) -> Dict[str, Any]:
+    """Write the dump itself into ``staging_dir`` and return its manifest.
+
+    Callers reach this only through :func:`create_backup`, which guarantees
+    ``staging_dir`` is a private directory. Keeping this split means the dump logic has
+    exactly one implementation and cannot be reached with ``staging_dir=None``.
     """
     _assert_maintenance_credential()
     os.makedirs(BACKUP_DIR, exist_ok=True)
+    if not staging_dir:
+        # Defence in depth: _create_backup_dump is private and only ever called with a
+        # real staging directory, but a missing one must never degrade to BACKUP_DIR.
+        return {"success": False, "error": "internal error: staged backup requires a staging directory"}
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
     safe_label = "".join(c for c in label if c.isalnum() or c in ("_", "-")) or "backup"
     engine_name = "postgresql" if is_postgres() else "sqlite"
@@ -213,7 +361,7 @@ def create_backup(label: str = "manual", staging_dir: Optional[str] = None) -> D
         else f"sqlite_backup_{safe_label}_{ts}.db.gz"
     )
     filename = inner_name
-    dest_path = os.path.join(staging_dir, inner_name) if staging_dir else os.path.join(BACKUP_DIR, inner_name)
+    dest_path = os.path.join(staging_dir, inner_name)
 
     if is_postgres():
         pg_url = get_database_url().replace("postgresql+psycopg2://", "postgresql://")
@@ -280,6 +428,13 @@ def create_backup(label: str = "manual", staging_dir: Optional[str] = None) -> D
     }
     with open(dest_path + ".meta.json", "w", encoding="utf-8") as mf:
         json.dump(metadata, mf, ensure_ascii=False, indent=2)
+    # Phase 20: Phase 19 found the manifest written 0644 while the dump itself was 0600.
+    # It carries the schema version and an exact table/row-count inventory — useful to an
+    # attacker sizing the target — so it is tenant-adjacent data and gets the same mode.
+    try:
+        os.chmod(dest_path + ".meta.json", 0o600)
+    except OSError:
+        pass
 
     return {
         "success": True,

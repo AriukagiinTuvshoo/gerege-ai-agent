@@ -123,3 +123,33 @@ def clear_audit_logs_for_test(conn=None):
     finally:
         if own:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Backup encryption test configuration (Phase 20)
+# ---------------------------------------------------------------------------
+#: Test-only AES-256 key. Obviously not a secret; production supplies its own through
+#: ``BACKUP_ENCRYPTION_KEY_FILE``.
+#:
+#: Phase 20 makes ``create_backup()`` enforce ``BACKUP_ENCRYPTION`` internally instead of
+#: leaving the policy to whichever CLI happened to call it. That is the fix for the Phase
+#: 19 plaintext-publication finding, and it means a test that creates a backup without a
+#: key now fails closed — which is the correct product behaviour.
+#:
+#: The suite therefore runs the way a deployed instance runs: encryption on, with a real
+#: key. This *strengthens* the backup tests. Before, they exercised the plaintext path
+#: that production never uses and did not touch the AEAD container at all. A test that
+#: needs to prove fail-closed behaviour deletes the variable itself with
+#: ``monkeypatch.delenv``/``setenv``.
+TEST_BACKUP_KEY = os.urandom(32)
+
+
+@pytest.fixture(autouse=True)
+def _backup_encryption_key(tmp_path_factory, monkeypatch):
+    """Give every test a real encryption key and a private backup directory."""
+    key_file = tmp_path_factory.getbasetemp() / "pytest-backup.key"
+    if not key_file.exists():
+        key_file.write_bytes(TEST_BACKUP_KEY)
+        key_file.chmod(0o600)
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_file))
+    monkeypatch.delenv("BACKUP_ENCRYPTION", raising=False)
