@@ -56,12 +56,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core import db_privileges  # noqa: E402
 from core.db_privileges import (  # noqa: E402
     ALWAYS_FORBIDDEN_PRIVILEGES,
     OWNER_ROLE,
     REQUIRED_TABLE_PRIVILEGES,
     RUNTIME_ROLE,
+    collect_ownership,
+    collect_role_privileges,
     collect_runtime_privileges,
+    evaluate_ownership,
     evaluate_runtime_privileges,
 )
 
@@ -362,6 +366,24 @@ def _admin_url(explicit: Optional[str]) -> str:
 
 
 def cmd_check(url: str, verify_only: bool = False) -> int:
+    """Report (and, in verify mode, enforce) the end state of provisioning.
+
+    Phase 16 (MEDIUM-01): the earlier version evaluated the runtime role only by
+    `SET ROLE`-ing into it. When the session could not do that — which is the case for
+    the *owner* credential everyone is told to verify with — it printed a note and then
+    reported PASS, because the violation list was simply empty. A check that cannot
+    look must fail, not pass.
+
+    Verification is now layered, and each layer is independent of the others:
+
+      1. role existence and attributes, from `pg_roles`;
+      2. effective privileges, from the catalogue *targeted at the role*
+         (`has_table_privilege(role, ...)`), which needs no impersonation;
+      3. ownership of every relation, because grants and ownership are independent
+         and only ownership permits `pg_dump` (HIGH-01);
+      4. the startup assertion's own evaluator, run over the same report, so `--verify`
+         and the boot gate cannot disagree.
+    """
     conn = _connect(url)
     try:
         rels = _live_relations(conn)
@@ -407,26 +429,54 @@ def cmd_check(url: str, verify_only: bool = False) -> int:
         if not role_state.get(RUNTIME_ROLE):
             problems.append(f"{RUNTIME_ROLE} does not exist")
 
-        # Evaluate the runtime role by actually becoming it where possible, so the
-        # report reflects inherited rights rather than the catalog entry alone.
-        if role_state.get(RUNTIME_ROLE):
-            report = _impersonation_report(conn, RUNTIME_ROLE)
-            if report is not None:
-                problems.extend(evaluate_runtime_privileges(report))
-            else:
-                print(
-                    f"\n(cannot SET ROLE {RUNTIME_ROLE} from this session; "
-                    "run --verify as that role for a definitive answer)"
+        # --- effective privileges of the runtime role, without impersonation -----
+        report = db_privileges.collect_role_privileges(conn, RUNTIME_ROLE, SCHEMA)
+        # `--verify` is a pre-flight gate: it must refuse a database that was never
+        # migrated. `--apply` (below) must not, because it runs before the migration by
+        # design.
+        report["require_migrated"] = True
+        problems.extend(db_privileges.evaluate_runtime_privileges(report))
+        print(
+            f"\nruntime privileges measured from the catalogue for '{RUNTIME_ROLE}' "
+            f"(collector: {report.get('collector')}, "
+            f"{len(report.get('existing_tables') or [])} table(s) evaluated)"
+        )
+
+        # --- the owner role must itself be unprivileged beyond ownership ---------
+        owner_report = db_privileges.collect_role_privileges(conn, OWNER_ROLE, SCHEMA)
+        if owner_report.get("exists"):
+            for attr, label in (
+                ("superuser", "SUPERUSER"),
+                ("createrole", "CREATEROLE"),
+                ("createdb", "CREATEDB"),
+                ("replication", "REPLICATION"),
+                ("bypassrls", "BYPASSRLS"),
+            ):
+                if owner_report.get(attr):
+                    problems.append(
+                        f"{OWNER_ROLE} has {label}; the maintenance role must be able to "
+                        "own and dump objects but must not hold server-wide powers"
+                    )
+            if owner_report.get("memberships"):
+                problems.append(
+                    f"{OWNER_ROLE} is a member of {owner_report['memberships']}; "
+                    "the maintenance role must stand alone"
                 )
+
+        # --- ownership invariant (HIGH-01) --------------------------------------
+        ownership = db_privileges.collect_ownership(conn, SCHEMA)
+        ownership["require_migrated"] = True
+        problems.extend(db_privileges.evaluate_ownership(ownership))
 
         print()
         if problems:
-            print("NOT least-privileged:")
+            print("NOT least-privileged:" if not verify_only else "VERIFICATION FAILED:")
             for problem in problems:
                 print(f"  - {problem}")
             print("\nRun: python scripts/provision_roles.py --apply")
             return 1 if verify_only else 0
-        print("Runtime role holds least privilege.")
+        print(f"Runtime role '{RUNTIME_ROLE}' holds least privilege.")
+        print(f"All {ownership['total']} relation(s) are owned by '{OWNER_ROLE}'.")
         return 0
     finally:
         conn.close()
@@ -542,21 +592,26 @@ def cmd_apply(url: str, rotate: Optional[str], converge_only: bool = False) -> i
 
         # Verify with the same evaluator the startup assertion uses, so a provisioning
         # run cannot report success on a database the application will refuse to boot on.
-        report = _impersonation_report(conn, RUNTIME_ROLE)
-        if report is None:
-            print(
-                f"\nWARNING: could not SET ROLE {RUNTIME_ROLE} to verify. "
-                "Re-run from a superuser session."
-            )
-        else:
-            violations = evaluate_runtime_privileges(report)
-            if violations:
-                print("\nProvisioning did not reach least privilege:")
-                for violation in violations:
-                    print(f"  - {violation}")
-                return 1
-            print(f"Verified: '{RUNTIME_ROLE}' holds least privilege "
-                  f"({len(report['table_privileges'])} table(s) evaluated).")
+        #
+        # Phase 16 (MEDIUM-01): this used to require `SET ROLE`, and downgraded a
+        # failure to a printed warning. It now measures the role from the catalogue —
+        # the same way `--verify` does — so `--apply` and `--verify` can never disagree
+        # and neither can pass without having actually looked.
+        report = collect_role_privileges(conn, RUNTIME_ROLE, SCHEMA)
+        ownership = collect_ownership(conn, SCHEMA)
+
+        violations = evaluate_runtime_privileges(report)
+        violations.extend(evaluate_ownership(ownership))
+
+        if violations:
+            print("\nProvisioning did not reach the required end state:")
+            for violation in violations:
+                print(f"  - {violation}")
+            return 1
+        print(f"Verified: '{RUNTIME_ROLE}' holds least privilege "
+              f"({len(report.get('table_privileges') or {})} table(s) evaluated) and "
+              f"{ownership['owned_by_owner_role']} of {ownership['total']} relation(s) "
+              f"are owned by '{OWNER_ROLE}'.")
     finally:
         conn.close()
 

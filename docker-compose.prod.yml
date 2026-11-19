@@ -244,9 +244,20 @@ services:
       db:
         condition: service_healthy
 
-  # Operator-invoked, never started by `up` (profile-scoped and restart: "no").
+  # Operator-invoked or timer-invoked, never started by `up` (profile-scoped,
+  # restart: "no"). This is the only service that holds the owner credential.
+  #
+  #   # manual
   #   docker compose -f docker-compose.prod.yml run --rm maintenance \
-  #       python scripts/maintenance.py backup --label daily_auto
+  #       python scripts/maintenance.py backup --label manual
+  #   # what the scheduler runs (backup + encrypt + verify + retain + alert)
+  #   docker compose -f docker-compose.prod.yml run --rm --no-deps maintenance \
+  #       python scripts/maintenance.py backup-run --label scheduled
+  #
+  # Phase 16 (MEDIUM-02): `backup-run` needs the encryption key and, optionally, an
+  # offsite target and an alert webhook. Encryption is ON by default and the run FAILS
+  # CLOSED in production if no key is configured, rather than quietly writing plaintext
+  # tenant data to the host. Set BACKUP_ENCRYPTION=off only in development.
   maintenance:
     build: .
     restart: "no"
@@ -255,8 +266,21 @@ services:
     environment:
       ENV: production
       DATABASE_OWNER_URL: postgresql://${POSTGRES_OWNER_USER:-gerege_owner}:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_crm}
+      BACKUP_ENCRYPTION: ${BACKUP_ENCRYPTION:-on}
+      BACKUP_ENCRYPTION_KEY_FILE: ${BACKUP_ENCRYPTION_KEY_FILE:-/run/secrets/backup.key}
+      BACKUP_OFFSITE_PATH: ${BACKUP_OFFSITE_PATH:-}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_MIN_KEEP: ${BACKUP_MIN_KEEP:-7}
+      BACKUP_ALERT_WEBHOOK: ${BACKUP_ALERT_WEBHOOK:-}
+      BACKUP_MAX_AGE_HOURS: ${BACKUP_MAX_AGE_HOURS:-36}
     volumes:
       - ./backups:/app/backups
+      # The key is mounted read-only from the host. It is a FILE, never an env value,
+      # so it cannot leak through `docker inspect` or a process listing.
+      - ./secrets/backup.key:/run/secrets/backup.key:ro
+      # Offsite target: point this at a DIFFERENT device or a synced mount. Left empty
+      # by default, which the run reports as "only copy is on this host".
+      - ${BACKUP_OFFSITE_MOUNT:-./backups}:/mnt/offsite
     depends_on:
       db:
         condition: service_healthy

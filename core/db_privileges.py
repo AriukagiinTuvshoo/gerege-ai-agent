@@ -105,6 +105,12 @@ REQUIRED_TABLE_PRIVILEGES["audit_logs"] = frozenset({"SELECT", "INSERT"})
 #: the role add a foreign key; TRIGGER would let it attach a function to a table.
 ALWAYS_FORBIDDEN_PRIVILEGES = frozenset({"TRUNCATE", "REFERENCES", "TRIGGER"})
 
+#: Privileges that must never be held on a *sequence* by the runtime role.
+#: USAGE is what `nextval()` needs. UPDATE/SELECT are not: UPDATE would let the runtime
+#: move a serial counter backwards, which is a duplicate-key and data-integrity
+#: primitive rather than a query need. (Phase 16, MEDIUM-01 completeness.)
+ALWAYS_FORBIDDEN_SEQUENCE_PRIVILEGES = frozenset({"UPDATE", "SELECT"})
+
 #: Predefined roles that grant power far beyond what the application needs. Membership
 #: is inherited, so holding one of these silently re-expands the credential.
 FORBIDDEN_PREDEFINED_ROLES = (
@@ -377,6 +383,272 @@ def collect_runtime_privileges(conn) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 16 (MEDIUM-01): role-targeted collection that does not require SET ROLE
+# ---------------------------------------------------------------------------
+#
+# `collect_runtime_privileges` answers "what can *this session* do". Verification
+# needs to answer "what can *gerege_app* do" from a session that may be neither
+# `gerege_app` nor able to `SET ROLE gerege_app` — an owner credential cannot
+# impersonate its own member, and the Phase 15 audit showed the previous code
+# silently downgraded that to a warning and then printed PASS.
+#
+# The functions below ask the catalogue the same questions *about a named role*:
+# `has_table_privilege(role, ...)` and friends already account for inheritance,
+# so no impersonation is needed and nothing can fail silently.
+
+_TABLE_PRIVS = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
+
+
+def _role_attrs(conn, role: str) -> Optional[Tuple]:
+    rows = _fetch(
+        conn,
+        """
+        SELECT rolname, rolsuper, rolcreatedb, rolcreaterole,
+               rolreplication, rolbypassrls, rolcanlogin
+          FROM pg_roles
+         WHERE rolname = %s
+        """,
+        (role,),
+    )
+    return rows[0] if rows else None
+
+
+def collect_role_privileges(conn, role: str, schema: Optional[str] = None) -> Dict[str, Any]:
+    """Collect what a *named* role can do, without impersonating it.
+
+    Every privilege question is asked with the explicit-role form
+    (``has_table_privilege(<role>, ...)``), which the server evaluates against the
+    role's own attribute set plus its inherited memberships. That is the same
+    effective-rights answer ``SET ROLE`` would give, and it works from any session
+    that can read the catalogue.
+
+    The report is deliberately the same shape as :func:`collect_runtime_privileges`
+    so one evaluator and one message path serve both the startup assertion and the
+    operator-facing ``--verify``. The extra key ``collector`` records which method
+    produced it, so a test can prove the fallback ran rather than assume it.
+    """
+    schema = schema or (_scalar(conn, "SELECT current_schema()") or "public")
+
+    attrs = _role_attrs(conn, role)
+    if attrs is None:
+        # Distinct sentinel: the evaluator turns this into a hard failure. Returning
+        # an empty-but-well-formed report here is exactly the failure mode Phase 15
+        # found in the `--verify` path.
+        return {"role": role, "schema": schema, "exists": False, "collector": "catalogue"}
+
+    name, superuser, createdb, createrole, replication, bypassrls, canlogin = attrs
+
+    # Membership: every role this login is a member of, excluding itself. A role is
+    # a member of itself, and a superuser is implicitly a member of everything, so
+    # the superuser case is reported by the attribute check instead.
+    memberships = set()
+    for (role_name,) in _fetch_safe(
+        conn,
+        """
+        SELECT r.rolname
+          FROM pg_auth_members m
+          JOIN pg_roles r ON r.oid = m.roleid
+          JOIN pg_roles u ON u.oid = m.member
+         WHERE u.rolname = %s
+         ORDER BY r.rolname
+        """,
+        (role,),
+    ):
+        if role_name != name:
+            memberships.add(role_name)
+
+    owning_roles = {
+        r[0]
+        for r in _fetch(
+            conn,
+            """
+            SELECT DISTINCT pg_get_userbyid(c.relowner)
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = %s
+               AND c.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+            """,
+            (schema,),
+        )
+    }
+
+    owned_relations = _scalar(
+        conn,
+        """
+        SELECT COUNT(*)
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = %s
+           AND c.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+           AND pg_get_userbyid(c.relowner) = %s
+        """,
+        (schema, role),
+    )
+
+    # Sequences: USAGE is required for `nextval()` on every SERIAL-backed insert;
+    # anything else (UPDATE/SELECT) is escalation and is reported by the evaluator.
+    sequence_privileges: Dict[str, Set[str]] = {}
+    for (seq_name,) in _fetch_safe(
+        conn,
+        """
+        SELECT c.relname
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = %s AND c.relkind = 'S'
+         ORDER BY c.relname
+        """,
+        (schema,),
+    ):
+        rows = _fetch_safe(
+            conn,
+            """
+            SELECT p, has_sequence_privilege(%s, %s, p)
+              FROM unnest(ARRAY['USAGE','SELECT','UPDATE']) AS p
+            """,
+            (role, f"{schema}.{seq_name}"),
+        )
+        sequence_privileges[seq_name] = {priv for priv, ok in rows if ok}
+
+    table_privileges: Dict[str, Set[str]] = {}
+    existing_matrix_tables: Set[str] = set()
+    for table in REQUIRED_TABLE_PRIVILEGES:
+        present = _scalar(
+            conn,
+            "SELECT to_regclass(%s) IS NOT NULL",
+            (f"{schema}.{table}",),
+            safe=True,
+        )
+        if not present:
+            table_privileges[table] = set()
+            continue
+        existing_matrix_tables.add(table)
+        rows = _fetch_safe(
+            conn,
+            """
+            SELECT p, has_table_privilege(%s, %s, p)
+              FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE',
+                                'TRUNCATE','REFERENCES','TRIGGER']) AS p
+            """,
+            (role, f"{schema}.{table}"),
+        )
+        table_privileges[table] = {priv for priv, ok in rows if ok}
+
+    schema_create = bool(
+        _scalar(conn, "SELECT has_schema_privilege(%s, %s, 'CREATE')", (role, schema))
+        if _scalar(conn, "SELECT to_regnamespace(%s) IS NOT NULL", (schema,), safe=True)
+        else False
+    )
+
+    db_owner = _scalar(
+        conn,
+        "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()",
+    )
+    is_db_owner = bool(db_owner) and db_owner == name
+
+    return {
+        "role": name,
+        "schema": schema,
+        "exists": True,
+        "canlogin": bool(canlogin),
+        "superuser": bool(superuser),
+        "createrole": bool(createrole),
+        "createdb": bool(createdb),
+        "replication": bool(replication),
+        "bypassrls": bool(bypassrls),
+        "memberships": sorted(memberships),
+        "owned_relations": int(owned_relations or 0),
+        "can_become_owner": bool(owning_roles & memberships) or bool(owned_relations),
+        "database_owner": db_owner,
+        "is_database_owner": is_db_owner,
+        "schema_create": schema_create,
+        "table_privileges": {k: sorted(v) for k, v in sorted(table_privileges.items())},
+        "sequence_privileges": {
+            k: sorted(v) for k, v in sorted(sequence_privileges.items())
+        },
+        "existing_tables": sorted(existing_matrix_tables),
+        "collector": "catalogue",
+    }
+
+
+def collect_ownership(conn, schema: Optional[str] = None) -> Dict[str, Any]:
+    """Who owns every relation in the schema, and how many the owner role owns.
+
+    Phase 16 (HIGH-01): a deployment can leave every table owned by the bootstrap
+    account while every privilege check still passes, because grants and ownership
+    are independent. That state cannot be backed up (``pg_dump`` needs ownership),
+    so ownership is a first-class invariant of provisioning, not a detail.
+    """
+    schema = schema or (_scalar(conn, "SELECT current_schema()") or "public")
+    rows = _fetch(
+        conn,
+        """
+        SELECT c.relname,
+               c.relkind,
+               pg_get_userbyid(c.relowner) AS owner
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = %s
+           AND c.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+         ORDER BY c.relname
+        """,
+        (schema,),
+    )
+    by_owner: Dict[str, int] = {}
+    names_by_owner: Dict[str, List[str]] = {}
+    for relname, _kind, owner in rows:
+        by_owner[owner] = by_owner.get(owner, 0) + 1
+        names_by_owner.setdefault(owner, []).append(relname)
+    return {
+        "schema": schema,
+        "total": len(rows),
+        "by_owner": dict(sorted(by_owner.items())),
+        "names_by_owner": {k: sorted(v) for k, v in names_by_owner.items()},
+        "owned_by_owner_role": by_owner.get(OWNER_ROLE, 0),
+        "relations": sorted((r[0] for r in rows)),
+    }
+
+
+def evaluate_ownership(ownership: Dict[str, Any]) -> List[str]:
+    """Violations for the ownership invariant.
+
+    Deliberately all-or-nothing, mirroring the backup guard: ``pg_dump`` locks
+    *every* table, so a single bootstrap-owned table defeats maintenance for the
+    whole schema. One unowned table is therefore a failure, not a warning.
+    """
+    problems: List[str] = []
+    total = int(ownership.get("total") or 0)
+    if total == 0:
+        # Same split as the privilege evaluator: a verification gate must refuse an
+        # un-migrated schema, while `--apply` runs before the first migration on a
+        # fresh install and must not.
+        if ownership.get("require_migrated"):
+            problems.append(
+                "no tables found: the schema has not been migrated, so ownership "
+                "convergence and least privilege cannot be verified"
+            )
+        return problems
+    foreign = {
+        owner: names
+        for owner, names in (ownership.get("names_by_owner") or {}).items()
+        if owner != OWNER_ROLE
+    }
+    if foreign:
+        sample = []
+        for owner, names in sorted(foreign.items()):
+            shown = ", ".join(names[:4])
+            more = "" if len(names) <= 4 else f" (+{len(names) - 4} more)"
+            sample.append(f"'{owner}': {shown}{more}")
+        problems.append(
+            f"{total - int(ownership.get('owned_by_owner_role') or 0)} of {total} "
+            f"relation(s) in schema '{ownership.get('schema')}' are NOT owned by "
+            f"'{OWNER_ROLE}' ({'; '.join(sample)}). pg_dump needs ownership of every "
+            f"table, so backup and restore cannot run. Run "
+            f"scripts/provision_roles.py --apply (a full pass, not --converge-only)"
+        )
+    return problems
+
+
 def evaluate_runtime_privileges(report: Dict[str, Any]) -> List[str]:
     """Return the violations in a privilege report. Empty list means least privilege.
 
@@ -384,6 +656,24 @@ def evaluate_runtime_privileges(report: Dict[str, Any]) -> List[str]:
     report it obtained separately, and so the message text is assembled in one place.
     """
     problems: List[str] = []
+
+    # Phase 16 (MEDIUM-01): a report about a role that does not exist must never
+    # evaluate to "no problems". The previous `--verify` path produced exactly that
+    # by returning `None` from a failed impersonation and printing a note.
+    if report.get("exists") is False:
+        problems.append(
+            f"role '{report.get('role')}' does not exist; provisioning has not run or "
+            f"the role was dropped. Nothing can be verified about its privileges"
+        )
+        return problems
+
+    # A role that cannot log in cannot serve the application, even if every grant is
+    # right. Checked here so an incomplete provisioning pass is not reported as PASS.
+    if report.get("collector") == "catalogue" and report.get("canlogin") is False:
+        problems.append(
+            f"role '{report.get('role')}' cannot log in (NOLOGIN); the application "
+            "connection would be refused"
+        )
 
     if report.get("superuser"):
         problems.append(
@@ -471,6 +761,34 @@ def evaluate_runtime_privileges(report: Dict[str, Any]) -> List[str]:
             problems.append(
                 f"audit_logs: role holds {priv}; audit history must not be mutable by the "
                 "credential that runs the application"
+            )
+
+    # Phase 16: incomplete provisioning. If the schema has no tables at all the
+    # database was never migrated. Whether that is a *failure* depends on the caller:
+    #
+    #   * `--verify`  requires a migrated database. A schema with no tables there means
+    #     the deploy ran provisioning but never migrated, and reporting PASS would be a
+    #     false pre-flight — the same class of mistake as MEDIUM-01, one level up.
+    #   * `--apply`   must tolerate it. The `migrate` service runs provisioning *before*
+    #     `alembic upgrade head`, deliberately, so the roles exist for the migration to
+    #     grant against. Failing there would break a fresh install.
+    #
+    # So the requirement is a property of the verification mode, not of the report.
+    if report.get("require_migrated") and not existing:
+        problems.append(
+            "no application tables exist in the schema; the migration has not run, so "
+            "least privilege cannot be verified"
+        )
+
+    # Phase 16: sequence privilege escalation. USAGE is what `nextval()` needs;
+    # UPDATE on a sequence would let the runtime move a primary-key counter backwards
+    # (a silent duplicate-key or data-corruption primitive). The startup collector does
+    # not gather this, so it is only reported when present.
+    for seq, held in (report.get("sequence_privileges") or {}).items():
+        bad = set(held) & ALWAYS_FORBIDDEN_SEQUENCE_PRIVILEGES
+        if bad and not report.get("superuser"):
+            problems.append(
+                f"sequence '{seq}': role holds {sorted(bad)}; the runtime needs only USAGE"
             )
 
     return problems
