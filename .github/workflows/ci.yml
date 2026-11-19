@@ -1343,6 +1343,62 @@ jobs:
             exit 1
           fi
 
+      - name: Phase 20 — backup confidentiality, offsite integrity, locking
+        if: ${{ !cancelled() }}
+        env:
+          UPGRADE: "1"
+        run: |
+          set -euo pipefail
+          pytest tests/test_e06_phase20_backup_remediation.py -v --tb=short -p no:cacheprovider | tee /tmp/p20suite.log
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p20suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 24 ]; then
+            echo "::error::Phase 20 expected at least 24 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+      # Phase 20: the critical property, asserted against the REAL CLI rather than a
+      # mocked service. Phase 19 found that `maintenance.py backup` published plaintext
+      # with BACKUP_ENCRYPTION=on; a unit test that monkeypatches the backup service
+      # would happily miss a regression that reintroduced it. This runs the command an
+      # operator actually runs, and fails if a single plaintext archive appears.
+      - name: Phase 20 — no CLI path may publish a plaintext archive
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          export BACKUP_ENCRYPTION=on
+          export BACKUP_ENCRYPTION_KEY_FILE=/tmp/p20-ci.key
+          head -c 32 /dev/urandom > "$BACKUP_ENCRYPTION_KEY_FILE"
+          chmod 600 "$BACKUP_ENCRYPTION_KEY_FILE"
+
+          for label in manual pre_deploy pre_migrate; do
+            dir="/tmp/p20-cli-$label"
+            rm -rf "$dir"; mkdir -p "$dir"
+            BACKUP_DIR="$dir" python scripts/maintenance.py backup --label "$label" >/tmp/p20-cli.log 2>&1 \
+              || { echo "::error::backup --label $label failed"; cat /tmp/p20-cli.log; exit 1; }
+
+            if ls "$dir"/*.sql.gz "$dir"/*.db.gz 2>/dev/null | grep -q .; then
+              echo "::error::backup --label $label published a PLAINTEXT archive"
+              ls -la "$dir"; exit 1
+            fi
+            ls "$dir"/*.enc >/dev/null 2>&1 \
+              || { echo "::error::backup --label $label produced no encrypted archive"; exit 1; }
+
+            # The archive must classify as authenticated, not merely end in .enc.
+            BACKUP_DIR="$dir" python scripts/verify_backup_confidentiality.py
+          done
+
+          # Fail closed: with encryption required and no key, nothing may be written.
+          dir=/tmp/p20-cli-nokey; rm -rf "$dir"; mkdir -p "$dir"
+          if BACKUP_DIR="$dir" BACKUP_ENCRYPTION=on BACKUP_ENCRYPTION_KEY_FILE= \
+               python scripts/maintenance.py backup --label nokey >/dev/null 2>&1; then
+            echo "::error::backup succeeded with encryption required and no key"; exit 1
+          fi
+          if [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+            echo "::error::a failed backup still wrote into the backup directory"
+            ls -la "$dir"; exit 1
+          fi
+          echo "No CLI path published plaintext; fail-closed verified."
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:

@@ -469,3 +469,198 @@ def test_p20_24_sweep_ignores_published_archives(tmp_path):
     os.utime(published, (old, old))
     backup_staging.sweep_stale_staging(str(directory), max_age=1)
     assert published.exists()
+
+
+# ---------------------------------------------------------------------------
+# Real restore integration (PostgreSQL only)
+#
+# Phase 19 verified these properties by hand against a live PG16 instance but no test
+# asserted them, so a regression would not have been caught. They are skipped on SQLite
+# rather than faked, because a mocked restore proves nothing about transactional
+# behaviour — the whole point is what the database does after a failed replay.
+# ---------------------------------------------------------------------------
+
+def _pg_available() -> bool:
+    try:
+        from core import db_engine
+        return db_engine.is_postgres()
+    except Exception:
+        return False
+
+
+pytestmark_pg = pytest.mark.skipif(
+    not _pg_available(), reason="requires a PostgreSQL target database"
+)
+
+
+@pytestmark_pg
+def test_p20_25_mid_restore_sql_failure_rolls_back_atomically(tmp_path, monkeypatch):
+    """A dump that is valid gzip and valid header but bad SQL must change nothing."""
+    import gzip as _gzip
+
+    import database as db_engine
+
+    from core import backup_service
+
+    directory = tmp_path / "b"
+    directory.mkdir()
+    monkeypatch.setattr("core.backup_service.BACKUP_DIR", str(directory))
+    monkeypatch.setenv("BACKUP_ENCRYPTION", "on")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", _key(tmp_path / "k"))
+
+    # A probe table that the bad dump tries to create then reference.
+    conn = db_engine.get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS _p20_probe")
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+    body = (
+        b"--\n-- PostgreSQL database dump\n--\n"
+        b"CREATE TABLE _p20_probe (id INT);\n"
+        b"INSERT INTO _p20_probe VALUES (1);\n"
+        b"THIS IS NOT VALID SQL;\n"
+    )
+    inner = directory / "pg_backup_bad.sql.gz"
+    with _gzip.open(inner, "wb") as handle:
+        handle.write(body)
+    digest = backup_service._compute_sha256(str(inner))
+    (directory / "pg_backup_bad.sql.gz.sha256").write_text(f"{digest}  pg_backup_bad.sql.gz\n")
+    (directory / "pg_backup_bad.sql.gz.meta.json").write_text(json.dumps({"table_counts": {"pages": 1}}))
+    encrypted = directory / "pg_backup_bad.sql.gz.enc"
+    backup_crypto.encrypt_file(str(inner), str(encrypted), os.environ["BACKUP_ENCRYPTION_KEY_FILE"])
+    os.chmod(encrypted, 0o600)
+    # Sidecars must describe the ciphertext now on disk.
+    cipher_digest = backup_service._compute_sha256(str(encrypted))
+    (directory / "pg_backup_bad.sql.gz.enc.sha256").write_text(
+        f"{cipher_digest}  pg_backup_bad.sql.gz.enc\n"
+    )
+    (directory / "pg_backup_bad.sql.gz.enc.meta.json").write_text(
+        json.dumps({"filename": "pg_backup_bad.sql.gz.enc", "table_counts": {"pages": 1}})
+    )
+    # verify_backup reads the plaintext-name sidecars; point them at the ciphertext.
+    (directory / "pg_backup_bad.sql.gz.sha256").write_text(
+        f"{cipher_digest}  pg_backup_bad.sql.gz\n"
+    )
+
+    result = backup_service.restore_backup("pg_backup_bad.sql.gz.enc")
+
+    assert result["success"] is False
+    conn = db_engine.get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_name='_p20_probe'"
+        )
+        remaining = cur.fetchone()[0]
+        cur.close()
+    finally:
+        conn.close()
+    assert remaining == 0, "a failed restore left a partially applied table behind"
+
+
+@pytestmark_pg
+def test_p20_26_restore_refuses_a_tampered_ciphertext(tmp_path, monkeypatch):
+    from core import backup_service
+
+    directory = tmp_path / "b"
+    directory.mkdir()
+    monkeypatch.setattr("core.backup_service.BACKUP_DIR", str(directory))
+    monkeypatch.setenv("BACKUP_ENCRYPTION", "on")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", _key(tmp_path / "k"))
+
+    created = backup_service.create_backup(label="tamper")
+    assert created["success"] is True
+    target = pathlib.Path(created["path"])
+    raw = bytearray(target.read_bytes())
+    raw[len(raw) // 2] ^= 0x01
+    target.write_bytes(bytes(raw))
+
+    result = backup_service.restore_backup(created["filename"])
+    assert result["success"] is False
+    assert result["post_restore_verified"] is False
+
+
+@pytestmark_pg
+def test_p20_27_restore_refuses_a_wrong_key(tmp_path, monkeypatch):
+    from core import backup_service
+
+    directory = tmp_path / "b"
+    directory.mkdir()
+    monkeypatch.setattr("core.backup_service.BACKUP_DIR", str(directory))
+    monkeypatch.setenv("BACKUP_ENCRYPTION", "on")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", _key(tmp_path / "k"))
+
+    created = backup_service.create_backup(label="wrongkey")
+    assert created["success"] is True
+
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", _key(tmp_path / "k2"))
+    result = backup_service.restore_backup(created["filename"])
+    assert result["success"] is False
+
+
+@pytestmark_pg
+def test_p20_28_encrypted_round_trip_restores_tenant_data(tmp_path, monkeypatch):
+    """The end-to-end property: encrypted backup -> restore -> original rows present."""
+    import database as db_engine
+
+    from core import backup_service
+
+    directory = tmp_path / "b"
+    directory.mkdir()
+    monkeypatch.setattr("core.backup_service.BACKUP_DIR", str(directory))
+    monkeypatch.setenv("BACKUP_ENCRYPTION", "on")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", _key(tmp_path / "k"))
+
+    conn = db_engine.get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pages")
+        before = cur.fetchone()[0]
+        cur.close()
+    finally:
+        conn.close()
+    assert before >= 1, "fixture database has no pages to round-trip"
+
+    created = backup_service.create_backup(label="roundtrip")
+    assert created["success"] is True
+    assert created["encrypted"] is True
+
+    result = backup_service.restore_backup(created["filename"])
+    assert result["success"] is True, result.get("error")
+    assert result["post_restore_verified"] is True
+    assert result["restored_table_counts"]["pages"] == before
+
+
+@pytestmark_pg
+def test_p20_29_restore_rearms_the_append_only_guard(tmp_path, monkeypatch):
+    """A replayed pg_dump recreates tables; the audit guard must survive the restore."""
+    from core import backup_service
+
+    directory = tmp_path / "b"
+    directory.mkdir()
+    monkeypatch.setattr("core.backup_service.BACKUP_DIR", str(directory))
+    monkeypatch.setenv("BACKUP_ENCRYPTION", "on")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", _key(tmp_path / "k"))
+
+    created = backup_service.create_backup(label="guard")
+    assert created["success"] is True
+    result = backup_service.restore_backup(created["filename"])
+    assert result["success"] is True, result.get("error")
+
+    # The guard is enforced by database triggers/rules; assert one is present and enabled.
+    import database as db_engine
+
+    conn = db_engine.get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'audit_logs_%' AND tgenabled='O'")
+        enabled = cur.fetchone()[0]
+        cur.close()
+    finally:
+        conn.close()
+    assert enabled >= 1, "the append-only audit guard was not restored"

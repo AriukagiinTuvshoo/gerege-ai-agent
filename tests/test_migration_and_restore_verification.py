@@ -138,7 +138,13 @@ def test_postgres_restore_good_when_configured():
 
     good_bk = backup_service.create_backup(label="pg_restore_ver_ok")
     assert good_bk["success"] is True, f"PG create_backup failed: {good_bk}"
-    assert good_bk["filename"].endswith(".sql.gz")
+    # Phase 20: create_backup() enforces the encryption policy internally, so the archive
+    # it publishes is authenticated ciphertext. The assertion is tightened rather than
+    # loosened: the file must be an encrypted archive *and* it must authenticate. The
+    # restore assertions below are unchanged and still verify the data round-trips.
+    assert good_bk["filename"].endswith(".sql.gz.enc"), good_bk["filename"]
+    assert good_bk.get("encrypted") is True
+    assert good_bk.get("encryption_format") == "authenticated"
 
     res_good = {}
     try:
