@@ -543,3 +543,56 @@ def test_p18_81_raw_key_ending_in_whitespace_is_accepted(tmp_path):
     out = tmp_path / "out.bin"
     backup_crypto.decrypt_file(str(dest), str(out), str(key_file))
     assert out.read_bytes() == src.read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Scheduler / monitoring states (Phase 17 MEDIUM-4: no scheduler installed)
+# ---------------------------------------------------------------------------
+
+def test_p18_90_operational_state_distinguishes_all_five_cases(tmp_path, monkeypatch):
+    from core import backup_automation
+
+    monkeypatch.setenv("BACKUP_DIR", str(tmp_path))
+    monkeypatch.setenv("BACKUP_MAX_AGE_HOURS", "36")
+    monkeypatch.setattr(backup_automation, "scheduler_installed", lambda paths=None: False)
+
+    # 1. Never executed.
+    assert backup_automation.operational_state()["state"] == backup_automation.STATE_NEVER_EXECUTED
+
+    # 2. In progress.
+    (tmp_path / ".last_backup_status.json").write_text(json.dumps({
+        "label": "x", "started_at": "2026-01-01T00:00:00+00:00",
+        "in_progress": True, "success": False,
+    }))
+    assert backup_automation.operational_state()["state"] == backup_automation.STATE_IN_PROGRESS
+
+    # 3. Failed.
+    (tmp_path / ".last_backup_status.json").write_text(json.dumps({
+        "success": False, "exit_code": 11, "error": "no key", "finished_at": "2026-01-01T00:00:00+00:00",
+    }))
+    assert backup_automation.operational_state()["state"] == backup_automation.STATE_FAILED
+
+    # 4. Stale (a success from long ago).
+    (tmp_path / ".last_backup_status.json").write_text(json.dumps({
+        "success": True, "finished_at": "2020-01-01T00:00:00+00:00",
+    }))
+    assert backup_automation.operational_state()["state"] == backup_automation.STATE_STALE
+
+    # 5. Fresh success.
+    from datetime import datetime, timezone
+
+    (tmp_path / ".last_backup_status.json").write_text(json.dumps({
+        "success": True, "finished_at": datetime.now(timezone.utc).isoformat(),
+    }))
+    fresh = backup_automation.operational_state()
+    assert fresh["state"] == backup_automation.STATE_SUCCESS
+    assert fresh["scheduler_installed"] is False
+
+
+def test_p18_91_status_reports_a_missing_scheduler_instead_of_assuming_one():
+    """Phase 17: two documents claimed a daily backup; nothing installed the timer."""
+    from core import backup_automation
+
+    # No timer exists in this environment, and the probe must say so rather than
+    # returning a bare "unhealthy" that an operator cannot act on.
+    assert backup_automation.scheduler_installed(paths=["/nonexistent/gerege-backup.timer"]) is False

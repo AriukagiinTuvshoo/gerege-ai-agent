@@ -370,6 +370,10 @@ def run_scheduled_backup(label: str = "scheduled") -> Dict[str, Any]:
 def _run_scheduled_backup_locked(label: str, directory: str, result: Dict[str, Any]) -> Dict[str, Any]:
     from core import backup_service, backup_staging
 
+    # Record that a run is under way, so monitoring can distinguish "in progress" from
+    # "failed" or "never ran" instead of inferring it from a stale timestamp.
+    _write_status({**result, "in_progress": True}, directory)
+
     encrypting = encryption_required()
     key_file = _key_path()
     staging = backup_staging.StagingDir(directory, prefix=".staging-")
@@ -546,3 +550,94 @@ def read_status() -> Optional[Dict[str, Any]]:
             return json.load(handle)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Operational state (Phase 18)
+# ---------------------------------------------------------------------------
+
+STATE_NEVER_EXECUTED = "NEVER_EXECUTED"
+STATE_IN_PROGRESS = "IN_PROGRESS"
+STATE_SUCCESS = "SUCCESS"
+STATE_FAILED = "FAILED"
+STATE_STALE = "STALE"
+
+
+def scheduler_installed(paths: Optional[List[str]] = None) -> bool:
+    """True when a timer/cron entry that invokes ``backup-run`` is present on this host.
+
+    The repository ships *templates*, not an installed timer. Phase 17 confirmed nothing
+    installs them, so "backups are scheduled" was an assumption rather than a fact. This
+    probe lets monitoring distinguish "the scheduler is running and the last backup
+    failed" from "no scheduler exists, so nothing will ever run".
+    """
+    candidates = paths or [
+        "/etc/systemd/system/gerege-backup.timer",
+        "/usr/lib/systemd/system/gerege-backup.timer",
+        "/etc/cron.d/gerege-backup",
+    ]
+    for candidate in candidates:
+        try:
+            if os.path.exists(candidate):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def operational_state(max_age_hours: Optional[int] = None) -> Dict[str, Any]:
+    """One of NEVER_EXECUTED / IN_PROGRESS / SUCCESS / FAILED / STALE, with detail.
+
+    Monitoring needs these five distinguished. A single "unhealthy" signal cannot tell an
+    operator whether to look at the last error, wait, or go and install a timer.
+    """
+    max_age = max_age_hours if max_age_hours is not None else _env_int("BACKUP_MAX_AGE_HOURS", 36)
+    status = read_status()
+    if not status:
+        return {
+            "state": STATE_NEVER_EXECUTED,
+            "scheduler_installed": scheduler_installed(),
+            "detail": "no scheduled run has ever been recorded on this host",
+        }
+
+    if status.get("in_progress"):
+        return {"state": STATE_IN_PROGRESS, "scheduler_installed": scheduler_installed(),
+                "detail": f"a run started at {status.get('started_at')} has not finished"}
+
+    if not status.get("success"):
+        return {
+            "state": STATE_FAILED,
+            "scheduler_installed": scheduler_installed(),
+            "exit_code": status.get("exit_code"),
+            "error": status.get("error"),
+            "detail": "the last recorded run failed",
+        }
+
+    from datetime import datetime, timezone
+
+    stamp = status.get("finished_at") or status.get("started_at")
+    age_hours: Optional[float] = None
+    if stamp:
+        try:
+            then = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            if then.tzinfo is None:
+                then = then.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - then).total_seconds() / 3600.0
+        except ValueError:
+            age_hours = None
+
+    if age_hours is not None and age_hours > max_age:
+        return {
+            "state": STATE_STALE,
+            "scheduler_installed": scheduler_installed(),
+            "age_hours": round(age_hours, 1),
+            "max_age_hours": max_age,
+            "detail": "the last successful run is older than the maximum age",
+        }
+
+    return {
+        "state": STATE_SUCCESS,
+        "scheduler_installed": scheduler_installed(),
+        "age_hours": round(age_hours, 1) if age_hours is not None else None,
+        "max_age_hours": max_age,
+    }

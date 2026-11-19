@@ -136,40 +136,56 @@ def cmd_backup_run(label: str) -> int:
 
 
 def cmd_status() -> int:
-    """Monitoring probe: exit non-zero if the last scheduled run failed or is stale."""
+    """Monitoring probe: distinguishes never-ran, in-progress, failed, stale and ok.
+
+    Phase 18: a single exit code could not tell an operator whether to read the last
+    error, wait, or go and install a scheduler that was never installed. The state is now
+    explicit, and "no scheduler is installed on this host" is reported as a fact rather
+    than inferred.
+    """
     from core import backup_automation
 
-    status = backup_automation.read_status()
-    if not status:
-        print("NO BACKUP STATUS: no scheduled run has been recorded on this host")
-        return 1
-    ok = bool(status.get("success"))
-    print(
-        f"last run: {status.get('finished_at') or status.get('started_at')} "
-        f"success={ok} encrypted={status.get('encrypted')} offsite={status.get('offsite')}"
-    )
-    if status.get("error"):
-        print(f"  error: {status.get('error')}")
-    # Staleness: a silent scheduler produces a "last success" that is days old. The
-    # threshold is deliberately explicit rather than derived from the schedule, because
-    # this process does not know what schedule the operator configured.
-    max_age_hours = backup_automation._env_int("BACKUP_MAX_AGE_HOURS", 36)
-    stamp = status.get("finished_at") or status.get("started_at")
-    if stamp and ok:
-        from datetime import datetime, timezone
+    info = backup_automation.operational_state()
+    state = info["state"]
+    installed = info.get("scheduler_installed")
 
-        try:
-            then = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-            if then.tzinfo is None:
-                then = then.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - then).total_seconds() / 3600.0
-            print(f"  age: {age:.1f}h (max {max_age_hours}h)")
-            if age > max_age_hours:
-                print("BACKUP IS STALE: no successful run within the maximum age", file=sys.stderr)
-                return 1
-        except ValueError:
-            pass
-    return 0 if ok else 1
+    if state == backup_automation.STATE_NEVER_EXECUTED:
+        print("NO BACKUP STATUS: no scheduled run has been recorded on this host")
+    elif state == backup_automation.STATE_IN_PROGRESS:
+        print(f"BACKUP IN PROGRESS: {info.get('detail')}")
+    elif state == backup_automation.STATE_FAILED:
+        print(f"BACKUP FAILED: exit_code={info.get('exit_code')} {info.get('error') or ''}".strip())
+    elif state == backup_automation.STATE_STALE:
+        print(f"BACKUP IS STALE: age {info.get('age_hours')}h (max {info.get('max_age_hours')}h)")
+    else:
+        print(f"BACKUP OK: last successful run {info.get('age_hours')}h ago "
+              f"(max {info.get('max_age_hours')}h)")
+
+    print(f"  state: {state}")
+    print(f"  scheduler installed on this host: {'yes' if installed else 'NO'}")
+    if not installed:
+        print(
+            "  WARNING: no gerege-backup.timer or /etc/cron.d/gerege-backup exists here.",
+            file=sys.stderr,
+        )
+        print(
+            "  The repository ships templates in deploy/systemd and deploy/cron; they are",
+            file=sys.stderr,
+        )
+        print(
+            "  NOT installed. Until they are, backups only happen when someone runs them.",
+            file=sys.stderr,
+        )
+
+    detail = backup_automation.read_status() or {}
+    if detail.get("offsite_state"):
+        print(f"  offsite: {detail.get('offsite_state')}"
+              + (f" (provider {detail.get('offsite_provider')})" if detail.get("offsite_provider") else ""))
+    if detail.get("warnings"):
+        for warning in detail["warnings"]:
+            print(f"  warning: {warning}")
+
+    return 0 if state == backup_automation.STATE_SUCCESS else 1
 
 
 def cmd_list() -> int:
