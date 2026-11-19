@@ -94,6 +94,12 @@ def load_key(key_file: str) -> bytes:
     except OSError as exc:
         raise EncryptionError(f"encryption key file is unreadable: {type(exc).__name__}") from exc
 
+    if len(raw) == KEY_LEN:
+        # A 32-byte file is the key, byte for byte. This check must come FIRST and must
+        # not strip: a random 32-byte key contains a whitespace byte at an end position
+        # about one time in forty, and stripping turned those perfectly good keys into
+        # "unexpected length" failures. Random keys are binary data, not text.
+        return raw
     stripped = raw.strip()
     if len(stripped) == KEY_LEN:
         return stripped

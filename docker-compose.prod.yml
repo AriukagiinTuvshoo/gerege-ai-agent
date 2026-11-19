@@ -267,6 +267,11 @@ services:
       ENV: production
       DATABASE_OWNER_URL: postgresql://${POSTGRES_OWNER_USER:-gerege_owner}:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_crm}
       BACKUP_ENCRYPTION: ${BACKUP_ENCRYPTION:-on}
+      # The key is a FILE, never an env value. It must be mounted from the host at the
+      # path below; the documentation (docs/operations/BACKUP_ENCRYPTION.md) names this
+      # same path. Phase 17 found the docs telling operators to create
+      # /etc/gerege/backup.key while Compose mounted ./secrets/backup.key, so following
+      # the instructions produced a key the container never saw.
       BACKUP_ENCRYPTION_KEY_FILE: ${BACKUP_ENCRYPTION_KEY_FILE:-/run/secrets/backup.key}
       BACKUP_OFFSITE_PATH: ${BACKUP_OFFSITE_PATH:-}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
@@ -278,9 +283,18 @@ services:
       # The key is mounted read-only from the host. It is a FILE, never an env value,
       # so it cannot leak through `docker inspect` or a process listing.
       - ./secrets/backup.key:/run/secrets/backup.key:ro
-      # Offsite target: point this at a DIFFERENT device or a synced mount. Left empty
-      # by default, which the run reports as "only copy is on this host".
-      - ${BACKUP_OFFSITE_MOUNT:-./backups}:/mnt/offsite
+      # Offsite target. Phase 18: this used to default to `./backups`, i.e. the SAME
+      # host directory already mounted at /app/backups, so a self-copy was reported as an
+      # offsite backup. There is deliberately NO default mount now, because a default
+      # that is silently the same disk is worse than none. To use a second device,
+      # uncomment and point it somewhere real:
+      #
+      #   - /mnt/backup-disk:/mnt/offsite
+      #
+      # and set BACKUP_OFFSITE_PATH=/mnt/offsite. Preferred in production is object
+      # storage: set BACKUP_OFFSITE_URL (https), BACKUP_OFFSITE_ACCESS_KEY,
+      # BACKUP_OFFSITE_SECRET_KEY and BACKUP_OFFSITE_REGION, which needs no mount at
+      # all. With nothing configured the run reports OFFSITE: NOT CONFIGURED.
     depends_on:
       db:
         condition: service_healthy

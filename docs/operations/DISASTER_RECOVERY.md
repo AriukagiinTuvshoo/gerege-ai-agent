@@ -90,24 +90,50 @@ A backup that has never been restored is a hypothesis. Run this **at least quart
 against an isolated database — never production:
 
 ```bash
-# 1. Decrypt the newest archive (skip if BACKUP_ENCRYPTION=off).
-openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-    -in backups/<archive>.sql.gz.enc -out /tmp/drill.sql.gz \
-    -pass file:/etc/gerege/backup.key
-gunzip -t /tmp/drill.sql.gz && echo "gzip OK"
+# 1. Restore the newest archive straight from its encrypted form. Phase 18 made this a
+#    supported operation: `restore` decrypts and authenticates the archive itself, so
+#    there is no manual `openssl` step and no chance of decrypting to the wrong file.
+#    Requires the owner credential and the key file.
+export DATABASE_OWNER_URL="postgresql://gerege_owner:...@host:5432/gerege_drill"
+export BACKUP_ENCRYPTION_KEY_FILE=/etc/gerege/backup.key
 
-# 2. Restore into a THROWAWAY database. Requires the owner credential.
-DATABASE_OWNER_URL=postgresql://gerege_owner:...@host:5432/gerege_drill \
-    python scripts/maintenance.py restore <archive> --yes
+python scripts/maintenance.py list                 # encrypted archives are listed
+python scripts/maintenance.py verify <archive>     # authenticates the ciphertext
+python scripts/maintenance.py restore <archive> --yes
 
-# 3. Prove the restored copy is complete AND correctly owned. `--verify` now checks
-#    ownership as well as privileges (Phase 16, HIGH-01).
-DATABASE_URL=postgresql://gerege_owner:...@host:5432/gerege_drill \
+# 2. Prove the restored copy is complete AND correctly owned. `--verify` checks
+#    ownership as well as privileges.
+DATABASE_URL="postgresql://gerege_owner:...@host:5432/gerege_drill" \
     python scripts/provision_roles.py --verify
 
-# 4. Record the wall-clock time of step 2. That measurement is the RTO.
+# 3. Record the wall-clock time of step 2. That measurement is the RTO.
 #    Record the archive timestamp vs. now. That interval is the RPO you actually have.
 ```
+
+## Emergency manual decryption (only if the application cannot run)
+
+`restore` is the supported path. If the maintenance tooling itself is unavailable, the
+archive can still be opened by hand. **Version 1 archives (Phase 18, AES-256-GCM) cannot
+be read by `openssl`** — the format is a Gerege container, not an openssl one. Use the
+module directly:
+
+```bash
+python -c "
+import sys; sys.path.insert(0, '.')
+from core import backup_crypto
+backup_crypto.decrypt_file('backups/<archive>.sql.gz.enc', '/tmp/drill.sql.gz', '/etc/gerege/backup.key')
+"
+gunzip -t /tmp/drill.sql.gz && echo "gzip OK"
+```
+
+A failure here means the archive is corrupt or the key is wrong; both are reported and
+neither produces partial plaintext.
+
+Legacy Phase 16 archives (produced before Phase 18) still begin with `Salted__` and are
+opened with `openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in <archive> -out <dest>
+-pass file:<keyfile>`. These carry **no authentication tag**; a successful decrypt does
+not prove the archive is genuine. `maintenance.py verify` reports them as
+`legacy-openssl` with `authenticated: false`.
 
 Delete the drill database afterwards. A drill that is never recorded did not happen:
 write the measured RTO and the date into the operations log.

@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import database
 from core import backup_archive
+from core import backup_staging
 from core.db_engine import is_postgres, get_database_url, dispose_shared_engine
 
 logger = logging.getLogger("core.backup_service")
@@ -305,7 +306,14 @@ def list_backups() -> List[Dict[str, Any]]:
     if not os.path.exists(BACKUP_DIR):
         return []
     items: List[Dict[str, Any]] = []
-    for fname in sorted(os.listdir(BACKUP_DIR), reverse=True):
+    # Newest first by mtime. Phase 18: the previous lexical sort ordered by *label*
+    # before date, so "newest" was not actually newest once more than one label existed.
+    candidates = [f for f in os.listdir(BACKUP_DIR) if not f.startswith(".")]
+    try:
+        candidates.sort(key=lambda f: os.path.getmtime(os.path.join(BACKUP_DIR, f)), reverse=True)
+    except OSError:
+        candidates.sort(reverse=True)
+    for fname in candidates:
         if fname.startswith("."):
             continue
         if not backup_archive.is_archive_name(fname):
@@ -748,6 +756,51 @@ def _database_is_empty() -> bool:
         return False
 
 
+def _create_pre_restore_snapshot() -> Dict[str, Any]:
+    """Snapshot the current database before a restore, encrypted like any other backup.
+
+    Phase 18: this used to call ``create_backup`` directly, which writes a **plaintext**
+    dump into ``BACKUP_DIR``. The pre-restore snapshot is a full copy of every tenant's
+    data, so leaving it unencrypted re-introduced the exact leak the scheduled path was
+    fixed for -- and it did so at the worst moment, during an incident. The snapshot now
+    goes through the same staging + authenticated-encryption path as a scheduled run.
+    """
+    from core import backup_automation
+
+    staging = backup_staging.StagingDir(BACKUP_DIR, prefix=".staging-")
+    staging.__enter__()
+    try:
+        created = create_backup(label="pre_restore", staging_dir=staging.path_dir)
+        if not created.get("success"):
+            return created
+        filename = created["filename"]
+        staged = os.path.join(staging.path_dir, filename)
+
+        key = backup_automation._key_path()
+        if backup_automation.encryption_required() and key:
+            ciphertext_name = filename + backup_archive.ENCRYPTED_SUFFIX
+            staged_cipher = staging.path(ciphertext_name)
+            ok, error = backup_automation.encrypt_file(staged, staged_cipher, key)
+            if not ok:
+                return {"success": False, "error": f"pre-restore snapshot encryption failed: {error}"}
+            target = os.path.join(BACKUP_DIR, ciphertext_name)
+            staging.publish(staged_cipher, target)
+            os.chmod(target, 0o600)
+            digest = backup_automation._publish_ciphertext_checksum(BACKUP_DIR, target)
+            created["filename"] = ciphertext_name
+            created["sha256"] = digest
+            created["encrypted"] = True
+            return created
+
+        # Encryption explicitly disabled: publish the plaintext, 0600.
+        target = os.path.join(BACKUP_DIR, filename)
+        staging.publish(staged, target)
+        os.chmod(target, 0o600)
+        return created
+    finally:
+        staging.cleanup()
+
+
 def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[str, Any]:
     """
     Backup файлаас өгөгдлийн санг атомик байдлаар аюулгүй сэргээх (Recovery):
@@ -805,7 +858,7 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
     if _database_is_empty():
         pre_snap = {"success": True, "skipped": True, "filename": None, "table_counts": {}}
     else:
-        pre_snap = create_backup(label="pre_restore")
+        pre_snap = _create_pre_restore_snapshot()
         if not pre_snap.get("success"):
             return {
                 "success": False,

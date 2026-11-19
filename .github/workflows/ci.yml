@@ -1206,6 +1206,143 @@ jobs:
           bash -n scripts/deploy.sh
           bash -n scripts/rollback.sh
           echo "Phase 16: deploy.sh and rollback.sh sequences verified."
+      # ---------------------------------------------------------------------
+      # Phase 18 (E-06). Proves the backup lifecycle end to end on PostgreSQL:
+      # encrypted archive -> authenticate -> destroy the database -> restore ->
+      # ownership re-convergence. Phase 17 found every one of these steps broken
+      # individually, and each assertion below corresponds to a specific defect.
+      # ---------------------------------------------------------------------
+      - name: Phase 18 — backup lifecycle, authenticated encryption, restore, rollback
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e05_p18_test"
+          DATABASE_OWNER_URL: "postgresql://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_e05_p18_test"
+          BACKUP_ENCRYPTION: "on"
+          BACKUP_ENCRYPTION_KEY_FILE: "/tmp/p18key"
+          BACKUP_DIR: "/tmp/p18backups"
+        run: |
+          set -euo pipefail
+          export PGPASSWORD="ci_pg_password_2026"
+          dropdb -h 127.0.0.1 -U gerege --if-exists gerege_e05_p18_test
+          createdb -h 127.0.0.1 -U gerege gerege_e05_p18_test
+
+          # `cryptography` must be present, or nothing below is meaningful.
+          python -c "import cryptography; print('cryptography', cryptography.__version__)"
+
+          # A key the way the docs say to make one.
+          head -c 32 /dev/urandom | base64 > /tmp/p18key
+          chmod 0400 /tmp/p18key
+          mkdir -p /tmp/p18backups
+
+          export GEREGE_OWNER_PASSWORD="ci_owner_password_2026"
+          export GEREGE_APP_PASSWORD="ci_app_password_2026"
+          export ADMIN_DATABASE_URL="postgresql://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e05_p18_test"
+          python scripts/provision_roles.py --apply
+          alembic upgrade head
+          python scripts/provision_roles.py --apply
+          python scripts/provision_roles.py --verify
+
+          psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -q <<'SQL'
+          INSERT INTO pages (page_id,name,category,is_active,knowledge_json,ai_provider,monthly_token_limit,tokens_used,ebarimt_enabled,daily_report_enabled)
+          VALUES ('P18A','TenantA','retail',1,'{}','gemini',1000,0,1,0),
+                 ('P18B','TenantB','service',1,'{}','gemini',1000,0,0,0);
+          INSERT INTO registrations (page_id,name,phone,service,channel,status,created_at)
+          VALUES ('P18A','Alice','99001122','demo','web','new',now());
+          INSERT INTO invoices (invoice_id,page_id,amount,currency,status,created_at)
+          VALUES ('INV-P18','P18A',15000,'MNT','paid',now());
+          INSERT INTO audit_logs (page_id,actor_role,actor_id,action,resource_type,resource_id,details_json,created_at)
+          VALUES ('P18A','admin','u1','payment.confirmed','invoice','INV-P18','{}',now());
+          SQL
+
+          # 1. Encrypted backup through the shipped scheduled entry point.
+          python scripts/maintenance.py backup-run --label ci
+
+          ENC=$(ls /tmp/p18backups/*.enc | head -1)
+          ARCHIVE=$(basename "$ENC")
+
+          # 2. The archive must be authenticated, 0600, and accompanied by a checksum
+          #    of the CIPHERTEXT (Phase 17 had the sidecar hashing the deleted plaintext).
+          test "$(stat -c '%a' "$ENC")" = "600"
+          ( cd /tmp/p18backups && sha256sum -c "$ARCHIVE.sha256" )
+          if ls /tmp/p18backups/*.sql.gz >/dev/null 2>&1; then
+            echo "::error::Phase 18 left a PLAINTEXT dump in the backup directory"
+            ls -la /tmp/p18backups
+            exit 1
+          fi
+
+          # 3. Listing must see the encrypted archive (Phase 17 printed "no backups").
+          python scripts/maintenance.py list | grep -q "$ARCHIVE"
+          python scripts/maintenance.py verify "$ARCHIVE"
+
+          # 4. Tampering must be refused. Flip one bit and require a nonzero exit.
+          cp "$ENC" /tmp/p18backups/tampered.sql.gz.enc
+          python - <<'PY'
+          p = "/tmp/p18backups/tampered.sql.gz.enc"
+          blob = bytearray(open(p, "rb").read())
+          blob[len(blob) // 2] ^= 0x01
+          open(p, "wb").write(bytes(blob))
+          PY
+          if python scripts/maintenance.py verify tampered.sql.gz.enc; then
+            echo "::error::Phase 18 accepted a tampered ciphertext"
+            exit 1
+          fi
+          rm -f /tmp/p18backups/tampered.sql.gz.enc
+
+          # 5. Destroy the database the way an incident would.
+          psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -q \
+            -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+          psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -q \
+            -c "GRANT USAGE, CREATE ON SCHEMA public TO gerege_owner; GRANT USAGE ON SCHEMA public TO gerege_app;"
+
+          # 6. Restore the ENCRYPTED archive with the shipped command. This is the
+          #    Phase 17 CRITICAL-1 defect: it used to be impossible.
+          python scripts/maintenance.py restore "$ARCHIVE" --yes
+
+          # 7. Validate content, audit trail, triggers and ownership.
+          PAGES=$(psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -tAc "SELECT count(*) FROM pages")
+          AUDIT=$(psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -tAc "SELECT count(*) FROM audit_logs")
+          TRIGGERS=$(psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -tAc \
+            "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'audit_logs_%' AND tgenabled='O'")
+          test "$PAGES" = "2"   || { echo "::error::Phase 18 restored $PAGES pages, expected 2"; exit 1; }
+          test "$AUDIT" = "1"   || { echo "::error::Phase 18 restored $AUDIT audit rows, expected 1"; exit 1; }
+          test "$TRIGGERS" = "3" || { echo "::error::Phase 18 restored $TRIGGERS audit triggers, expected 3"; exit 1; }
+          python scripts/provision_roles.py --verify
+
+          # 8. The pre-restore snapshot must ALSO be encrypted -- Phase 18 found the
+          #    rollback path writing a plaintext dump into the backup directory.
+          if ls /tmp/p18backups/*.sql.gz >/dev/null 2>&1; then
+            echo "::error::Phase 18 restore left a PLAINTEXT pre-restore snapshot"
+            ls -la /tmp/p18backups
+            exit 1
+          fi
+
+          # 9. Rollback discovery: the encrypted pre_deploy snapshot must be findable,
+          #    and a missing snapshot must be fatal (Phase 17 silently skipped it).
+          python scripts/maintenance.py backup-run --label pre_deploy
+          PRE=$(python scripts/maintenance.py list | grep pre_deploy | head -1 | awk '{print $1}')
+          test -n "$PRE" || { echo "::error::Phase 18 rollback cannot discover its snapshot"; exit 1; }
+          python scripts/maintenance.py restore "$PRE" --yes
+
+          echo "Phase 18: encrypted backup -> tamper refused -> destroy -> restore -> verify OK."
+          rm -f /tmp/p18key
+      - name: Phase 18 — Phase 17 regression suite (crypto, staging, retention, secrets)
+        if: ${{ !cancelled() }}
+        env:
+          UPGRADE: "1"
+        run: |
+          set -euo pipefail
+          pytest tests/test_e06_phase18_backup_recovery.py -v --tb=short -p no:cacheprovider | tee /tmp/p18suite.log
+          if grep -qE "SKIPPED" /tmp/p18suite.log; then
+            echo "::error::Phase 18 skipped a case; the remediation must be verified:"
+            grep -E "SKIPPED" /tmp/p18suite.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p18suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 32 ]; then
+            echo "::error::Phase 18 expected at least 32 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:

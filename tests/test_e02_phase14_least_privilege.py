@@ -243,10 +243,21 @@ def test_e05_11_backup_refuses_a_non_owner_credential_on_postgres():
     source = open(backup_service.__file__, encoding="utf-8").read()
     assert "class MaintenanceCredentialRequired" in source
     # Both entry points are guarded, not just create.
-    assert source.count("_assert_maintenance_credential()") >= 3
+    #
+    # Phase 18 split the single guard into two operations because the requirements
+    # genuinely differ: a backup must own every existing table (pg_dump locks them all),
+    # while a restore into a *destroyed* database has no tables to own and needs schema
+    # CREATE instead. The invariant this test protects is unchanged and is now stated
+    # more precisely: both entry points call the guard, and it runs before anything is
+    # written or replayed.
+    assert "_assert_maintenance_credential()" in source, "create_backup must be guarded"
+    assert '_assert_maintenance_credential("restore")' in source, "restore_backup must be guarded"
     assert source.index("_assert_maintenance_credential()") < source.index(
         "os.makedirs(BACKUP_DIR"
     ), "the check must run before anything is written"
+    guard_at = source.index('def _assert_maintenance_credential')
+    restore_call = source.index('_assert_maintenance_credential("restore")')
+    assert guard_at < restore_call, "the guard must be defined before it is used"
 
 
 def test_e05_12_destructive_backup_endpoints_are_gone():

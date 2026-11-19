@@ -55,19 +55,37 @@ docker compose -f docker-compose.prod.yml run --rm maintenance \
    spawned rather than producing a 0-byte archive.
 2. **Verify** the archive with `backup_service.verify_backup()` (gzip stream, SQL
    structure, SHA-256). An unverifiable archive is treated as a failed backup.
-3. **Encrypt** with `openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt`, key read from
-   a **file** so it never appears in `argv`/`ps`. The plaintext is deleted only after a
-   non-empty ciphertext exists. When encryption is on and no key is configured, the run
-   **fails closed** and leaves nothing on disk.
-4. **Offsite copy** to `BACKUP_OFFSITE_PATH`, proven by size comparison.
-5. **Retention** by age (`BACKUP_RETENTION_DAYS`, default 14) with a hard count floor
-   (`BACKUP_MIN_KEEP`, default 7) so a retention bug can never delete every backup.
-6. **Status file** `<BACKUP_DIR>/.last_backup_status.json` and an optional
+3. **Encrypt** with **AES-256-GCM** (authenticated). Phase 18 replaced the Phase 16
+   `openssl enc -aes-256-cbc` call, which had no MAC: a modified archive decrypted
+   cleanly and nothing could tell a genuine archive from a forged one. `openssl enc`
+   cannot do AEAD at all in OpenSSL 3.0, so the primitive comes from the `cryptography`
+   package. The key is read from a **file**, never `argv`. See
+   [BACKUP_ENCRYPTION.md](BACKUP_ENCRYPTION.md) for the container format.
+4. **Round-trip check** — the ciphertext is decrypted and authenticated once before it is
+   published, so an archive that was written wrong is never recorded as a backup.
+5. **Offsite upload** through a provider interface: S3-compatible over HTTPS with SigV4,
+   or an explicitly-labelled local directory. With nothing configured the run reports
+   `NOT CONFIGURED` rather than treating a same-disk copy as offsite.
+6. **Retention** by age (`BACKUP_RETENTION_DAYS`, default 14) with a hard count floor
+   (`BACKUP_MIN_KEEP`, default 7, clamped to >= 1) so a retention bug can never delete
+   every backup. Sidecars are removed with their archive.
+7. **Status file** `<BACKUP_DIR>/.last_backup_status.json` and an optional
    `BACKUP_ALERT_WEBHOOK` POST.
+
+The whole run holds an exclusive `flock` on `<BACKUP_DIR>/.backup.lock`, so two timers,
+or a backup and a prune, cannot overlap. The kernel releases the lock on process death
+(including `SIGKILL`), so a crash cannot wedge the backup system.
+
+**Nothing plaintext ever enters `BACKUP_DIR`.** The dump is written into a private 0700
+`.staging-*` directory inside the same filesystem and only the ciphertext is published by
+an atomic rename; the staging directory is destroyed on success, on exception, on
+`SIGTERM` and at interpreter exit, and a directory left by a `SIGKILL` is swept at the
+start of the next run.
 
 Exit codes are distinct per failure class so a timer unit or alerting rule can
 distinguish them: `0` ok, `10` backup failed, `11` encryption failed, `12` integrity
-failed, `13` credential invalid, `14` offsite failed, `15` not configured.
+failed, `13` credential invalid, `14` offsite failed, `15` not configured,
+`16` another backup/prune/restore holds the lock.
 
 ## 5. Configuration
 
@@ -112,11 +130,12 @@ not mark backups as operational until each line is true in the target environmen
 Backups that have never been restored are a hypothesis. Run at least quarterly:
 
 ```bash
-# 1. Choose the newest archive and decrypt it.
-openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-    -in backups/<archive>.sql.gz.enc -out /tmp/drill.sql.gz \
-    -pass file:/etc/gerege/backup.key
-gunzip -t /tmp/drill.sql.gz
+# 1. Restore the encrypted archive directly. Phase 18 made this a supported operation:
+#    `restore` authenticates and decrypts the archive itself, so there is no manual
+#    step and no way to decrypt to a file the restore path cannot see.
+export BACKUP_ENCRYPTION_KEY_FILE=/etc/gerege/backup.key
+python scripts/maintenance.py list            # encrypted archives are listed
+python scripts/maintenance.py verify <archive>
 
 # 2. Restore into an ISOLATED database (never production).
 #    restore requires the owner credential, by design.

@@ -462,18 +462,45 @@ def _run_scheduled_backup_locked(label: str, directory: str, result: Dict[str, A
         # Destroying staging removes any plaintext that is still there, on every path.
         staging.cleanup()
 
-    # 4. Offsite / independent copy. Configured or explicitly absent; never assumed.
-    target = offsite_target()
-    if target:
-        ok, error = copy_offsite(archive, target)
-        result["offsite"] = bool(ok)
-        if not ok:
-            result["warnings"].append(error)
-            result["exit_code"] = EXIT_OFFSITE_FAILED
-    else:
+    # 4. Offsite. Phase 17 found this was `shutil.copy2` to a local path, reported as
+    # "offsite" success -- no independent failure domain and no transport security.
+    # Phase 18 resolves a real provider from the environment, records which one it used
+    # and whether it is genuinely independent, and says NOT CONFIGURED when it is not.
+    from core import backup_offsite
+
+    try:
+        provider = backup_offsite.provider_from_env()
+        offsite_error: Optional[str] = None
+    except backup_offsite.OffsiteError as exc:
+        provider, offsite_error = None, str(exc)
+
+    if offsite_error:
+        result["offsite_state"] = "MISCONFIGURED"
+        result["warnings"].append(f"offsite storage misconfigured: {offsite_error}")
+        result["exit_code"] = EXIT_OFFSITE_FAILED
+    elif provider is None:
+        result["offsite_state"] = backup_offsite.OFFSITE_NOT_CONFIGURED
         result["warnings"].append(
-            "BACKUP_OFFSITE_PATH is not configured: the only copy is on this host"
+            "BACKUP_OFFSITE_PATH/BACKUP_OFFSITE_URL is not configured: the only copy is on "
+            "this host, so losing the host loses every backup"
         )
+    else:
+        remote_name = os.path.basename(archive)
+        ok, error = provider.upload(archive, remote_name, sha256=result.get("sha256", ""))
+        result["offsite"] = bool(ok)
+        result["offsite_state"] = "UPLOADED" if ok else "UPLOAD_FAILED"
+        result["offsite_provider"] = provider.name
+        result["offsite_independent"] = provider.independent_failure_domain
+        if not ok:
+            result["warnings"].append(f"offsite upload failed: {error}")
+            result["exit_code"] = EXIT_OFFSITE_FAILED
+        else:
+            result["pruned_offsite"] = provider.apply_remote_retention(min_keep())
+            if not provider.independent_failure_domain:
+                result["warnings"].append(
+                    f"offsite provider '{provider.name}' is a local directory: it does not "
+                    "provide an independent failure domain"
+                )
 
     # 5. Retention, bounded by a count floor.
     result["pruned"] = prune(directory, retention_days(), min_keep())
