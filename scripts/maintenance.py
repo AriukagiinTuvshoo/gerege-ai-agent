@@ -195,9 +195,24 @@ def cmd_list() -> int:
     if not items:
         print("no backups")
         return 0
-    print(f"{'filename':<52} {'size':>12}  created")
+    from core import backup_automation, backup_service as _bs
+
+    # Phase 20: show the security class next to each archive. Before this, a plaintext
+    # leftover and a verified encrypted archive printed identically, so an operator
+    # reading `list` had no way to tell which lines were safe restore points.
+    print(f"{'filename':<52} {'size':>12}  {'class':<16} created")
+    unauthenticated = 0
     for item in items[:50]:
-        print(f"{item['filename']:<52} {item['size_bytes']:>12}  {item['modified_at']}")
+        path = os.path.join(_bs.BACKUP_DIR, item["filename"])
+        klass = backup_automation.classify_archive(path)
+        if klass != "authenticated":
+            unauthenticated += 1
+        print(f"{item['filename']:<52} {item['size_bytes']:>12}  {klass:<16} {item['modified_at']}")
+    if unauthenticated:
+        print(
+            f"\nWARNING: {unauthenticated} archive(s) are not authenticated encrypted backups; "
+            "run `maintenance.py legacy` for a detailed report."
+        )
     return 0
 
 
@@ -272,6 +287,87 @@ def cmd_restore(filename: str, assume_yes: bool) -> int:
     return 1
 
 
+def cmd_legacy(quarantine: Optional[str] = None, confirmed: bool = False) -> int:
+    """Report plaintext/legacy archives in the backup directory. Read-only by default.
+
+    Phase 19 found that ``maintenance.py backup``, ``migrate.py`` and ``deploy.sh``
+    published plaintext dumps into ``BACKUP_DIR``. Those files may still exist on a
+    deployed host, and they are the most sensitive artifacts the product produces.
+
+    Deliberately conservative:
+
+    * never reads archive **contents** — only enough of the file header to classify it, so
+      running it cannot spill tenant data into a terminal or a log;
+    * never deletes anything; ``--quarantine`` *moves* files, and requires ``--yes``;
+    * refuses a quarantine directory inside the backup directory, which would defeat it.
+
+    Exit codes: 0 = no plaintext found, 17 = plaintext present (action needed).
+    """
+    import shutil
+
+    from core import backup_automation, backup_service
+
+    directory = backup_service.BACKUP_DIR
+    if not os.path.isdir(directory):
+        print(f"no backup directory at {directory}")
+        return 0
+
+    classified = [
+        (name, backup_automation.classify_archive(os.path.join(directory, name)))
+        for name, _st in backup_automation._archives(directory)
+    ]
+    plaintext = [n for n, c in classified if c == "plaintext"]
+    legacy_ossl = [n for n, c in classified if c == "legacy-openssl"]
+    unknown = [n for n, c in classified if c == "unknown"]
+    encrypted = [n for n, c in classified if c == "authenticated"]
+
+    print(f"backup directory: {directory}")
+    print(f"  authenticated (AEAD) : {len(encrypted)}")
+    print(f"  legacy openssl (.enc): {len(legacy_ossl)}  (restorable, NOT authenticated)")
+    print(f"  plaintext            : {len(plaintext)}  (tenant data in the clear)")
+    print(f"  unknown              : {len(unknown)}  (not restorable; never counted)")
+
+    if plaintext:
+        print()
+        print("PLAINTEXT ARCHIVES PRESENT — readable without the encryption key:")
+        for name in plaintext:
+            print(f"  {name}")
+
+    if quarantine:
+        if not confirmed:
+            print("\nrefusing to move archives: pass --yes with --quarantine")
+            return 17
+        if os.path.abspath(quarantine) == os.path.abspath(directory):
+            print("\nrefusing: quarantine directory is the backup directory itself")
+            return 17
+        os.makedirs(quarantine, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(quarantine, 0o700)
+        except OSError:
+            pass
+        moved = 0
+        for name in plaintext + legacy_ossl:
+            src = os.path.join(directory, name)
+            dst = os.path.join(quarantine, name)
+            try:
+                shutil.move(src, dst)
+            except OSError as exc:
+                print(f"  could not move {name}: {type(exc).__name__}")
+                continue
+            # Sidecars describe a file that is no longer in this directory.
+            for suffix in (".sha256", ".meta.json"):
+                sidecar = src + suffix
+                if os.path.exists(sidecar):
+                    try:
+                        shutil.move(sidecar, dst + suffix)
+                    except OSError:
+                        pass
+            moved += 1
+        print(f"\nmoved {moved} archive(s) to {quarantine} (nothing was deleted)")
+
+    return 17 if plaintext else 0
+
+
 def cmd_prune(days: int) -> int:
     from core import backup_service
 
@@ -306,6 +402,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     p_prune = sub.add_parser("prune", help="delete old archives")
     p_prune.add_argument("--days", type=int, default=14)
+
+    # Phase 20: safe detection of plaintext archives left by the pre-fix manual path.
+    p_legacy = sub.add_parser(
+        "legacy",
+        help="report plaintext/unauthenticated archives in the backup directory (read-only)",
+    )
+    p_legacy.add_argument(
+        "--quarantine",
+        metavar="DIR",
+        help="move plaintext archives to DIR (a private 0700 directory) after reporting",
+    )
+    p_legacy.add_argument(
+        "--yes",
+        action="store_true",
+        help="required with --quarantine; no archive is ever deleted automatically",
+    )
 
     # Phase 16: the scheduled entry point, and the monitoring probe that reads it.
     p_run = sub.add_parser(
@@ -345,6 +457,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_restore(args.filename, args.yes)
     if args.command == "prune":
         return cmd_prune(args.days)
+    if args.command == "legacy":
+        return cmd_legacy(args.quarantine, args.yes)
     if args.command == "backup-run":
         return cmd_backup_run(args.label)
     if args.command == "status":

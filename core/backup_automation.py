@@ -162,6 +162,44 @@ def decrypt_file(src: str, dest: str, key_file: str) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+def classify_archive(path: str) -> str:
+    """Classify a file in the backup directory without reading its contents.
+
+    Phase 20. Phase 19 found that a plaintext dump produced by the old manual path was
+    indistinguishable, to the retention code and to ``list``, from a real encrypted
+    restore point — so it counted toward the retention floor and could push a genuine
+    encrypted archive out of retention.
+
+    Returns one of:
+
+    ``authenticated``
+        ``.enc`` carrying this repository's AEAD magic. A cryptographically verifiable
+        restore point.
+    ``legacy-openssl``
+        ``.enc`` with the Phase 16 ``Salted__`` header. Restorable, but **unauthenticated**.
+    ``plaintext``
+        ``.sql.gz``/``.db.gz``. Restorable, and tenant data in the clear.
+    ``unknown``
+        An ``.enc`` with neither magic. Never restorable and never counted as a backup.
+
+    Only the file header is inspected — never the body — so classification cannot leak
+    tenant data into a log or terminal.
+    """
+    from core import backup_archive
+
+    name = os.path.basename(path)
+    if backup_archive.is_encrypted_name(name):
+        return backup_archive.encryption_format(path)
+    if backup_archive.is_plaintext_name(name):
+        return "plaintext"
+    return "unknown"
+
+
+def is_verified_encrypted(path: str) -> bool:
+    """True only for an authenticated AEAD archive — the only thing that counts as secure."""
+    return classify_archive(path) == "authenticated"
+
+
 def _archives(directory: str) -> List[Tuple[str, os.stat_result]]:
     if not os.path.isdir(directory):
         return []
@@ -176,6 +214,27 @@ def _archives(directory: str) -> List[Tuple[str, os.stat_result]]:
         if os.path.isfile(path):
             out.append((name, os.stat(path)))
     return sorted(out, key=lambda item: item[1].st_mtime, reverse=True)
+
+
+def encrypted_archives(directory: str) -> List[Tuple[str, os.stat_result]]:
+    """Only authenticated AEAD archives, newest first.
+
+    This is the inventory the *encrypted* retention floor is measured against. A plaintext
+    file sitting in the directory must not be able to satisfy that floor.
+    """
+    return [(name, st) for name, st in _archives(directory)
+            if is_verified_encrypted(os.path.join(directory, name))]
+
+
+def legacy_plaintext_archives(directory: str) -> List[Tuple[str, os.stat_result]]:
+    """Plaintext archives found in a backup directory (Phase 19 leak leftovers).
+
+    Named, not deleted. Phase 20's rule is that these are detected and reported but never
+    removed automatically: they may be the only copy of something, and deleting a
+    customer's data because a scanner decided it was insecure is worse than the exposure.
+    """
+    return [(name, st) for name, st in _archives(directory)
+            if classify_archive(os.path.join(directory, name)) == "plaintext"]
 
 
 def prune(directory: str, days: int, keep_min: int, dry_run: bool = False) -> List[str]:
@@ -195,10 +254,21 @@ def prune(directory: str, days: int, keep_min: int, dry_run: bool = False) -> Li
     keep_min = max(1, int(keep_min))
     cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
     items = _archives(directory)
+    # Phase 20: the floor protects *verified encrypted* restore points. Counting every
+    # file meant a plaintext leftover satisfied the floor, so retention would keep the
+    # unencrypted file and delete the encrypted one behind it.
+    #
+    # Safety net: when the directory holds no authenticated archive at all (a legacy
+    # plaintext-only host, or an archive store whose headers are damaged), there is
+    # nothing encrypted to protect, and an empty protected set would let the floor be
+    # bypassed entirely and delete every file. In that case fall back to protecting the
+    # newest `keep_min` of whatever is there. This rule can only ever protect *more*
+    # than the plain inventory-based floor did, never less.
+    protected_encrypted = {name for name, _st in encrypted_archives(directory)[:keep_min]}
+    protected = protected_encrypted or {name for name, _st in items[:keep_min]}
     removed: List[str] = []
-    # Keep the newest `keep_min` regardless of age.
-    for index, (name, st) in enumerate(items):
-        if index < keep_min:
+    for name, st in items:
+        if name in protected:
             continue
         if st.st_mtime > cutoff:
             continue
