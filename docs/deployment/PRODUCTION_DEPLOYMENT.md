@@ -17,7 +17,24 @@ Production deployments run 4 isolated services with healthchecks and resource li
    - Runs `uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2 --no-proxy-headers`.
    - Enforces `ENV=production`, `STRICT_SECURITY=1`, `WEBHOOK_FAIL_CLOSED=1`, `STRICT_QPAY_VERIFICATION=1`, and `DISABLE_INLINE_SCHEDULER=1`.
 4. **`worker` (`Dockerfile` — non-root user `gerege`):**
-   - Runs `python worker.py` in a dedicated container to process background jobs, scheduled follow-ups, daily executive digests, and automated database backups.
+   - Runs `python worker.py` in a dedicated container to process background jobs, scheduled follow-ups and daily executive digests.
+   - **Does not run database backups** (corrected in Phase 16, MEDIUM-02). E-05 removed the backup job from `worker.py`: `pg_dump` needs table ownership, and the worker now connects as `gerege_app`, which deliberately has none. Backups run on the owner-credentialed maintenance plane instead — see [BACKUP_AUTOMATION.md](../operations/BACKUP_AUTOMATION.md).
+5. **`migrate` (`Dockerfile`, one-shot, `restart: "no"`):**
+   - The only service holding the bootstrap and owner credentials. Runs
+     `provision_roles --apply` → `alembic upgrade head` → `provision_roles --apply` → `provision_roles --verify`.
+   - `web` and `worker` wait on `condition: service_completed_successfully`, so a
+     provisioning or verification failure stops the stack instead of serving traffic
+     against a database that is not least-privileged.
+6. **`maintenance` (`Dockerfile`, profile `maintenance`, `restart: "no"`):**
+   - Operator- or timer-invoked only; never started by `up`. Holds `DATABASE_OWNER_URL`
+     and nothing else's credential.
+   - `python scripts/maintenance.py backup-run --label scheduled` is the single entry
+     point for a scheduled run (backup → encrypt → verify → retain → offsite → alert).
+
+> **Backup automation status: NOT CONFIGURED.** No scheduler is installed by this
+> repository. `deploy/systemd/` and `deploy/cron/` contain templates; installing one,
+> pointing `BACKUP_ALERT_WEBHOOK` at a real destination and measuring a restore are
+> operator steps. No RPO can be quoted until they are done.
 
 ### 1.1 Client IP and `TRUSTED_PROXIES` (E-02 Phase 3)
 
@@ -198,18 +215,79 @@ instant reset.
 
 ---
 
-## 4. Rollback & Incident Recovery Procedure
+## 4. Deployment sequence
 
-1. **Pre-Deploy Snapshot:**
-   ```bash
-   python -c "from core import backup_service; print(backup_service.create_backup(label='pre_deploy'))"
-   ```
-2. **Application Rollback:**
-   ```bash
-   git checkout <previous-known-good-commit>
-   docker compose -f docker-compose.prod.yml up -d --build
-   ```
-3. **Database Rollback (if schema/data regression occurred):**
-   ```bash
-   python -c "from core import backup_service; print(backup_service.restore_backup('<pre_deploy_backup_filename>'))"
-   ```
+`scripts/deploy.sh` performs the same ordered sequence as the `migrate` service, and
+stops at the first failure. The ordering matters and is not arbitrary:
+
+| Step | Action | Credential | Why this order |
+|---|---|---|---|
+| 1 | Pre-deploy backup | owner | A deploy without a restore point cannot be rolled back. **Fatal** unless `ALLOW_DEPLOY_WITHOUT_BACKUP=1`. |
+| 2 | `git pull --ff-only` | — | |
+| 3 | `provision_roles --apply` | bootstrap | Creates/refreshes the two roles. On a fresh volume there are no tables yet. |
+| 4 | `alembic upgrade head` | bootstrap | The migrator **owns what it creates**. |
+| 5 | `provision_roles --apply` | bootstrap | **Transfers ownership** of everything the migration just created to `gerege_owner`, then applies grants. Must be a full `--apply`: `--converge-only` emits GRANT/REVOKE only and would skip this — that was finding HIGH-01. |
+| 6 | `provision_roles --verify` | any | Fails non-zero on over-privilege, under-provisioning, a missing role, or **any relation not owned by `gerege_owner`**. |
+| 7 | `compose up -d --build` | — | `migrate` re-runs steps 3–6 inside the cluster network; `web`/`worker` wait on `service_completed_successfully`. |
+| 8 | Healthcheck → auto-rollback | — | |
+
+**Why step 5 cannot be `--converge-only`.** Grants and ownership are independent: a
+database can grant `gerege_app` exactly the right privileges while every table is still
+owned by the bootstrap superuser. That state passes every privilege check and still
+cannot be backed up, because `pg_dump` needs ownership of every table. `--verify` now
+checks ownership explicitly, and `--converge-only` is reserved for the post-*restore*
+path where ownership already exists.
+
+## 5. Rollback & incident recovery
+
+```bash
+bash scripts/rollback.sh
+```
+
+The script rolls back code (to `.last_working_commit`) and data (to the newest
+`pre_deploy` archive) **independently**, and prints exactly which of the two happened:
+
+```
+=== [Gerege Rollback] Completed ===
+    code rolled back:     yes
+    database rolled back: no
+    NOTE: the database still contains the state produced by the failed deploy.
+```
+
+A failed restore is **fatal** — the script does not restart services onto a
+half-restored database. After a restore it re-runs a full `provision_roles --apply`
+(the replayed dump recreates objects that must be re-owned by `gerege_owner`) and then
+`--verify`.
+
+> The previous version of this section showed `backup_service.create_backup(...)` and
+> `restore_backup(...)` called directly. Both now run the E-05 maintenance-credential
+> guard and **refuse** to run under the runtime credential, so those snippets no longer
+> work. Use the CLI, which sets the owner credential explicitly.
+
+## 6. Credential rotation
+
+```bash
+# App credential: the old password stops working immediately.
+python scripts/provision_roles.py --apply --rotate app     # prints the new one ONCE
+# update POSTGRES_APP_PASSWORD in the secret store, then:
+docker compose -f docker-compose.prod.yml up -d            # restart web + worker
+
+# Owner credential:
+python scripts/provision_roles.py --apply --rotate owner
+# update POSTGRES_OWNER_PASSWORD and DATABASE_OWNER_URL
+```
+
+`--rotate` requires the bootstrap/`CREATEROLE` credential. The generated password is
+printed once, never logged, and never written to the backups directory. Rotate both
+credentials at any staff change and at least annually.
+
+## 7. Failure recovery
+
+| Symptom | Meaning | Action |
+|---|---|---|
+| `refusing to start: the database role '…' is more privileged…` | Over-privileged runtime credential | Point `DATABASE_URL` at `gerege_app`; run `provision_roles.py --apply` |
+| `VERIFICATION FAILED: … NOT owned by 'gerege_owner'` | Migration ran, ownership transfer did not (HIGH-01) | `provision_roles.py --apply` — full pass, not `--converge-only` |
+| `cannot create a trustworthy backup or restore: it owns N of M tables` | Owner credential is not actually the owner | Same repair as above |
+| `refusing to deploy without a backup` | `DATABASE_OWNER_URL` unset in `deploy.sh` | Set it, or accept the risk with `ALLOW_DEPLOY_WITHOUT_BACKUP=1` |
+| `BACKUP_ENCRYPTION_KEY_FILE is not set but encryption is required` | Scheduled backup has no key | Install the key file (§ backup automation doc) |
+| `BACKUP IS STALE` from `maintenance.py status` | The scheduler is not running | Check the timer: `systemctl list-timers gerege-backup.timer` |

@@ -1,0 +1,16 @@
+# Gerege backup — cron alternative to the systemd timer. Use ONE of the two.
+#
+# NOT INSTALLED by this repository. Install with:
+#   sudo cp deploy/cron/gerege-backup.cron /etc/cron.d/gerege-backup
+#   sudo chmod 0644 /etc/cron.d/gerege-backup
+#   verify: grep CRON /var/log/syslog | tail
+#
+# Cron runs in a minimal environment: set every required variable in the env file and
+# source it explicitly. MAILTO is the only built-in failure notification, which is why
+# BACKUP_ALERT_WEBHOOK is the better channel.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+MAILTO=ops@example.mn
+
+# m h dom mon dow user  command
+17 *  * * *   root  set -a; . /etc/gerege/backup.env; set +a; cd /opt/gerege && /usr/bin/docker compose -f docker-compose.prod.yml run --rm --no-deps maintenance python scripts/maintenance.py backup-run --label scheduled >> /var/log/gerege-backup.log 2>&1

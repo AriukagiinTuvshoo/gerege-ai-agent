@@ -7,9 +7,30 @@
 
 ## 1. Recovery Objectives (RPO & RTO)
 
-- **Recovery Point Objective (RPO):** <= 24 hours via automated daily 03:00 AM snapshots (`worker.py`), or 0 minutes before any manual migration/restore (`pre_restore` automatic snapshot).
-- **Recovery Time Objective (RTO):** <= 5 minutes via `scripts/maintenance.py restore` (E-05: the restore HTTP endpoint was removed; restore requires the owner credential).
-- **Retention Policy:** 14 days rolling retention (`backup_service.prune_old_backups(keep_days=14)`).
+> **Corrected in Phase 16 (MEDIUM-02).** The previous text claimed "RPO ≤ 24 hours via
+> automated daily 03:00 AM snapshots (`worker.py`)". **That scheduler no longer exists.**
+> E-05 removed backup execution from `worker.py`, because `pg_dump` requires table
+> ownership and the restricted runtime role deliberately does not have it. No
+> replacement timer is installed by this repository, so *no RPO can be quoted*.
+
+- **Recovery Point Objective (RPO):** **NOT CONFIGURED / undefined.** The RPO equals the
+  interval of whatever external scheduler is installed around
+  `scripts/maintenance.py backup-run` (see
+  [BACKUP_AUTOMATION.md](BACKUP_AUTOMATION.md)). `deploy/systemd/gerege-backup.timer`
+  and `deploy/cron/gerege-backup.cron` are templates in this repository; **neither is
+  installed on any host by this repository**. Until one is installed and verified with
+  `systemctl list-timers`, the only backup is one an operator takes by hand.
+- **Manual backup:** `python scripts/maintenance.py backup --label manual` (owner
+  credential). A pre-deploy snapshot is taken by `scripts/deploy.sh`, which now
+  **refuses to deploy without one** unless explicitly overridden.
+- **Recovery Time Objective (RTO):** **UNMEASURED.** Restore is
+  `scripts/maintenance.py restore` with the owner credential (E-05 removed the restore
+  HTTP endpoint). The only defensible RTO figure is one measured in a restore drill on
+  the real dataset — see §3.2. The previous "≤ 5 minutes" was never measured.
+- **Retention Policy:** age-based (`BACKUP_RETENTION_DAYS`, default 14) with a hard
+  count floor (`BACKUP_MIN_KEEP`, default 7), so a retention bug cannot delete every
+  archive. Enforced by `maintenance.py backup-run` and available manually via
+  `maintenance.py prune --days N`.
 
 ---
 
@@ -57,18 +78,36 @@ schema, which needs ownership. The old `POST /api/admin/backups/restore` endpoin
 removed for that reason — see [LEAST_PRIVILEGE_ROLES.md](LEAST_PRIVILEGE_ROLES.md).
 
 ### 3.2 Via CLI into an Isolated Target Database (Restore Drill)
-```python
-from core import backup_service
 
-# 1. Create a fresh backup
-bk = backup_service.create_backup(label="drill")
-assert bk["success"] is True
+> **Corrected in Phase 16.** The previous snippet called
+> `backup_service.create_backup()` and `restore_backup()` directly. Both now run the
+> E-05 maintenance-credential guard, so they only work from a process whose
+> `DATABASE_URL` is the **owner** credential — `create_backup()` from an interactive
+> Python shell using the runtime DSN is refused by design. Use the CLI, which sets the
+> credential explicitly and cannot be pointed at the wrong role by accident.
 
-# 2. Verify SHA-256 and structural integrity
-ver = backup_service.verify_backup(bk["filename"])
-assert ver["valid"] is True
+A backup that has never been restored is a hypothesis. Run this **at least quarterly**,
+against an isolated database — never production:
 
-# 3. Restore (for PostgreSQL, pass target_db_url to test on a throwaway database)
-res = backup_service.restore_backup(bk["filename"])
-assert res["success"] is True
+```bash
+# 1. Decrypt the newest archive (skip if BACKUP_ENCRYPTION=off).
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+    -in backups/<archive>.sql.gz.enc -out /tmp/drill.sql.gz \
+    -pass file:/etc/gerege/backup.key
+gunzip -t /tmp/drill.sql.gz && echo "gzip OK"
+
+# 2. Restore into a THROWAWAY database. Requires the owner credential.
+DATABASE_OWNER_URL=postgresql://gerege_owner:...@host:5432/gerege_drill \
+    python scripts/maintenance.py restore <archive> --yes
+
+# 3. Prove the restored copy is complete AND correctly owned. `--verify` now checks
+#    ownership as well as privileges (Phase 16, HIGH-01).
+DATABASE_URL=postgresql://gerege_owner:...@host:5432/gerege_drill \
+    python scripts/provision_roles.py --verify
+
+# 4. Record the wall-clock time of step 2. That measurement is the RTO.
+#    Record the archive timestamp vs. now. That interval is the RPO you actually have.
 ```
+
+Delete the drill database afterwards. A drill that is never recorded did not happen:
+write the measured RTO and the date into the operations log.

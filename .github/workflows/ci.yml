@@ -1068,6 +1068,144 @@ jobs:
           admin.close()
           PY
 
+      # ---------------------------------------------------------------------
+      # Phase 16 (E-05 audit remediation). Runs on its own fresh database so the
+      # gate cannot inherit state from the Phase 14 job above, and so the HIGH-01
+      # scenario (a database migrated by the bootstrap account, never re-owned) is
+      # reproducible from scratch on every run.
+      # ---------------------------------------------------------------------
+      - name: Phase 16 — deploy sequence, ownership convergence, fail-closed verify
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e05_p16_test"
+        run: |
+          set -euo pipefail
+          export PGPASSWORD="ci_pg_password_2026"
+          createdb -h 127.0.0.1 -p 5432 -U gerege gerege_e05_p16_test 2>/dev/null || true
+
+          # A fresh database, provisioned and migrated the way the `migrate` service
+          # does it: provision -> migrate -> provision (ownership transfer) -> verify.
+          # Starting from a properly converged database is what makes the negative
+          # controls below meaningful: they break exactly one invariant at a time and
+          # require `--verify` to notice. (Starting from a bare `alembic upgrade head`
+          # would leave every relation bootstrap-owned, so the "repair" step would have
+          # nothing to prove.)
+          export GEREGE_OWNER_PASSWORD="$(openssl rand -base64 24)"
+          export GEREGE_APP_PASSWORD="$(openssl rand -base64 24)"
+          export ADMIN_DATABASE_URL="${DATABASE_URL/postgresql+psycopg2:\/\//postgresql://}"
+          python scripts/provision_roles.py --apply
+          alembic upgrade head
+          python scripts/provision_roles.py --apply
+          python scripts/provision_roles.py --verify
+
+          pytest tests/test_e05_phase16_remediation.py -v --tb=short -p no:cacheprovider | tee /tmp/p16.log
+
+          # No skip is legitimate here: every case must run on PostgreSQL.
+          if grep -qE "SKIPPED" /tmp/p16.log; then
+            echo "::error::Phase 16 skipped a case; the remediation must be verified on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/p16.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p16.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 29 ]; then
+            echo "::error::Phase 16 expected at least 29 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          # Name-level assertions, for the same reason Phase 14 has them: a rename or
+          # an accidental `skipif` must not silently reduce coverage.
+          for t in test_p16_01_verify_fails_closed_when_it_cannot_set_role \
+                   test_p16_02_verify_passes_again_after_the_grant_is_removed \
+                   test_p16_04_missing_runtime_role_is_detected_not_skipped \
+                   test_p16_06_sequence_escalation_is_detected \
+                   test_p16_07_owner_role_server_powers_are_reported \
+                   test_p16_11_bootstrap_owned_relations_are_detected \
+                   test_p16_12_only_a_full_apply_repairs_ownership \
+                   test_p16_16_unowned_relations_break_the_owner_backup \
+                   test_p16_20_deploy_script_transfers_ownership_with_a_full_apply \
+                   test_p16_21_deploy_orders_provision_after_migration_and_before_start \
+                   test_p16_22_deploy_refuses_without_a_backup \
+                   test_p16_33_encryption_is_fail_closed_without_a_key \
+                   test_p16_35_retention_never_deletes_below_the_floor \
+                   test_p16_40_app_role_cannot_read_the_backups_directory_secrets \
+                   test_p16_41_scheduled_run_refuses_the_runtime_credential \
+                   test_p16_05b_pre_migration_apply_is_not_a_failure \
+                   test_p16_42_status_probe_reports_missing_and_failed_runs; do
+            grep -qE "$t .*PASSED" /tmp/p16.log || {
+              echo "::error::Phase 16: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Negative control 1: a bootstrap-owned relation MUST fail `--verify`.
+          # This is the HIGH-01 end state; if this passes, the ownership check is dead.
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".")
+          import psycopg2
+
+          DB = os.environ["DATABASE_URL"].replace("postgresql+psycopg2://", "postgresql://", 1)
+          admin = psycopg2.connect(DB); admin.autocommit = True
+          cur = admin.cursor()
+          cur.execute("ALTER TABLE appointments OWNER TO gerege")
+          admin.close()
+
+          os.environ["ADMIN_DATABASE_URL"] = DB
+          from scripts import provision_roles
+          rc = provision_roles.main(["--verify"])
+          if rc == 0:
+              sys.exit("::error::NEGATIVE CONTROL FAILED: --verify accepted a "
+                       "bootstrap-owned relation (HIGH-01 is back)")
+          print("Phase 16: --verify refused a bootstrap-owned relation. Control OK.")
+
+          admin = psycopg2.connect(DB); admin.autocommit = True
+          cur = admin.cursor()
+          cur.execute("ALTER TABLE appointments OWNER TO gerege_owner")
+          admin.close()
+          if provision_roles.main(["--verify"]) != 0:
+              sys.exit("::error::--verify did not recover after repair")
+          print("Phase 16: --verify recovered after repair.")
+          PY
+
+          # Negative control 2: out-of-band UPDATE/DELETE on audit_logs MUST fail
+          # `--verify` even when the caller cannot SET ROLE (the MEDIUM-01 false pass).
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".")
+          import psycopg2
+
+          DB = os.environ["DATABASE_URL"].replace("postgresql+psycopg2://", "postgresql://", 1)
+          admin = psycopg2.connect(DB); admin.autocommit = True
+          cur = admin.cursor()
+          cur.execute("GRANT UPDATE, DELETE ON audit_logs TO gerege_app")
+          admin.close()
+
+          os.environ["ADMIN_DATABASE_URL"] = DB
+          from scripts import provision_roles
+          if provision_roles.main(["--verify"]) == 0:
+              sys.exit("::error::NEGATIVE CONTROL FAILED: --verify accepted UPDATE/DELETE "
+                       "on audit_logs (MEDIUM-01 false pass is back)")
+          print("Phase 16: --verify refused mutated audit privileges. Control OK.")
+
+          admin = psycopg2.connect(DB); admin.autocommit = True
+          cur = admin.cursor()
+          cur.execute("REVOKE UPDATE, DELETE ON audit_logs FROM gerege_app")
+          cur.close(); admin.close()
+          if provision_roles.main(["--verify"]) != 0:
+              sys.exit("::error::--verify did not recover after revoking the grant")
+          print("Phase 16: --verify recovered after revoking the grant.")
+          PY
+
+          # The deploy script must remain ordered correctly and must never reintroduce
+          # `--converge-only` after the migration, which is what HIGH-01 was.
+          if grep -E "^\s*python .*provision_roles\.py" scripts/deploy.sh | grep -q -- "--converge-only"; then
+            echo "::error::deploy.sh uses --converge-only; ownership will not converge (HIGH-01)"
+            exit 1
+          fi
+          bash -n scripts/deploy.sh
+          bash -n scripts/rollback.sh
+          echo "Phase 16: deploy.sh and rollback.sh sequences verified."
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
         if: ${{ !cancelled() }}
         env:

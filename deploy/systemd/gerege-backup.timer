@@ -1,0 +1,20 @@
+# Gerege backup schedule.
+#
+# NOT INSTALLED by this repository. Install and verify:
+#   sudo cp deploy/systemd/gerege-backup.* /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now gerege-backup.timer
+#   systemctl list-timers gerege-backup.timer      # must show a NEXT run
+#
+# Hourly is the default because it is the cheapest way to get a defensible RPO.
+# `Persistent=true` runs a missed backup after downtime instead of skipping it.
+[Unit]
+Description=Hourly Gerege CRM database backup
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+Unit=gerege-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -41,8 +41,25 @@ as before. The assertion is a no-op on SQLite and only enforced in production mo
 python scripts/provision_roles.py --check      # read-only report
 python scripts/provision_roles.py --dry-run    # the SQL, passwords redacted
 python scripts/provision_roles.py --apply      # converge (idempotent)
-python scripts/provision_roles.py --verify     # exit 1 unless least-privileged
+python scripts/provision_roles.py --verify     # exit 1 unless least-privileged + owned
 ```
+
+`--verify` (Phase 16) measures the runtime role **from the catalogue, targeted at the
+role** (`has_table_privilege('gerege_app', …)`), so it needs no `SET ROLE` and works
+from any credential, including the owner one. It also checks:
+
+* role existence, `LOGIN`, and the absence of `SUPERUSER`/`CREATEROLE`/`CREATEDB`/
+  `REPLICATION`/`BYPASSRLS` — on **both** roles;
+* memberships on both roles (a member can `SET ROLE` to its grantor);
+* every table and sequence, for over- *and* under-privilege;
+* `audit_logs` `UPDATE`/`DELETE`/`TRUNCATE` specifically;
+* **ownership**: every relation must be owned by `gerege_owner`, otherwise `pg_dump`
+  cannot run (HIGH-01);
+* an un-migrated schema is a failure, not a pass.
+
+It **fails closed**: if something cannot be measured, that is a failure, not a warning.
+The earlier version downgraded an impossible `SET ROLE` to a printed note and then
+reported PASS — see the Phase 16 remediation.
 
 Passwords come from `GEREGE_OWNER_PASSWORD` / `GEREGE_APP_PASSWORD`. If unset during
 `--apply`, a strong password is generated and printed **once**. It is not stored, not
@@ -122,7 +139,9 @@ The order matters: nothing is removed until the new path is proven.
 1. **Provision.** `provision_roles.py --apply`. Roles exist; `gerege_app` can read and
    write; `gerege_owner` owns everything. The app still runs as before, as the bootstrap
    user, so this step is invisible.
-2. **Verify.** `provision_roles.py --verify` → exit 0.
+2. **Verify.** `provision_roles.py --verify` → exit 0. It checks grants **and**
+   ownership: after step 1 a fresh database is migrated by the bootstrap account and
+   the tables belong to it until the second `--apply` moves them.
 3. **Back up** with the *old* path while it still works
    (`maintenance.py backup` as the bootstrap account works too — it owns everything).
 4. **Point `web` and `worker` at `gerege_app`.** Set `POSTGRES_APP_PASSWORD`, update the
@@ -165,7 +184,9 @@ fails.
 - `gerege_owner` compromise defeats the audit guard. Documented above, not mitigated.
 - The assertion runs at startup, not continuously. A grant added while the app is running
   is detected at the next restart, not immediately. `--verify` in cron narrows that gap;
-  it is not a substitute for not granting things.
+  it is not a substitute for not granting things. Note that no such cron job is
+  installed by this repository — see `docs/operations/BACKUP_AUTOMATION.md`, which
+  applies the same reasoning to the backup timer.
 - A role that is a member of `gerege_owner` is treated as an owner. `gerege_app` is
   created `NOINHERIT` and is a member of nothing, and the assertion already reports any
   membership as a violation.

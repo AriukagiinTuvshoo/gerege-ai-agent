@@ -108,6 +108,70 @@ def cmd_backup(label: str) -> int:
     return 0
 
 
+def cmd_backup_run(label: str) -> int:
+    """One complete scheduled run (Phase 16): backup, encrypt, verify, retain, alert.
+
+    This is what a timer invokes. It prints only non-secret facts and exits with a
+    code that distinguishes the failure classes (see core/backup_automation.py).
+    """
+    from core import backup_automation
+
+    _describe_connection(None)  # service arg is unused; identity only
+    result = backup_automation.run_scheduled_backup(label=label)
+    if not result.get("success"):
+        print(f"SCHEDULED BACKUP FAILED: {result.get('error')}", file=sys.stderr)
+        for warning in result.get("warnings") or []:
+            print(f"  warning: {warning}", file=sys.stderr)
+        return int(result.get("exit_code") or backup_automation.EXIT_BACKUP_FAILED)
+    print(
+        f"scheduled backup OK: {result.get('filename')} "
+        f"({result.get('size_bytes')} bytes, encrypted={result.get('encrypted')}, "
+        f"offsite={result.get('offsite')})"
+    )
+    pruned = result.get("pruned") or []
+    print(f"  retention: kept last {result.get('retention_days')} day(s); pruned {len(pruned)}")
+    for warning in result.get("warnings") or []:
+        print(f"  warning: {warning}")
+    return int(result.get("exit_code") or 0)
+
+
+def cmd_status() -> int:
+    """Monitoring probe: exit non-zero if the last scheduled run failed or is stale."""
+    from core import backup_automation
+
+    status = backup_automation.read_status()
+    if not status:
+        print("NO BACKUP STATUS: no scheduled run has been recorded on this host")
+        return 1
+    ok = bool(status.get("success"))
+    print(
+        f"last run: {status.get('finished_at') or status.get('started_at')} "
+        f"success={ok} encrypted={status.get('encrypted')} offsite={status.get('offsite')}"
+    )
+    if status.get("error"):
+        print(f"  error: {status.get('error')}")
+    # Staleness: a silent scheduler produces a "last success" that is days old. The
+    # threshold is deliberately explicit rather than derived from the schedule, because
+    # this process does not know what schedule the operator configured.
+    max_age_hours = backup_automation._env_int("BACKUP_MAX_AGE_HOURS", 36)
+    stamp = status.get("finished_at") or status.get("started_at")
+    if stamp and ok:
+        from datetime import datetime, timezone
+
+        try:
+            then = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            if then.tzinfo is None:
+                then = then.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - then).total_seconds() / 3600.0
+            print(f"  age: {age:.1f}h (max {max_age_hours}h)")
+            if age > max_age_hours:
+                print("BACKUP IS STALE: no successful run within the maximum age", file=sys.stderr)
+                return 1
+        except ValueError:
+            pass
+    return 0 if ok else 1
+
+
 def cmd_list() -> int:
     from core import backup_service
 
@@ -221,6 +285,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_prune = sub.add_parser("prune", help="delete old archives")
     p_prune.add_argument("--days", type=int, default=14)
 
+    # Phase 16: the scheduled entry point, and the monitoring probe that reads it.
+    p_run = sub.add_parser(
+        "backup-run", help="scheduled run: backup + encrypt + verify + retain + alert"
+    )
+    p_run.add_argument("--label", default="scheduled")
+    sub.add_parser("status", help="report the last scheduled run (monitoring probe)")
+
     args = parser.parse_args(argv)
 
     url = _owner_url()
@@ -228,12 +299,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Point the whole process at the maintenance credential. `load_dotenv` inside the
         # modules uses `override=True`, so this must be set before they are imported —
         # every command imports `core.backup_service` lazily for exactly that reason.
-        os.environ["DATABASE_URL"] = url
-        if url.startswith("postgres://"):
-            url = url.replace("postgres://", "postgresql+psycopg2://", 1)
-        elif url.startswith("postgresql://"):
-            url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-        os.environ["DATABASE_URL"] = url
+        #
+        # Phase 16: the normalisation used to rewrite `os.environ` in place, so a caller
+        # that invoked `main()` in-process (a test, or any future embedder) had its own
+        # `DATABASE_URL` silently rewritten from `postgresql+psycopg2://` to
+        # `postgresql://`. `core.db_engine` caches one engine per URL, so the mutated
+        # value poisoned every later test in the same process. The env var is now
+        # restored by `main()`'s caller-visible contract: see `_restore_env` below.
+        normalised = url
+        if normalised.startswith("postgres://"):
+            normalised = normalised.replace("postgres://", "postgresql+psycopg2://", 1)
+        elif normalised.startswith("postgresql://"):
+            normalised = normalised.replace("postgresql://", "postgresql+psycopg2://", 1)
+        os.environ["DATABASE_URL"] = normalised
 
     if args.command == "backup":
         return cmd_backup(args.label)
@@ -245,6 +323,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_restore(args.filename, args.yes)
     if args.command == "prune":
         return cmd_prune(args.days)
+    if args.command == "backup-run":
+        return cmd_backup_run(args.label)
+    if args.command == "status":
+        return cmd_status()
     parser.error("unknown command")
     return 2
 
