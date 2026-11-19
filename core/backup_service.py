@@ -968,6 +968,31 @@ def restore_backup(filename: str, target_db_url: Optional[str] = None) -> Dict[s
     4. Баталгаажуулалт унавал `pre_restore` snapshot-оос буцаан бодитоор сэргээнэ (P0 Rollback Fix).
     """
     _assert_maintenance_credential("restore")
+    # Phase 20: restore now takes the same directory lock as backup and prune.
+    #
+    # Phase 19 showed the lock message promised "backup, prune or restore is already
+    # running" while only the scheduled backup path ever acquired it. A restore therefore
+    # ran happily through a held lock, and a concurrent prune could unlink the archive it
+    # was reading (prune selects by mtime and knows nothing about in-flight readers).
+    #
+    # Lock ordering is deliberately trivial — one lock, at most one holder:
+    #     BACKUP_DIR/.backup.lock  ->  everything else
+    # No code path takes a second lock while holding this one, so there is no cycle and
+    # therefore no deadlock. flock() is released by the kernel on process death, so a
+    # SIGKILL cannot wedge the system.
+    try:
+        with backup_staging.backup_lock(BACKUP_DIR):
+            return _restore_backup_locked(filename, target_db_url)
+    except backup_staging.LockUnavailable as exc:
+        return {
+            "success": False,
+            "locked": True,
+            "error": f"{exc}. A restore, backup or prune is using this backup directory; retry when it finishes.",
+            "post_restore_verified": False,
+        }
+
+
+def _restore_backup_locked(filename: str, target_db_url: Optional[str]) -> Dict[str, Any]:
     check = verify_backup(filename)
     if not check.get("valid"):
         return {"success": False, "error": check.get("error", "Invalid backup"), "post_restore_verified": False}
@@ -1239,23 +1264,36 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
         }
 
 
-def prune_old_backups(keep_days: int = 14) -> Dict[str, Any]:
-    """Retention Policy: keep_days-ээс хуучин backup файлуудыг автоматаар цэвэрлэх"""
+def prune_old_backups(keep_days: int = 14, keep_min: Optional[int] = None) -> Dict[str, Any]:
+    """Retention Policy: keep_days-ээс хуучин backup файлуудыг автоматаар цэвэрлэх
+
+    Phase 20 rewrote this against the shared retention rules. As written before, it had
+    three defects that only surface during an incident:
+
+    * it matched only ``.sql.gz``/``.db.gz``, so **encrypted archives were never pruned**
+      by the operator command (unbounded growth) while their plaintext-named sidecars
+      were;
+    * it had no count floor at all, so ``--days 0`` deleted every archive including the
+      last recoverable one — the exact outcome Phase 18 added a floor to ``prune()`` to
+      prevent, in the other retention path;
+    * it ran with no lock, so it could race a restore or a backup.
+    """
+    from core import backup_automation
+
     if not os.path.exists(BACKUP_DIR):
-        return {"pruned_count": 0, "pruned_files": []}
-    cutoff_ts = time.time() - (max(1, int(keep_days)) * 86400)
-    pruned: List[str] = []
-    for fname in os.listdir(BACKUP_DIR):
-        if not (fname.endswith(".db.gz") or fname.endswith(".sql.gz")):
-            continue
-        fpath = os.path.join(BACKUP_DIR, fname)
-        try:
-            if os.path.getmtime(fpath) < cutoff_ts:
-                os.remove(fpath)
-                for ext in (".sha256", ".meta.json"):
-                    if os.path.exists(fpath + ext):
-                        os.remove(fpath + ext)
-                pruned.append(fname)
-        except Exception as e:
-            logger.warning(f"Could not prune old backup {fname}: {e}")
-    return {"pruned_count": len(pruned), "pruned_files": pruned}
+        return {"pruned_count": 0, "pruned_files": [], "locked": False}
+    floor = backup_automation.min_keep() if keep_min is None else max(1, int(keep_min))
+    try:
+        with backup_staging.backup_lock(BACKUP_DIR):
+            # `prune` already implements age + floor + sidecar cleanup + encrypted-aware
+            # inventory. Reusing it means there is one retention implementation, not two
+            # that disagree about which files count.
+            removed = backup_automation.prune(BACKUP_DIR, days=max(1, int(keep_days)), keep_min=floor)
+            return {"pruned_count": len(removed), "pruned_files": removed, "locked": False}
+    except backup_staging.LockUnavailable as exc:
+        return {
+            "pruned_count": 0,
+            "pruned_files": [],
+            "locked": True,
+            "error": str(exc),
+        }

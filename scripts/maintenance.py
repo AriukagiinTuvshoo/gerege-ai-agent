@@ -276,6 +276,12 @@ def cmd_prune(days: int) -> int:
     from core import backup_service
 
     result = backup_service.prune_old_backups(keep_days=days)
+    # Phase 20: a locked-out prune used to print "pruned 0 backup(s)" and exit 0, which
+    # reads exactly like a successful retention pass that found nothing to do. It is a
+    # *refusal*, and an operator tuning retention needs to know the difference.
+    if result.get("locked"):
+        print(f"SKIPPED: {result.get('error', 'backup directory is locked')}")
+        return 16
     print(f"pruned {result['pruned_count']} backup(s) older than {days} day(s)")
     for name in result["pruned_files"]:
         print(f"  {name}")
