@@ -406,9 +406,6 @@ def run_scheduled_backup(label: str = "scheduled") -> Dict[str, Any]:
     }
 
     os.makedirs(directory, exist_ok=True)
-    swept = backup_staging.sweep_stale_staging(directory)
-    if swept:
-        result["warnings"].append(f"removed {len(swept)} stale staging director(ies) from a previous crash")
 
     try:
         lock = backup_staging.backup_lock(directory)
@@ -432,6 +429,24 @@ def run_scheduled_backup(label: str = "scheduled") -> Dict[str, Any]:
         return result
 
     try:
+        # Phase 20: sweep now runs *while the lock is held*.
+        #
+        # Phase 19 found that a SIGKILL leaves a plaintext dump in `.staging-*` and that
+        # the sweep's 6-hour age guard is the exposure window. The guard exists to avoid
+        # deleting a live sibling's staging directory, but once we hold the exclusive
+        # directory lock there is provably no other backup running, so the age guard is
+        # no longer needed for that purpose. Holding the lock is the sound proof; the age
+        # value is only a secondary backstop for a shared filesystem where PIDs collide.
+        #
+        # This shortens plaintext exposure after a crash from up to 6 hours to "the next
+        # backup run", without ever risking an active run's staging directory.
+        swept = backup_staging.sweep_stale_staging(
+            directory, max_age=backup_staging.STALE_SWEEP_MAX_AGE_LOCKED
+        )
+        if swept:
+            result["warnings"].append(
+                f"removed {len(swept)} stale staging director(ies) from a previous crash"
+            )
         return _run_scheduled_backup_locked(label, directory, result)
     finally:
         lock.__exit__(None, None, None)

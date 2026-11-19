@@ -42,6 +42,17 @@ from typing import Optional
 STAGING_PREFIX = ".staging-"
 LOCK_NAME = ".backup.lock"
 _SECURE_MODE = 0o700
+
+#: Age guard used when the sweep runs *while holding the directory lock*.
+#:
+#: The ordinary sweep waits 6 hours before removing a staging directory whose creating
+#: process is gone, because on a shared filesystem a PID may be reused by an unrelated
+#: process and a live backup must never lose its working directory. Once the exclusive
+#: directory lock is held, no sibling backup can be running in this directory at all, so
+#: the long wait buys nothing and only extends how long a SIGKILL'd run's plaintext sits
+#: on disk. Phase 20 uses this much shorter backstop in the locked path; the PID check
+#: remains the primary signal in both.
+STALE_SWEEP_MAX_AGE_LOCKED = 60.0
 _FILE_MODE = 0o600
 
 

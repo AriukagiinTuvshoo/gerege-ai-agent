@@ -496,10 +496,28 @@ class LocalOffsite(OffsiteProvider):
     def download_verified(self, remote_name: str, local_path: str,
                           expected_size: int = -1,
                           expected_sha256: str = "") -> Tuple[bool, str]:
+        """Download, then hash the bytes that actually landed on disk.
+
+        The remote copy is not re-consulted here: the point of a verified download is to
+        check the bytes this process received, not to ask the same server twice.
+        """
         ok, error = self.download(remote_name, local_path)
         if not ok:
             return False, error
-        return self.verify(os.path.basename(local_path), expected_size, expected_sha256)
+        try:
+            size = os.path.getsize(local_path)
+            if expected_size is not None and expected_size >= 0 and size != expected_size:
+                return False, f"downloaded size mismatch: {size} != expected {expected_size}"
+            if expected_sha256:
+                digest = hashlib.sha256()
+                with open(local_path, "rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(block)
+                if digest.hexdigest().lower() != expected_sha256.lower():
+                    return False, "downloaded digest does not match the expected sha256"
+        except OSError as exc:
+            return False, f"cannot hash downloaded object: {type(exc).__name__}"
+        return True, ""
 
     def list_remote_objects(self) -> List[Tuple[str, Optional[float]]]:
         if not os.path.isdir(self.target):

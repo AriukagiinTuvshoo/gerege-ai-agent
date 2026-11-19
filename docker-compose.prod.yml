@@ -137,7 +137,13 @@ services:
       META_VERIFY_TOKEN: ${META_VERIFY_TOKEN:-}
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
     volumes:
-      - ./backups:/app/backups
+      # Phase 20: read-only. Phase 19 showed the web container could DELETE or replace
+      # any archive, checksum or manifest in this directory — a compromised app could
+      # destroy the entire local backup set, and a plaintext leftover was readable
+      # outright. The admin API only lists and verifies (GET /backups, POST
+      # /backups/verify), both of which need read access and nothing more; create and
+      # restore were removed in E-05 and run from the maintenance container.
+      - ./backups:/app/backups:ro
       - ./static/qrcodes:/app/static/qrcodes
     depends_on:
       db:
@@ -174,7 +180,9 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
     volumes:
-      - ./backups:/app/backups
+      # Phase 20: read-only, same reasoning as `web` above. The worker has no backup code
+      # path at all; it never needed write access.
+      - ./backups:/app/backups:ro
     depends_on:
       db:
         condition: service_healthy
