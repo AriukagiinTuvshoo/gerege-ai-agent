@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import database
 from core import backup_archive
+from core import backup_crypto
 from core import backup_staging
 from core.db_engine import is_postgres, get_database_url, dispose_shared_engine
 
@@ -770,6 +771,12 @@ def _reset_public_schema(pg_url: str) -> Tuple[bool, str]:
     the replay authoritative.
     """
     try:
+        # Phase 20: `DROP SCHEMA ... CASCADE` takes ACCESS EXCLUSIVE on every object in
+        # the schema, so it queues behind any other open session (a pooling app, a test
+        # harness, a psql left open) and blocks indefinitely. During an incident that is
+        # the worst possible behaviour: the rollback that exists to undo a bad restore
+        # hangs instead. A bounded lock_timeout makes it fail fast and report honestly,
+        # so the operator is told to disconnect clients rather than left waiting.
         proc = subprocess.run(
             [
                 "psql",
@@ -777,6 +784,7 @@ def _reset_public_schema(pg_url: str) -> Tuple[bool, str]:
                 "-v",
                 "ON_ERROR_STOP=1",
                 "-c",
+                "SET lock_timeout = '10s'; SET statement_timeout = '50s'; "
                 "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;",
                 pg_url,
             ],
@@ -1152,6 +1160,36 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
         pre_gz = os.path.join(BACKUP_DIR, pre_name) if pre_name else None
         pre_counts = pre_snap.get("table_counts", {})
 
+        # Phase 20: the pre-restore snapshot is an *encrypted* archive (`.sql.gz.enc`),
+        # but every rollback path below hands ``pre_gz`` straight to
+        # ``_apply_postgres_sql_file``, which gzip-reads it. gzip on ciphertext fails, so
+        # the automatic rollback could never work once Phase 18 started encrypting the
+        # snapshot: it logged "rollback ... FAILED", returned ROLLBACK_FAILED, and left the
+        # damaged restore in place. The CI suite did not catch it because the shared test
+        # database had already been emptied by an earlier case, so the snapshot step was
+        # skipped entirely and the failure never ran.
+        #
+        # Plaintext is materialised for the duration of the rollback only, inside a 0700
+        # directory, and destroyed afterwards.
+        # StagingDir registers an atexit hook and a SIGTERM guard in __enter__, so the
+        # decrypted copy is removed even if this function returns early or the process is
+        # signalled; the explicit cleanup at each exit makes it prompt for the normal case.
+        pre_stage = backup_staging.StagingDir(BACKUP_DIR)
+        pre_replay = pre_gz
+        if pre_gz and os.path.exists(pre_gz) and backup_archive.is_encrypted_name(pre_gz):
+            pre_stage.__enter__()
+            plaintext = pre_stage.path(os.path.basename(pre_gz)[: -len(backup_archive.ENCRYPTED_SUFFIX)])
+            try:
+                backup_crypto.decrypt_file(pre_gz, plaintext, _key_file())
+                pre_replay = plaintext
+            except Exception as exc:
+                pre_stage.cleanup()
+                pre_replay = None
+                logger.error(
+                    "cannot decrypt the pre-restore snapshot for replay (%s); the snapshot "
+                    "exists but this build cannot use it", type(exc).__name__,
+                )
+
         # Step 1: Apply SQL dump to PostgreSQL under --single-transaction
         apply_ok, apply_output = _apply_postgres_sql_file(fpath, pg_url, server_ver=server_ver)
 
@@ -1159,6 +1197,7 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
             # SQL execution failed; since --single-transaction was used, check if pre-existing state is intact
             intact_check = _verify_restored_postgres(pg_url, pre_counts)
             if intact_check.get("verified"):
+                pre_stage.cleanup()
                 return {
                     "success": False,
                     "error": f"psql restore execution failed: {apply_output[:400]}",
@@ -1170,11 +1209,12 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                 }
             # If not intact, actively recover from pre-restore snapshot
             recovered = False
-            if pre_gz and os.path.exists(pre_gz):
-                rec_ok, _ = _apply_postgres_sql_file(pre_gz, pg_url, server_ver=server_ver)
+            if pre_replay and os.path.exists(pre_replay):
+                rec_ok, _ = _apply_postgres_sql_file(pre_replay, pg_url, server_ver=server_ver)
                 if rec_ok and _verify_restored_postgres(pg_url, pre_counts).get("verified"):
                     recovered = True
 
+            pre_stage.cleanup()
             return {
                 "success": False,
                 "error": f"psql restore execution failed: {apply_output[:400]}",
@@ -1207,14 +1247,14 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                 f"PostgreSQL post-restore verification failed ({ver_err}); executing real rollback to pre_restore snapshot: {pre_name}"
             )
             rollback_ok = False
-            if pre_gz and os.path.exists(pre_gz):
+            if pre_replay and os.path.exists(pre_replay):
                 # Replay the snapshot onto a clean schema: the dump cannot drop tables that
                 # were created after it was taken, so dropping first is what makes the
                 # rollback actually atomic.
                 reset_ok, reset_err = _reset_public_schema(pg_url)
                 if not reset_ok:
                     logger.error(f"Could not reset schema before rollback: {reset_err}")
-                rb_applied, rb_err = _apply_postgres_sql_file(pre_gz, pg_url, server_ver=server_ver)
+                rb_applied, rb_err = _apply_postgres_sql_file(pre_replay, pg_url, server_ver=server_ver)
                 if rb_applied:
                     rb_verify = _verify_restored_postgres(pg_url, pre_counts)
                     if rb_verify.get("verified"):
@@ -1222,6 +1262,7 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
 
             if rollback_ok:
                 logger.info(f"PostgreSQL rollback to pre_restore snapshot {pre_name} succeeded.")
+                pre_stage.cleanup()
                 return {
                     "success": False,
                     "error": ver_err,
@@ -1233,6 +1274,7 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                 }
             else:
                 logger.error(f"PostgreSQL rollback to pre_restore snapshot {pre_name} FAILED!")
+                pre_stage.cleanup()
                 return {
                     "success": False,
                     "error": ver_err,
@@ -1251,6 +1293,8 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                 }
 
         # Restore and verification both succeeded!
+        # Phase 20: destroy the decrypted snapshot copy if one was staged for replay.
+        pre_stage.cleanup()
         return {
             "success": True,
             "engine": "postgresql",

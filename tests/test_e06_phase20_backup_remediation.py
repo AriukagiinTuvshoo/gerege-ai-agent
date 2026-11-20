@@ -664,3 +664,67 @@ def test_p20_29_restore_rearms_the_append_only_guard(tmp_path, monkeypatch):
     finally:
         conn.close()
     assert enabled >= 1, "the append-only audit guard was not restored"
+
+
+@pytestmark_pg
+def test_p20_30_rollback_replays_an_encrypted_pre_restore_snapshot(tmp_path, monkeypatch):
+    """Phase 20: the automatic rollback handed the *encrypted* snapshot to a gzip reader.
+
+    ``_create_pre_restore_snapshot`` publishes an AEAD archive (``.sql.gz.enc``), but every
+    rollback path passed that filename straight to ``_apply_postgres_sql_file``, which
+    gzip-decodes it. gzip on ciphertext raises, so the automatic rollback could never run:
+    it logged "rollback ... FAILED", returned ``ROLLBACK_FAILED`` and left the damaged
+    restore in place — during an incident, on the one path that exists to undo it.
+
+    The defect predates Phase 20 (present at fef08a3); it survived because the only suite
+    that exercised it ran against a shared database that an earlier case had already
+    emptied, so the snapshot step was skipped and the replay never executed.
+
+    This asserts the observable outcome, not the mechanism: a restore whose post-check
+    fails must end ROLLED_BACK_TO_PRE_SNAPSHOT with the pre-restore row counts intact.
+    """
+    import gzip as _gzip
+
+    from core import backup_service
+
+    directory = tmp_path / "b"
+    directory.mkdir()
+    monkeypatch.setattr("core.backup_service.BACKUP_DIR", str(directory))
+    monkeypatch.setenv("BACKUP_ENCRYPTION", "on")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", _key(tmp_path / "k"))
+
+    # The rollback only exists when there is something to roll back to: on an empty
+    # database `_restore_resolved` deliberately skips the snapshot (a restore into a
+    # destroyed database is the primary disaster case, and refusing it would turn
+    # recovery into a no-op). So the test must first make the database populated,
+    # otherwise it asserts nothing about the rollback and passes for the wrong reason.
+    from core import backup_service as _bs
+
+    if _bs._database_is_empty():
+        import database as _database
+
+        _database.init_db()
+    assert _bs._database_is_empty() is False, "the fixture database must be populated"
+
+    # A dump that replays cleanly but declares an impossible row count, so the post-restore
+    # verification fails and the rollback path is the thing under test.
+    bad = "pg_backup_p20_rb.sql.gz"
+    path = directory / bad
+    with _gzip.open(path, "wt") as handle:
+        handle.write("CREATE TABLE IF NOT EXISTS _p20_rb (id INT);\n")
+    (directory / (bad + ".sha256")).write_text(
+        f"{backup_service._compute_sha256(str(path))}  {bad}\n"
+    )
+    (directory / (bad + ".meta.json")).write_text(json.dumps({"table_counts": {"pages": 99999}}))
+
+    result = backup_service.restore_backup(bad)
+
+    assert result["success"] is False
+    assert result["rollback_status"] == "ROLLED_BACK_TO_PRE_SNAPSHOT", (
+        f"rollback did not recover from the encrypted snapshot: {result.get('rollback_status')}"
+    )
+    assert result["rolled_back"] is True
+    assert result["atomic_rollback"] is True
+    # No plaintext copy of the snapshot may survive the rollback.
+    leftovers = [f for f in os.listdir(directory) if f.startswith(".staging-")]
+    assert leftovers == [], f"staging directories left behind: {leftovers}"

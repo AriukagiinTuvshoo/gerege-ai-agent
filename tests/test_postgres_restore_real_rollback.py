@@ -118,7 +118,12 @@ def test_postgres_restore_success_verifies_data():
 
     bk = backup_service.create_backup(label="pg_p0_good")
     assert bk["success"] is True, f"create_backup failed: {bk}"
-    assert bk["filename"].endswith(".sql.gz")
+    # Phase 20: create_backup() now enforces the encryption policy internally, so a
+    # production backup is authenticated ciphertext. Tightened, not loosened: the archive
+    # must also report that it is encrypted and authenticated.
+    assert bk["filename"].endswith(".sql.gz.enc"), bk["filename"]
+    assert bk.get("encrypted") is True
+    assert bk.get("encryption_format") == "authenticated"
 
     # Insert noise row after backup
     noise_id = f"noise_{uuid.uuid4().hex[:8]}"
