@@ -67,6 +67,11 @@ class BackupSecurityPolicy:
     warning: str = ""
     #: Machine-readable tag for the CLI and the status file.
     code: str = ""
+    #: Exit status the caller must return. The policy states it so that every entry point
+    #: agrees: the documented codes are 11 (encryption failed) and 15 (not configured), and
+    #: a missing key has always been 11. Splitting this out here keeps the pre-existing
+    #: contract instead of silently reclassifying a failure class that alerting may key on.
+    exit_code: int = 15
 
     @property
     def encrypting(self) -> bool:
@@ -136,6 +141,7 @@ def evaluate() -> BackupSecurityPolicy:
                 f"unrecognised value must not silently select a weaker mode."
             ),
             code="ENCRYPTION_CONFIG_INVALID",
+            exit_code=15,
         )
 
     wants_encryption = mode in _ENCRYPTED_VALUES
@@ -157,6 +163,7 @@ def evaluate() -> BackupSecurityPolicy:
                 "was read."
             ),
             code="ENCRYPTION_DISABLED_IN_PRODUCTION",
+            exit_code=15,
         )
 
     if not wants_encryption:
@@ -193,6 +200,10 @@ def evaluate() -> BackupSecurityPolicy:
                 )
             ),
             code="ENCRYPTION_KEY_MISSING",
+            # No key configured at all is the documented "not configured" class (15); the
+            # encryption step never begins. A key that is configured but unusable is a
+            # different failure (11, below) and alerting may treat them differently.
+            exit_code=15,
         )
 
     if not os.path.exists(path):
@@ -207,6 +218,7 @@ def evaluate() -> BackupSecurityPolicy:
                 "No backup was written."
             ),
             code="ENCRYPTION_KEY_MISSING",
+            exit_code=11,
         )
     if not os.path.isfile(path):
         return BackupSecurityPolicy(
@@ -219,6 +231,7 @@ def evaluate() -> BackupSecurityPolicy:
                 f"({os.path.basename(path)}). No backup was written."
             ),
             code="ENCRYPTION_KEY_INVALID",
+            exit_code=11,
         )
     try:
         size = os.path.getsize(path)
@@ -230,6 +243,7 @@ def evaluate() -> BackupSecurityPolicy:
             reason="key file unreadable",
             error="encryption key file is unreadable. No backup was written.",
             code="ENCRYPTION_KEY_INVALID",
+            exit_code=11,
         )
     if size == 0:
         return BackupSecurityPolicy(
@@ -242,6 +256,7 @@ def evaluate() -> BackupSecurityPolicy:
                 "A zero-length key is never a valid AES-256 key."
             ),
             code="ENCRYPTION_KEY_INVALID",
+            exit_code=11,
         )
 
     return BackupSecurityPolicy(

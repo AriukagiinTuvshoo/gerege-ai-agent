@@ -561,3 +561,38 @@ def test_non_production_plaintext_is_labelled_not_silent(backup_dir, monkeypatch
     assert result.get("success") is True, result.get("error")
     assert result.get("encryption_format") == "none"
     assert result.get("warning"), "a plaintext archive must carry a warning"
+
+
+def test_exit_codes_preserve_the_preexisting_failure_classification(env, tmp_path):
+    """Two distinct failures must not collapse into one exit code.
+
+    The runbook and alerting already distinguish "not configured" (15) from "encryption
+    failed" (11). A missing key *variable* means the encryption step never had a
+    configuration; a key that is present but unusable means encryption was attempted and
+    could not work. Collapsing them would silently reclassify a failure an operator has
+    been told to handle differently.
+    """
+    env.set(BACKUP_ENCRYPTION="on")
+    assert backup_policy.evaluate().exit_code == 15, "unset key variable is 'not configured'"
+
+    # An empty value is indistinguishable from unset: there is no key configured.
+    env.set(BACKUP_ENCRYPTION="on", BACKUP_ENCRYPTION_KEY_FILE="")
+    assert backup_policy.evaluate().exit_code == 15
+
+    # A configured path that does not work is a different failure class.
+    for value in ("/nonexistent/key", str(tmp_path)):
+        env.set(BACKUP_ENCRYPTION="on", BACKUP_ENCRYPTION_KEY_FILE=value)
+        policy = backup_policy.evaluate()
+        assert policy.allowed is False
+        assert policy.exit_code == 11, f"{value!r} is 'encryption failed', not 'not configured'"
+
+    empty = tmp_path / "empty.key"
+    empty.write_bytes(b"")
+    env.set(BACKUP_ENCRYPTION="on", BACKUP_ENCRYPTION_KEY_FILE=str(empty))
+    assert backup_policy.evaluate().exit_code == 11
+
+
+def test_production_plaintext_refusal_is_a_configuration_error(env):
+    """`off` in production is a configuration fault, not an encryption failure."""
+    env.set(ENV="production", BACKUP_ENCRYPTION="off")
+    assert backup_policy.evaluate().exit_code == 15

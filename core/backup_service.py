@@ -196,6 +196,8 @@ def _collect_db_table_counts(
     from core import db_bounds
 
     counts: Dict[str, int] = {}
+    # SQLite has no server-side timeouts; bounded_session applies none there and the
+    # deadline check still runs, so the call is safe on both engines.
     with db_bounds.bounded_session(
         label="table row counts", deadline=deadline, cancel_event=cancel_event
     ) as (conn, dl):
@@ -272,7 +274,7 @@ def _create_backup_secured(label: str) -> Dict[str, Any]:
         return {
             "success": False,
             "error": policy.error,
-            "exit_code": 11,
+            "exit_code": policy.exit_code,
             "encryption_policy": policy.code,
             "policy_refused": True,
         }

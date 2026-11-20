@@ -325,3 +325,60 @@ def test_restore_statements_carry_their_own_lock_and_statement_timeouts():
     source = (REPO_ROOT / "core" / "backup_service.py").read_text()
     assert "lock_timeout" in source
     assert "statement_timeout" in source
+
+
+def test_sqlite_sessions_are_not_sent_postgres_set_statements():
+    """The SQLite backup path shares `_collect_db_table_counts()` with PostgreSQL.
+
+    Applying `SET statement_timeout` to SQLite raises `near "SET": syntax error`, which broke
+    every SQLite backup until the bounds module learned to tell the engines apart. SQLite has
+    no server-side statement timeouts at all - the deadline check is what bounds it - so the
+    correct behaviour is a no-op rather than an error.
+    """
+    import sqlite3
+
+    from core import backup_service, db_bounds
+
+    tmp = pathlib.Path(__file__).parent / "_sqlite_bounds_probe.db"
+    try:
+        conn = sqlite3.connect(str(tmp))
+        assert db_bounds._is_sqlite_connection(conn) is True
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        # Must not raise, and must not attempt a SET.
+        db_bounds.bound_dbapi_connection(conn)
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.commit()
+        conn.close()
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def test_sqlite_table_counts_work_end_to_end(monkeypatch, tmp_path):
+    """The path that broke: a SQLite database must still produce a backup manifest."""
+    import sqlite3
+
+    import database as database_module
+
+    db_path = tmp_path / "app.db"
+    conn = sqlite3.connect(str(db_path))
+    for table in ("pages", "registrations", "messages", "session_states", "sessions",
+                  "user_memories", "invoices", "cargo_packages", "automated_rules",
+                  "marketing_campaigns", "sent_followups", "appointments",
+                  "notification_locks", "task_jobs", "audit_logs",
+                  "comment_automations", "tracked_links"):
+        conn.execute(f"CREATE TABLE {table} (x INTEGER)")
+    conn.execute("INSERT INTO pages VALUES (1)")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(database_module, "DB_PATH", str(db_path), raising=False)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.delenv("ENV", raising=False)
+    monkeypatch.delenv("STRICT_SECURITY", raising=False)
+
+    from core import backup_service
+
+    counts = backup_service._collect_db_table_counts()
+    assert counts.get("pages") == 1
+    assert len(counts) == 17

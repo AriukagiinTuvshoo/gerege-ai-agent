@@ -118,7 +118,13 @@ def test_p20_04_encryption_required_but_key_unset_is_fatal(tmp_path, monkeypatch
 
     result = backup_service.create_backup(label="nokey")
     assert result["success"] is False
-    assert result.get("exit_code") == 11
+    # Phase 22 (P21-01) made this code path-independent. Before the centralized policy the
+    # *direct* path returned 11 here while the *scheduled* path returned 15 for the same
+    # condition (test_p16_33 / test_p18_13 pin 15), so the code an operator saw depended on
+    # which entry point ran. One policy now answers for both, and "no encryption
+    # configured" is the documented "not configured" class (15) everywhere.
+    assert result.get("exit_code") == 15
+    assert result.get("encryption_policy") == "ENCRYPTION_KEY_MISSING"
     assert os.listdir(tmp_path / "b") == []
 
 

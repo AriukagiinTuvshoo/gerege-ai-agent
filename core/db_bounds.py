@@ -209,8 +209,34 @@ def bounded_session(
                 pass
 
 
+def _is_sqlite_connection(conn) -> bool:
+    """True for a SQLite connection, which has no server-side statement timeouts.
+
+    SQLite is bounded by `busy_timeout` and by the process itself: there is no second
+    session that can hold a lock for minutes, so `SET lock_timeout` is not merely absent,
+    it is meaningless. Issuing one is a syntax error (`near "SET": syntax error`), which is
+    how this distinction was discovered - the SQLite backup path shares
+    `_collect_db_table_counts()` with PostgreSQL.
+    """
+    module = type(conn).__module__ or ""
+    if "sqlite" in module.lower():
+        return True
+    try:
+        from core.db_engine import is_postgres
+
+        return not is_postgres()
+    except Exception:
+        return False
+
+
 def _apply_session_bounds(conn, *, statement_timeout: float, lock_timeout: float) -> None:
-    """SET the session timeouts. Failure here is fatal: an unbounded session is the bug."""
+    """SET the session timeouts. Failure here is fatal: an unbounded session is the bug.
+
+    On SQLite this is a no-op by design, not a silent downgrade: the caller still gets the
+    deadline check, which is the part that is meaningful there.
+    """
+    if _is_sqlite_connection(conn):
+        return
     budget_ms = _ms(statement_timeout)
     lock_ms = _ms(lock_timeout)
     cur = conn.cursor()
