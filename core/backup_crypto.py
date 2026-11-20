@@ -54,6 +54,7 @@ that path is **not** authenticated and is reported as such.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -61,7 +62,12 @@ import struct
 from typing import Any, Dict, Optional, Tuple
 
 MAGIC = b"GEREGE-B"
-FORMAT_VERSION = 1
+#: Format this build writes. Version 2 binds the chunk index and length into the AEAD
+#: associated data; version 1 did not (see ``_chunk_aad`` for the defect this fixes).
+FORMAT_VERSION = 2
+#: Versions this build can still READ. Old archives stay restorable after an upgrade;
+#: dropping a readable version would strand every existing restore point.
+READABLE_VERSIONS = (1, 2)
 KEY_LEN = 32
 NONCE_LEN = 12
 TAG_LEN = 16
@@ -125,6 +131,44 @@ def _header_bytes(header: Dict[str, Any]) -> bytes:
     return json.dumps(ordered, sort_keys=False, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
+def _chunk_aad(header_bytes: bytes, version: int, index: int, plain_len: int) -> bytes:
+    """Associated data bound to each frame.
+
+    Phase 22 (P21-02). Version 1 authenticated every frame against the *header* only, so
+    the frames were individually authentic but not bound to their position. Phase 21
+    swapped two data frames in a real archive and ``decrypt_file`` returned success -
+    producing 1,572,864 bytes of silently wrong plaintext for a 1,572,864-byte original.
+    The docstring claimed "a reordered chunk ... raise[s] here". It did not.
+
+    That was not remotely exploitable (the sidecar checksum and gzip both reject the
+    result), but "the AEAD would catch it" was a false statement about the format, and a
+    future caller that trusted the archive layer alone would have been wrong.
+
+    Version 2 binds, per frame: the header, the chunk index, and the plaintext length.
+    * index - swapping, duplicating or dropping a frame changes the index it is checked
+      against, so the tag no longer verifies;
+    * length - a frame cannot be relabelled with a different size;
+    * header - the container metadata stays bound as before.
+
+    The end marker uses a distinguishable type byte and the total chunk count, so a data
+    frame cannot be substituted for the terminator or vice versa.
+    """
+    return (
+        b"gerege-chunk-v2\x00"
+        + struct.pack(">BII", version, index, plain_len)
+        + hashlib.sha256(header_bytes).digest()
+    )
+
+
+def _end_aad(header_bytes: bytes, version: int, chunk_count: int) -> bytes:
+    """Associated data for the end marker: distinct type, plus the total frame count."""
+    return (
+        b"gerege-end-v2\x00"
+        + struct.pack(">BI", version, chunk_count)
+        + hashlib.sha256(header_bytes).digest()
+    )
+
+
 def encrypt_file(src: str, dest: str, key_file: str, original_name: Optional[str] = None) -> Dict[str, Any]:
     """Encrypt ``src`` to ``dest`` with AES-256-GCM.
 
@@ -158,6 +202,7 @@ def encrypt_file(src: str, dest: str, key_file: str, original_name: Optional[str
             fout.write(MAGIC)
             fout.write(struct.pack(">BH", FORMAT_VERSION, len(header_bytes)))
             fout.write(header_bytes)
+            index = 0
             while True:
                 chunk = fin.read(CHUNK_SIZE)
                 if not chunk:
@@ -166,15 +211,24 @@ def encrypt_file(src: str, dest: str, key_file: str, original_name: Optional[str
                 # A per-chunk nonce is safe: the key is single-purpose and, at 12 random
                 # bytes, collision probability stays negligible across any realistic
                 # archive count. The nonce is authenticated as part of the ciphertext.
-                sealed = aead.encrypt(nonce, chunk, header_bytes)
+                # Phase 22: the AAD binds the frame to its index and length, so a
+                # reordered or duplicated frame fails authentication.
+                sealed = aead.encrypt(
+                    nonce, chunk, _chunk_aad(header_bytes, FORMAT_VERSION, index, len(chunk))
+                )
                 fout.write(struct.pack(">I", len(chunk)))
                 fout.write(nonce)
                 fout.write(sealed)
                 written += len(chunk)
-            # End marker: frame_len 0 proves the stream was not truncated.
+                index += 1
+            # End marker: frame_len 0 proves the stream was not truncated. Its AAD carries
+            # the total frame count, so truncating whole frames off the end is detected even
+            # when the terminator is copied across.
             fout.write(struct.pack(">I", 0))
             fout.write(b"\x00" * NONCE_LEN)
-            fout.write(aead.encrypt(b"\x00" * NONCE_LEN, b"", header_bytes))
+            fout.write(
+                aead.encrypt(b"\x00" * NONCE_LEN, b"", _end_aad(header_bytes, FORMAT_VERSION, index))
+            )
             fout.flush()
             os.fsync(fout.fileno())
 
@@ -210,9 +264,10 @@ def read_header(path: str) -> Dict[str, Any]:
         if len(raw) != 3:
             raise EncryptionError("encrypted archive header is truncated")
         version, header_len = struct.unpack(">BH", raw)
-        if version != FORMAT_VERSION:
+        if version not in READABLE_VERSIONS:
             raise EncryptionError(
-                f"unsupported encrypted archive version {version}; this build reads version {FORMAT_VERSION}"
+                f"unsupported encrypted archive version {version}; this build reads "
+                f"version(s) {', '.join(str(v) for v in READABLE_VERSIONS)}"
             )
         header_bytes = handle.read(header_len)
         if len(header_bytes) != header_len:
@@ -221,8 +276,11 @@ def read_header(path: str) -> Dict[str, Any]:
         header = json.loads(header_bytes.decode("ascii"))
     except Exception as exc:
         raise EncryptionError("encrypted archive header is not valid JSON") from exc
-    if header.get("format") != "gerege-backup" or header.get("version") != FORMAT_VERSION:
+    if header.get("format") != "gerege-backup" or header.get("version") not in READABLE_VERSIONS:
         raise EncryptionError("encrypted archive header is inconsistent")
+    # The version that governs frame binding is the one in the *binary* prefix, which the
+    # reader has already consumed; recording it lets decrypt choose the right AAD scheme.
+    header["_container_version"] = version
     if header.get("cipher") != "AES-256-GCM":
         raise EncryptionError(f"unsupported cipher {header.get('cipher')!r}")
     header["_raw"] = header_bytes
@@ -250,6 +308,7 @@ def decrypt_file(src: str, dest: str, key_file: str) -> Dict[str, Any]:
 
     header = read_header(src)
     header_bytes = header["_raw"]
+    version_from_prefix = int(header.get("_container_version", FORMAT_VERSION))
 
     tmp_dest = f"{dest}.partial-{secrets.token_hex(4)}"
     total = 0
@@ -260,6 +319,8 @@ def decrypt_file(src: str, dest: str, key_file: str) -> Dict[str, Any]:
             fin.read(len(MAGIC))
             fin.read(3)
             fin.read(len(header_bytes))
+            version = header.get("_container_version", version_from_prefix)
+            index = 0
             while True:
                 raw_len = fin.read(4)
                 if len(raw_len) < 4:
@@ -276,8 +337,16 @@ def decrypt_file(src: str, dest: str, key_file: str) -> Dict[str, Any]:
                     tag = fin.read(TAG_LEN)
                     if len(tag) != TAG_LEN:
                         raise EncryptionError("encrypted archive is truncated")
+                    # Version 2 binds the terminator's *type* and the total frame count, so
+                    # a data frame cannot be passed off as the terminator and a stream
+                    # cannot be truncated by whole frames while keeping an old marker.
+                    end_aad = (
+                        _end_aad(header_bytes, version, index)
+                        if version >= 2
+                        else header_bytes
+                    )
                     try:
-                        aead.decrypt(nonce, tag, header_bytes)
+                        aead.decrypt(nonce, tag, end_aad)
                     except Exception as exc:
                         raise EncryptionError("encrypted archive failed authentication (end marker)") from exc
                     saw_terminator = True
@@ -287,14 +356,21 @@ def decrypt_file(src: str, dest: str, key_file: str) -> Dict[str, Any]:
                 body = fin.read(frame_len + TAG_LEN)
                 if len(body) < frame_len + TAG_LEN:
                     raise EncryptionError("encrypted archive is truncated")
+                frame_aad = (
+                    _chunk_aad(header_bytes, version, index, frame_len)
+                    if version >= 2
+                    else header_bytes
+                )
                 try:
-                    plain = aead.decrypt(nonce, body, header_bytes)
+                    plain = aead.decrypt(nonce, body, frame_aad)
                 except Exception as exc:
                     raise EncryptionError(
-                        "encrypted archive failed authentication: wrong key or the archive has been modified"
+                        "encrypted archive failed authentication: wrong key, a modified "
+                        "byte, or a chunk that is out of order / duplicated / missing"
                     ) from exc
                 fout.write(plain)
                 total += len(plain)
+                index += 1
 
             if not saw_terminator:
                 raise EncryptionError("encrypted archive is truncated (no end marker)")
