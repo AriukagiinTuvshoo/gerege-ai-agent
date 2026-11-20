@@ -87,17 +87,22 @@ def min_keep() -> int:
 
 
 def encryption_required() -> bool:
-    """Encryption is on by default in production mode.
+    """Whether this process must encrypt. Delegates to the centralized policy.
 
-    Backups are a full copy of every tenant's data. Writing them unencrypted next to
-    the database — the Phase 15 finding — is the failure mode this default removes.
-    ``BACKUP_ENCRYPTION=off`` is available for local development, and the run fails
-    closed in production instead of silently downgrading.
+    Phase 22 (P21-01): the body used to be an inline ``BACKUP_ENCRYPTION`` read that
+    had no notion of environment, so ``ENV=production BACKUP_ENCRYPTION=off`` returned
+    False and the caller happily wrote plaintext. The decision now lives in
+    :mod:`core.backup_policy` so that every entry point cannot disagree.
+
+    Contract for legacy callers: True means "encrypt"; a *refused* configuration also
+    returns True, so a caller that never looks at ``allowed`` still fails closed
+    (missing key + encrypting ⇒ the existing error path) instead of downgrading to
+    plaintext. Use :func:`core.backup_policy.evaluate` for the full answer.
     """
-    mode = os.getenv("BACKUP_ENCRYPTION", "on").strip().lower()
-    if mode in ("off", "0", "false", "no"):
-        return False
-    return True
+    from core.backup_policy import evaluate
+
+    policy = evaluate()
+    return policy.encrypting or not policy.allowed
 
 
 def _key_path() -> Optional[str]:
@@ -459,8 +464,24 @@ def _run_scheduled_backup_locked(label: str, directory: str, result: Dict[str, A
     # "failed" or "never ran" instead of inferring it from a stale timestamp.
     _write_status({**result, "in_progress": True}, directory)
 
-    encrypting = encryption_required()
-    key_file = _key_path()
+    # Phase 22 (P21-01): the same centralized policy the direct path uses. A scheduled
+    # run that cannot satisfy the policy must fail loudly rather than publish plaintext.
+    from core import backup_policy
+
+    policy = backup_policy.evaluate()
+    if not policy.allowed:
+        result.update(
+            success=False,
+            exit_code=EXIT_NOT_CONFIGURED,
+            error=policy.error,
+            encryption_policy=policy.code,
+            policy_refused=True,
+        )
+        _finish(result, directory)
+        return result
+
+    encrypting = policy.encrypting
+    key_file = backup_policy.key_path()
     staging = backup_staging.StagingDir(directory, prefix=".staging-")
     staging.__enter__()
 

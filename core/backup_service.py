@@ -64,6 +64,12 @@ def _assert_maintenance_credential(operation: str = "backup") -> None:
             f"cannot reach the database to check the backup credential: {type(exc).__name__}"
         ) from None
     try:
+        # Phase 22 (P21-10): even a catalog read is bounded. pg_class is normally
+        # uncontended, but "normally" is not a bound, and this check runs before every
+        # backup, so an unbounded hang here has the same symptom as the reported defect.
+        from core import db_bounds
+
+        db_bounds.bound_dbapi_connection(conn)
         cur = conn.cursor()
         # Ask what the role can DO, not what it is called.
         #
@@ -152,39 +158,57 @@ def _compute_sha256(filepath: str) -> str:
     return h.hexdigest()
 
 
-def _collect_db_table_counts() -> Dict[str, int]:
+#: Tables whose row counts are reported in the backup manifest.
+_COUNTED_TABLES = (
+    "pages", "registrations", "messages", "session_states", "sessions",
+    "user_memories", "invoices", "cargo_packages", "automated_rules",
+    "marketing_campaigns", "sent_followups", "appointments",
+    "notification_locks", "task_jobs", "audit_logs",
+    "comment_automations", "tracked_links",
+)
+
+
+def _collect_db_table_counts(
+    deadline: Optional["db_bounds.Deadline"] = None,
+    cancel_event: Any = None,
+) -> Dict[str, int]:
+    """Row counts for the manifest, bounded by a deadline and never faked.
+
+    Phase 22 (P21-10). Three defects are fixed here.
+
+    * **Unbounded.** Every ``SELECT COUNT(*)`` ran on a connection with
+      ``statement_timeout = 0``. Under an ``ACCESS EXCLUSIVE`` lock on ``pages`` the first
+      count blocked forever and the backup never reached its 120 s dump timeout: Phase 21
+      measured 398 s of silence and a harness kill. The session now carries
+      ``statement_timeout``/``lock_timeout`` and the whole loop shares one
+      :class:`core.db_bounds.Deadline`.
+    * **Silent.** ``except Exception: counts[tbl] = 0`` turned a blocked or failed query
+      into a plausible zero. A manifest that says ``pages=0`` for a locked table is worse
+      than no manifest: it is a false statement about tenant data. A failure now raises.
+    * **Unclean.** ``try/finally`` closed the cursor and connection, but a failed statement
+      left the transaction open; the context manager rolls back before closing.
+
+    The counts are advisory (they describe what was dumped), so the caller treats a
+    timeout as a *failed backup* rather than publishing an archive with a misleading
+    manifest. ``deadline=None`` keeps unit callers simple and still applies the session
+    bounds.
+    """
+    from core import db_bounds
+
     counts: Dict[str, int] = {}
-    conn = None
-    cur = None
-    try:
-        conn = database.get_connection()
+    with db_bounds.bounded_session(
+        label="table row counts", deadline=deadline, cancel_event=cancel_event
+    ) as (conn, dl):
         cur = conn.cursor()
-        for tbl in (
-            "pages", "registrations", "messages", "session_states", "sessions",
-            "user_memories", "invoices", "cargo_packages", "automated_rules",
-            "marketing_campaigns", "sent_followups", "appointments",
-            "notification_locks", "task_jobs", "audit_logs",
-            "comment_automations", "tracked_links",
-        ):
-            try:
+        try:
+            for tbl in _COUNTED_TABLES:
+                dl.check()
                 cur.execute(f"SELECT COUNT(*) FROM {tbl}")
                 row = cur.fetchone()
                 counts[tbl] = int(row[0] or 0) if row else 0
-            except Exception:
-                counts[tbl] = 0
-        try:
-            conn.commit()
-        except Exception:
-            pass
-    finally:
-        if cur is not None:
+        finally:
             try:
                 cur.close()
-            except Exception:
-                pass
-        if conn is not None:
-            try:
-                conn.close()
             except Exception:
                 pass
     return counts
@@ -234,24 +258,26 @@ def _create_backup_secured(label: str) -> Dict[str, Any]:
     flagged ``encryption_format="none"`` and carries a warning, so it is never mistaken
     for an encrypted restore point.
     """
-    from core import backup_automation
+    from core import backup_automation, backup_policy
 
-    encrypting = backup_automation.encryption_required()
-    key_file = backup_automation._key_path()
-
-    # Fail closed before any dump is taken: a policy that cannot be satisfied must not
-    # produce an artifact at all.
-    if encrypting and not key_file:
+    # Phase 22 (P21-01): one policy, evaluated before anything touches the database.
+    # Phase 20 checked only the key file here and left "may this host write plaintext at
+    # all?" to `encryption_required()`, which reads a single variable and does not know
+    # what environment it is in - so `ENV=production BACKUP_ENCRYPTION=off` published a
+    # full plaintext dump and exited 0. `backup_policy.evaluate()` owns both questions now,
+    # and it is a pure function of the environment, so the refusal happens before any
+    # tenant row is read.
+    policy = backup_policy.evaluate()
+    if not policy.allowed:
         return {
             "success": False,
-            "error": (
-                "encryption is required (BACKUP_ENCRYPTION=on) but BACKUP_ENCRYPTION_KEY_FILE "
-                "is not set. No backup was written and no plaintext was published; configure "
-                "the key file or explicitly set BACKUP_ENCRYPTION=off for a non-production "
-                "environment."
-            ),
+            "error": policy.error,
             "exit_code": 11,
+            "encryption_policy": policy.code,
+            "policy_refused": True,
         }
+    encrypting = policy.encrypting
+    key_file = backup_policy.key_path()
 
     staging = backup_staging.StagingDir(BACKUP_DIR)
     try:
@@ -338,7 +364,12 @@ def _create_backup_secured(label: str) -> Dict[str, Any]:
         staging.cleanup()
 
 
-def _create_backup_dump(label: str, staging_dir: str) -> Dict[str, Any]:
+def _create_backup_dump(
+    label: str,
+    staging_dir: str,
+    deadline: Optional["db_bounds.Deadline"] = None,
+    cancel_event: Any = None,
+) -> Dict[str, Any]:
     """Write the dump itself into ``staging_dir`` and return its manifest.
 
     Callers reach this only through :func:`create_backup`, which guarantees
@@ -354,7 +385,27 @@ def _create_backup_dump(label: str, staging_dir: str) -> Dict[str, Any]:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:18]
     safe_label = "".join(c for c in label if c.isalnum() or c in ("_", "-")) or "backup"
     engine_name = "postgresql" if is_postgres() else "sqlite"
-    table_counts = _collect_db_table_counts()
+    # Phase 22 (P21-10): the counts are bounded and their failure is fatal. A manifest
+    # that says pages=0 for a table it could not read is a false statement about tenant
+    # data, and it is exactly what a lock-blocked preflight used to produce.
+    from core import db_bounds
+
+    deadline = deadline or db_bounds.Deadline(
+        db_bounds.OPERATION_DEADLINE_S, label=f"backup {label}"
+    )
+    try:
+        table_counts = _collect_db_table_counts(deadline=deadline, cancel_event=cancel_event)
+    except (db_bounds.BoundedOperationTimeout, db_bounds.BoundedOperationCancelled) as exc:
+        logger.error("backup preflight bounds exceeded: %s", exc)
+        return {
+            "success": False,
+            # `exc` already names the step and the bound that fired, so this only adds the
+            # consequence: nothing was published and no dump was taken.
+            "error": f"database preflight exceeded its deadline - {exc} No archive was published.",
+
+            "exit_code": 17,
+            "timeout": True,
+        }
 
     inner_name = (
         f"pg_backup_{safe_label}_{ts}.sql.gz"
@@ -366,15 +417,35 @@ def _create_backup_dump(label: str, staging_dir: str) -> Dict[str, Any]:
 
     if is_postgres():
         pg_url = get_database_url().replace("postgresql+psycopg2://", "postgresql://")
+        # The dump gets what is left of the operation deadline, not a fresh 120 s. Without
+        # this the preflight and the dump could each wait out their own bound and the
+        # operator would see a hang roughly twice the configured limit.
+        try:
+            dump_budget = deadline.budget(120.0)
+        except Exception as exc:
+            return {"success": False, "error": f"deadline exceeded before dump: {exc}",
+                    "exit_code": 17, "timeout": True}
         try:
             proc = subprocess.run(
                 ["pg_dump", "--clean", "--if-exists", "--no-owner", "--no-privileges", pg_url],
                 capture_output=True,
                 check=True,
-                timeout=120,
+                timeout=dump_budget,
             )
             with gzip.open(dest_path, "wb") as gz:
                 gz.write(proc.stdout)
+        except subprocess.TimeoutExpired:
+            logger.error("pg_dump exceeded its %.1fs budget", dump_budget)
+            return {
+                "success": False,
+                "error": (
+                    f"pg_dump did not finish within {dump_budget:.0f}s. The deadline is "
+                    f"BACKUP_DB_OPERATION_DEADLINE ({db_bounds.OPERATION_DEADLINE_S:.0f}s). "
+                    f"Nothing was published."
+                ),
+                "exit_code": 17,
+                "timeout": True,
+            }
         except Exception as e:
             logger.error(f"PostgreSQL pg_dump failed: {e}")
             return {"success": False, "error": str(e)}
@@ -723,9 +794,21 @@ def _verify_restored_postgres(pg_url: str, expected_counts: Dict[str, int]) -> D
     elif sa_url.startswith("postgresql://"):
         sa_url = "postgresql+psycopg2://" + sa_url[len("postgresql://"):]
 
-    engine = create_engine(sa_url, pool_pre_ping=True, future=True)
+    from core import db_bounds
+
+    engine = create_engine(
+        sa_url,
+        pool_pre_ping=True,
+        future=True,
+        # A restore verification is a bounded operation: it must not wait out a lock held
+        # by a stray session, and the connect itself must not hang silently.
+        connect_args={"connect_timeout": int(db_bounds.CONNECT_TIMEOUT_S)},
+    )
     try:
         with engine.connect() as conn:
+            # Phase 22 (P21-10): every statement below counts user tables. Under an
+            # ACCESS EXCLUSIVE lock the old code blocked here with no bound at all.
+            db_bounds.bound_sqlalchemy_connection(conn)
             existing = {
                 r[0]
                 for r in conn.execute(
@@ -842,8 +925,19 @@ def _reset_public_schema(pg_url: str) -> Tuple[bool, str]:
                 "END LOOP; END $$",
             ]
         )
+        from core import db_bounds
+
+        # Phase 22 (P21-10): bound the server side as well as the subprocess. DROP TABLE
+        # waits for its lock; without a lock_timeout the destructive step can burn the
+        # whole 120 s subprocess budget queued behind another session and then fail with
+        # no useful diagnostic.
+        guarded_script = (
+            f"SET lock_timeout = {db_bounds._ms(db_bounds.LOCK_TIMEOUT_S)};\n"
+            f"SET statement_timeout = {db_bounds._ms(max(db_bounds.STATEMENT_TIMEOUT_S, 55.0))};\n"
+            + script
+        )
         proc = subprocess.run(
-            ["psql", "-v", "ON_ERROR_STOP=1", "-c", script, pg_url],
+            ["psql", "-v", "ON_ERROR_STOP=1", "-c", guarded_script, pg_url],
             capture_output=True,
             timeout=120,
         )
@@ -980,8 +1074,13 @@ def _database_is_empty() -> bool:
             return not os.path.exists(database.DB_PATH) or os.path.getsize(database.DB_PATH) == 0
         from core.db_engine import get_db_connection
 
+        from core import db_bounds
+
         conn = get_db_connection()
         try:
+            # Bounded: this check decides whether a snapshot is needed before a
+            # destructive reset, so a hang here blocks the recovery path itself.
+            db_bounds.bound_dbapi_connection(conn)
             cur = conn.cursor()
             cur.execute(
                 """

@@ -91,9 +91,30 @@ def _describe_connection(service) -> None:
     print(f"engine: postgresql   role: {user}   tables owned: {owned}")
 
 
+def _policy_preflight() -> Optional[int]:
+    """Refuse an unsatisfiable backup policy before anything touches the database.
+
+    Phase 22 (P21-01). ``create_backup()`` already refuses, but by then the CLI has
+    opened a connection to print its identity banner. "No tenant data was read" is part
+    of the security claim, so the check has to come first: this returns an exit code
+    when the run must not start, and None when it may proceed. ``evaluate()`` is a pure
+    function of the environment, so this costs nothing and cannot fail for I/O reasons.
+    """
+    from core import backup_policy
+
+    policy = backup_policy.evaluate()
+    if policy.allowed:
+        return None
+    print(f"backup REFUSED [{policy.code}]: {policy.error}", file=sys.stderr)
+    return 11
+
+
 def cmd_backup(label: str) -> int:
     from core import backup_service
 
+    refused = _policy_preflight()
+    if refused is not None:
+        return refused
     _describe_connection(backup_service)
     result = backup_service.create_backup(label=label)
     if not result.get("success"):
@@ -116,6 +137,9 @@ def cmd_backup_run(label: str) -> int:
     """
     from core import backup_automation
 
+    refused = _policy_preflight()
+    if refused is not None:
+        return refused
     _describe_connection(None)  # service arg is unused; identity only
     result = backup_automation.run_scheduled_backup(label=label)
     if not result.get("success"):
@@ -143,7 +167,22 @@ def cmd_status() -> int:
     explicit, and "no scheduler is installed on this host" is reported as a fact rather
     than inferred.
     """
-    from core import backup_automation
+    from core import backup_automation, backup_policy
+
+    # Phase 22 (P21-01): report the resolved security policy alongside run health. An
+    # operator asking "is this host able to back up at all?" should get an answer before
+    # the first failed run, and a misconfigured policy is a configuration fact, not a run
+    # outcome. Only names and reasons are printed - never key material or a DSN.
+    policy = backup_policy.describe()
+    print(
+        f"encryption policy: {policy['code']} "
+        f"(production={policy['production']}, mode={policy['mode']}, "
+        f"key_configured={policy['key_configured']})"
+    )
+    if not policy["allowed"]:
+        print(f"  POLICY REFUSES BACKUPS: {policy['error']}", file=sys.stderr)
+    elif policy["warning"]:
+        print(f"  warning: {policy['warning']}")
 
     info = backup_automation.operational_state()
     state = info["state"]

@@ -69,7 +69,35 @@ rather than being guessed at, which is what makes a future format change safe.
 | Environment | Value |
 |---|---|
 | `BACKUP_ENCRYPTION_KEY_FILE` | path to the key (container: `/run/secrets/backup.key`) |
-| `BACKUP_ENCRYPTION` | `on` (default) or `off` for development only |
+| `BACKUP_ENCRYPTION` | `on` (default). `off` is **refused** in production. |
+
+### Production has no plaintext mode
+
+`BACKUP_ENCRYPTION=off` is honoured only outside production. In production — `ENV=production`,
+`ENV=prod`, or `STRICT_SECURITY=1` — it is refused outright, with a nonzero exit, **before any
+database connection is opened**. There is no override variable, because the override is the
+thing that gets typo'd at 3am.
+
+The same refusal applies to every configuration that cannot be satisfied:
+
+| Configuration | Result |
+|---|---|
+| `ENV=production` + `BACKUP_ENCRYPTION=off` | refused, `ENCRYPTION_DISABLED_IN_PRODUCTION`, exit 11 |
+| `BACKUP_ENCRYPTION` set to an unrecognised value (e.g. `of`, `maybe`) | refused, `ENCRYPTION_CONFIG_INVALID` |
+| encryption required, `BACKUP_ENCRYPTION_KEY_FILE` unset | refused, `ENCRYPTION_KEY_MISSING` |
+| key file missing, not a regular file, or zero-length | refused, `ENCRYPTION_KEY_MISSING` / `ENCRYPTION_KEY_INVALID` |
+
+An unrecognised value is treated as a configuration error rather than as a request for
+plaintext: a typo must never be able to select the weaker mode. Outside production,
+`BACKUP_ENCRYPTION=off` still works for local development, and the resulting archive is
+labelled `encryption_format="none"` and carries a warning so it cannot be mistaken for an
+encrypted restore point.
+
+The decision lives in one place, `core/backup_policy.py`, and every entry point uses it:
+`maintenance.py backup`, `maintenance.py backup-run`, the scheduled runner, `migrate.py`'s
+pre-migration backup and `deploy.sh`. A new caller cannot re-open the hole by forgetting to
+ask. `backup_policy.describe()` reports the resolved decision without exposing key material,
+which is what `maintenance.py status` prints.
 
 Generate it once, on the maintenance host:
 

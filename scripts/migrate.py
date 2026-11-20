@@ -61,6 +61,19 @@ def cmd_dry_run() -> int:
 def cmd_upgrade(backup: bool) -> int:
     from core.schema_manager import current_revision, ensure_schema, head_revision
 
+    # Phase 22 (P21-01): decide before reading the schema. `current_revision()` opens a
+    # connection, and the claim "no tenant data was read" has to hold for the refusal as
+    # well as for the backup. Evaluating the policy here is free (it is a pure function of
+    # the environment) and prevents a typo'd BACKUP_ENCRYPTION from reaching the dump.
+    if backup:
+        from core import backup_policy
+
+        policy = backup_policy.evaluate()
+        if not policy.allowed:
+            print(f"Backup policy refused [{policy.code}]: {policy.error}", file=sys.stderr)
+            print("Refusing to migrate.", file=sys.stderr)
+            return 1
+
     before = current_revision()
 
     if backup:

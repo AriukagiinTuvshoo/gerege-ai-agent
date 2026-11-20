@@ -76,11 +76,18 @@ The whole run holds an exclusive `flock` on `<BACKUP_DIR>/.backup.lock`, so two 
 or a backup and a prune, cannot overlap. The kernel releases the lock on process death
 (including `SIGKILL`), so a crash cannot wedge the backup system.
 
-**Nothing plaintext ever enters `BACKUP_DIR`.** The dump is written into a private 0700
-`.staging-*` directory inside the same filesystem and only the ciphertext is published by
-an atomic rename; the staging directory is destroyed on success, on exception, on
-`SIGTERM` and at interpreter exit, and a directory left by a `SIGKILL` is swept at the
-start of the next run.
+**In production, nothing plaintext ever enters `BACKUP_DIR`.** The dump is written into a
+private 0700 `.staging-*` directory inside the same filesystem and only the ciphertext is
+published by an atomic rename; the staging directory is destroyed on success, on exception,
+on `SIGTERM` and at interpreter exit, and a directory left by a `SIGKILL` is swept at the
+start of the next run. Production cannot disable encryption at all
+(`core/backup_policy.py`), so the plaintext file never leaves staging.
+
+Outside production, `BACKUP_ENCRYPTION=off` is still available for local development. In
+that mode the dump **is** published to `BACKUP_DIR` as a plaintext `.sql.gz` at mode 0600,
+flagged `encryption_format="none"` and carrying a warning. The earlier wording of this
+paragraph claimed plaintext never enters `BACKUP_DIR` without that qualification, which was
+true of the production path only.
 
 Exit codes are distinct per failure class so a timer unit or alerting rule can
 distinguish them: `0` ok, `10` backup failed, `11` encryption failed, `12` integrity
