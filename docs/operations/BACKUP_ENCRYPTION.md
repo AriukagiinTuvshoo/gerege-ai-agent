@@ -29,11 +29,11 @@ invented in this repository.
 `age` would also have been acceptable, but it is not a dependency, is not present in the
 runtime image, and would add an external binary to the deployment surface.
 
-## Container format (version 1)
+## Container format (version 2, current)
 
 ```
 magic        8 bytes    b"GEREGE-B"
-version      1 byte     0x01
+version      1 byte     0x02
 header_len   2 bytes    big-endian
 header       N bytes    UTF-8 JSON, key-ordered, ASCII
 frame*                  [frame_len 4][nonce 12][ciphertext frame_len][tag 16]
@@ -41,8 +41,23 @@ terminator              [frame_len = 0][nonce 12][tag 16]
 ```
 
 Header fields: `cipher`, `created_at`, `format`, `original_name`, `original_size`,
-`version`. The header is passed as **additional authenticated data** to every frame, so
-`original_size` and `version` cannot be altered without authentication failing.
+`version`.
+
+**What each frame authenticates (v2).** The AES-GCM associated data for a data frame is
+`"gerege-chunk-v2" + version + chunk_index + plaintext_length + SHA-256(header)`. The
+terminator uses a different type tag and the **total frame count** instead of an index.
+Consequences, each covered by a test:
+
+| Attack | Result |
+|---|---|
+| swap two frames | rejected — the index no longer matches |
+| delete a middle frame | rejected — every later index shifts |
+| duplicate a frame | rejected — the second copy has the wrong index |
+| relabel a frame with a different length | rejected — the length is bound |
+| cut the stream between frames | rejected — the terminator's frame count is bound |
+| pass a data frame off as the terminator | rejected — the type tags differ |
+| edit the header | rejected — the header hash is bound |
+| append bytes after the terminator | rejected explicitly |
 
 * `frame_len` counts the ciphertext bytes following its nonce. Without an explicit length
   the final frame is indistinguishable from the start of the terminator; that bug was
@@ -51,6 +66,22 @@ Header fields: `cipher`, `created_at`, `format`, `original_name`, `original_size
   authenticated as part of the ciphertext.
 * The zero-length terminator proves the stream was not truncated. Trailing bytes after it
   are rejected rather than ignored.
+
+### Version 1 archives
+
+Version 1 (Phase 20 and earlier) authenticated every frame against the header **only**. A
+frame was authentic but not bound to its position, so swapping two frames decrypted
+successfully into wrong plaintext of the correct length. This was found by Phase 21 and is
+the reason for version 2.
+
+**Version 1 archives remain readable.** `decrypt_file` dispatches on the version in the
+binary prefix, so archives written before this change still restore. That is deliberate:
+they are the only restore points some deployments have, and refusing to read them would
+strand them. A version 1 archive is weaker — its frames are not position-bound — but it is
+still authenticated and still protected by the sidecar checksum, which rejects the reorder
+before any restore reaches the database. Rotation to version 2 happens naturally: every
+new backup is written as version 2, and retention eventually removes the version 1 files.
+No bulk re-encryption is required or provided.
 
 **Unsupported versions are rejected by name** (`unsupported encrypted archive version N`)
 rather than being guessed at, which is what makes a future format change safe.

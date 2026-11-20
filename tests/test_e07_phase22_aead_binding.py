@@ -352,3 +352,76 @@ def test_docstring_no_longer_claims_something_untrue():
     assert "reordered" in doc or "out of order" in doc
     # And the format version that makes the claim true must be the one written.
     assert "FORMAT_VERSION = 2" in source
+
+
+# ---------------------------------------------------------------------------
+# the documented v1 trade-off must be true, not reassuring
+# ---------------------------------------------------------------------------
+
+def test_reordered_v1_archive_is_still_caught_by_the_sidecar(tmp_path, key_file, monkeypatch):
+    """The doc says v1 is weaker but "still protected by the sidecar checksum, which
+    rejects the reorder before any restore reaches the database". Prove that sentence.
+
+    A v1 archive's frames are not position-bound, so the AEAD alone accepts a reorder.
+    The checksum sidecar is what actually stops it in the restore path - which is why the
+    documentation is allowed to keep v1 readable.
+    """
+    import hashlib
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    import gzip
+    import base64
+    import secrets
+
+    key = pathlib.Path(key_file).read_bytes()
+    aead = AESGCM(key)
+    # Enough incompressible rows to produce more than one 1 MiB frame; gzip would
+    # otherwise collapse repetitive data and leave nothing to reorder.
+    rows = b"".join(base64.b64encode(os.urandom(48)) + b"\n" for _ in range(40000))
+    sql = (
+        b"-- PostgreSQL database dump\nSET statement_timeout = 0;\n"
+        b"COPY public.pages (page_id) FROM stdin;\n" + rows + b"\\.\n"
+    )
+    gz = gzip.compress(sql)
+    header = {
+        "cipher": "AES-256-GCM",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "format": "gerege-backup",
+        "original_name": "old.sql.gz",
+        "original_size": len(gz),
+        "version": 1,
+    }
+    header_bytes = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("ascii")
+    prefix = bc.MAGIC + struct.pack(">BH", 1, len(header_bytes)) + header_bytes
+    frames = []
+    for offset in range(0, len(gz), bc.CHUNK_SIZE):
+        chunk = gz[offset:offset + bc.CHUNK_SIZE]
+        nonce = secrets.token_bytes(bc.NONCE_LEN)
+        frames.append(struct.pack(">I", len(chunk)) + nonce + aead.encrypt(nonce, chunk, header_bytes))
+    assert len(frames) >= 2, "fixture needs at least two frames to reorder"
+    zero = b"\x00" * bc.NONCE_LEN
+    terminator = struct.pack(">I", 0) + zero + aead.encrypt(zero, b"", header_bytes)
+
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    name = "pg_backup_old_20260101_000000_00.sql.gz.enc"
+    archive = backup_dir / name
+    original = prefix + b"".join(frames) + terminator
+    archive.write_bytes(original)
+    (backup_dir / (name + ".sha256")).write_text(
+        f"{hashlib.sha256(original).hexdigest()}  {name}\n"
+    )
+
+    # Sanity: the untouched archive verifies.
+    from core import backup_service
+
+    monkeypatch.setattr(backup_service, "BACKUP_DIR", str(backup_dir), raising=True)
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", key_file)
+    monkeypatch.setenv("BACKUP_ENCRYPTION", "on")
+    assert backup_service.verify_backup(name).get("valid") is True
+
+    # Reorder the two frames, keeping the ORIGINAL sidecar.
+    archive.write_bytes(prefix + frames[1] + frames[0] + b"".join(frames[2:]) + terminator)
+    result = backup_service.verify_backup(name)
+    assert result.get("valid") is False
+    assert "checksum" in str(result.get("error", "")).lower()
