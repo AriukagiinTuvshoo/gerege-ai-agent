@@ -783,10 +783,27 @@ def test_p16_35_retention_never_deletes_below_the_floor(monkeypatch, tmp_path):
     from core import backup_automation
 
     now = time.time()
-    for i in range(10):
-        path = tmp_path / f"pg_backup_{i}.sql.gz.enc"
-        path.write_bytes(b"x")
-        os.utime(path, (now - (100 + i) * 86400, now - (100 + i) * 86400))
+    # Phase 22 (P21-03): genuinely authenticated archives. Retention now refuses to delete
+    # anything it cannot classify, so placeholder `.enc` bytes would be exempt for the wrong
+    # reason and this floor guarantee would pass without ever being exercised.
+    import tempfile
+
+    from core import backup_crypto
+
+    key_handle, key_path = tempfile.mkstemp(prefix="p16-key-", suffix=".bin")
+    with os.fdopen(key_handle, "wb") as key_fh:
+        key_fh.write(bytes(range(32)))
+    os.chmod(key_path, 0o600)
+    try:
+        for i in range(10):
+            path = tmp_path / f"pg_backup_{i}.sql.gz.enc"
+            src = tmp_path / f"_src_{i}"
+            src.write_bytes(b"dump " * 8)
+            backup_crypto.encrypt_file(str(src), str(path), key_path)
+            src.unlink()
+            os.utime(path, (now - (100 + i) * 86400, now - (100 + i) * 86400))
+    finally:
+        os.unlink(key_path)
 
     removed = backup_automation.prune(str(tmp_path), days=1, keep_min=7)
     remaining = [p for p in os.listdir(tmp_path) if p.endswith(".enc")]
@@ -1173,10 +1190,27 @@ def test_p16_35_retention_never_deletes_below_the_floor(monkeypatch, tmp_path):
     from core import backup_automation
 
     now = time.time()
-    for i in range(10):
-        path = tmp_path / f"pg_backup_{i}.sql.gz.enc"
-        path.write_bytes(b"x")
-        os.utime(path, (now - (100 + i) * 86400, now - (100 + i) * 86400))
+    # Phase 22 (P21-03): genuinely authenticated archives. Retention now refuses to delete
+    # anything it cannot classify, so placeholder `.enc` bytes would be exempt for the wrong
+    # reason and this floor guarantee would pass without ever being exercised.
+    import tempfile
+
+    from core import backup_crypto
+
+    key_handle, key_path = tempfile.mkstemp(prefix="p16-key-", suffix=".bin")
+    with os.fdopen(key_handle, "wb") as key_fh:
+        key_fh.write(bytes(range(32)))
+    os.chmod(key_path, 0o600)
+    try:
+        for i in range(10):
+            path = tmp_path / f"pg_backup_{i}.sql.gz.enc"
+            src = tmp_path / f"_src_{i}"
+            src.write_bytes(b"dump " * 8)
+            backup_crypto.encrypt_file(str(src), str(path), key_path)
+            src.unlink()
+            os.utime(path, (now - (100 + i) * 86400, now - (100 + i) * 86400))
+    finally:
+        os.unlink(key_path)
 
     removed = backup_automation.prune(str(tmp_path), days=1, keep_min=7)
     remaining = [p for p in os.listdir(tmp_path) if p.endswith(".enc")]

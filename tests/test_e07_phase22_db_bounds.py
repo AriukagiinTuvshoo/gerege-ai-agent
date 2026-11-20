@@ -382,3 +382,23 @@ def test_sqlite_table_counts_work_end_to_end(monkeypatch, tmp_path):
     counts = backup_service._collect_db_table_counts()
     assert counts.get("pages") == 1
     assert len(counts) == 17
+
+
+def test_sqlalchemy_bounds_skip_sqlite_and_apply_to_postgres(tmp_path):
+    """`bound_sqlalchemy_connection` must distinguish engines like the DB-API path does.
+
+    The restore verifiers accept any engine, so this function is reachable from a SQLite
+    run. `SET statement_timeout` there is a syntax error, not a bound. It skipped the fix
+    applied to `bound_dbapi_connection` and would have failed the same way.
+    """
+    from sqlalchemy import create_engine, text
+
+    from core import db_bounds
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'b.db'}")
+    try:
+        with engine.connect() as conn:
+            db_bounds.bound_sqlalchemy_connection(conn)  # must not raise
+            assert conn.execute(text("SELECT 1")).scalar() == 1
+    finally:
+        engine.dispose()

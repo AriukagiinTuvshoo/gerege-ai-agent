@@ -317,6 +317,21 @@ def bound_sqlalchemy_connection(conn, *, statement_timeout: Optional[float] = No
     """
     from sqlalchemy import text
 
+    # Same rule as the DB-API path: SQLite has no server-side statement timeouts, and a
+    # `SET` there is a syntax error rather than a bound. The restore verifiers accept any
+    # engine, so this has to hold for both.
+    try:
+        dialect = getattr(getattr(conn, "dialect", None), "name", "") or ""
+    except Exception:
+        dialect = ""
+    if not dialect:
+        try:
+            dialect = conn.engine.dialect.name
+        except Exception:
+            dialect = ""
+    if dialect == "sqlite":
+        return
+
     stmt_ms = _ms(statement_timeout if statement_timeout is not None else STATEMENT_TIMEOUT_S)
     lock_ms = _ms(lock_timeout if lock_timeout is not None else LOCK_TIMEOUT_S)
     conn.execute(text(f"SET statement_timeout = {stmt_ms}"))

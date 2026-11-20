@@ -69,6 +69,18 @@ docker compose -f docker-compose.prod.yml run --rm maintenance \
 6. **Retention** by age (`BACKUP_RETENTION_DAYS`, default 14) with a hard count floor
    (`BACKUP_MIN_KEEP`, default 7, clamped to >= 1) so a retention bug can never delete
    every backup. Sidecars are removed with their archive.
+
+   Retention deletes only what it can classify as a superseded restore point. It
+   **never deletes a plaintext archive**, whatever its age, and it **never deletes a file
+   it cannot classify** — an `.enc` whose header this build does not recognise may come
+   from a newer format or a different key, and deleting it to satisfy an age rule is not a
+   decision retention is allowed to make. Both were wrong before Phase 22: an aged
+   plaintext dump was deleted while an encrypted archive was kept, and an unclassifiable
+   `.enc` was swept.
+
+   Plaintext leftovers are reported by `maintenance.py legacy` (exit 17) and removed only
+   by `maintenance.py legacy --quarantine <dir> --yes`, which **moves** them and never
+   deletes. That command is the single path by which plaintext leaves `BACKUP_DIR`.
 7. **Status file** `<BACKUP_DIR>/.last_backup_status.json` and an optional
    `BACKUP_ALERT_WEBHOOK` POST.
 

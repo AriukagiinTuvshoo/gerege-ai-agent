@@ -179,10 +179,19 @@ def test_p20_07_plaintext_cannot_satisfy_the_encrypted_floor(tmp_path):
 
     removed = backup_automation.prune(str(tmp_path), days=1, keep_min=1)
     survivors = [f for f in os.listdir(tmp_path) if f.startswith("pg_backup")]
-    assert survivors == ["pg_backup_real.sql.gz.enc"], (
+    # Phase 22 (P21-03): plaintext archives are no longer deleted by retention - they are
+    # reported by `maintenance.py legacy` and removed only by an explicit quarantine. The
+    # property this test exists to protect is unchanged and still asserted: the plaintext
+    # files do NOT satisfy the floor, so the encrypted archive survives. The old assertion
+    # that all three plaintext files were removed was incidental, and it contradicted the
+    # documented rule that plaintext is never removed automatically.
+    assert "pg_backup_real.sql.gz.enc" in survivors, (
         "the encrypted archive must be the one the floor protects"
     )
-    assert len(removed) == 3
+    assert sorted(n for n in survivors if n.endswith(".sql.gz")) == [
+        "pg_backup_leak0.sql.gz", "pg_backup_leak1.sql.gz", "pg_backup_leak2.sql.gz"
+    ], "plaintext leftovers must not be deleted by retention"
+    assert removed == []
 
 
 def test_p20_08_floor_never_empties_a_plaintext_only_directory(tmp_path):

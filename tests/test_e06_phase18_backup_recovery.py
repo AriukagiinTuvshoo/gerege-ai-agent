@@ -308,9 +308,16 @@ def test_p18_30_negative_floor_cannot_delete_everything(tmp_path, monkeypatch):
     monkeypatch.setenv("BACKUP_MIN_KEEP", "-5")
     assert backup_automation.min_keep() >= 1
 
+    # Phase 22 (P21-03): these must be genuinely authenticated archives. Retention now
+    # refuses to delete a file it cannot classify, so placeholder bytes would be exempt for
+    # the wrong reason and the floor guarantee would pass without being exercised.
+    key = _key(tmp_path / "k")
     for index in range(6):
         archive = tmp_path / f"pg_backup_x{index}.sql.gz.enc"
-        archive.write_bytes(b"x" * 32)
+        src = tmp_path / f"_src{index}"
+        src.write_bytes(b"dump " * 8)
+        backup_crypto.encrypt_file(str(src), str(archive), key)
+        src.unlink()
         (tmp_path / f"pg_backup_x{index}.sql.gz.meta.json").write_text("{}")
         (tmp_path / f"pg_backup_x{index}.sql.gz.sha256").write_text("0" * 64 + "  x\n")
         old = time.time() - 200 * 86400
@@ -326,9 +333,15 @@ def test_p18_31_prune_removes_sidecars_with_the_archive(tmp_path):
     """Phase 17: prune built `<archive>.enc.json` and orphaned every real sidecar."""
     from core import backup_automation
 
+    # The key file lives outside the pruned directory: this test asserts the exact set of
+    # survivors, and a key is not a backup.
+    key = _key(tmp_path.parent / (tmp_path.name + "_k"))
     for index in range(4):
         archive = tmp_path / f"pg_backup_y{index}.sql.gz.enc"
-        archive.write_bytes(b"x" * 32)
+        src = tmp_path / f"_ysrc{index}"
+        src.write_bytes(b"dump " * 8)
+        backup_crypto.encrypt_file(str(src), str(archive), key)
+        src.unlink()
         inner = tmp_path / f"pg_backup_y{index}.sql.gz"
         (pathlib.Path(str(inner) + ".sha256")).write_text("0" * 64 + "  x\n")
         (pathlib.Path(str(inner) + ".meta.json")).write_text("{}")

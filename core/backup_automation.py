@@ -253,12 +253,39 @@ def prune(directory: str, days: int, keep_min: int, dry_run: bool = False) -> Li
     Phase 18 also fixed sidecar orphaning: Phase 16 built ``<archive>.enc.json`` while the
     real metadata file is ``<archive>.meta.json``, so every pruned archive left its
     checksum and manifest behind forever.
+
+    Phase 22 (P21-03). Plaintext archives are **never deleted here**, whatever their age.
+    The documented rule - stated in `legacy_plaintext_archives()` and in the operations
+    guide - is that a plaintext leftover is detected and reported but not removed
+    automatically, because it may be the only copy of something and silently deleting
+    customer data is worse than the exposure. The code did not do that: `prune()` iterated
+    every archive, so an aged plaintext dump was deleted while an encrypted one was kept by
+    the floor. Detection and removal were on opposite sides of the promise.
+    Removing plaintext is now exclusively `maintenance.py legacy --quarantine <dir> --yes`,
+    which moves rather than deletes and has to be asked for.
     """
     from core import backup_archive
 
     keep_min = max(1, int(keep_min))
     cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
-    items = _archives(directory)
+    # P21-03: exclude plaintext before anything else looks at the list, so no age rule and
+    # no floor calculation can act on it. `legacy_plaintext_archives()` was defined for
+    # exactly this and had no callers; it is what makes the exclusion auditable.
+    #
+    # Unknown files are excluded for the same reason and were the more dangerous half: an
+    # `.enc` whose header this build does not recognise was iterated, aged, and deleted. It
+    # may be a backup from a newer schema, a differently-keyed archive, or something an
+    # operator put there deliberately. Retention deletes things it can prove are superseded
+    # restore points; it has no business deleting something it cannot classify at all.
+    legacy = {name for name, _st in legacy_plaintext_archives(directory)}
+    unknown = {
+        name for name, _st in _archives(directory)
+        if classify_archive(os.path.join(directory, name)) == "unknown"
+    }
+    items = [
+        (name, st) for name, st in _archives(directory)
+        if name not in legacy and name not in unknown
+    ]
     # Phase 20: the floor protects *verified encrypted* restore points. Counting every
     # file meant a plaintext leftover satisfied the floor, so retention would keep the
     # unencrypted file and delete the encrypted one behind it.
@@ -271,6 +298,9 @@ def prune(directory: str, days: int, keep_min: int, dry_run: bool = False) -> Li
     # than the plain inventory-based floor did, never less.
     protected_encrypted = {name for name, _st in encrypted_archives(directory)[:keep_min]}
     protected = protected_encrypted or {name for name, _st in items[:keep_min]}
+    # Note: `items` no longer contains plaintext, so the fallback can only protect an
+    # encrypted archive or a legacy-openssl one. It can never keep a plaintext dump alive
+    # for the next run to trip over again.
     removed: List[str] = []
     for name, st in items:
         if name in protected:

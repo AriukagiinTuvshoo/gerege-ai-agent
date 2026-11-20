@@ -355,7 +355,11 @@ def cmd_legacy(quarantine: Optional[str] = None, confirmed: bool = False) -> int
         (name, backup_automation.classify_archive(os.path.join(directory, name)))
         for name, _st in backup_automation._archives(directory)
     ]
-    plaintext = [n for n, c in classified if c == "plaintext"]
+    # Use the shared inventory rather than re-deriving it here. It was written for this
+    # purpose and had no caller (P21-03); two independent definitions of "plaintext" is how
+    # `prune` and `legacy` came to disagree about whether these files may be deleted.
+    plaintext = [n for n, _st in backup_automation.legacy_plaintext_archives(directory)]
+    assert set(plaintext) <= {n for n, c in classified if c == "plaintext"}
     legacy_ossl = [n for n, c in classified if c == "legacy-openssl"]
     unknown = [n for n, c in classified if c == "unknown"]
     encrypted = [n for n, c in classified if c == "authenticated"]
@@ -403,6 +407,13 @@ def cmd_legacy(quarantine: Optional[str] = None, confirmed: bool = False) -> int
                         pass
             moved += 1
         print(f"\nmoved {moved} archive(s) to {quarantine} (nothing was deleted)")
+        if moved:
+            # The list above was computed before the move. Exit status has to describe the
+            # directory as it stands now: a quarantine that moved every plaintext archive
+            # has resolved the condition, and returning 17 anyway made a successful
+            # remediation indistinguishable from "still exposed" to an operator or a
+            # monitor. P21-03 follow-up.
+            return 17 if (len(plaintext) + len(legacy_ossl) - moved) > 0 else 0
 
     return 17 if plaintext else 0
 
