@@ -218,14 +218,22 @@ def _is_sqlite_connection(conn) -> bool:
     how this distinction was discovered - the SQLite backup path shares
     `_collect_db_table_counts()` with PostgreSQL.
     """
-    module = type(conn).__module__ or ""
-    if "sqlite" in module.lower():
+    name = f"{type(conn).__module__}.{type(conn).__name__}".lower()
+    # Positive identification first, in both directions: the connection object itself is
+    # the authority on what it is, and this must not depend on the process environment.
+    if "sqlite" in name:
         return True
+    if "psycopg" in name or "postgres" in name or "pg8000" in name:
+        return False
+    # Unknown wrapper (a proxy, a pool adapter): fall back to the configured engine. This
+    # is the weaker signal, so it is only consulted when the object says nothing.
     try:
         from core.db_engine import is_postgres
 
         return not is_postgres()
     except Exception:
+        # Cannot tell. Assume NOT SQLite: sending SET to PostgreSQL is correct, and sending
+        # it to SQLite fails loudly at once rather than silently leaving work unbounded.
         return False
 
 

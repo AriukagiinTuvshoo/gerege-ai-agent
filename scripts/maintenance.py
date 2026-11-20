@@ -106,7 +106,7 @@ def _policy_preflight() -> Optional[int]:
     if policy.allowed:
         return None
     print(f"backup REFUSED [{policy.code}]: {policy.error}", file=sys.stderr)
-    return 11
+    return policy.exit_code
 
 
 def cmd_backup(label: str) -> int:

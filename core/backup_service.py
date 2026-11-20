@@ -339,6 +339,34 @@ def _create_backup_secured(label: str) -> Dict[str, Any]:
         except OSError:
             pass
 
+        # The manifest names the archive it describes and records the row counts that
+        # post-restore verification compares against. Phase 22 found it was written into
+        # staging and never published on the encrypted path - only `.sha256` was - so
+        # `_load_expected_counts()` returned {} for every encrypted backup and post-restore
+        # verification silently had nothing to check beyond "the tables exist". A restore
+        # that drops every row then passes. Publish it, rewritten to name the ciphertext.
+        staged_meta = staging.path(filename + ".meta.json")
+        if os.path.exists(staged_meta):
+            try:
+                with open(staged_meta, "r", encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+                manifest["encrypted"] = True
+                manifest["archive"] = ciphertext_name
+                manifest["ciphertext_sha256"] = _compute_sha256(target)
+                published_meta = os.path.join(BACKUP_DIR, ciphertext_name + ".meta.json")
+                with open(published_meta, "w", encoding="utf-8") as handle:
+                    json.dump(manifest, handle, ensure_ascii=False, indent=2)
+                os.chmod(published_meta, 0o600)
+                # Keep the plaintext-name manifest too: `verify`/`list` resolve sidecars by
+                # the archive name, and both spellings are used across the code base.
+                companion = os.path.join(BACKUP_DIR, filename + ".meta.json")
+                if companion != published_meta:
+                    with open(companion, "w", encoding="utf-8") as handle:
+                        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+                    os.chmod(companion, 0o600)
+            except (OSError, ValueError) as exc:
+                logger.warning("could not publish the backup manifest: %s", type(exc).__name__)
+
         # Rewrite the sidecars so the checksum describes the ciphertext that now exists,
         # not the plaintext that staging is about to destroy (Phase 17's orphaned-checksum
         # bug). The plaintext-name sidecar is kept for compatibility with list/verify.
@@ -747,6 +775,146 @@ def _load_expected_counts(backup_fpath: str) -> Dict[str, int]:
         return {str(k): int(v) for k, v in raw.items() if isinstance(v, (int, float)) and v >= 0}
     except Exception:
         return {}
+
+
+def _as_sqlalchemy_postgres_url(url: str) -> str:
+    """Normalize a libpq-style URL to the SQLAlchemy + psycopg2 form.
+
+    `_apply_postgres_sql_file` and friends take `postgres://`/`postgresql://` URLs, while
+    `create_engine` in this codebase needs the explicit driver. Raises on anything that is
+    not PostgreSQL rather than silently handing SQLite to a PostgreSQL check.
+    """
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg2://" + url[len("postgres://"):]
+    if url.startswith("postgresql://") and "+" not in url.split("://", 1)[0]:
+        return "postgresql+psycopg2://" + url[len("postgresql://"):]
+    if url.startswith("postgresql+psycopg2://"):
+        return url
+    raise ValueError("expected a PostgreSQL URL for a rollback invariant check")
+
+
+def _rollback_invariants(pg_url: str) -> Dict[str, Any]:
+    """Post-rollback checks that a row-count comparison cannot make.
+
+    Phase 21 (P21-07) observed a failed rollback that left the database reportable as
+    drifted: `verify_schema_drift()` returned ``has_drift=True`` after the operator had
+    replayed the pre-restore snapshot by hand. Reporting ``ROLLED_BACK_TO_PRE_SNAPSHOT``
+    on row counts alone would have been a false success claim about a database whose schema
+    no longer matched the models.
+
+    Checks, each independently meaningful:
+
+    ``schema``      live schema vs `core/models.py` (types, indexes, constraints)
+    ``ownership``   every public table owned by the owner role (a reset recreates them)
+    ``grants``      the runtime role still holds privileges (a reset drops every GRANT)
+
+    Returns a dict with ``all_ok`` and a list of human-readable ``failures``. A failure is
+    not fatal to the process; it downgrades the rollback status to RECOVERY_REQUIRED so an
+    operator knows the database is not provably in its pre-restore shape.
+    """
+    from core import db_bounds
+
+    failures: List[str] = []
+    detail: Dict[str, Any] = {}
+
+    # 1. Schema drift. Alembic autogenerate with compare_type, against the live database.
+    #
+    # The engine is passed EXPLICITLY. `verify_schema_drift()` with no argument inspects
+    # whatever `DATABASE_URL` happens to be in the process environment, which during a
+    # restore is not necessarily the database being restored - the negative control for
+    # this check returned "no drift" while a column had just been added to the target,
+    # because it was comparing SQLite against the models. A check that can pass without
+    # looking at the thing it is checking is worse than no check.
+    try:
+        from core.schema_manager import drift_report
+        from core.db_bounds import CONNECT_TIMEOUT_S
+        from sqlalchemy import create_engine as _create_engine
+
+        _drift_engine = _create_engine(
+            _as_sqlalchemy_postgres_url(pg_url), future=True,
+            connect_args={"connect_timeout": int(CONNECT_TIMEOUT_S)},
+        )
+        try:
+            _raw = drift_report(_drift_engine)
+        finally:
+            _drift_engine.dispose()
+        # Normalize: drift_report() reports the total under "count"; the older
+        # verify_schema_drift() wrapper called it "diff_count". Accept either.
+        drift = {
+            "has_drift": _raw.get("has_drift", True),
+            "diff_count": _raw.get("count", _raw.get("diff_count")),
+        }
+        detail["schema"] = {"has_drift": drift.get("has_drift"),
+                            "diff_count": drift.get("diff_count")}
+        if drift.get("has_drift"):
+            failures.append(
+                f"schema drift after rollback: {drift.get('diff_count')} difference(s) "
+                f"from core/models.py"
+            )
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        detail["schema"] = {"error": type(exc).__name__}
+        failures.append(f"could not check schema drift: {type(exc).__name__}")
+
+    # 2 & 3. Ownership and privileges, in one bounded query.
+    try:
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(
+            _as_sqlalchemy_postgres_url(pg_url), pool_pre_ping=True, future=True,
+            connect_args={"connect_timeout": int(db_bounds.CONNECT_TIMEOUT_S)},
+        )
+        try:
+            with engine.connect() as conn:
+                db_bounds.bound_sqlalchemy_connection(conn)
+                unowned = conn.execute(text(
+                    "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname='public' AND c.relkind IN ('r','p') "
+                    "AND pg_get_userbyid(c.relowner) <> current_user"
+                )).scalar()
+                detail["ownership"] = {"tables_not_owned_by_current_role": int(unowned or 0)}
+                if unowned:
+                    failures.append(
+                        f"{unowned} public table(s) are not owned by the current role; a "
+                        f"rollback recreated them under a different owner"
+                    )
+
+                # The runtime role must still be able to read a representative table.
+                runtime_role = os.getenv("GEREGE_RUNTIME_ROLE", "gerege_app")
+                exists = conn.execute(
+                    text("SELECT count(*) FROM pg_roles WHERE rolname = :r"), {"r": runtime_role}
+                ).scalar()
+                if exists:
+                    can_select = conn.execute(text(
+                        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                        "WHERE n.nspname='public' AND c.relkind='r' "
+                        f"AND has_table_privilege(:r, c.oid, 'SELECT')"
+                    ), {"r": runtime_role}).scalar()
+                    total = conn.execute(text(
+                        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                        "WHERE n.nspname='public' AND c.relkind='r'"
+                    )).scalar()
+                    detail["grants"] = {"runtime_role": runtime_role,
+                                        "tables_selectable": int(can_select or 0),
+                                        "tables": int(total or 0)}
+                    if total and can_select != total:
+                        failures.append(
+                            f"runtime role {runtime_role} can SELECT only "
+                            f"{can_select}/{total} tables; grants did not survive the rollback"
+                        )
+                else:
+                    detail["grants"] = {"runtime_role": runtime_role, "present": False}
+        finally:
+            engine.dispose()
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        detail["ownership"] = {"error": type(exc).__name__}
+        failures.append(f"could not check ownership/grants: {type(exc).__name__}")
+
+    return {
+        "all_ok": not failures,
+        "checked": True,
+        "failures": failures,
+        "detail": detail,
+    }
 
 
 def _verify_restored_sqlite(db_path: str, expected_counts: Dict[str, int]) -> Dict[str, Any]:
@@ -1457,9 +1625,11 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                         "success": False,
                         "error": ver_err,
                         "post_restore_verified": False,
-                        "rollback_status": "ROLLBACK_FAILED",
+                        "rollback_status": "RECOVERY_REQUIRED",
                         "rolled_back": False,
                         "atomic_rollback": False,
+                        "recovery_required": True,
+                        "state_unknown": True,
                         # Phase 18: never interpolate the DSN. Diagnostics only.
                         "rollback_error": (
                             "Could not reset the schema before replaying the pre-restore "
@@ -1495,7 +1665,24 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                         )
                     rb_verify = _verify_restored_postgres(pg_url, pre_counts)
                     if rb_verify.get("verified"):
-                        rollback_ok = True
+                        # Phase 6 (P21-07): row counts prove the data came back. They do not
+                        # prove the schema did: Phase 21 found a failed rollback left a
+                        # database that `verify_schema_drift()` reported as drifted, and
+                        # nothing in the rollback path had looked. Ownership and grants are
+                        # checked for the same reason - a rollback that restores rows but
+                        # loses `gerege_app`'s privileges is data-correct and
+                        # permission-broken, which is not a successful recovery.
+                        invariants = _rollback_invariants(pg_url)
+                        rb_verify["invariants"] = invariants
+                        rollback_ok = bool(invariants.get("all_ok"))
+                        if not rollback_ok:
+                            logger.error(
+                                "rollback restored the rows but an invariant failed: %s",
+                                invariants.get("failures"),
+                            )
+                    else:
+                        rb_verify["invariants"] = {"all_ok": False, "checked": False,
+                                                   "failures": ["row counts did not match"]}
 
             if rollback_ok:
                 logger.info(f"PostgreSQL rollback to pre_restore snapshot {pre_name} succeeded.")
@@ -1507,6 +1694,8 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                     "rollback_status": "ROLLED_BACK_TO_PRE_SNAPSHOT",
                     "rolled_back": True,
                     "atomic_rollback": True,
+                    # The proof, not just the claim: this is what makes the status honest.
+                    "rollback_invariants": rb_verify.get("invariants", {}),
                     "pre_restore_snapshot": pre_name,
                 }
             else:
@@ -1516,15 +1705,26 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                     "success": False,
                     "error": ver_err,
                     "post_restore_verified": False,
-                    "rollback_status": "ROLLBACK_FAILED",
+                    "rollback_status": "RECOVERY_REQUIRED",
                     "rolled_back": False,
                     "atomic_rollback": False,
+                    # Phase 6 (P21-07): the database is in an unknown state - the restore
+                    # half-applied and the rollback did not prove it undid that. Say so with
+                    # a status an operator or monitor can act on, rather than "FAILED",
+                    # which reads as "the operation did not happen" when the truth is
+                    # "the operation happened and was not undone".
+                    "recovery_required": True,
+                    "state_unknown": True,
                     # Phase 18: never interpolate the DSN here. It carries the owner password,
                     # and this string is printed, logged and returned to the CLI.
                     "recovery_instruction": (
-                        "CRITICAL: Automatic rollback failed and manual recovery is required. "
-                        f"Snapshot: {pre_name}. Replay it with maintenance.py restore "
-                        "(the connection string is intentionally omitted from this message)."
+                        "CRITICAL: RECOVERY_REQUIRED - the restore was interrupted and the "
+                        "automatic rollback could not prove it restored the pre-restore state. "
+                        f"Snapshot: {pre_name}. Do not serve traffic from this database until "
+                        "you have replayed that snapshot with maintenance.py restore and then "
+                        "run `python scripts/provision_roles.py --verify` and "
+                        "`python scripts/maintenance.py status`. "
+                        "(The connection string is intentionally omitted from this message.)"
                     ),
                     "pre_restore_snapshot": pre_name,
                 }
