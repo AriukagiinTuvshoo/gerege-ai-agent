@@ -121,15 +121,29 @@ class OffsiteProvider:
         raise NotImplementedError
 
     def list_remote(self) -> List[str]:
-        raise NotImplementedError
+        return [entry["Key"].split("/")[-1] for entry in self._list_objects_raw()]
 
     def list_remote_objects(self) -> List[Tuple[str, Optional[float]]]:
-        """Return ``(name, epoch_seconds_or_None)`` for every remote object.
+        """``(name, epoch)`` using the server's LastModified."""
+        from datetime import datetime, timezone
 
-        The timestamp is the server's own last-modified time, never anything derived from
-        the object name. ``None`` means the backend could not supply one.
-        """
-        return [(name, None) for name in self.list_remote()]
+        result: List[Tuple[str, Optional[float]]] = []
+        for entry in self._list_objects_raw():
+            name = entry["Key"].split("/")[-1]
+            stamp = entry.get("LastModified")
+            epoch: Optional[float] = None
+            if stamp:
+                try:
+                    parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+                    epoch = parsed.replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    try:
+                        parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+                        epoch = parsed.replace(tzinfo=timezone.utc).timestamp()
+                    except ValueError:
+                        epoch = None
+            result.append((name, epoch))
+        return result
 
     def download(self, remote_name: str, local_path: str) -> Tuple[bool, str]:
         raise NotImplementedError
@@ -190,6 +204,11 @@ class S3Offsite(OffsiteProvider):
         self.sse = sse
         self.timeout = timeout
         self.retries = max(1, retries)
+        # Phase 22 (P21-06): a listing can now fail instead of returning [], so the
+        # "was the view complete?" answer is carried explicitly rather than inferred from
+        # an empty list.
+        self._last_listing_complete = True
+        self._last_listing_error = ""
 
     # -- helpers -----------------------------------------------------------
     def _key(self, remote_name: str) -> str:
@@ -369,40 +388,130 @@ class S3Offsite(OffsiteProvider):
             return False, str(exc)
         return status in (200, 204), "" if status in (200, 204) else f"delete http {status}"
 
-    def _list_objects_raw(self) -> List[Dict[str, Any]]:
-        """Parse ListObjectsV2 into ``[{name, size, last_modified}]``.
+    def _list_objects_raw(self, *, fail_hard: bool = True) -> List[Dict[str, Any]]:
+        """List every object under the prefix, following continuation tokens.
 
-        Retention needs the server's LastModified, so this reads the whole ``<Contents>``
-        block rather than pulling ``<Key>`` out with a string split.
+        Phase 22 (P21-06). The previous implementation sent one request with
+        ``max-keys=1000`` and ignored ``IsTruncated``, so a bucket holding 1005 objects
+        reported 1000. That is not a cosmetic shortfall: the view feeds remote retention
+        ("delete objects not in the local keep-set") and the operator's inventory. A
+        truncated view means objects past the first page are invisible - they were
+        correctly not deleted, but they were also never reported, so the documented
+        "retention sees the complete set" guarantee was false.
+
+        It also returned ``[]`` on any error, which is worse than an exception: an
+        unreachable bucket looked like an empty one, and an empty bucket looks like
+        "nothing to retain" rather than "I could not ask".
+
+        Loop protection: S3 pages by an opaque token, and a malformed or hostile server can
+        return the same token forever. A repeated token, a missing
+        ``NextContinuationToken`` on a truncated page, or exceeding
+        ``BACKUP_OFFSITE_MAX_PAGES`` raises instead of spinning. Results are ordered by
+        key (the S3 contract), so retention's "newest" is deterministic across pages.
         """
-        base = f"{self.endpoint}/{self.bucket}"
-        query = {"list-type": "2", "max-keys": "1000"}
-        if self.prefix:
-            query["prefix"] = self.prefix + "/"
-        url = f"{base}?{urllib.parse.urlencode(query)}"
-        try:
-            status, body = self._request("GET", url)
-        except OffsiteError:
-            return []
-        if status != 200:
-            return []
+        import os
         import xml.etree.ElementTree as ET
 
-        try:
-            root = ET.fromstring(body)
-        except ET.ParseError:
-            return []
+        base = f"{self.endpoint}/{self.bucket}"
+        max_pages = int(os.getenv("BACKUP_OFFSITE_MAX_PAGES", "1000"))
         out: List[Dict[str, Any]] = []
-        for node in root.iter():
-            if not node.tag.endswith("}Contents") and node.tag != "Contents":
-                continue
-            entry: Dict[str, Any] = {}
-            for child in node:
-                tag = child.tag.rsplit("}", 1)[-1]
-                entry[tag] = (child.text or "").strip()
-            if "Key" in entry:
-                out.append(entry)
+        seen_tokens = set()
+        token: Optional[str] = None
+        pages = 0
+
+        while True:
+            pages += 1
+            if pages > max_pages:
+                raise OffsiteError(
+                    f"listing {self.bucket!r} exceeded {max_pages} pages; refusing to loop. "
+                    f"Increase BACKUP_OFFSITE_MAX_PAGES if the bucket really is this large."
+                )
+            query = {"list-type": "2", "max-keys": "1000"}
+            if self.prefix:
+                query["prefix"] = self.prefix + "/"
+            if token:
+                query["continuation-token"] = token
+            url = f"{base}?{urllib.parse.urlencode(query)}"
+
+            try:
+                status, body = self._request("GET", url)
+            except OffsiteError as exc:
+                # Recorded even when we raise: the caller may catch the error and still
+                # hold a partial view, and "was this complete?" must answer honestly.
+                self._last_listing_complete = False
+                self._last_listing_error = str(exc)
+                if not fail_hard:
+                    return []
+                raise
+            if status != 200:
+                self._last_listing_complete = False
+                self._last_listing_error = f"listing http {status} after {len(out)} object(s)"
+                if not fail_hard:
+                    return []
+                raise OffsiteError(
+                    f"listing {self.bucket!r} failed with HTTP {status} after "
+                    f"{len(out)} object(s); the view is incomplete"
+                )
+            try:
+                root = ET.fromstring(body)
+            except ET.ParseError as exc:
+                self._last_listing_complete = False
+                self._last_listing_error = f"malformed XML: {exc}"
+                if not fail_hard:
+                    return []
+                raise OffsiteError(f"listing {self.bucket!r} returned malformed XML: {exc}") from exc
+
+            # Namespace-agnostic tag matching: S3 uses a default namespace, but moto and
+            # some gateways vary. rsplit on '}' handles both.
+            truncated_raw = ""
+            next_token = ""
+            for node in root.iter():
+                tag = node.tag.rsplit("}", 1)[-1]
+                if tag == "IsTruncated":
+                    truncated_raw = (node.text or "").strip().lower()
+                elif tag == "NextContinuationToken":
+                    next_token = (node.text or "").strip()
+
+            for node in root.iter():
+                if node.tag.rsplit("}", 1)[-1] != "Contents":
+                    continue
+                entry: Dict[str, Any] = {}
+                for child in node:
+                    entry[child.tag.rsplit("}", 1)[-1]] = (child.text or "").strip()
+                if "Key" in entry:
+                    out.append(entry)
+
+            truncated = truncated_raw == "true"
+            if not truncated:
+                break
+            if not next_token:
+                # Truncated but no token: retrying would re-fetch page one forever.
+                raise OffsiteError(
+                    f"listing {self.bucket!r} reported IsTruncated=true without a "
+                    f"NextContinuationToken; the view would silently stop at "
+                    f"{len(out)} object(s)"
+                )
+            if next_token in seen_tokens:
+                raise OffsiteError(
+                    f"listing {self.bucket!r} repeated continuation token after "
+                    f"{len(out)} object(s); aborting rather than looping"
+                )
+            seen_tokens.add(next_token)
+            token = next_token
+
+        self._last_listing_complete = True
+        self._last_listing_error = ""
         return out
+
+    def list_remote_complete(self) -> bool:
+        """True when the last listing completed; False when it failed soft.
+
+        Callers that must distinguish "no objects" from "I could not ask" use this.
+        """
+        return self._last_listing_complete
+
+    def _listing_error(self) -> str:
+        return self._last_listing_error
 
     def list_remote(self) -> List[str]:
         return [entry["Key"].split("/")[-1] for entry in self._list_objects_raw()]
@@ -430,19 +539,45 @@ class S3Offsite(OffsiteProvider):
         return result
 
     def download(self, remote_name: str, local_path: str) -> Tuple[bool, str]:
-        try:
-            status, body = self._request("GET", self._url(remote_name))
-        except OffsiteError as exc:
-            return False, str(exc)
-        if status != 200:
-            return False, f"download http {status}"
-        try:
-            with open(local_path, "wb") as handle:
-                handle.write(body)
-            os.chmod(local_path, 0o600)
-        except OSError as exc:
-            return False, f"cannot write download: {type(exc).__name__}"
-        return True, ""
+        raise NotImplementedError
+
+    def download_verified(self, remote_name: str, local_path: str,
+                          expected_size: int = -1,
+                          expected_sha256: str = "") -> Tuple[bool, str]:
+        return self.download(remote_name, local_path)
+
+    # -- retention ---------------------------------------------------------
+    def apply_remote_retention(self, keep: int, *, dry_run: bool = False) -> List[str]:
+        """Delete the oldest remote objects, never below ``keep``. Returns deleted names.
+
+        Phase 19 found this sorted object **names** and deleted ``names[:-keep]``. Archive
+        names carry a *label* (``pg_backup_dr_…``, ``pg_backup_pre_deploy_…``), so lexical
+        order is not chronological order: a reproduction deleted the newest object and
+        kept a truncated one. Remote retention is the last line of defence against a
+        local loss; deleting the wrong object there is unrecoverable.
+
+        Ordering now uses the server's LastModified time. Objects whose time is unknown
+        are never deleted — an object we cannot date cannot be proven old, and the safe
+        default for a backup store is to keep it and report it.
+        """
+        keep = max(1, int(keep))
+        objects = self.list_remote_objects()
+        dated = [(name, ts) for name, ts in objects if ts is not None]
+        undated = [name for name, ts in objects if ts is None]
+        # Newest first. Ties broken by name only to make the order deterministic; a tie
+        # means the two objects are equally old, so either may be the oldest.
+        dated.sort(key=lambda pair: (pair[1], pair[0]), reverse=True)
+
+        candidates = [name for name, _ts in dated[keep:]]
+        deleted: List[str] = []
+        for name in candidates:
+            if dry_run:
+                deleted.append(name)
+                continue
+            ok, _error = self.delete(name)
+            if ok:
+                deleted.append(name)
+        return deleted
 
 
 class LocalOffsite(OffsiteProvider):
