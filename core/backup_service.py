@@ -771,28 +771,110 @@ def _reset_public_schema(pg_url: str) -> Tuple[bool, str]:
     the replay authoritative.
     """
     try:
-        # Phase 20: `DROP SCHEMA ... CASCADE` takes ACCESS EXCLUSIVE on every object in
-        # the schema, so it queues behind any other open session (a pooling app, a test
-        # harness, a psql left open) and blocks indefinitely. During an incident that is
-        # the worst possible behaviour: the rollback that exists to undo a bad restore
-        # hangs instead. A bounded lock_timeout makes it fail fast and report honestly,
-        # so the operator is told to disconnect clients rather than left waiting.
+        # Phase 20 rewrote this. The previous implementation ran
+        #     DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;
+        # as the *restoring* role. On any normal cluster `public` is owned by the bootstrap
+        # superuser (it is created by initdb), so that statement failed with "must be owner
+        # of schema public" **every time**. The caller logged the failure and replayed
+        # anyway, which is why the rollback looked like it worked while the schema was
+        # never actually reset — and why, after the schema *was* eventually recreated in
+        # one test run, `gerege_owner` lost the ability to GRANT on it and the app could no
+        # longer read its own tables.
+        #
+        # The owner does not need to own `public`; it needs the schema to contain exactly
+        # the objects the snapshot has. Dropping every table/view/sequence/function the
+        # owner owns achieves that with privileges the least-privilege model actually
+        # grants, and it never touches the schema itself, so grants and ownership of
+        # `public` survive.
+        #
+        # `DROP ... CASCADE` takes ACCESS EXCLUSIVE, so it queues behind any open session
+        # (a pooling app, a test harness, a psql left open). A bounded lock_timeout makes
+        # it fail fast and report honestly instead of hanging during an incident.
+        # All statements go in ONE psql invocation: `SET lock_timeout` is session-local, so
+        # issuing the SET in a separate call would leave the drops unbounded and the reset
+        # would hang exactly as it did before (241 s in CI).
+        # Every object in `public` must go, not just the ones the connecting role happens
+        # to own. `pg_dump` refuses to run unless the maintenance role owns every table it
+        # will lock, so in a correctly-provisioned database those are the same set — but a
+        # cluster where migrations were applied by the bootstrap role (which is exactly how
+        # CI and a fresh install converge) leaves tables owned by *someone else*. Filtering
+        # on `current_user` silently dropped nothing there, and because the script exited 0
+        # the caller believed the schema had been reset and replayed the snapshot over live
+        # tables. Prefer an honest failure over a silent no-op: if an object cannot be
+        # dropped, the DROP raises, psql exits non-zero, and the caller reports that it could
+        # not reset the schema instead of pretending it did.
+        #
+        # `DROP ... CASCADE` takes ACCESS EXCLUSIVE, so it queues behind any open session
+        # (a pooling app, a test harness, a psql left open). A bounded lock_timeout makes
+        # it fail fast and report honestly instead of hanging during an incident - that hang
+        # was real: 180 s in CI, and it turned a recoverable rollback into ROLLBACK_FAILED.
+        #
+        # All statements go in ONE psql invocation because `SET lock_timeout` is
+        # session-local; issuing it separately leaves the drops unbounded.
+        script = "; ".join(
+            [
+                "SET lock_timeout = '10s'",
+                "SET statement_timeout = '50s'",
+                # Views and materialised views first: they may depend on the tables below.
+                "DO $$ DECLARE r record; BEGIN "
+                "FOR r IN SELECT c.relname FROM pg_class c "
+                "  JOIN pg_namespace n ON n.oid = c.relnamespace "
+                " WHERE n.nspname = 'public' AND c.relkind IN ('v','m') LOOP "
+                "  EXECUTE format('DROP VIEW IF EXISTS public.%I CASCADE', r.relname); "
+                "END LOOP; END $$",
+                "DO $$ DECLARE r record; BEGIN "
+                "FOR r IN SELECT c.relname FROM pg_class c "
+                "  JOIN pg_namespace n ON n.oid = c.relnamespace "
+                " WHERE n.nspname = 'public' AND c.relkind IN ('r','p','f') LOOP "
+                "  EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.relname); "
+                "END LOOP; END $$",
+                "DO $$ DECLARE r record; BEGIN "
+                "FOR r IN SELECT c.relname FROM pg_class c "
+                "  JOIN pg_namespace n ON n.oid = c.relnamespace "
+                " WHERE n.nspname = 'public' AND c.relkind = 'S' LOOP "
+                "  EXECUTE format('DROP SEQUENCE IF EXISTS public.%I CASCADE', r.relname); "
+                "END LOOP; END $$",
+                "DO $$ DECLARE r record; BEGIN "
+                "FOR r IN SELECT p.oid::regprocedure AS sig FROM pg_proc p "
+                "  JOIN pg_namespace n ON n.oid = p.pronamespace "
+                " WHERE n.nspname = 'public' LOOP "
+                "  EXECUTE format('DROP FUNCTION IF EXISTS %s CASCADE', r.sig); "
+                "END LOOP; END $$",
+            ]
+        )
         proc = subprocess.run(
+            ["psql", "-v", "ON_ERROR_STOP=1", "-c", script, pg_url],
+            capture_output=True,
+            timeout=120,
+        )
+        if proc.returncode != 0:
+            return False, (proc.stderr or b"").decode("utf-8", errors="replace")
+
+        # Post-condition: prove the schema is actually empty. Exit status alone is not
+        # evidence - the previous implementation returned 0 while dropping nothing, and the
+        # caller replayed a snapshot over live tables on the strength of that 0.
+        check = subprocess.run(
             [
                 "psql",
-                "--single-transaction",
+                "-tA",
                 "-v",
                 "ON_ERROR_STOP=1",
                 "-c",
-                "SET lock_timeout = '10s'; SET statement_timeout = '50s'; "
-                "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;",
+                "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','S','f')",
                 pg_url,
             ],
             capture_output=True,
             timeout=60,
         )
-        if proc.returncode != 0:
-            return False, (proc.stderr or b"").decode("utf-8", errors="replace")
+        if check.returncode != 0:
+            return False, (check.stderr or b"").decode("utf-8", errors="replace")
+        remaining = (check.stdout or b"").decode("utf-8", errors="replace").strip()
+        if remaining not in ("0", ""):
+            return False, (
+                f"{remaining} relation(s) still present in schema 'public' after DROP; "
+                "the schema was NOT clean and the snapshot must not be replayed over it"
+            )
         return True, ""
     except Exception as exc:  # pragma: no cover - depends on the server
         return False, str(exc)
@@ -1212,6 +1294,9 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
             if pre_replay and os.path.exists(pre_replay):
                 rec_ok, _ = _apply_postgres_sql_file(pre_replay, pg_url, server_ver=server_ver)
                 if rec_ok and _verify_restored_postgres(pg_url, pre_counts).get("verified"):
+                    # Same grant problem as the rollback path below: the replay restores
+                    # objects, not the least-privilege grants they had.
+                    _reconverge_runtime_grants(pg_url)
                     recovered = True
 
             pre_stage.cleanup()
@@ -1253,9 +1338,60 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                 # rollback actually atomic.
                 reset_ok, reset_err = _reset_public_schema(pg_url)
                 if not reset_ok:
-                    logger.error(f"Could not reset schema before rollback: {reset_err}")
+                    # Phase 20: this used to be logged and then IGNORED. The replay would
+                    # run against a schema that still held the failed restore's tables, so
+                    # `pg_dump --clean` could not drop them, the replay blocked on their
+                    # locks until psql's own 180 s timeout, and restore_backup reported
+                    # ROLLBACK_FAILED — while the operator was told only "rollback failed",
+                    # with no hint that a stale client connection was the cause. Not replaying
+                    # is the honest, safe outcome: the pre-restore snapshot is untouched and
+                    # still on disk, and the caller gets a precise recovery instruction.
+                    logger.error(
+                        "Could not reset schema before rollback (%s). Pre-restore snapshot "
+                        "preserved for manual recovery: %s",
+                        reset_err.strip(), pre_name,
+                    )
+                    pre_stage.cleanup()
+                    return {
+                        "success": False,
+                        "error": ver_err,
+                        "post_restore_verified": False,
+                        "rollback_status": "ROLLBACK_FAILED",
+                        "rolled_back": False,
+                        "atomic_rollback": False,
+                        # Phase 18: never interpolate the DSN. Diagnostics only.
+                        "rollback_error": (
+                            "Could not reset the schema before replaying the pre-restore "
+                            f"snapshot: {reset_err.strip().splitlines()[-1] if reset_err.strip() else 'unknown error'}. "
+                            "A session holding locks on the schema blocks a clean rollback — "
+                            "usually an application or psql client left 'idle in transaction'. "
+                            "Disconnect clients, then replay the snapshot with maintenance.py restore."
+                        ),
+                        "recovery_instruction": (
+                            "CRITICAL: Automatic rollback could not run and manual recovery is "
+                            f"required. Snapshot: {pre_name}. Replay it with maintenance.py restore "
+                            "(the connection string is intentionally omitted from this message)."
+                        ),
+                        "pre_restore_snapshot": pre_name,
+                    }
                 rb_applied, rb_err = _apply_postgres_sql_file(pre_replay, pg_url, server_ver=server_ver)
                 if rb_applied:
+                    # Phase 20: `_reset_public_schema` recreates `public` from scratch, so
+                    # every GRANT the runtime role held was destroyed with it. Replaying
+                    # pg_dump output as the owner restores objects but not the
+                    # least-privilege grants — `--no-privileges` is passed deliberately.
+                    # Without this the database is data-correct and permission-broken: the
+                    # rollback "succeeds", then the application gets "permission denied"
+                    # on every table. Phase 20 caught it because the suite's own
+                    # post-rollback requests began returning 500s.
+                    grants_ok, grants_note = _reconverge_runtime_grants(pg_url)
+                    if not grants_ok:
+                        logger.error(
+                            "rollback restored the data but could not re-converge runtime "
+                            "grants (%s); the application will fail until "
+                            "`scripts/provision_roles.py --apply` is run",
+                            grants_note,
+                        )
                     rb_verify = _verify_restored_postgres(pg_url, pre_counts)
                     if rb_verify.get("verified"):
                         rollback_ok = True

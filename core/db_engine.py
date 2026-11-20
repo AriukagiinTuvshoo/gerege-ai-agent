@@ -424,6 +424,19 @@ class PostgresCompatConnection:
         if not self._closed:
             self._closed = True
             try:
+                # Phase 20: `close()` used to hand the raw connection straight back to the
+                # SQLAlchemy pool WITHOUT rolling back. psycopg2 opens a transaction on the
+                # first statement, so a reader that only ever SELECTed handed the pool a
+                # connection that was still `idle in transaction` — holding its locks until
+                # the next borrower happened to end the transaction. Nothing noticed until
+                # a DDL operation needed ACCESS EXCLUSIVE: `_reset_public_schema` waited out
+                # `lock_timeout`, and the restore rollback that exists to undo a bad restore
+                # could not run. Rolling back first matches `sqlite3.Connection.close()`,
+                # which discards the pending transaction, and releases the locks immediately.
+                self._conn.rollback()
+            except Exception:
+                pass
+            try:
                 self._conn.close()
             except Exception:
                 pass
@@ -439,6 +452,30 @@ class PostgresCompatConnection:
                 self.rollback()
         finally:
             self.close()
+
+    def __del__(self):
+        # Phase 20: last-resort release. `database.py` has dozens of helpers shaped
+        # ```conn = get_connection(); ...; conn.close()``` with no `try/finally`, so an
+        # exception anywhere in the middle skips `close()` and the connection goes back to
+        # the pool — except it never goes back, it stays checked out and, because psycopg2
+        # opened a transaction on the first statement, it is `idle in transaction` holding
+        # its row locks. Those locks outlive the failed call for the life of the process.
+        #
+        # This is not theoretical: it is what made the restore rollback hang. A restore test
+        # raised a foreign-key error, leaked one such connection, and the rollback that
+        # followed could not take ACCESS EXCLUSIVE on `pages` — so the atomic rollback that
+        # exists to undo a bad restore reported ROLLBACK_FAILED, and the suite waited out a
+        # 180 s psql timeout. Reproduced by lock inspection: the blocking session's last
+        # statement was `RELEASE SAVEPOINT sp_gerege_120`, i.e. one of these cursors.
+        #
+        # CPython releases the frame's locals deterministically when the exception unwinds,
+        # so this reclaims the connection at the same moment `try/finally` would have. It is
+        # a net, not a substitute: new code should still use `try/finally` or `with`.
+        if not getattr(self, "_closed", True):
+            try:
+                self.close()
+            except Exception:
+                pass
 
 
 def get_db_connection(sqlite_path: Optional[str] = None):

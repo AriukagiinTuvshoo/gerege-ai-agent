@@ -1347,6 +1347,11 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           UPGRADE: "1"
+          # Two cases in this module deliberately empty `public` to prove the rollback's
+          # schema reset is not a silent no-op, so they cannot share a database with the
+          # rest of the suite. This step owns a disposable database, which is why the
+          # opt-in belongs here and nowhere else.
+          GEREGE_DESTRUCTIVE_TESTS: "1"
         run: |
           set -euo pipefail
           pytest tests/test_e06_phase20_backup_remediation.py -v --tb=short -p no:cacheprovider | tee /tmp/p20suite.log

@@ -1181,28 +1181,46 @@ def save_registration(
     page_id: str = DEFAULT_PAGE_ID
 ) -> int:
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO registrations (page_id, name, phone, service, channel, sender_id, status, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (page_id, name, phone, service, channel, sender_id, status, notes))
-    reg_id = cursor.lastrowid
-
-    if sender_id:
-        display_name = name if name and name != "Баримт баталгаажсан" else None
-        # E-01: tenant-scoped. The old `page_id = COALESCE(?, page_id)` always took the
-        # NEW page_id, which reassigned the row to the most recent tenant.
+    try:
+        cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO session_states (sender_id, page_id, channel, customer_name, customer_phone, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(page_id, sender_id) DO UPDATE SET
-                customer_name = COALESCE(?, session_states.customer_name, ?),
-                customer_phone = COALESCE(?, session_states.customer_phone),
-                updated_at = CURRENT_TIMESTAMP
-        """, (sender_id, page_id, channel, display_name or name, phone, display_name, name, phone))
+            INSERT INTO registrations (page_id, name, phone, service, channel, sender_id, status, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (page_id, name, phone, service, channel, sender_id, status, notes))
+        reg_id = cursor.lastrowid
 
-    conn.commit()
-    conn.close()
+        if sender_id:
+            display_name = name if name and name != "Баримт баталгаажсан" else None
+            # E-01: tenant-scoped. The old `page_id = COALESCE(?, page_id)` always took the
+            # NEW page_id, which reassigned the row to the most recent tenant.
+            cursor.execute("""
+                INSERT INTO session_states (sender_id, page_id, channel, customer_name, customer_phone, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(page_id, sender_id) DO UPDATE SET
+                    customer_name = COALESCE(?, session_states.customer_name, ?),
+                    customer_phone = COALESCE(?, session_states.customer_phone),
+                    updated_at = CURRENT_TIMESTAMP
+            """, (sender_id, page_id, channel, display_name or name, phone, display_name, name, phone))
+
+        conn.commit()
+    except Exception:
+        # Phase 20: a rejected write must not strand the connection. This function used to
+        # reach `conn.close()` only on the happy path, so a foreign-key violation left the
+        # connection checked out of the pool and `idle in transaction`, holding its locks
+        # for the life of the process. That is what made `restore_backup`'s atomic rollback
+        # time out: a seeded registration failed, the leaked transaction kept ACCESS
+        # EXCLUSIVE off `pages`, and the rollback reported ROLLBACK_FAILED instead of
+        # restoring the pre-restore snapshot.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     sync_to_csv()
     return reg_id
 

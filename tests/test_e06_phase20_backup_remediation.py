@@ -728,3 +728,167 @@ def test_p20_30_rollback_replays_an_encrypted_pre_restore_snapshot(tmp_path, mon
     # No plaintext copy of the snapshot may survive the rollback.
     leftovers = [f for f in os.listdir(directory) if f.startswith(".staging-")]
     assert leftovers == [], f"staging directories left behind: {leftovers}"
+
+
+def test_p20_31_a_stranded_connection_releases_its_locks(tmp_path, monkeypatch):
+    """A connection that never reaches `close()` must still release its locks.
+
+    The defect that broke the atomic rollback, spelled out because it took three attempts
+    to characterise correctly.
+
+    `database.save_registration` and ~60 siblings are shaped
+    ```conn = get_connection(); ...; conn.close()``` with no `try/finally`. When a call
+    raises, `close()` is skipped and the wrapper never returns to the SQLAlchemy pool.
+    psycopg2 opened a transaction on the first statement, so the raw connection sits
+    `idle in transaction` holding its row locks.
+
+    Measured, not assumed: dropping the *cursor* does not clear it and neither does
+    dropping the wrapper, because `PostgresCompatCursor` keeps a reference to the raw
+    connection. The frame also stays alive as long as anything retains the exception's
+    traceback - which pytest does, for the report. In CI the last statement of the backend
+    blocking `DROP TABLE public.pages` was `RELEASE SAVEPOINT sp_gerege_120`, one of these
+    cursors, and the rollback whose entire purpose is to undo a bad restore reported
+    ROLLBACK_FAILED after a 180 s psql timeout.
+
+    `PostgresCompatConnection.__del__` is the net that makes the release happen once the
+    traceback is finally dropped. Both halves are asserted below, so deleting the net
+    fails this test.
+    """
+    from core import backup_service
+    from core import db_engine
+
+    if not db_engine.is_postgres():
+        print("[SKIP] Not connected to live PostgreSQL")
+        return
+    if os.getenv("GEREGE_DESTRUCTIVE_TESTS") != "1":
+        # This test disposes the shared engine and empties the schema, so it cannot share a
+        # database with the rest of the suite (doing so broke 24 unrelated tests). CI runs
+        # this module in its own step, where the flag is set and it must run.
+        print("[SKIP] set GEREGE_DESTRUCTIVE_TESTS=1 to run (uses the live database)")
+        return
+
+    import gc
+
+    import psycopg2
+
+    pg_url = db_engine.get_database_url().replace("postgresql+psycopg2://", "postgresql://")
+
+    def _idle_in_tx():
+        conn = psycopg2.connect(pg_url)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND state = 'idle in transaction'"
+            )
+            return cur.fetchone()[0]
+        finally:
+            conn.close()
+
+    def _abandon_a_raising_helper():
+        """Reproduce `save_registration`'s shape; return the exception, traceback included."""
+        conn = db_engine.get_db_connection()
+        try:
+            conn.cursor().execute(
+                "INSERT INTO registrations (page_id, name, phone) VALUES ('p20_no_page', 'x', '1')"
+            )
+            conn.commit()
+            conn.close()
+            raise AssertionError("the insert was expected to be rejected")
+        except Exception as exc:  # noqa: BLE001 - the point is to keep the traceback alive
+            return exc
+
+    assert hasattr(db_engine.PostgresCompatConnection, "__del__"), (
+        "PostgresCompatConnection has no __del__ safety net; a helper that raises between "
+        "get_connection() and close() strands the connection holding row locks"
+    )
+
+    baseline = _idle_in_tx()
+    stranded = _abandon_a_raising_helper()
+    gc.collect()
+    assert _idle_in_tx() > baseline, (
+        "the probe did not strand a transaction, so it cannot prove anything about the net"
+    )
+
+    # Dropping the last reference to the traceback releases the frame, hence the wrapper,
+    # hence the raw connection - if and only if the net is in place.
+    del stranded
+    gc.collect()
+    assert _idle_in_tx() <= baseline, (
+        "the abandoned connection is still 'idle in transaction' after the traceback was "
+        "dropped; its locks would outlive the failed operation and block the rollback of "
+        "a bad restore"
+    )
+
+    # The rollback path itself must be able to take ACCESS EXCLUSIVE immediately
+    # afterwards - that is the real-world consequence.
+    reset_ok, reset_err = backup_service._reset_public_schema(pg_url)
+    assert reset_ok, f"schema reset blocked after the leak: {reset_err}"
+
+
+def test_p20_32_schema_reset_actually_empties_the_schema(monkeypatch):
+    """`_reset_public_schema` must drop everything, and must prove it did.
+
+    It used to run `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` as the restoring
+    role, which is refused on a default cluster because `public` belongs to the bootstrap
+    superuser - so it failed every time and the caller replayed the snapshot onto a schema
+    that had never been cleaned. The first rewrite filtered the drops by
+    `current_user`, which silently dropped *nothing* whenever migrations had been applied
+    by the bootstrap role, yet still exited 0.
+
+    A reset that cannot be distinguished from a no-op is worse than no reset: the caller
+    treats success as licence to replay over live tables.
+    """
+    from core import backup_service
+    from core import db_engine
+
+    if not db_engine.is_postgres():
+        print("[SKIP] Not connected to live PostgreSQL")
+        return
+    if os.getenv("GEREGE_DESTRUCTIVE_TESTS") != "1":
+        print("[SKIP] set GEREGE_DESTRUCTIVE_TESTS=1 to run (drops every object in public)")
+        return
+
+    import psycopg2
+    import sqlalchemy as sa
+
+    pg_url = db_engine.get_database_url().replace("postgresql+psycopg2://", "postgresql://")
+    engine = sa.create_engine("postgresql+psycopg2://" + pg_url[len("postgresql://"):], future=True)
+
+    def _relation_count():
+        with engine.connect() as conn:
+            return conn.execute(
+                sa.text(
+                    "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','S','f')"
+                )
+            ).scalar()
+
+    if _relation_count() == 0:
+        # Earlier tests in this module (p20_31) legitimately empty the schema, so seed it
+        # rather than skipping: a reset that drops nothing is precisely the bug under test.
+        import database as _database
+
+        _database.init_db()
+    assert _relation_count() > 0, "fixture must have a populated schema for this to mean anything"
+
+    ok, err = backup_service._reset_public_schema(pg_url)
+    try:
+        assert ok is True, f"schema reset refused: {err}"
+        assert _relation_count() == 0, (
+            "schema reset reported success but relations remain; the snapshot would be "
+            "replayed over live tables and the 'atomic' rollback would not be atomic"
+        )
+    finally:
+        engine.dispose()
+
+    # The schema itself must survive: the reset drops the objects *inside* `public` and
+    # never `public` itself. Recreating the schema is what destroyed `gerege_app`'s grants
+    # and left a "successfully rolled back" database the application could not read.
+    conn = psycopg2.connect(pg_url)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pg_namespace WHERE nspname = 'public'")
+        assert cur.fetchone()[0] == 1, "the reset dropped schema 'public' itself"
+    finally:
+        conn.close()
