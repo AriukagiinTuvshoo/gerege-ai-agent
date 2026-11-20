@@ -472,7 +472,9 @@ def _run_scheduled_backup_locked(label: str, directory: str, result: Dict[str, A
     if not policy.allowed:
         result.update(
             success=False,
-            exit_code=EXIT_NOT_CONFIGURED,
+            # The policy owns the code: 11 for an unusable key (the historical contract
+            # that alerting and the runbook reference), 15 for a configuration refusal.
+            exit_code=policy.exit_code,
             error=policy.error,
             encryption_policy=policy.code,
             policy_refused=True,
@@ -605,7 +607,45 @@ def _run_scheduled_backup_locked(label: str, directory: str, result: Dict[str, A
             result["warnings"].append(f"offsite upload failed: {error}")
             result["exit_code"] = EXIT_OFFSITE_FAILED
         else:
-            result["pruned_offsite"] = provider.apply_remote_retention(min_keep())
+            # Phase 22 (P21-05): an upload that returned 200 is not a verified copy.
+            # Read the object back and compare its bytes with the digest recorded locally
+            # when the archive was written. "OFFSITE_VERIFIED" must mean someone checked,
+            # not that a request completed.
+            expected_sha = result.get("sha256", "")
+            verify_method = getattr(provider, "verify_against_record", None)
+            if verify_method is not None and expected_sha:
+                verified, verify_error = verify_method(
+                    remote_name, expected_sha256=expected_sha,
+                    expected_size=result.get("size_bytes"),
+                )
+            else:
+                # Providers without a download implementation fall back to the metadata
+                # check, and the result is recorded as weaker so the report can say so.
+                verified, verify_error = provider.verify(
+                    remote_name, result.get("size_bytes", -1), expected_sha
+                )
+            result["offsite_readback_verified"] = bool(verified)
+            if verified:
+                result["offsite_state"] = backup_offsite.OFFSITE_VERIFIED
+            else:
+                result["offsite_state"] = backup_offsite.OFFSITE_FAILED
+                result["warnings"].append(
+                    f"offsite read-back verification failed: {verify_error}. The object is "
+                    f"present but its bytes are not proven to match this host's copy."
+                )
+                result["exit_code"] = EXIT_OFFSITE_FAILED
+
+            # Remote retention only removes objects that were verified as readable. Deleting
+            # an unverified object risks destroying the only good copy of something the
+            # local inventory has already aged out.
+            if result.get("offsite_readback_verified"):
+                result["pruned_offsite"] = provider.apply_remote_retention(min_keep())
+            else:
+                result["pruned_offsite"] = []
+                result["warnings"].append(
+                    "remote retention skipped: no object was deleted while the uploaded "
+                    "copy could not be verified"
+                )
             if not provider.independent_failure_domain:
                 result["warnings"].append(
                     f"offsite provider '{provider.name}' is a local directory: it does not "

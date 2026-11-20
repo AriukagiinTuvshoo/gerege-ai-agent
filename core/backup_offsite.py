@@ -27,6 +27,7 @@ backup is operational until an operator supplies a real target.
 from __future__ import annotations
 
 import hashlib
+import secrets
 import hmac
 import os
 import shutil
@@ -35,7 +36,13 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-OFFSITE_NOT_CONFIGURED = "NOT CONFIGURED"
+# The four offsite states an operator must be able to tell apart. Phase 12 requires that
+# "configured" and "verified" are never conflated: a bucket URL in the environment proves
+# nothing about whether a byte can be read back out of it.
+OFFSITE_NOT_CONFIGURED = "OFFSITE_NOT_CONFIGURED"
+OFFSITE_CONFIGURED = "OFFSITE_CONFIGURED"
+OFFSITE_VERIFIED = "OFFSITE_VERIFIED"
+OFFSITE_FAILED = "OFFSITE_FAILED"
 
 _REQUIRED_ENV = (
     "BACKUP_OFFSITE_URL",          # e.g. https://s3.eu-central-1.amazonaws.com/bucket
@@ -146,12 +153,73 @@ class OffsiteProvider:
         return result
 
     def download(self, remote_name: str, local_path: str) -> Tuple[bool, str]:
-        raise NotImplementedError
+        """Fetch one object to ``local_path``.
+
+        Phase 22: this raised ``NotImplementedError``. S3 offsite upload, listing and
+        retention all worked, and ``verify()`` did a real HEAD - so "offsite is verified"
+        looked true while the one operation a disaster recovery actually needs, getting the
+        bytes back, was unimplemented. The Phase 20 test for ``download_verified`` exercised
+        ``LocalOffsite`` only, so nothing caught it.
+
+        Writes to a private sibling and renames on success: a partial download must never
+        be left where a restore could pick it up.
+        """
+        url = self._url(remote_name)
+        tmp_path = f"{local_path}.part-{secrets.token_hex(4)}"
+        try:
+            status, body = self._request("GET", url)
+            if status != 200:
+                return False, f"download http {status}"
+            if not isinstance(body, (bytes, bytearray)):
+                return False, "download returned no body"
+            parent = os.path.dirname(os.path.abspath(local_path)) or "."
+            os.makedirs(parent, exist_ok=True)
+            with open(tmp_path, "wb") as handle:
+                os.chmod(tmp_path, 0o600)
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, local_path)
+            return True, ""
+        except OffsiteError as exc:
+            return False, str(exc)
+        except OSError as exc:
+            return False, f"cannot write download: {type(exc).__name__}"
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def download_verified(self, remote_name: str, local_path: str,
                           expected_size: int = -1,
                           expected_sha256: str = "") -> Tuple[bool, str]:
-        return self.download(remote_name, local_path)
+        """Download and hash the bytes actually received.
+
+        The digest is compared against ``expected_sha256`` - which the caller must supply
+        from its own record, never from the object's stored metadata. Metadata is a claim
+        the server makes about the object; hashing the received bytes is evidence. A
+        same-size corruption that preserves the echoed metadata passes ``verify()`` (Phase
+        21 found exactly that), so this is the only check that can catch it.
+        """
+        ok, error = self.download(remote_name, local_path)
+        if not ok:
+            return False, error
+        try:
+            digest = hashlib.sha256()
+            size = 0
+            with open(local_path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+                    size += len(block)
+        except OSError as exc:
+            return False, f"cannot hash downloaded object: {type(exc).__name__}"
+        if expected_size is not None and expected_size >= 0 and size != expected_size:
+            return False, f"downloaded size mismatch: {size} != expected {expected_size}"
+        if expected_sha256 and digest.hexdigest().lower() != expected_sha256.lower():
+            return False, "downloaded digest does not match the expected digest"
+        return True, ""
 
     # -- retention ---------------------------------------------------------
     def apply_remote_retention(self, keep: int, *, dry_run: bool = False) -> List[str]:
@@ -538,13 +606,78 @@ class S3Offsite(OffsiteProvider):
             result.append((name, epoch))
         return result
 
-    def download(self, remote_name: str, local_path: str) -> Tuple[bool, str]:
-        raise NotImplementedError
+    # `download` and `download_verified` are implemented on the base class so that every
+    # provider gets the same verified-download semantics; LocalOffsite overrides both with
+    # a filesystem copy. S3 previously carried a `raise NotImplementedError` placeholder
+    # here, which shadowed nothing useful and made disaster recovery impossible.
 
-    def download_verified(self, remote_name: str, local_path: str,
-                          expected_size: int = -1,
-                          expected_sha256: str = "") -> Tuple[bool, str]:
-        return self.download(remote_name, local_path)
+    # -- remote integrity --------------------------------------------------
+    def verify_against_record(
+        self,
+        remote_name: str,
+        *,
+        expected_sha256: str,
+        expected_size: Optional[int] = None,
+        workdir: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Download a remote object and prove its bytes match an *independent* record.
+
+        Phase 22 (P21-05). ``verify()`` reads only what the server says about an object: its
+        Content-Length and the ``x-amz-meta-p20-*`` values it echoes back. Those are claims,
+        not evidence. Phase 21 confirmed the gap by overwriting an object with same-size
+        corruption while preserving the metadata, after which:
+
+            >>> offsite.verify("obj.enc", len(good), sha)
+            (True, '')
+
+        The digest is a parameter here, never something read from the object. Callers pass
+        the value they recorded locally when the archive was created (the ``.sha256``
+        sidecar), so the comparison is between server bytes and local knowledge. Metadata
+        can be rewritten by anyone who can write to the bucket; a locally recorded digest
+        cannot.
+
+        ``workdir`` keeps the temporary download out of the caller's tree; the temporary
+        file is removed on every exit path. A truncated object, a missing object, a
+        same-size corruption and a different-size corruption all fail.
+        """
+        import tempfile
+
+        if not expected_sha256:
+            return False, "refusing to verify without an expected digest"
+
+        tmp_dir = workdir or tempfile.mkdtemp(prefix="offsite-verify-")
+        created = workdir is None
+        target = os.path.join(tmp_dir, os.path.basename(remote_name) + ".verify")
+        try:
+            ok, error = self.download_verified(
+                remote_name, target,
+                -1 if expected_size is None else expected_size, expected_sha256,
+            )
+            if not ok:
+                return False, error
+            digest = hashlib.sha256()
+            size = 0
+            with open(target, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+                    size += len(block)
+            if digest.hexdigest().lower() != expected_sha256.lower():
+                return False, "downloaded object does not match the recorded digest"
+            if expected_size is not None and expected_size >= 0 and size != expected_size:
+                return False, f"downloaded object is {size} bytes, recorded {expected_size}"
+            return True, ""
+        except OSError as exc:
+            return False, f"verification could not read the downloaded object: {type(exc).__name__}"
+        finally:
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+            if created:
+                try:
+                    os.rmdir(tmp_dir)
+                except OSError:
+                    pass
 
     # -- retention ---------------------------------------------------------
     def apply_remote_retention(self, keep: int, *, dry_run: bool = False) -> List[str]:
