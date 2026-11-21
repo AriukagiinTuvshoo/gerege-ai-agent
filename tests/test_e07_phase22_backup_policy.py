@@ -25,6 +25,7 @@ plaintext is on disk" would otherwise pass.
 
 from __future__ import annotations
 
+import base64
 import os
 import pathlib
 import subprocess
@@ -625,17 +626,65 @@ def test_a_wrong_length_key_is_a_configuration_error_not_an_integrity_error(tmp_
     assert "short" not in policy.error.replace("short.key", "")
 
 
-def test_a_valid_32_byte_key_is_still_accepted(tmp_path, monkeypatch):
-    """The new length check must not reject a correct key."""
+@pytest.mark.parametrize(
+    "name,content",
+    [
+        ("raw", bytes(range(32))),
+        # The documented generator: `head -c 32 /dev/urandom | base64`. 44 characters
+        # plus the newline the pipeline writes, so 45 bytes. A first attempt at the
+        # key-validity check used a hand-written set of accepted byte counts, omitted this
+        # form, and broke the Phase 18 CI step at exit 11.
+        ("base64-single-line", base64.b64encode(bytes(range(32)))),
+        ("base64-newline", base64.b64encode(bytes(range(32))) + b"\n"),
+    ],
+)
+def test_every_documented_key_form_is_accepted(tmp_path, monkeypatch, name, content):
+    """Valid keys must not be rejected by the new check - including the one CI uses."""
     from core import backup_policy
 
-    good = tmp_path / "good.key"
-    good.write_bytes(bytes(range(32)))
+    good = tmp_path / f"{name}.key"
+    good.write_bytes(content)
     good.chmod(0o600)
     monkeypatch.setenv("ENV", "production")
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(good))
     monkeypatch.delenv("BACKUP_ENCRYPTION", raising=False)
 
     policy = backup_policy.evaluate()
-    assert policy.allowed is True
+    assert policy.allowed is True, f"{name} ({len(content)} bytes) was rejected: {policy.error}"
     assert policy.code == "ENCRYPTED"
+
+
+def test_a_hex_key_is_rejected(tmp_path, monkeypatch):
+    """Hex is *not* an accepted form, and the policy must not invent one.
+
+    `load_key` accepts 32 raw bytes or a base64 encoding of 32 bytes, and says so in its
+    error. Asserting the rejection keeps the test honest about the real contract - the
+    first draft of this test assumed hex was supported and asserted the wrong thing.
+    """
+    from core import backup_policy
+
+    key = tmp_path / "hex.key"
+    key.write_bytes(bytes(range(32)).hex().encode())
+    key.chmod(0o600)
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key))
+    monkeypatch.delenv("BACKUP_ENCRYPTION", raising=False)
+
+    policy = backup_policy.evaluate()
+    assert policy.allowed is False
+    assert policy.exit_code == 11
+
+
+def test_the_policy_does_not_restate_the_loaders_rules():
+    """Structural guard: validity must be decided by `load_key`, not by a copy of its rules.
+
+    The duplicate-rules version was wrong within minutes of being written. Anything that
+    restates the loader's accepted forms will drift from them again.
+    """
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parent.parent / "core" / "backup_policy.py"
+    ).read_text(encoding="utf-8")
+    assert "_ACCEPTABLE_KEY_SIZES" not in source
+    assert "from core.backup_crypto import load_key" in source

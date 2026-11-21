@@ -48,11 +48,6 @@ _PLAINTEXT_VALUES = frozenset({"off", "0", "false", "no", "disabled", "none", "p
 
 #: A backup may be produced encrypted, or refused. Never plaintext in production.
 MODE_ENCRYPTED = "encrypted"
-
-#: Byte lengths `core.backup_crypto.load_key` can accept: 32 raw bytes, or the common
-#: text encodings of a 32-byte key (base64 = 44 with padding, hex = 64). Kept deliberately
-#: narrow - anything else is a mistake worth failing closed on.
-_ACCEPTABLE_KEY_SIZES = frozenset({32, 43, 44, 64})
 MODE_PLAINTEXT = "plaintext"
 
 
@@ -264,24 +259,33 @@ def evaluate() -> BackupSecurityPolicy:
             exit_code=11,
         )
 
-    # Phase 22: a key of the wrong length is *unusable*, not merely unusual. The checks
+    # Phase 22: a key that cannot be loaded is *unusable*, not merely unusual. The checks
     # above catch "not a file" and "empty", which let a 5-byte key through as ENCRYPTED -
     # the run then failed deep in the crypto layer with 12 (integrity), reporting an
     # encryption failure for what is a configuration error. The code table exists so an
     # operator can tell "my key is wrong" (11) from "the archive did not authenticate"
-    # (12); a key that cannot possibly be AES-256 belongs in the first category. The
-    # length is reported, never the content.
-    if size not in _ACCEPTABLE_KEY_SIZES:
+    # (12); a key that cannot possibly be AES-256 belongs in the first category.
+    #
+    # The question is delegated to `load_key` rather than answered here. A first attempt
+    # duplicated the accepted lengths as a set of byte counts and was wrong: the documented
+    # generator is `head -c 32 /dev/urandom | base64`, which writes 44 characters *plus a
+    # newline*, so a perfectly good 45-byte file was refused and CI failed at exit 11.
+    # Anything that restates the loader's rules will drift from them; asking the loader is
+    # the only version that cannot. Nothing is logged or returned from the key itself.
+    try:
+        from core.backup_crypto import load_key
+
+        load_key(path)
+    except Exception as exc:
         return BackupSecurityPolicy(
             allowed=False,
             mode=MODE_ENCRYPTED,
             production=production,
-            reason="key file is not a valid AES-256 key length",
+            reason="key file cannot be loaded as an AES-256 key",
             error=(
-                f"encryption key file is {size} bytes; an AES-256 key must be 32 raw "
-                "bytes (or one of the encoded forms the loader accepts). No backup was "
-                "written. Check how the key was generated - see "
-                "docs/operations/BACKUP_ENCRYPTION.md."
+                "encryption key file is present but cannot be loaded as an AES-256 key. "
+                f"No backup was written. ({type(exc).__name__}) See "
+                "docs/operations/BACKUP_ENCRYPTION.md for the accepted key forms."
             ),
             code="ENCRYPTION_KEY_INVALID",
             exit_code=11,

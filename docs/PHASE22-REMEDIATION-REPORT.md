@@ -168,9 +168,27 @@ Each was reproduced before being fixed.
 | N-11 | **The documented offsite path could not reach a local S3 server** (`http://` refused unconditionally), so the Phase 12 verification requirement was unreachable | LOW | Fixed: narrow loopback opt-in, refused in production |
 | N-12 | **Alerting made a single attempt** — one dropped packet lost the alert for a failed backup | MEDIUM | Fixed: bounded retry, 4xx not retried |
 | N-13 | **CI could not report which test failed** | MEDIUM | Fixed: names on the annotation's first line |
+| N-14 | **The N-8 key check was itself wrong**, and broke CI: it duplicated `load_key`'s accepted lengths as a byte-count set, omitted the newline the documented `base64` generator writes, and refused the 45-byte key CI uses — step 29, exit 11 | HIGH (self-inflicted) | Fixed: the policy asks `load_key` instead of restating its rules |
 
 Two of these (N-1, N-9) were defects *in Phase 22's own work*, caught by Phase 22's own
 negative controls. They are listed because the controls working is the point.
+
+**N-14 deserves its own paragraph**, because it is the same failure mode this whole phase is
+about. The fix for N-8 was written, tested against a 5-byte key, and looked correct. It
+restated `load_key`'s accepted byte lengths as a hand-maintained set. The documented key
+generator is `head -c 32 /dev/urandom | base64`, which writes 44 characters **plus a
+newline** — 45 bytes. My set said `{32, 43, 44, 64}`. Nothing local used the documented
+generator; the CI step does. CI caught it at step 29, exit 11, and the run went red on
+`cf19bea`.
+
+The lesson is not "add 45 to the set" — that set would drift again the moment `load_key`
+changed. The policy now calls `load_key` and treats any exception as "unusable", so the
+question has one answer in one place. A structural test asserts the duplicated set is gone,
+and the test that had assumed hex was an accepted form was corrected to assert the real
+contract instead of my assumption about it.
+
+This is recorded rather than quietly amended because a report whose author hides the
+defects they introduced has no business claiming any of the others are fixed.
 
 ---
 
@@ -188,7 +206,7 @@ BACKUP_OFFSITE_TEST_ENDPOINT=http://127.0.0.1:5062 REDIS_URL=redis://127.0.0.1:6
 python -m pytest tests/ -q -p no:randomly
 ```
 
-**902 passed, 0 failed, 4 skipped** (401 s).
+**906 passed, 0 failed, 4 skipped** (401 s).
 
 The 4 skips, each explained:
 
@@ -203,7 +221,7 @@ The 4 skips, each explained:
 
 | Suite | Tests | Result |
 |---|---|---|
-| `test_e07_phase22_backup_policy.py` | 44 (2 skipped) | pass |
+| `test_e07_phase22_backup_policy.py` | 46 (2 skipped) | pass |
 | `test_e07_phase22_db_bounds.py` | 19 | pass |
 | `test_e07_phase22_offsite_pagination.py` | 23 | pass |
 | `test_e07_phase22_aead_binding.py` | 22 | pass |
@@ -355,8 +373,10 @@ fbcf933 fix(backup): bound every backup database operation (P21-10)
 Pushed **only** to `arena/d78ebf88-gerege-ai-agent`. `main` untouched. PR #1 open, not
 merged. No force-push, no history rewrite, no deployment, no production access.
 
-**CI runs on this branch:** `e6fd261`, `81a628a`, `6291da3`, `4a88af3` all **success**,
-54/54 steps. The four commits before `e6fd261` failed step 17 for the reason in §2.
+**CI runs on this branch:** `e6fd261`, `81a628a`, `6291da3`, `4a88af3`, `b9c4f28` all
+**success**, 54/54 steps. The four commits before `e6fd261` failed step 17 for the reason in
+§2. `cf19bea` failed **step 29 at exit 11** for N-14; `cf19bea`'s successor fixes it and was
+verified with step 29 run locally (exit 0) before being pushed.
 
 ---
 
