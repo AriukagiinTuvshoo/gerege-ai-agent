@@ -402,3 +402,81 @@ def test_sqlalchemy_bounds_skip_sqlite_and_apply_to_postgres(tmp_path):
             assert conn.execute(text("SELECT 1")).scalar() == 1
     finally:
         engine.dispose()
+
+
+def test_timeout_exit_code_does_not_collide_with_plaintext_detection():
+    """Phase 22: a timeout must be distinguishable from "plaintext is on disk".
+
+    Both used to exit 17. `maintenance.py legacy` documents 17 for plaintext-present
+    (action needed), so the timeout code had to move: an alerting rule that saw 17 could
+    not tell "slow database" from "unencrypted tenant data is sitting in the backup
+    directory". Timeouts are 18 throughout the backup path.
+    """
+    import pathlib
+    import re
+
+    source = pathlib.Path(__file__).resolve().parent.parent / "core" / "backup_service.py"
+    text = source.read_text(encoding="utf-8")
+
+    # Every timeout result carries exit_code 18 and timeout=True.
+    timeout_sites = [
+        match.start() for match in re.finditer(r'"timeout":\s*True', text)
+    ]
+    assert timeout_sites, "no timeout result found; did the shape change?"
+    for position in timeout_sites:
+        window = text[max(0, position - 400):position + 120]
+        assert '"exit_code": 18' in window, (
+            "a timeout result does not carry exit_code 18 (it may have regressed to 17)"
+        )
+        assert '"exit_code": 17' not in window
+
+    # And 17 must not be produced anywhere as a timeout.
+    assert '"exit_code": 17' not in text
+
+
+def test_legacy_plaintext_exit_code_is_still_17():
+    """The documented contract for `legacy` must not have been changed to suit the fix."""
+    import pathlib
+
+    maintenance = (
+        pathlib.Path(__file__).resolve().parent.parent / "scripts" / "maintenance.py"
+    ).read_text(encoding="utf-8")
+    assert "17 = plaintext present" in maintenance
+
+
+def test_a_specific_exit_code_survives_the_dump_wrapper(monkeypatch, tmp_path):
+    """Phase 22: the timeout code must not be flattened to 10 on the way out.
+
+    `create_backup` overwrote `created["exit_code"] = 10` unconditionally when the dump
+    step failed, which erased the 18 that `_create_backup_dump` had just set for a
+    configured bound. The documented distinction between "exceeded a bound" and "the
+    backup failed" therefore existed only in the docs. A default is correct; an override
+    is not.
+    """
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parent.parent / "core" / "backup_service.py")
+    text = source.read_text(encoding="utf-8")
+    assert 'created.setdefault("exit_code", 10)' in text, (
+        "the dump-failure path must default the code, not overwrite it"
+    )
+    assert 'created["exit_code"] = 10' not in text
+
+
+def test_cli_propagates_the_service_exit_code():
+    """`cmd_backup` used to return a blanket 1, discarding every structured code.
+
+    The scheduled path (`backup-run`) has always returned `result["exit_code"]`, so the
+    code table described one entry point and not the other.
+    """
+    import pathlib
+
+    maintenance = (
+        pathlib.Path(__file__).resolve().parent.parent / "scripts" / "maintenance.py"
+    ).read_text(encoding="utf-8")
+    start = maintenance.index("def cmd_backup(label: str) -> int:")
+    end = maintenance.index("\ndef ", start + 1)
+    body = maintenance[start:end]
+    assert 'result.get("exit_code")' in body, (
+        "cmd_backup discards the structured exit code again"
+    )

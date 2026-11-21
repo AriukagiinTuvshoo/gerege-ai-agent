@@ -286,7 +286,14 @@ def _create_backup_secured(label: str) -> Dict[str, Any]:
         staging.__enter__()
         created = _create_backup_dump(label, staging.path_dir)
         if not created.get("success"):
-            created["exit_code"] = 10
+            # Phase 22: preserve a specific code the dump step already chose.
+            #
+            # This used to overwrite unconditionally with 10, which erased the timeout
+            # code (18) two frames below - so a lock-blocked backup exited 10, the same
+            # code as a disk-full, and the documented distinction between "exceeded a
+            # configured bound" and "the backup failed" existed only in the docs. A
+            # blanket default is correct; a blanket override is not.
+            created.setdefault("exit_code", 10)
             return created
 
         filename = created["filename"]
@@ -431,9 +438,14 @@ def _create_backup_dump(
             "success": False,
             # `exc` already names the step and the bound that fired, so this only adds the
             # consequence: nothing was published and no dump was taken.
+            # Phase 22: 18, not 17. `17` already means "plaintext archives present"
+            # for `maintenance.py legacy`, and a monitor that saw 17 could not tell an
+            # unresolved plaintext exposure from a database that was merely slow. Every
+            # timeout in the backup path uses 18 so an alerting rule can distinguish
+            # "took too long" from "something is simultaneously wrong".
             "error": f"database preflight exceeded its deadline - {exc} No archive was published.",
 
-            "exit_code": 17,
+            "exit_code": 18,
             "timeout": True,
         }
 
@@ -454,7 +466,7 @@ def _create_backup_dump(
             dump_budget = deadline.budget(120.0)
         except Exception as exc:
             return {"success": False, "error": f"deadline exceeded before dump: {exc}",
-                    "exit_code": 17, "timeout": True}
+                    "exit_code": 18, "timeout": True}
         try:
             proc = subprocess.run(
                 ["pg_dump", "--clean", "--if-exists", "--no-owner", "--no-privileges", pg_url],
@@ -473,7 +485,7 @@ def _create_backup_dump(
                     f"BACKUP_DB_OPERATION_DEADLINE ({db_bounds.OPERATION_DEADLINE_S:.0f}s). "
                     f"Nothing was published."
                 ),
-                "exit_code": 17,
+                "exit_code": 18,
                 "timeout": True,
             }
         except Exception as e:

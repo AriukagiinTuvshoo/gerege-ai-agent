@@ -16,7 +16,9 @@ Type=oneshot
 WorkingDirectory=/opt/gerege
 EnvironmentFile=/etc/gerege/backup.env
 # Distinct exit codes are passed through unchanged (10 backup, 11 crypto, 12 integrity,
-# 14 offsite, 15 not configured) so OnFailure handlers and alerting can distinguish them.
+# 13 credential, 14 offsite, 15 not configured, 16 locked, 18 timeout) so OnFailure
+# handlers and alerting can distinguish them. 17 is reserved for `maintenance.py legacy`
+# reporting plaintext on disk, which is a different operator action entirely.
 ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml run --rm \
     --no-deps maintenance python scripts/maintenance.py backup-run --label scheduled
 TimeoutStartSec=2h

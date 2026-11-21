@@ -596,3 +596,46 @@ def test_production_plaintext_refusal_is_a_configuration_error(env):
     """`off` in production is a configuration fault, not an encryption failure."""
     env.set(ENV="production", BACKUP_ENCRYPTION="off")
     assert backup_policy.evaluate().exit_code == 15
+
+
+def test_a_wrong_length_key_is_a_configuration_error_not_an_integrity_error(tmp_path, monkeypatch):
+    """Phase 22: a 5-byte key used to pass the policy and fail later as exit 12.
+
+    `ENCRYPTION_KEY_INVALID` (11) is meant to mean "configured, but unusable". The policy
+    checked "is a file" and "is not empty", which let a key that cannot possibly be AES-256
+    through as ENCRYPTED; the run then failed inside the crypto layer and reported 12 - an
+    integrity failure - for what is a configuration mistake. The two codes exist so an
+    operator can tell them apart.
+    """
+    from core import backup_policy
+
+    bad = tmp_path / "short.key"
+    bad.write_bytes(b"short")
+    bad.chmod(0o600)
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(bad))
+    monkeypatch.delenv("BACKUP_ENCRYPTION", raising=False)
+
+    policy = backup_policy.evaluate()
+    assert policy.allowed is False
+    assert policy.code == "ENCRYPTION_KEY_INVALID"
+    assert policy.exit_code == 11
+    # The length may be reported; the content never.
+    assert "5 bytes" in policy.error or "5" in policy.error
+    assert "short" not in policy.error.replace("short.key", "")
+
+
+def test_a_valid_32_byte_key_is_still_accepted(tmp_path, monkeypatch):
+    """The new length check must not reject a correct key."""
+    from core import backup_policy
+
+    good = tmp_path / "good.key"
+    good.write_bytes(bytes(range(32)))
+    good.chmod(0o600)
+    monkeypatch.setenv("ENV", "production")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(good))
+    monkeypatch.delenv("BACKUP_ENCRYPTION", raising=False)
+
+    policy = backup_policy.evaluate()
+    assert policy.allowed is True
+    assert policy.code == "ENCRYPTED"

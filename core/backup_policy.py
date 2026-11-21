@@ -48,6 +48,11 @@ _PLAINTEXT_VALUES = frozenset({"off", "0", "false", "no", "disabled", "none", "p
 
 #: A backup may be produced encrypted, or refused. Never plaintext in production.
 MODE_ENCRYPTED = "encrypted"
+
+#: Byte lengths `core.backup_crypto.load_key` can accept: 32 raw bytes, or the common
+#: text encodings of a 32-byte key (base64 = 44 with padding, hex = 64). Kept deliberately
+#: narrow - anything else is a mistake worth failing closed on.
+_ACCEPTABLE_KEY_SIZES = frozenset({32, 43, 44, 64})
 MODE_PLAINTEXT = "plaintext"
 
 
@@ -254,6 +259,29 @@ def evaluate() -> BackupSecurityPolicy:
             error=(
                 "encryption key file is empty (0 bytes). No backup was written. "
                 "A zero-length key is never a valid AES-256 key."
+            ),
+            code="ENCRYPTION_KEY_INVALID",
+            exit_code=11,
+        )
+
+    # Phase 22: a key of the wrong length is *unusable*, not merely unusual. The checks
+    # above catch "not a file" and "empty", which let a 5-byte key through as ENCRYPTED -
+    # the run then failed deep in the crypto layer with 12 (integrity), reporting an
+    # encryption failure for what is a configuration error. The code table exists so an
+    # operator can tell "my key is wrong" (11) from "the archive did not authenticate"
+    # (12); a key that cannot possibly be AES-256 belongs in the first category. The
+    # length is reported, never the content.
+    if size not in _ACCEPTABLE_KEY_SIZES:
+        return BackupSecurityPolicy(
+            allowed=False,
+            mode=MODE_ENCRYPTED,
+            production=production,
+            reason="key file is not a valid AES-256 key length",
+            error=(
+                f"encryption key file is {size} bytes; an AES-256 key must be 32 raw "
+                "bytes (or one of the encoded forms the loader accepts). No backup was "
+                "written. Check how the key was generated - see "
+                "docs/operations/BACKUP_ENCRYPTION.md."
             ),
             code="ENCRYPTION_KEY_INVALID",
             exit_code=11,

@@ -102,9 +102,26 @@ paragraph claimed plaintext never enters `BACKUP_DIR` without that qualification
 true of the production path only.
 
 Exit codes are distinct per failure class so a timer unit or alerting rule can
-distinguish them: `0` ok, `10` backup failed, `11` encryption failed, `12` integrity
-failed, `13` credential invalid, `14` offsite failed, `15` not configured,
-`16` another backup/prune/restore holds the lock.
+distinguish them:
+
+| Code | Meaning |
+|---|---|
+| `0` | ok |
+| `10` | backup failed |
+| `11` | encryption failed (a key is configured but unusable) |
+| `12` | integrity failed (the archive did not authenticate or did not verify) |
+| `13` | credential invalid (the role cannot perform the operation) |
+| `14` | offsite failed |
+| `15` | not configured (no key, encryption refused, configuration refused) |
+| `16` | another backup/prune/restore holds the lock |
+| `17` | **plaintext archives present** (`maintenance.py legacy`: action needed) |
+| `18` | **a configured bound was exceeded** — database or `pg_dump` timed out |
+
+`17` and `18` were the same number until Phase 22: timeouts returned `17`, which
+`maintenance.py legacy` already used for "plaintext is on disk". A monitor could not tell an
+unresolved plaintext exposure from a slow database. Timeouts are now `18` throughout. Every
+timeout carries `"timeout": true` in the result as well, so a caller does not have to parse
+the code.
 
 ## 5. Configuration
 

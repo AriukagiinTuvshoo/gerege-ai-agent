@@ -119,7 +119,15 @@ def cmd_backup(label: str) -> int:
     result = backup_service.create_backup(label=label)
     if not result.get("success"):
         print(f"backup FAILED: {result.get('error')}", file=sys.stderr)
-        return 1
+        # Phase 22: propagate the code the service computed instead of a blanket 1.
+        #
+        # The scheduled path (`backup-run`) has always returned `result["exit_code"]`, so
+        # the documented code table - 11 crypto, 12 integrity, 15 not configured, 18
+        # timeout - described one entry point and not the other. A timer or alerting rule
+        # watching a manual backup could not distinguish a timeout from a missing key from
+        # a disk-full, and the codes were effectively decorative for this command.
+        code = result.get("exit_code")
+        return int(code) if code else 1
     print(
         f"backup OK: {result['filename']} "
         f"({result['size_bytes']} bytes, sha256 {result['sha256'][:16]}…)"
