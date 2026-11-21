@@ -1,0 +1,29 @@
+# Gerege backup — one run. Invoked by gerege-backup.timer.
+#
+# NOT INSTALLED by this repository. Copy to /etc/systemd/system/, enable the timer,
+# and verify with `systemctl list-timers`. See docs/operations/BACKUP_AUTOMATION.md.
+#
+# The owner credential lives in an EnvironmentFile with mode 0600, owned by root.
+# It is never placed in this unit file, so it never appears in `systemctl cat`.
+[Unit]
+Description=Gerege CRM database backup (encrypted, verified, retained)
+Documentation=file:///app/docs/operations/BACKUP_AUTOMATION.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/gerege
+EnvironmentFile=/etc/gerege/backup.env
+# Distinct exit codes are passed through unchanged (10 backup, 11 crypto, 12 integrity,
+# 13 credential, 14 offsite, 15 not configured, 16 locked, 18 timeout) so OnFailure
+# handlers and alerting can distinguish them. 17 is reserved for `maintenance.py legacy`
+# reporting plaintext on disk, which is a different operator action entirely.
+ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml run --rm \
+    --no-deps maintenance python scripts/maintenance.py backup-run --label scheduled
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

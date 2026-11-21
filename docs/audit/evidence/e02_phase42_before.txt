@@ -1,0 +1,65 @@
+===============================================================================
+E-02 Phase 4.2 — RED evidence: admission ownership / window-bound refund
+Recorded before any Phase 4.2 change. HEAD at recording time:
+74d736b3884bee5bef6c39bc04a67dee77d2ff74
+  74d736b docs(E-02): record Phase 4.1 CI run 44011261364 (success, zero failed steps)
+===============================================================================
+
+## 1. Direct reproduction of the reported race, MEMORY store (injected clock)
+   A admitted in W1, W1 expires, B admitted (and therefore recorded) in W2,
+   A's success refunds. B's failure must survive.
+
+  A admitted in W1        count=1  keys=['allowed', 'canonical', 'count', 'identity', 'limit', 'retry_after']
+  B admitted in W2 (fails) count=1  stored=1
+  A's success refunds      applied=False  stored=0
+  EXPECTED stored=1 (B's W2 failure kept)   ACTUAL stored=0
+  RESULT: RACE REPRODUCED — B's failure erased by a refund from an expired window
+
+## 2. Same sequence, REAL REDIS with a 1-second TTL
+
+  A admitted in W1        count=1
+  B admitted in W2 (fails) count=1  stored=1
+  A's success refunds      applied=False  stored=0
+  EXPECTED stored=1 (B's W2 failure kept)   ACTUAL stored=0
+  RESULT: RACE REPRODUCED on Redis — B's failure erased
+
+## 3. Store asymmetry behind the same sequence
+   memory decrement_floor_zero() honours window_seconds (and is still defeated:
+   W2 recreates the key with a fresh 'started', so the stale refund lands inside W2).
+   _RedisStore.decrement_floor_zero() ignores window_seconds entirely — no TTL or
+   generation predicate in _DECR_SCRIPT_SOURCE.
+
+## 4. Adjacent finding (audit B) — duplicate client_username divergence
+   resolve_canonical_account(): ORDER BY page_id LIMIT 1            -> page-dup-a
+   authenticate_client_detailed(): fetchone(), no ORDER BY (rowid)  -> page-dup-b
+   Measured: the account the throttle charges cannot log in with its own
+   correct password, while the other tenant authenticates. See test_221.
+
+## 5. Test suite status at this commit (RED)
+
+FFFFFFF.FFFF.FFFFFFFF.......                                             [100%]
+=========================== short test summary info ============================
+FAILED tests/test_e02_phase42_admission_ownership.py::test_201_admission_returns_a_generation_token
+FAILED tests/test_e02_phase42_admission_ownership.py::test_202_refund_from_an_expired_generation_does_not_touch_the_new_window
+FAILED tests/test_e02_phase42_admission_ownership.py::test_203_refund_from_the_current_generation_is_applied
+FAILED tests/test_e02_phase42_admission_ownership.py::test_204_a_token_cannot_be_refunded_twice
+FAILED tests/test_e02_phase42_admission_ownership.py::test_205_a_refund_cannot_decrement_another_requests_admission
+FAILED tests/test_e02_phase42_admission_ownership.py::test_206_multiple_simultaneous_successes_refund_exactly_once_each
+FAILED tests/test_e02_phase42_admission_ownership.py::test_207_concurrent_successes_and_failures_land_on_the_documented_count
+FAILED tests/test_e02_phase42_admission_ownership.py::test_209_redis_refund_from_an_expired_generation_is_refused
+FAILED tests/test_e02_phase42_admission_ownership.py::test_210_redis_refund_preserves_the_window_ttl
+FAILED tests/test_e02_phase42_admission_ownership.py::test_211_redis_token_cannot_be_refunded_twice
+FAILED tests/test_e02_phase42_admission_ownership.py::test_212_redis_refunds_are_attributed_per_account
+FAILED tests/test_e02_phase42_admission_ownership.py::test_214_both_stores_agree_on_the_stale_refund_decision
+FAILED tests/test_e02_phase42_admission_ownership.py::test_215_neither_store_can_return_a_negative_count
+FAILED tests/test_e02_phase42_admission_ownership.py::test_216_a_token_from_another_identity_is_refused
+FAILED tests/test_e02_phase42_admission_ownership.py::test_217_resolution_failure_fallback_does_not_casefold
+FAILED tests/test_e02_phase42_admission_ownership.py::test_218_resolution_failure_fallback_is_still_privacy_safe
+FAILED tests/test_e02_phase42_admission_ownership.py::test_219_resolution_failure_does_not_disable_the_throttle
+FAILED tests/test_e02_phase42_admission_ownership.py::test_220_fallback_keeps_the_database_comparison_when_only_the_lookup_fails
+FAILED tests/test_e02_phase42_admission_ownership.py::test_221_resolver_and_authentication_select_the_same_account
+19 failed, 9 passed in 8.48s
+
+  (0 skipped: RED is measured with Redis available, so no case is hidden by a skip.)
+
+  19 failed / 9 passed / 0 skipped / 28 collected

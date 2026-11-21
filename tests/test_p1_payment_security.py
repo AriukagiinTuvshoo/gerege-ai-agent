@@ -9,6 +9,11 @@ import sys
 import time
 import uuid
 import unittest.mock
+
+try:
+    import pytest
+except ImportError:  # script mode
+    pytest = None
 from typing import Dict, Any
 
 from fastapi.testclient import TestClient
@@ -38,6 +43,22 @@ def _setup_test_environment():
         username="p1_client_b",
         password="Password123!",
     )
+
+
+if pytest is not None:
+    @pytest.fixture(autouse=True, scope="session")
+    def _pytest_environment():
+        """
+        TD-03 (B-08): `_setup_test_environment()` used to run only inside the
+        `if __name__ == "__main__":` block, so under pytest the tenant pages
+        p1_tenant_a / p1_client_a never existed and 5 tests failed with a 401 that
+        had nothing to do with payment security.
+
+        Session-scoped and idempotent: CI runs this file both standalone and as part
+        of the full `pytest tests/` invocation, and in PostgreSQL mode the rows may
+        already be present.
+        """
+        _setup_test_environment()
 
 
 def _get_admin_token() -> str:

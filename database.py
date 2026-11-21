@@ -8,19 +8,40 @@ import secrets
 import hashlib
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple
-from core.db_engine import get_db_connection
+from core.db_engine import get_db_connection, get_sqlite_db_path, verify_schema_drift
 
 logger = logging.getLogger("database")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "leads.db")
+#: The SQLite file this process writes to, resolved once at import time.
+#:
+#: Resolution: ``DB_PATH`` environment variable, else the repository default. Doing
+#: this at import (instead of inside `get_connection`) is what keeps the module
+#: attribute and the connection factory in agreement — callers that read
+#: ``database.DB_PATH`` (backup/restore, the SQLite→PostgreSQL migrator, tests) then
+#: observe the same file the application actually uses.
+_DEFAULT_DB_PATH = get_sqlite_db_path(None)
+DB_PATH = _DEFAULT_DB_PATH
 CSV_PATH = os.path.join(os.path.dirname(__file__), "leads.csv")
 DEFAULT_PAGE_ID = "100799479495809"
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ADMIN2026")
 
 
+def resolved_sqlite_path() -> str:
+    """The SQLite path the application is using right now.
+
+    Single authority: `database.DB_PATH` is initialised from the environment at
+    import, and may be rebound at runtime (tests, tooling). `core.schema_manager`
+    consults this function so migrations always target the same file the repositories
+    read and write — the split-brain that silently sent `init_db()`'s seed to
+    `leads.db` while the app read a configured path.
+    """
+    return DB_PATH
+
+
 def get_connection():
     """Нэгдсэн Authoritative Database Connection (PostgreSQL эсвэл SQLite WAL)"""
-    return get_db_connection(sqlite_path=DB_PATH)
+    return get_db_connection(sqlite_path=resolved_sqlite_path())
+
 
 def mask_secret(secret: Optional[str], show_start: int = 6, show_end: int = 4) -> str:
     """Нууц токен болон түлхүүрүүдийг UI дээр ил задгай харагдахаас сэргийлж далдлах"""
@@ -59,346 +80,63 @@ def hmac_equal(a: str, b: str) -> bool:
     """Timing attack хамгаалалттай харьцуулалт"""
     return secrets.compare_digest(a, b)
 
+
+#: Dummy credential for the unknown-account path (E-02 Phase 4).
+#:
+#: Generated once per process, so no fixed value can be recognised, and it is never stored
+#: anywhere — nothing can authenticate against it.
+_DUMMY_HASH, _DUMMY_SALT = hash_password(secrets.token_hex(32))
+
+
+def dummy_password_verify(password: Optional[str]) -> bool:
+    """
+    Spend the same work as `verify_password` when there is no account to verify against.
+
+    Why this exists: `authenticate_client_detailed` returns as soon as the account lookup
+    misses, so an unknown username answered in ~6 ms while a known one took ~38 ms
+    (measured, `docs/audit/evidence/e02_phase4_before.txt`). That 6x gap is a practical
+    enumeration oracle — it tells an attacker which tenant names are real without ever
+    needing a valid password.
+
+    This runs the *same* PBKDF2-HMAC-SHA256 at the same iteration count as a real
+    verification, against a throwaway credential, so both paths cost the same. It is a real
+    verification rather than a `sleep` on purpose: a sleep has to be tuned to a cost that
+    changes with hardware and configuration, while this tracks the real cost automatically.
+    """
+    verify_password(password or "", _DUMMY_HASH, _DUMMY_SALT)
+    return False
+
 def init_db():
-    """Өгөгдлийн санг үүсгэх / шинэчлэх (Multi-Tenant Agency & RBAC Auth Support)"""
+    """Bring the database to the current schema, then seed first-run data.
+
+    **The schema is no longer defined here.** `init_db()` used to execute ~350 lines
+    of hand-written `CREATE TABLE` DDL plus an `ALTER TABLE ... ADD COLUMN` loop
+    wrapped in bare `except: pass`. That was a second, independent schema definition
+    next to `migrations/versions/0001_*.py`, and the two disagreed on every timestamp
+    (`VARCHAR(64)` vs `TIMESTAMP`) and on ~91 string widths — so the database shape
+    depended on how it happened to be created (findings P1-02 / P2-01).
+
+    Now `core/models.py` + Alembic are the only authority:
+
+      * an empty database is created by running the migrations (this function does it),
+      * an existing database is upgraded in place, with data preserved,
+      * the schema is guaranteed to be at `head` on return, or the call raises.
+
+    Everything below is *data*, not structure: the default tenant row, its magic
+    token, and a one-off cleanup of legacy URL-shaped `page_id` values.
+    """
+    from core.schema_manager import ensure_schema
+
+    report = ensure_schema()
+    logger.info(
+        "Schema ready: %s (%s -> %s)",
+        "upgraded" if report["upgraded"] else "already at head",
+        report["from"] or "<empty>",
+        report["to"],
+    )
+
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA busy_timeout=5000")
-    
-    # 0. Олон Хуудас / Харилцагчийн хүснэгт (Tenants / Pages)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS pages (
-            page_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            category TEXT DEFAULT 'general',
-            page_access_token TEXT,
-            verify_token TEXT DEFAULT 'agent_verify_secret_token_123',
-            is_active INTEGER DEFAULT 1,
-            knowledge_json TEXT,
-            gemini_api_key TEXT DEFAULT '',
-            client_username TEXT,
-            client_password_hash TEXT,
-            client_salt TEXT,
-            client_magic_token TEXT,
-            monthly_token_limit INTEGER DEFAULT 100000,
-            tokens_used INTEGER DEFAULT 0,
-            google_sheets_url TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 1. Бүртгэгдсэн харилцагчид (Leads)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS registrations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT DEFAULT '100799479495809',
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            service TEXT,
-            channel TEXT DEFAULT 'web',
-            sender_id TEXT,
-            status TEXT DEFAULT 'шинэ',
-            notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 2. Харилцан ярианы түүх (Chatwoot загвар - Unified Messages)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT DEFAULT '100799479495809',
-            sender_id TEXT NOT NULL,
-            channel TEXT DEFAULT 'web',
-            sender_type TEXT NOT NULL, -- 'user', 'bot', 'agent' (human)
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 3. Хэрэглэгчийн төлөв (Human takeover status)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS session_states (
-            sender_id TEXT PRIMARY KEY,
-            page_id TEXT DEFAULT '100799479495809',
-            channel TEXT DEFAULT 'web',
-            is_human_takeover INTEGER DEFAULT 0, -- 1 бол AI түр зогсоно
-            customer_name TEXT,
-            customer_phone TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 4. Нэвтрэлтийн сессүүд (RBAC Sessions)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_token TEXT PRIMARY KEY,
-            role TEXT NOT NULL, -- 'admin' or 'client'
-            page_id TEXT,       -- NULL for admin, specific page_id for client
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP
-        )
-    """)
-
-    # 5. Харилцагчийн 3-Түвшинт Санах Ой (Entity & Episodic Memory - Mem0 & Zep загвар)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            customer_name TEXT,
-            phone TEXT,
-            interests TEXT,
-            notes TEXT,
-            last_topic TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, user_id)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_memories_page_user ON user_memories (page_id, user_id)")
-
-    # 6. Финтек & Төлбөрийн нэхэмжлэхүүд (QPay v2 & Bank Deep Links)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS invoices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            invoice_id TEXT UNIQUE NOT NULL,
-            page_id TEXT NOT NULL,
-            sender_id TEXT,
-            channel TEXT DEFAULT 'web',
-            amount INTEGER NOT NULL,
-            description TEXT,
-            status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PAID', 'EXPIRED', 'CANCELLED'
-            qr_text TEXT,
-            qr_image_url TEXT,
-            deep_links_json TEXT,
-            ebarimt_lottery TEXT,
-            ebarimt_qr TEXT,
-            paid_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_page_id ON invoices (page_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invoices_invoice_id ON invoices (invoice_id)")
-
-    # 7. Карго тээвэр ба агуулахын ачаанууд (Warehouse Barcode & Tracking)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS cargo_packages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            tracking_code TEXT NOT NULL,
-            customer_name TEXT,
-            customer_phone TEXT,
-            sender_id TEXT,
-            channel TEXT DEFAULT 'web',
-            weight_kg REAL DEFAULT 0.0,
-            price_amount INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'REGISTERED', -- REGISTERED, IN_TRANSIT, ARRIVED_UB, PAID, DELIVERED
-            warehouse_location TEXT DEFAULT 'УБ Агуулах',
-            invoice_id TEXT,
-            notified_at TIMESTAMP,
-            arrived_at TIMESTAMP,
-            delivered_at TIMESTAMP,
-            notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, tracking_code)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_page_tracking ON cargo_packages (page_id, tracking_code)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_phone ON cargo_packages (customer_phone)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cargo_status ON cargo_packages (status)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_page ON messages (sender_id, page_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_page_created ON messages (page_id, created_at)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_registrations_page_created ON registrations (page_id, created_at)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_registrations_page_phone ON registrations (page_id, phone)")
-
-    # 8. Автомат борлуулалт, сэргээх дүрмүүд (Smart Retention & Follow-up Rules)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS automated_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            rule_type TEXT NOT NULL, -- 'abandoned_chat', 'cargo_pickup', 'retention_followup'
-            delay_hours INTEGER DEFAULT 2,
-            message_template TEXT NOT NULL,
-            is_active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, rule_type)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_rules_page ON automated_rules (page_id)")
-
-    # 9. Маркетингийн кампэйн ба 1-Click Broadcast
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS marketing_campaigns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            message TEXT NOT NULL,
-            target_segment TEXT DEFAULT 'all', -- 'all', 'leads_only', 'unregistered'
-            channel TEXT DEFAULT 'all', -- 'all', 'facebook', 'telegram'
-            status TEXT DEFAULT 'COMPLETED',
-            sent_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_page ON marketing_campaigns (page_id)")
-
-    # 10. Илгээгдсэн сэргээх зурвасуудын түүх (Давхардахаас сэргийлэх)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sent_followups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            rule_type TEXT NOT NULL,
-            sender_id TEXT NOT NULL,
-            channel TEXT DEFAULT 'web',
-            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, rule_type, sender_id)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_followups ON sent_followups (page_id, rule_type, sender_id)")
-
-    # 11. Цаг захиалгын систем (Appointments & Booking Calendar)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS appointments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            customer_name TEXT NOT NULL,
-            customer_phone TEXT NOT NULL,
-            service_name TEXT NOT NULL,
-            appointment_date TEXT NOT NULL, -- YYYY-MM-DD
-            appointment_time TEXT NOT NULL, -- HH:MM
-            sender_id TEXT,
-            channel TEXT DEFAULT 'web',
-            status TEXT DEFAULT 'CONFIRMED', -- 'CONFIRMED', 'COMPLETED', 'CANCELLED'
-            reminder_sent INTEGER DEFAULT 0,
-            notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(page_id, appointment_date, appointment_time, service_name)
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_appointments_page_date ON appointments (page_id, appointment_date)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments (customer_phone)")
-
-    # 12. Давхар мэдэгдлээс хамгаалах түгжээ (Idempotent Notification Lock)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS notification_locks (
-            idempotency_key TEXT PRIMARY KEY,
-            channel TEXT DEFAULT 'any',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # 13. Асинхрон фоновые даалгаврын дараалал (Task Queue Jobs)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS task_jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            idempotency_key TEXT UNIQUE,
-            task_name TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            status TEXT DEFAULT 'PENDING', -- 'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'DEAD_LETTER'
-            attempts INTEGER DEFAULT 0,
-            max_retries INTEGER DEFAULT 3,
-            timeout_seconds INTEGER DEFAULT 60,
-            next_run_at TIMESTAMP,
-            locked_by TEXT,
-            locked_at TIMESTAMP,
-            last_error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_jobs_status ON task_jobs (status, created_at)")
-
-    # 14. Аюулгүй байдал ба AI Tool-ийн Аудит Бүртгэл (Audit Logs)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT,
-            actor_role TEXT,
-            actor_id TEXT,
-            action TEXT NOT NULL,
-            resource_type TEXT,
-            resource_id TEXT,
-            details_json TEXT DEFAULT '{}',
-            ip_address TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_page_created ON audit_logs (page_id, created_at)")
-
-    # 15. Сэтгэгдлээс шууд чат руу (Comment-to-DM Automations - noflow inspired)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS comment_automations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            post_id TEXT DEFAULT '*',
-            keyword_pattern TEXT DEFAULT '*',
-            public_reply_text TEXT DEFAULT 'Танд чат руу дэлгэрэнгүй мэдээлэл илгээлээ! ✅',
-            dm_message_text TEXT NOT NULL,
-            cta_button_text TEXT DEFAULT '',
-            cta_url TEXT DEFAULT '',
-            is_active INTEGER DEFAULT 1,
-            trigger_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_comment_auto_page_active ON comment_automations (page_id, is_active)")
-
-    # 16. Богино холбоос ба Click Tracking (CTR Analytics)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tracked_links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            page_id TEXT NOT NULL,
-            automation_id INTEGER,
-            title TEXT DEFAULT '',
-            target_url TEXT NOT NULL,
-            clicks_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracked_links_code ON tracked_links (code)")
-
-    # Багануудыг аюулгүй нэмэх (Migration check)
-    tables_to_migrate = [
-        ("registrations", "page_id", "TEXT DEFAULT '100799479495809'"),
-        ("messages", "page_id", "TEXT DEFAULT '100799479495809'"),
-        ("session_states", "page_id", "TEXT DEFAULT '100799479495809'"),
-        ("sessions", "revoked", "INTEGER DEFAULT 0"),
-        ("sessions", "revoked_at", "TIMESTAMP"),
-        ("sessions", "ip_address", "TEXT"),
-        ("invoices", "currency", "TEXT DEFAULT 'MNT'"),
-        ("invoices", "qpay_invoice_id", "TEXT"),
-        ("invoices", "provider_payment_id", "TEXT"),
-        ("invoices", "callback_verified", "INTEGER DEFAULT 0"),
-        ("notification_locks", "expires_at", "TIMESTAMP"),
-        ("task_jobs", "timeout_seconds", "INTEGER DEFAULT 60"),
-        ("task_jobs", "next_run_at", "TIMESTAMP"),
-        ("task_jobs", "locked_by", "TEXT"),
-        ("task_jobs", "locked_at", "TIMESTAMP"),
-        ("pages", "gemini_api_key", "TEXT DEFAULT ''"),
-        ("pages", "ai_provider", "TEXT DEFAULT 'gemini'"),
-        ("pages", "client_username", "TEXT"),
-        ("pages", "client_password_hash", "TEXT"),
-        ("pages", "client_salt", "TEXT"),
-        ("pages", "client_magic_token", "TEXT"),
-        ("pages", "monthly_token_limit", "INTEGER DEFAULT 100000"),
-        ("pages", "tokens_used", "INTEGER DEFAULT 0"),
-        ("pages", "qpay_username", "TEXT DEFAULT ''"),
-        ("pages", "qpay_password", "TEXT DEFAULT ''"),
-        ("pages", "qpay_invoice_code", "TEXT DEFAULT ''"),
-        ("pages", "ebarimt_enabled", "INTEGER DEFAULT 1"),
-        ("pages", "telegram_bot_token", "TEXT DEFAULT ''"),
-        ("pages", "telegram_manager_chat_id", "TEXT DEFAULT ''"),
-        ("pages", "daily_report_time", "TEXT DEFAULT '08:30'"),
-        ("pages", "daily_report_enabled", "INTEGER DEFAULT 1")
-    ]
-    for table, col, col_def in tables_to_migrate:
-        try:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
-        except Exception:
-            pass
 
     # Анхны Tuvshok хуудсыг автоматаар бүртгэж үүсгэх
     cursor.execute("SELECT page_id FROM pages WHERE page_id = ?", (DEFAULT_PAGE_ID,))
@@ -447,10 +185,23 @@ def init_db():
                 cursor.execute("UPDATE OR IGNORE pages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
                 cursor.execute("UPDATE OR IGNORE registrations SET page_id = ? WHERE page_id = ?", (new_id, old_id))
                 cursor.execute("UPDATE OR IGNORE messages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                # E-01: `UPDATE OR IGNORE` silently skips a row when the rewritten
+                # (page_id, sender_id) already exists, which would leave that customer's
+                # session behind on the old page_id. Report instead of silently dropping.
+                cursor.execute("SELECT COUNT(*) FROM session_states WHERE page_id = ?", (old_id,))
+                pending = cursor.fetchone()[0]
                 cursor.execute("UPDATE OR IGNORE session_states SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                cursor.execute("SELECT COUNT(*) FROM session_states WHERE page_id = ?", (old_id,))
+                left = cursor.fetchone()[0]
+                if left:
+                    logger.warning(
+                        f"page_id sanitisation left {left} of {pending} session rows on {old_id!r}: "
+                        f"the rewritten identity already exists on {new_id!r}. Review manually."
+                    )
     except Exception as e:
         logger.error(f"Migration page_id sanitization error: {e}")
 
+    conn.commit()
     conn.commit()
     conn.close()
 
@@ -543,6 +294,34 @@ def authenticate_admin(password: str) -> bool:
     return secrets.compare_digest(p, DEFAULT_ADMIN_PASSWORD) or secrets.compare_digest(p.lower(), DEFAULT_ADMIN_PASSWORD.lower())
 
 
+def _lock_already_held_exceptions() -> tuple:
+    """
+    Exception types raised when the `notification_locks` primary key rejects a duplicate.
+
+    SQLite raises `sqlite3.IntegrityError`; psycopg2 raises `errors.UniqueViolation`
+    (which is *not* a subclass of the DB-API `IntegrityError` alias). Both are matched so
+    the duplicate path behaves identically on the two dialects. Resolved lazily so
+    psycopg2 stays an optional import on SQLite-only deployments.
+    """
+    types: list[type] = [sqlite3.IntegrityError]
+    try:
+        from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+        types.append(SAIntegrityError)
+    except Exception:  # pragma: no cover - sqlalchemy is a hard dependency in practice
+        pass
+    try:
+        import psycopg2.errors
+
+        types.append(psycopg2.errors.UniqueViolation)
+    except Exception:
+        pass
+    return tuple(types)
+
+
+_LOCK_ALREADY_HELD = _lock_already_held_exceptions()
+
+
 def claim_notification_lock(
     idempotency_key: str,
     channel: str = "any",
@@ -574,10 +353,42 @@ def claim_notification_lock(
         )
         conn.commit()
         return True
-    except Exception:
+    except _LOCK_ALREADY_HELD:
+        # The primary key rejected the insert: another caller already holds the lock.
+        # This is the *expected* duplicate path, not an error.
+        conn.rollback()
         return False
+    except Exception as exc:
+        # Anything else (connection lost, schema missing, disk full) must not be reported
+        # as "already claimed" — that would silently drop a notification the caller
+        # believed was handled. Surface it so the caller can decide, and log loudly.
+        conn.rollback()
+        logger.error(f"claim_notification_lock failed for {key_clean!r}: {exc}")
+        raise
     finally:
         conn.close()
+
+
+class AuditLogWriteError(RuntimeError):
+    """A mandated audit event could not be persisted.
+
+    E-02 Phase 11 (R17). Before this existed, audit failures were indistinguishable
+    from a bug in the endpoint: a caller that had already committed its business
+    write would surface the raw exception, and the HTTP layer would answer 500
+    "Internal server error" — which says the *operation* failed when in fact it
+    succeeded and only its audit record was lost. That is the worst of both worlds:
+    a false failure report and a missing audit trail.
+
+    This exception carries the action and the fact that the write already
+    committed, so callers can report precisely that.
+    """
+
+    def __init__(self, action: str, original: BaseException):
+        self.action = action
+        self.original = original
+        super().__init__(
+            f"audit event {action!r} could not be recorded: {type(original).__name__}: {original}"
+        )
 
 
 def record_audit_log(
@@ -590,21 +401,63 @@ def record_audit_log(
     details: Optional[Dict[str, Any]] = None,
     ip_address: Optional[str] = None,
 ) -> int:
-    """Аюулгүй байдал, эрхийн өөрчлөлт болон AI Tool дуудлагын аудит лог бичих"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    details_str = json.dumps(details or {}, ensure_ascii=False)
-    cursor.execute(
-        """
-        INSERT INTO audit_logs (page_id, actor_role, actor_id, action, resource_type, resource_id, details_json, ip_address)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (page_id, actor_role, actor_id, action, resource_type, str(resource_id) if resource_id is not None else None, details_str, ip_address),
-    )
-    log_id = cursor.lastrowid or 0
-    conn.commit()
-    conn.close()
-    return log_id
+    """Аюулгүй байдал, эрхийн өөрчлөлт болон AI Tool дуудлагын аудит лог бичих
+
+    The parameter names are `resource_type`/`resource_id`. They match the columns of
+    `audit_logs` and the other eight call sites in this codebase; `target_type`/
+    `target_id` were never accepted by this function (E-02 Phase 11, R17).
+
+    Raises `AuditLogWriteError` — never a bare driver exception — so a caller can
+    tell "the audit write failed" apart from every other failure, and the connection
+    is always closed.
+
+    E-03 (Phase 12 finding F-A). `get_connection()` used to be called OUTSIDE this
+    try. When acquisition itself failed — PostgreSQL "too many clients", pool
+    exhaustion, a mid-failover refusal — the raw driver exception escaped untyped,
+    `_audit_or_report` caught only `AuditLogWriteError`, and the endpoint answered
+    the framework's bare 500 "Internal server error" *after the business write had
+    already committed*. That is the exact R17 signature this function exists to
+    prevent, so acquisition is now inside the protected region: every failure of
+    the audit path, including failing to reach the database at all, arrives at the
+    caller as the one explicit contract.
+    """
+    conn = None
+    try:
+        # Inside the try on purpose — see the note above.
+        conn = get_connection()
+        cursor = conn.cursor()
+        details_str = json.dumps(details or {}, ensure_ascii=False)
+        cursor.execute(
+            """
+            INSERT INTO audit_logs (page_id, actor_role, actor_id, action, resource_type, resource_id, details_json, ip_address)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (page_id, actor_role, actor_id, action, resource_type, str(resource_id) if resource_id is not None else None, details_str, ip_address),
+        )
+        log_id = cursor.lastrowid or 0
+        conn.commit()
+        return log_id
+    except Exception as exc:
+        # Roll back and surface a typed failure. `close()` releases the write lock, but
+        # an explicit rollback is cheap and does not depend on that (measured in Phase 10:
+        # an *unclosed* connection blocks every later SQLite writer).
+        #
+        # `conn` may be None if acquisition itself failed; there is then nothing to roll
+        # back, and the original acquisition error is still the documented cause.
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise AuditLogWriteError(action, exc) from exc
+    finally:
+        # Cleanup must be unconditional *and* safe: a connection that was never acquired
+        # must not turn a typed audit failure into an AttributeError at this boundary.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def list_audit_logs(page_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
@@ -673,6 +526,116 @@ def sanitize_page_id(page_id: str) -> str:
     cleaned = re.sub(r'[^a-zA-Z0-9_\-]', '_', p).strip('_')
     return cleaned or ("page_" + secrets.token_hex(4))
 
+def sql_lower_trim(value: str) -> str:
+    """
+    Evaluate `LOWER(TRIM(?))` on the authoritative connection.
+
+    E-02 Phase 4.1. The account throttle must key on the same comparison the login query makes.
+    Re-implementing that comparison in Python is not equivalent: `str.casefold()` folds `ß` to
+    `ss`, which neither SQLite nor PostgreSQL does, and SQLite's `LOWER` is ASCII-only while
+    PostgreSQL's is Unicode-aware and locale-dependent. Asking the database keeps the two in
+    step by construction and on every engine.
+
+    Returns the trimmed, lower-cased value exactly as the engine produces it.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT LOWER(TRIM(?))", (value,))
+        row = cursor.fetchone()
+        result = row[0] if row else ""
+        return "" if result is None else str(result)
+    finally:
+        conn.close()
+
+
+def resolve_canonical_account(identifier: str) -> Optional[str]:
+    """
+    Resolve a login identifier to the canonical account id (`pages.page_id`), or None.
+
+    E-02 Phase 4.1, finding A. The login lookup accepts `client_username` OR `page_id`, so an
+    account reachable through both had two independent failure budgets: 20 failures on the
+    username left the page_id alias free to start again. The throttle now keys on the resolved
+    account rather than on whatever spelling the client submitted, so every supported alias
+    consumes one budget.
+
+    `page_id` is the primary key of `pages`, so it is the natural canonical identity: stable,
+    unique, and not user-editable through the login form. It is only ever used as *input* to a
+    keyed digest, never written to the store in plaintext.
+
+    Returns None for identifiers that match no active account — the caller must then fall back
+    to keying on the normalized identifier, so unknown accounts stay protected and unsupported
+    identifiers keep an independent budget.
+
+    Never merges unrelated accounts: one row is returned, and a duplicate username (the schema
+    has no unique constraint on `client_username`) is resolved deterministically to the lowest
+    `page_id`; `canonical_resolution_is_ambiguous()` reports that case.
+    """
+    if not identifier:
+        return None
+    ident = str(identifier).strip()
+    if not ident:
+        return None
+
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    try:
+        # Same predicates as the login query, minus the magic-token branch: a magic token is
+        # a full credential, so it is not an account-guessing alias and is deliberately not
+        # folded into the canonical identity here.
+        cursor.execute(
+            """
+            SELECT page_id FROM pages
+            WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?))
+              AND is_active = 1
+            ORDER BY page_id
+            LIMIT 1
+            """,
+            (ident, ident),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        value = row["page_id"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(value) if value is not None else None
+    finally:
+        conn.close()
+
+
+def canonical_resolution_is_ambiguous(identifier: str) -> bool:
+    """
+    True when one identifier matches more than one active account.
+
+    `pages.client_username` carries a non-unique index, so duplicates are possible even though
+    the admin UI does not create them. Reporting the ambiguity lets the throttle and the tests
+    be explicit rather than silently picking a row: a duplicate means two tenants already share
+    a login name, and the honest response is to make that visible, not to merge their budgets
+    silently or to pretend the question does not exist.
+    """
+    if not identifier:
+        return False
+    ident = str(identifier).strip()
+    if not ident:
+        return False
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM pages
+            WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?))
+              AND is_active = 1
+            """,
+            (ident, ident),
+        )
+        row = cursor.fetchone()
+        return bool(row and int(row[0]) > 1)
+    finally:
+        conn.close()
+
+
 def authenticate_client_detailed(identifier: str, password: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Харилцагчийн нэвтрэлтийг нарийвчлан шалгаж, тодорхой алдааны тайлбар буцаах"""
     if not identifier:
@@ -690,14 +653,34 @@ def authenticate_client_detailed(identifier: str, password: Optional[str] = None
         return dict(row), None
 
     # 2. Username эсвэл Page ID-аар хайх (Case-insensitive)
+    #
+    # E-02 Phase 4.2, audit B. `pages.client_username` has only a non-unique index, so the
+    # schema permits two tenants sharing one login name. Without an ORDER BY this `fetchone()`
+    # returned whichever row the engine produced first — in practice rowid order — while
+    # `resolve_canonical_account()` (which the account throttle keys on) deliberately picks
+    # the LOWEST page_id. The two could therefore disagree: the throttle charged one tenant
+    # while another tenant authenticated. Measured before the fix: the account the throttle
+    # charged could not log in with its own correct password.
+    #
+    # The ORDER BY makes authentication select exactly what the resolver selects, so the
+    # counter and the authenticated identity are the same account by construction. Which of
+    # two colliding tenants wins is still arbitrary from a product standpoint — that needs a
+    # schema decision (a unique constraint) and is not made here; the point is that the
+    # choice is deterministic and identical in both places.
     cursor.execute("""
         SELECT * FROM pages 
         WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?)) 
           AND is_active = 1
+        ORDER BY page_id
+        LIMIT 1
     """, (ident, ident))
     row = cursor.fetchone()
     if not row:
         conn.close()
+        # E-02 Phase 4: no account means no password to check, which would return in ~6 ms
+        # instead of ~38 ms and disclose which tenant names exist. Spend the same work on a
+        # throwaway credential first.
+        dummy_password_verify(password)
         return None, f"'{ident}' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
 
     p_dict = dict(row)
@@ -706,10 +689,15 @@ def authenticate_client_detailed(identifier: str, password: Optional[str] = None
 
     if not stored_hash or not salt:
         conn.close()
+        # Same equalisation: this branch is only reachable for a REAL account, so without it
+        # "exists but unconfigured" would answer faster than "exists with a password".
+        dummy_password_verify(password)
         return None, f"'{p_dict.get('name')}' салбарт одоогоор нууц үг хадгалаагүй байна. Админ самбарын 'Хандалт' цонхноос шинэ нууц үг хадгалж өгөх эсвэл Magic Link-ээр орно уу."
 
     if not password or not password.strip():
         conn.close()
+        # verify_password() also returns early on an empty password, so equalise here too.
+        dummy_password_verify(password)
         return None, "Нууц үгээ оруулна уу."
 
     if verify_password(password.strip(), stored_hash, salt):
@@ -724,32 +712,211 @@ def authenticate_client(identifier: str, password: Optional[str] = None) -> Opti
     client, _ = authenticate_client_detailed(identifier, password)
     return client
 
+class CredentialConflictError(ValueError):
+    """
+    A requested login username is already owned by a different tenant.
+
+    E-02 Phase 6, R10. Raised by `set_client_credentials` instead of performing the update.
+
+    Why an exception and not a silent no-op: the previous implementation matched on
+    `LOWER(client_username)` with no tenant scope, so tenant B setting a username that tenant A
+    already used rewrote **tenant A's row** — its password hash, salt, and magic token — while
+    leaving tenant B's own row untouched. One admin action became a cross-tenant account
+    takeover (tenant A's old password stopped working; tenant B's new one authenticated *as*
+    tenant A). Silently declining would still leave the caller believing the update succeeded,
+    so the failure is explicit and mapped to a 409 by the API layer.
+
+    Attributes:
+        username: the requested username, so callers can name it without parsing the message.
+    """
+
+    def __init__(self, message: str, username: str = "") -> None:
+        super().__init__(message)
+        self.username = username
+
+
 def set_client_credentials(page_id: str, username: str, password: Optional[str] = None) -> Dict[str, str]:
-    """Харилцагчийн нэвтрэх нэр, нууц үг, шууд орох Magic холбоос шинэчлэх"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    magic_token = secrets.token_urlsafe(24)
+    """
+    Харилцагчийн нэвтрэх нэр, нууц үг, шууд орох Magic холбоос шинэчлэх
+
+    Sets the login username, password and magic token for exactly one page.
+
+    E-02 Phase 6, R10. Two independent defects were fixed here:
+
+    1. **Tenant-unscoped write predicate.** The statement was
+       ``WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)``. The third
+       disjunct had no tenant scope, so setting a username that another tenant already used
+       updated *that other tenant's row*. The username branch is gone: a credential write is
+       addressed by `page_id` and by nothing else. (The old branch existed so that a caller who
+       passed a username as the page id would still find its row; that is now resolved
+       explicitly, below, and never by overwriting somebody else.)
+
+    2. **Ambiguous duplicate usernames.** Login, the account throttle, and
+       `resolve_canonical_account` all treat `LOWER(TRIM(client_username))` as the identity.
+       Two rows sharing one normalized username therefore make "who does this name mean?"
+       ambiguous, and the entire system has to disambiguate by `ORDER BY page_id LIMIT 1`. A
+       write path that can create that state is a defect, so it now raises
+       `CredentialConflictError` instead.
+
+    Accepted: a username already owned by the *same* tenant (i.e. its current value, a
+    case/whitespace variant of it, or its `page_id`). Only a collision with a **different**
+    tenant is refused.
+
+    Raises:
+        CredentialConflictError: the username belongs to another tenant, or is that tenant's
+            `page_id` (which is also a login identifier).
+        ValueError: `page_id` is blank.
+
+    Returns:
+        ``{"username", "magic_token"}`` as before. The magic token is regenerated on every
+        call, and the page's sessions are revoked — unchanged from the previous behaviour.
+    """
     u_clean = username.strip()
     p_clean = page_id.strip()
+    if not p_clean:
+        raise ValueError("page_id is required")
     clean_pid = sanitize_page_id(p_clean)
-    
-    if password:
-        pw_hash, salt = hash_password(password.strip())
-        cursor.execute("""
-            UPDATE pages 
-            SET client_username = ?, client_password_hash = ?, client_salt = ?, client_magic_token = ?
-            WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)
-        """, (u_clean, pw_hash, salt, magic_token, p_clean, clean_pid, u_clean))
-    else:
-        cursor.execute("""
-            UPDATE pages 
-            SET client_username = ?, client_magic_token = ?
-            WHERE page_id = ? OR page_id = ? OR LOWER(client_username) = LOWER(?)
-        """, (u_clean, magic_token, p_clean, clean_pid, u_clean))
 
-    conn.commit()
-    conn.close()
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        # Resolve the target row first: a credential write must address exactly one tenant.
+        # `p_clean` is the authoritative id; `clean_pid` is accepted as a convenience because
+        # that is what the caller sees when the id needed sanitizing.
+        cursor.execute(
+            "SELECT page_id FROM pages WHERE page_id = ?", (p_clean,)
+        )
+        row = cursor.fetchone()
+        owner_page_id = row[0] if row else None
+        if owner_page_id is None:
+            cursor.execute("SELECT page_id FROM pages WHERE page_id = ?", (clean_pid,))
+            row = cursor.fetchone()
+            owner_page_id = row[0] if row else None
+
+        # The two old call shapes that must keep working:
+        #   * callers that never created the page row (the login flow treats a missing page as
+        #     "no such tenant", so this is not a security boundary, but changing it would alter
+        #     documented behaviour) -> fall back to the old two-id address;
+        #   * callers that pass the *username* as the page id -> resolve it, but only when it
+        #     is unambiguous, so this can never pick a tenant arbitrarily.
+        if owner_page_id is None:
+            cursor.execute(
+                "SELECT page_id FROM pages WHERE page_id IN (?, ?) ORDER BY page_id LIMIT 1",
+                (p_clean, clean_pid),
+            )
+            row = cursor.fetchone()
+            owner_page_id = row[0] if row else None
+        if owner_page_id is None and u_clean:
+            cursor.execute(
+                "SELECT page_id FROM pages "
+                "WHERE LOWER(TRIM(client_username)) = LOWER(TRIM(?)) OR LOWER(TRIM(page_id)) = LOWER(TRIM(?)) "
+                "ORDER BY page_id LIMIT 2",
+                (u_clean, u_clean),
+            )
+            candidates = [r[0] for r in cursor.fetchall()]
+            if len(candidates) == 1:
+                owner_page_id = candidates[0]
+
+        # `page_id` is itself a login identifier (`authenticate_client_detailed` matches
+        # `LOWER(TRIM(page_id))`), so a username equal to *another* tenant's page_id recreates
+        # exactly the ambiguity R10 is about, through the other door. Refuse it too when we
+        # know which tenant we are writing (owner_page_id is None means "no row yet", in which
+        # case the generic check below already covers it).
+        if u_clean and owner_page_id is not None:
+            cursor.execute(
+                "SELECT page_id FROM pages WHERE LOWER(TRIM(page_id)) = LOWER(TRIM(?)) "
+                "AND page_id <> ?",
+                (u_clean, owner_page_id),
+            )
+            if cursor.fetchall():
+                raise CredentialConflictError(
+                    "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу.",
+                    username=u_clean,
+                )
+
+        # Ownership check for the requested username. Same normalization as login, so the
+        # uniqueness rule is the one the authentication path actually relies on.
+        if u_clean:
+            if owner_page_id is not None:
+                cursor.execute(
+                    "SELECT page_id FROM pages WHERE LOWER(TRIM(client_username)) = LOWER(TRIM(?)) "
+                    "AND page_id <> ?",
+                    (u_clean, owner_page_id),
+                )
+                clash = [r[0] for r in cursor.fetchall()]
+            else:
+                cursor.execute(
+                    "SELECT page_id FROM pages WHERE LOWER(TRIM(client_username)) = LOWER(TRIM(?)) "
+                    "OR LOWER(TRIM(page_id)) = LOWER(TRIM(?))",
+                    (u_clean, u_clean),
+                )
+                clash = [r[0] for r in cursor.fetchall()]
+            if clash:
+                raise CredentialConflictError(
+                    "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу.",
+                    username=u_clean,
+                )
+
+        magic_token = secrets.token_urlsafe(24)
+
+        if owner_page_id is not None:
+            if password:
+                pw_hash, salt = hash_password(password.strip())
+                cursor.execute(
+                    "UPDATE pages SET client_username = ?, client_password_hash = ?, "
+                    "client_salt = ?, client_magic_token = ? WHERE page_id = ?",
+                    (u_clean, pw_hash, salt, magic_token, owner_page_id),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE pages SET client_username = ?, client_magic_token = ? WHERE page_id = ?",
+                    (u_clean, magic_token, owner_page_id),
+                )
+        elif password:
+            # No row to address: the username is provably unused (checked above), so create the
+            # tenant row rather than performing a zero-row UPDATE that reported success.
+            pw_hash, salt = hash_password(password.strip())
+            cursor.execute(
+                "INSERT INTO pages (page_id, client_username, client_password_hash, client_salt, "
+                "client_magic_token, name, category) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (clean_pid, u_clean, pw_hash, salt, magic_token, clean_pid, "general"),
+            )
+            owner_page_id = clean_pid
+        else:
+            # Nothing to address and no password: preserve the old no-op-and-report-success
+            # contract for a magic-token-only call, without creating a half-built tenant.
+            conn.commit()
+            return {"username": u_clean, "magic_token": magic_token}
+
+        conn.commit()
+    except Exception as exc:
+        # E-02 Phase 8 (R10). The SELECT checks above are an optimisation, not the guarantee:
+        # they run under READ COMMITTED (PostgreSQL) or per-connection deferred transactions
+        # (SQLite), so two concurrent claimants can both pass them. The unique index
+        # `uq_pages_client_username_norm` is what actually decides the winner, and this is
+        # where its verdict is translated back into the same controlled conflict the
+        # sequential path returns.
+        #
+        # Roll back first, unconditionally: a losing claimant may already have written part
+        # of its own row (the UPDATE sets username, hash, salt and magic token), and leaving
+        # that half-applied would mutate a tenant's credentials on a rejected operation.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if _is_username_uniqueness_violation(exc):
+            raise CredentialConflictError(
+                "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу.",
+                username=u_clean,
+            ) from exc
+        # Anything else is a real database failure. It must not be disguised as a 409: a
+        # caller told "someone else owns that name" would retry with a different name and
+        # never learn the database is broken.
+        raise
+    finally:
+        conn.close()
+
     try:
         revoke_all_page_sessions(p_clean)
         if clean_pid != p_clean:
@@ -757,6 +924,39 @@ def set_client_credentials(page_id: str, username: str, password: Optional[str] 
     except Exception:
         pass
     return {"username": u_clean, "magic_token": magic_token}
+
+
+def _is_username_uniqueness_violation(exc: BaseException) -> bool:
+    """
+    True only for a uniqueness violation on the username index.
+
+    Narrow on purpose, in both directions:
+
+      * it must not catch an unrelated `IntegrityError` (foreign key, NOT NULL, another
+        unique constraint) — mapping those to "username taken" would hide a real defect and
+        send the caller down the wrong path;
+      * it must recognise the violation through whichever adapter is in play, which is why
+        the index name is matched in the error text as well as the SQLSTATE. PostgreSQL
+        reports 23505 on `uq_pages_client_username_norm`; SQLite reports a plain
+        `sqlite3.IntegrityError` naming the index as `UNIQUE constraint failed: index
+        'uq_pages_client_username_norm'`.
+
+    `core.db_engine.PostgresCompatCursor` re-raises psycopg2 errors unwrapped, so the
+    SQLSTATE is available; the class-name check keeps this working if a future adapter
+    wraps them instead.
+    """
+    from core.username_uniqueness import USERNAME_UNIQUE_INDEX
+
+    text = str(exc)
+    if USERNAME_UNIQUE_INDEX not in text:
+        return False
+    sqlstate = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+    if sqlstate:
+        return sqlstate == "23505"
+    # No SQLSTATE (SQLite, or a wrapped driver error): the index name is the discriminator,
+    # and it is only ever raised by this one constraint.
+    return "unique" in text.lower() or "duplicate key" in text.lower()
+
 
 def update_page_google_sheets(page_id: str, sheets_url: str) -> bool:
     """Хуудасны Google Sheets холбоосыг шинэчлэх"""
@@ -848,13 +1048,26 @@ def get_all_pages(mask_secrets: bool = True, include_magic_token: bool = False) 
     return result
 
 def get_page(page_id: str, mask_secrets: bool = False, include_magic_token: bool = False) -> Optional[Dict]:
+    """
+    Load one page by its `page_id`.
+
+    E-02 Phase 6, R10. The query used to be
+    ``WHERE page_id = ? OR LOWER(client_username) = LOWER(?)``. That second branch is not
+    tenant-scoped: `get_page("alice")` returned whichever row happened to own the *username*
+    `alice`, so any caller that reached this function with a value it believed was a page id
+    received another tenant's configuration — including `gemini_api_key` when `mask_secrets`
+    is False. Every caller in this repository passes a real `page_id` (a session's `page_id`,
+    a path parameter, or `DEFAULT_PAGE_ID`), and magic-link tokens are resolved by their own
+    dedicated query, so the username branch served no caller while creating a cross-tenant
+    read. It is removed: this lookup is now by primary key only.
+    """
     if not page_id:
         return None
     p_id = str(page_id).strip()
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pages WHERE page_id = ? OR LOWER(client_username) = LOWER(?)", (p_id, p_id))
+    cursor.execute("SELECT * FROM pages WHERE page_id = ?", (p_id,))
     row = cursor.fetchone()
     if not row and "/" in p_id:
         clean_id = sanitize_page_id(p_id)
@@ -889,46 +1102,69 @@ def save_page(
     conn = get_connection()
     cursor = conn.cursor()
     magic = secrets.token_urlsafe(24)
-    cursor.execute("""
-        INSERT INTO pages (
-            page_id, name, category, page_access_token, verify_token, is_active, 
-            knowledge_json, gemini_api_key, monthly_token_limit, client_magic_token
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(page_id) DO UPDATE SET
-            name = excluded.name,
-            category = excluded.category,
-            page_access_token = COALESCE(NULLIF(excluded.page_access_token, ''), pages.page_access_token),
-            verify_token = excluded.verify_token,
-            is_active = excluded.is_active,
-            knowledge_json = excluded.knowledge_json,
-            gemini_api_key = COALESCE(NULLIF(excluded.gemini_api_key, ''), pages.gemini_api_key),
-            monthly_token_limit = COALESCE(excluded.monthly_token_limit, pages.monthly_token_limit)
-    """, (clean_id, name, category, page_access_token, verify_token, is_active, knowledge_json, gemini_api_key, monthly_token_limit, magic))
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute("""
+            INSERT INTO pages (
+                page_id, name, category, page_access_token, verify_token, is_active, 
+                knowledge_json, gemini_api_key, monthly_token_limit, client_magic_token
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(page_id) DO UPDATE SET
+                name = excluded.name,
+                category = excluded.category,
+                page_access_token = COALESCE(NULLIF(excluded.page_access_token, ''), pages.page_access_token),
+                verify_token = excluded.verify_token,
+                is_active = excluded.is_active,
+                knowledge_json = excluded.knowledge_json,
+                gemini_api_key = COALESCE(NULLIF(excluded.gemini_api_key, ''), pages.gemini_api_key),
+                monthly_token_limit = COALESCE(excluded.monthly_token_limit, pages.monthly_token_limit)
+        """, (clean_id, name, category, page_access_token, verify_token, is_active, knowledge_json, gemini_api_key, monthly_token_limit, magic))
+        conn.commit()
+    except Exception:
+        # E-02 Phase 10 (R16). Since revision `0006` a rejected `page_id` can be
+        # refused by the namespace trigger. SQLite leaves the write transaction OPEN
+        # when a statement is aborted, so this connection would be closed while still
+        # holding it.
+        #
+        # MEASURED, not assumed: `close()` below releases that lock anyway, so with or
+        # without this rollback the next writer succeeds (verified both ways against the
+        # committed code). This is therefore defensive hygiene, not a bug fix, and it is
+        # labelled as such. Relying on an implicit rollback inside `close()` to release a
+        # lock is a fragile property of the driver, and the explicit rollback costs
+        # nothing.
+        #
+        # The `database is locked` seen while developing this change was a *harness*
+        # defect: a script left its own connection open, and that blocks every later
+        # writer on SQLite whether or not this rollback exists. It was reproduced both
+        # ways. Do not cite this block as the cure for it.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
     return True
 
 def delete_page(page_id: str) -> bool:
+    """
+    Delete a tenant and everything that belongs to it.
+
+    The child rows are removed by the database, not by this function: every tenant-scoped
+    table has ``page_id ... ON DELETE CASCADE`` (P1-06, revision `0003_foreign_keys`), so
+    deleting the `pages` row is the whole operation. This used to walk a hand-maintained
+    list of twelve table names, and that list had already drifted — it never deleted
+    `comment_automations`, `tracked_links`, `audit_logs` or `task_jobs`, so deleting a
+    tenant stranded those rows permanently.
+
+    `audit_logs` is deliberately *not* deleted: its foreign key is `ON DELETE SET NULL`,
+    so the audit trail outlives the tenant it describes.
+    """
     if page_id == DEFAULT_PAGE_ID:
         return False  # Үндсэн хуудсыг устгахгүй
     conn = get_connection()
     cursor = conn.cursor()
-    for tbl in (
-        "pages",
-        "registrations",
-        "messages",
-        "session_states",
-        "sessions",
-        "user_memories",
-        "invoices",
-        "cargo_packages",
-        "automated_rules",
-        "marketing_campaigns",
-        "sent_followups",
-        "appointments",
-    ):
-        cursor.execute(f"DELETE FROM {tbl} WHERE page_id = ?", (page_id,))
+    cursor.execute("DELETE FROM pages WHERE page_id = ?", (page_id,))
     conn.commit()
     conn.close()
     return True
@@ -945,27 +1181,46 @@ def save_registration(
     page_id: str = DEFAULT_PAGE_ID
 ) -> int:
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO registrations (page_id, name, phone, service, channel, sender_id, status, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (page_id, name, phone, service, channel, sender_id, status, notes))
-    reg_id = cursor.lastrowid
-
-    if sender_id:
-        display_name = name if name and name != "Баримт баталгаажсан" else None
+    try:
+        cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO session_states (sender_id, page_id, channel, customer_name, customer_phone, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(sender_id) DO UPDATE SET
-                page_id = COALESCE(?, session_states.page_id),
-                customer_name = COALESCE(?, session_states.customer_name, ?),
-                customer_phone = COALESCE(?, session_states.customer_phone),
-                updated_at = CURRENT_TIMESTAMP
-        """, (sender_id, page_id, channel, display_name or name, phone, page_id, display_name, name, phone))
+            INSERT INTO registrations (page_id, name, phone, service, channel, sender_id, status, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (page_id, name, phone, service, channel, sender_id, status, notes))
+        reg_id = cursor.lastrowid
 
-    conn.commit()
-    conn.close()
+        if sender_id:
+            display_name = name if name and name != "Баримт баталгаажсан" else None
+            # E-01: tenant-scoped. The old `page_id = COALESCE(?, page_id)` always took the
+            # NEW page_id, which reassigned the row to the most recent tenant.
+            cursor.execute("""
+                INSERT INTO session_states (sender_id, page_id, channel, customer_name, customer_phone, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(page_id, sender_id) DO UPDATE SET
+                    customer_name = COALESCE(?, session_states.customer_name, ?),
+                    customer_phone = COALESCE(?, session_states.customer_phone),
+                    updated_at = CURRENT_TIMESTAMP
+            """, (sender_id, page_id, channel, display_name or name, phone, display_name, name, phone))
+
+        conn.commit()
+    except Exception:
+        # Phase 20: a rejected write must not strand the connection. This function used to
+        # reach `conn.close()` only on the happy path, so a foreign-key violation left the
+        # connection checked out of the pool and `idle in transaction`, holding its locks
+        # for the life of the process. That is what made `restore_backup`'s atomic rollback
+        # time out: a seeded registration failed, the leaked transaction kept ACCESS
+        # EXCLUSIVE off `pages`, and the rollback reported ROLLBACK_FAILED instead of
+        # restoring the pre-restore snapshot.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     sync_to_csv()
     return reg_id
 
@@ -1151,13 +1406,14 @@ def log_message(sender_id: str, channel: str, sender_type: str, content: str, pa
         VALUES (?, ?, ?, ?, ?)
     """, (page_id, sender_id, channel, sender_type, content))
     
+    # E-01: the session identity is (page_id, sender_id). Conflict target and update are
+    # both tenant-scoped, so one tenant's traffic can never move or overwrite another's row.
     cursor.execute("""
         INSERT INTO session_states (sender_id, page_id, channel, updated_at)
         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(sender_id) DO UPDATE SET 
-            page_id = COALESCE(?, session_states.page_id),
+        ON CONFLICT(page_id, sender_id) DO UPDATE SET
             updated_at = CURRENT_TIMESTAMP
-    """, (sender_id, page_id, channel, page_id))
+    """, (sender_id, page_id, channel))
 
     conn.commit()
     conn.close()
@@ -1165,62 +1421,100 @@ def log_message(sender_id: str, channel: str, sender_type: str, content: str, pa
 def save_chat_message(page_id: str, sender_id: str, channel: str, sender_type: str, content: str):
     return log_message(sender_id=sender_id, channel=channel, sender_type=sender_type, content=content, page_id=page_id)
 
-def get_conversation_history(sender_id: str, limit: int = 50) -> List[Dict]:
+def get_conversation_history(sender_id: str, limit: int = 50, page_id: Optional[str] = None) -> List[Dict]:
+    """
+    Conversation history for one customer.
+
+    E-01: `page_id` is required in practice — without it this returns every tenant's
+    messages for that sender. It stays keyword-optional only so old call sites fail loudly
+    (they are audited) rather than silently; all in-repo callers pass it.
+    """
+    if not page_id:
+        raise ValueError("get_conversation_history requires page_id (tenant scope, E-01)")
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT * FROM messages 
-        WHERE sender_id = ? 
-        ORDER BY created_at ASC 
+        SELECT * FROM messages
+        WHERE sender_id = ? AND page_id = ?
+        ORDER BY created_at ASC
         LIMIT ?
-    """, (sender_id, limit))
+    """, (sender_id, str(page_id), limit))
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
 def get_active_sessions(page_id: Optional[str] = None) -> List[Dict]:
+    """
+    Active sessions, tenant-scoped.
+
+    E-01: the correlated subqueries used to filter on `sender_id` alone, so each row's
+    `last_message`, `last_sender_type` and `message_count` were computed across EVERY
+    tenant that had ever seen that sender — a count and content leak even when the outer
+    query was scoped. Every subquery now repeats `page_id`.
+    """
+    if not page_id:
+        raise ValueError("get_active_sessions requires page_id (tenant scope, E-01)")
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    if page_id:
-        cursor.execute("""
-            SELECT s.sender_id, s.page_id, s.channel, s.is_human_takeover, s.customer_name, s.customer_phone, s.updated_at,
-                   (SELECT content FROM messages WHERE sender_id = s.sender_id ORDER BY id DESC LIMIT 1) as last_message,
-                   (SELECT sender_type FROM messages WHERE sender_id = s.sender_id ORDER BY id DESC LIMIT 1) as last_sender_type,
-                   (SELECT COUNT(*) FROM messages WHERE sender_id = s.sender_id) as message_count
-            FROM session_states s
-            WHERE s.page_id = ?
-            ORDER BY s.updated_at DESC
-        """, (page_id,))
-    else:
-        cursor.execute("""
-            SELECT s.sender_id, s.page_id, s.channel, s.is_human_takeover, s.customer_name, s.customer_phone, s.updated_at,
-                   (SELECT content FROM messages WHERE sender_id = s.sender_id ORDER BY id DESC LIMIT 1) as last_message,
-                   (SELECT sender_type FROM messages WHERE sender_id = s.sender_id ORDER BY id DESC LIMIT 1) as last_sender_type,
-                   (SELECT COUNT(*) FROM messages WHERE sender_id = s.sender_id) as message_count
-            FROM session_states s
-            ORDER BY s.updated_at DESC
-        """)
+    cursor.execute("""
+        SELECT s.sender_id, s.page_id, s.channel, s.is_human_takeover, s.customer_name, s.customer_phone, s.updated_at,
+               (SELECT content FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id ORDER BY id DESC LIMIT 1) as last_message,
+               (SELECT sender_type FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id ORDER BY id DESC LIMIT 1) as last_sender_type,
+               (SELECT COUNT(*) FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id) as message_count
+        FROM session_states s
+        WHERE s.page_id = ?
+        ORDER BY s.updated_at DESC
+    """, (str(page_id),))
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
-def set_human_takeover(sender_id: str, is_takeover: bool):
+def session_belongs_to_page(sender_id: str, page_id: Optional[str] = None) -> bool:
+    """
+    True when THIS tenant has a session row for that sender.
+
+    E-01: the positive tenancy check for takeover/send. Deliberately a row-existence test
+    rather than "does any tenant know this sender" — the latter is the leak we removed.
+    """
+    if not page_id:
+        raise ValueError("session_belongs_to_page requires page_id (tenant scope, E-01)")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM session_states WHERE sender_id = ? AND page_id = ? LIMIT 1",
+        (str(sender_id), str(page_id)),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def set_human_takeover(sender_id: str, is_takeover: bool, page_id: Optional[str] = None):
+    """E-01: takeover state belongs to one tenant's session, never to the sender globally."""
+    if not page_id:
+        raise ValueError("set_human_takeover requires page_id (tenant scope, E-01)")
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        UPDATE session_states 
-        SET is_human_takeover = ? 
-        WHERE sender_id = ?
-    """, (1 if is_takeover else 0, sender_id))
+        UPDATE session_states
+        SET is_human_takeover = ?
+        WHERE sender_id = ? AND page_id = ?
+    """, (1 if is_takeover else 0, str(sender_id), str(page_id)))
     conn.commit()
     conn.close()
 
-def is_session_human_takeover(sender_id: str) -> bool:
+def is_session_human_takeover(sender_id: str, page_id: Optional[str] = None) -> bool:
+    """E-01: another tenant's takeover must not silence this tenant's bot."""
+    if not page_id:
+        raise ValueError("is_session_human_takeover requires page_id (tenant scope, E-01)")
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT is_human_takeover FROM session_states WHERE sender_id = ?", (sender_id,))
+    cursor.execute(
+        "SELECT is_human_takeover FROM session_states WHERE sender_id = ? AND page_id = ?",
+        (str(sender_id), str(page_id)),
+    )
     row = cursor.fetchone()
     conn.close()
     return bool(row and row[0] == 1)
@@ -1412,6 +1706,29 @@ def list_invoices(page_id: Optional[str] = None, limit: int = 50, status: Option
         res.append(d)
     return res
 
+def day_range_bounds(date_str: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Тухайн өдрийн [эхлэл, дараагийн өдрийн эхлэл) хязгаарыг буцаана.
+
+    P1-03 (B-04): `col LIKE '2026-11-16%'` нь зөвхөн TEXT баганад ажиллана. Хүснэгтийн
+    `created_at` нь жинхэнэ `TIMESTAMP` үед PostgreSQL
+    `operator does not exist: timestamp without time zone ~~ unknown` алдаа шиддэг.
+    Хязгаарын харьцуулалт нь TEXT (ISO-8601) болон TIMESTAMP хоёр дээр ижил ажиллана.
+    """
+    if date_str:
+        try:
+            start_dt = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
+        except ValueError:
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(days=1)
+    return (
+        start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
 def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
     """Финтек хяналтын самбарын тоон үзүүлэлтүүд (KPIs)"""
     conn = get_connection()
@@ -1428,10 +1745,16 @@ def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
     cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PENDING'", params)
     pending_sum, pending_count = cursor.fetchone()
     
-    # Өнөөдрийн орлого
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    today_params = (str(page_id), f"{today_str}%") if page_id else (f"{today_str}%",)
-    today_where = " WHERE page_id = ? AND status = 'PAID' AND paid_at LIKE ?" if page_id else " WHERE status = 'PAID' AND paid_at LIKE ?"
+    # Өнөөдрийн орлого (P1-03: LIKE биш, хязгаарын харьцуулалт)
+    day_start, day_end = day_range_bounds()
+    today_params = (
+        (str(page_id), day_start, day_end) if page_id else (day_start, day_end)
+    )
+    today_where = (
+        " WHERE page_id = ? AND status = 'PAID' AND paid_at >= ? AND paid_at < ?"
+        if page_id
+        else " WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?"
+    )
     cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{today_where}", today_params)
     today_sum, today_count = cursor.fetchone()
 
@@ -1677,25 +2000,39 @@ def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optiona
     
     if not date_str:
         date_str = datetime.now().strftime("%Y-%m-%d")
-        
-    date_pattern = f"{date_str}%"
+
+    # P1-03 (B-04): range predicates work on both TEXT (ISO-8601) and TIMESTAMP columns.
+    day_start, day_end = day_range_bounds(date_str)
     p_cond = " AND page_id = ?" if page_id else ""
-    p_params = [date_pattern, str(page_id)] if page_id else [date_pattern]
-    
+    p_params = [day_start, day_end, str(page_id)] if page_id else [day_start, day_end]
+
     # 1. Шинэ харилцагч / Leads
-    cursor.execute(f"SELECT COUNT(id) FROM registrations WHERE created_at LIKE ?{p_cond}", tuple(p_params))
+    cursor.execute(
+        f"SELECT COUNT(id) FROM registrations WHERE created_at >= ? AND created_at < ?{p_cond}",
+        tuple(p_params),
+    )
     leads_count = cursor.fetchone()[0] or 0
-    
+
     # 2. Чат харилцан ярианууд
-    cursor.execute(f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at LIKE ?{p_cond}", tuple(p_params))
+    cursor.execute(
+        f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at >= ? AND created_at < ?{p_cond}",
+        tuple(p_params),
+    )
     chats_count = cursor.fetchone()[0] or 0
-    
+
     # 3. Карго ачаанууд (ирсэн)
-    cursor.execute(f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at LIKE ?{p_cond}", tuple(p_params))
+    cursor.execute(
+        f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at >= ? AND arrived_at < ?{p_cond}",
+        tuple(p_params),
+    )
     cargo_arrived = cursor.fetchone()[0] or 0
-    
+
     # 4. QPay төлбөрүүд
-    cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices WHERE status = 'PAID' AND paid_at LIKE ?{p_cond}", tuple(p_params))
+    cursor.execute(
+        f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices "
+        f"WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?{p_cond}",
+        tuple(p_params),
+    )
     paid_count, paid_amount = cursor.fetchone()
     
     # 5. Хүлээгдэж буй карго ачаа (төлөгдөөгүй)
@@ -1820,6 +2157,15 @@ def get_abandoned_chat_candidates(page_id: str, delay_hours: int = 2) -> List[Di
     threshold_iso = (datetime.now() - timedelta(hours=delay_hours)).strftime("%Y-%m-%d %H:%M:%S")
     max_threshold_iso = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
 
+    # P1-07 (B-12): `GROUP BY m.sender_id` while selecting m.channel / m.content /
+    # m.created_at is invalid SQL. SQLite silently returns an arbitrary row; PostgreSQL
+    # raises `GroupingError: column "m.channel" must appear in the GROUP BY clause`.
+    # Effect on production: abandoned-chat detection raised on every worker tick, so
+    # `run_worker_tick` aborted before retention reminders were dispatched.
+    #
+    # Portable fix: pick the *latest* message per sender explicitly. `m2.id` breaks ties
+    # deterministically, and the correlated aggregate works on SQLite, PostgreSQL and
+    # MySQL (no window functions required).
     cursor.execute("""
         SELECT m.sender_id, m.channel, m.content, m.created_at
         FROM messages m
@@ -1833,7 +2179,16 @@ def get_abandoned_chat_candidates(page_id: str, delay_hours: int = 2) -> List[Di
           AND m.sender_id NOT IN (
               SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'abandoned_chat'
           )
-        GROUP BY m.sender_id
+          AND NOT EXISTS (
+              SELECT 1 FROM messages m2
+              WHERE m2.page_id = m.page_id
+                AND m2.sender_id = m.sender_id
+                AND m2.sender_type = 'user'
+                AND (
+                    m2.created_at > m.created_at
+                    OR (m2.created_at = m.created_at AND m2.id > m.id)
+                )
+          )
         ORDER BY m.created_at DESC
         LIMIT 50
     """, (str(page_id), threshold_iso, max_threshold_iso, str(page_id), str(page_id)))

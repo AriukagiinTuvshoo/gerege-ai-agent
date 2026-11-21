@@ -1,0 +1,85 @@
+FF.FFFFFFFFF.FsF.F.Fs                                                    [100%]
+=================================== FAILURES ===================================
+E   AssertionError: E-02: 40 failed logins were accepted with a rotating X-Forwarded-For; the configured login limit is 10/60s. The limiter is being keyed on a client-controlled header with no trust check.
+    assert 40 < 40
+---------------------------- Captured stderr setup -----------------------------
+  next(self.gen)
+WARNI [agent] GEMINI_API_KEY тохируулаагүй байна.
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:158: AssertionError: E-02: 40 failed logins were accepted with a rotating X-Forwarded-For; the configured login limit is 10/60s. The limiter is being keyed on a client-controlled header with no trust check.
+E   AssertionError: E-02: 40 failed logins were accepted with a rotating X-Real-IP
+    assert 40 < 40
+---------------------------- Captured stderr setup -----------------------------
+  next(self.gen)
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:170: AssertionError: E-02: 40 failed logins were accepted with a rotating X-Real-IP
+E   AssertionError: E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no way to express 'trust X-Forwarded-For only from these peers' today, which is why the header is believed unconditionally.
+    assert None is not None
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:677: AssertionError: E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no way to express 'trust X-Forwarded-For only from these peers' today, which is why the header is believed unconditionally.
+E   AssertionError: E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no way to express 'trust X-Forwarded-For only from these peers' today, which is why the header is believed unconditionally.
+    assert None is not None
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:677: AssertionError: E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no way to express 'trust X-Forwarded-For only from these peers' today, which is why the header is believed unconditionally.
+E   AssertionError: E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no way to express 'trust X-Forwarded-For only from these peers' today, which is why the header is believed unconditionally.
+    assert None is not None
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:677: AssertionError: E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no way to express 'trust X-Forwarded-For only from these peers' today, which is why the header is believed unconditionally.
+E   AssertionError: E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no way to express 'trust X-Forwarded-For only from these peers' today, which is why the header is believed unconditionally.
+    assert None is not None
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:677: AssertionError: E-02: core.rate_limit has no trusted-proxy configuration entry point. There is no way to express 'trust X-Forwarded-For only from these peers' today, which is why the header is believed unconditionally.
+E   AssertionError: E-02: 40 failed logins against ONE account from rotating IPs were all accepted. There is no account-level failed-login protection.
+    assert 40 < 40
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:286: AssertionError: E-02: 40 failed logins against ONE account from rotating IPs were all accepted. There is no account-level failed-login protection.
+E   AssertionError: E-02: 100/100 failed logins accepted across 100 spoofed IPs
+    assert 100 < 100
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:300: AssertionError: E-02: 100/100 failed logins accepted across 100 spoofed IPs
+E   AssertionError: E-02: 40 attempts accepted by cycling username spelling (single-spelling budget is 10); each variant is counted as a separate account
+    assert 40 <= (10 + 2)
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:324: AssertionError: E-02: 40 attempts accepted by cycling username spelling (single-spelling budget is 10); each variant is counted as a separate account
+E   AssertionError: E-02: the error message reveals whether the account exists: 'Нууц үг буруу байна! Нүдний дүрс 👁️ дээр даран нууц үгээ шалгана уу.' vs "'no-such-account-at-all' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
+    assert 'Нууц үг буру...э шалгана уу.' == "'no-such-acc...э шалгана уу."
+      
+      - 'no-such-account-at-all' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу.
+      + Нууц үг буруу байна! Нүдний дүрс 👁️ дээр даран нууц үгээ шалгана уу.
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:345: AssertionError: E-02: the error message reveals whether the account exists: 'Нууц үг буруу байна! Нүдний дүрс 👁️ дээр даран нууц үгээ шалгана уу.' vs "'no-such-account-at-all' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
+E   AssertionError: E-02: empty-password response differs for known vs unknown tenant: 'Нууц үгээ оруулна уу.' vs "'ghost-tenant-xyz' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
+    assert 'Нууц үгээ оруулна уу.' == "'ghost-tenan...э шалгана уу."
+      
+      - 'ghost-tenant-xyz' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу.
+      + Нууц үгээ оруулна уу.
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:359: AssertionError: E-02: empty-password response differs for known vs unknown tenant: 'Нууц үгээ оруулна уу.' vs "'ghost-tenant-xyz' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
+E   AssertionError: E-02: none of 30 concurrent failed logins was blocked (statuses: [401])
+    assert 0 > 0
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:418: AssertionError: E-02: none of 30 concurrent failed logins was blocked (statuses: [401])
+E   AssertionError: precondition: account should be throttled
+    assert 200 == 429
+     +  where 200 = <Response [200 OK]>.status_code
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:499: AssertionError: precondition: account should be throttled
+E   AssertionError: E-02: 40 attempts on ONE account from many IPs were never blocked
+    assert False
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:570: AssertionError: E-02: 40 attempts on ONE account from many IPs were never blocked
+E   AssertionError: E-02: after a reset the account counter no longer blocks at all
+    assert False
+---------------------------- Captured stderr setup -----------------------------
+/home/user/gerege-ai-agent/tests/test_e02_login_rate_limit.py:617: AssertionError: E-02: after a reset the account counter no longer blocks at all
+=========================== short test summary info ============================
+FAILED tests/test_e02_login_rate_limit.py::test_01_rotating_x_forwarded_for_cannot_bypass_the_ip_limit
+FAILED tests/test_e02_login_rate_limit.py::test_02_rotating_x_real_ip_cannot_bypass_the_ip_limit
+FAILED tests/test_e02_login_rate_limit.py::test_04_forwarded_header_is_used_only_when_a_trusted_proxy_is_configured
+FAILED tests/test_e02_login_rate_limit.py::test_05_forwarding_headers_from_an_untrusted_peer_are_ignored
+FAILED tests/test_e02_login_rate_limit.py::test_06_multi_hop_forwarding_picks_the_client_and_ignores_spoofed_prefix
+FAILED tests/test_e02_login_rate_limit.py::test_07_malformed_forwarding_headers_are_handled_safely
+FAILED tests/test_e02_login_rate_limit.py::test_08_account_is_protected_across_many_source_ips
+FAILED tests/test_e02_login_rate_limit.py::test_09_hundred_rotations_still_hit_the_account_limit
+FAILED tests/test_e02_login_rate_limit.py::test_10_username_case_and_whitespace_variants_share_one_budget
+FAILED tests/test_e02_login_rate_limit.py::test_11_unknown_account_and_wrong_password_are_indistinguishable
+FAILED tests/test_e02_login_rate_limit.py::test_11b_enumeration_oracle_is_not_available_through_any_login_type
+FAILED tests/test_e02_login_rate_limit.py::test_13_concurrent_failed_logins_are_counted_accurately
+FAILED tests/test_e02_login_rate_limit.py::test_15_attacker_cannot_lock_a_victim_out_of_their_account
+FAILED tests/test_e02_login_rate_limit.py::test_17_ip_limit_and_account_limit_are_independent
+FAILED tests/test_e02_login_rate_limit.py::test_19_failure_then_success_does_not_corrupt_the_counter
+15 failed, 4 passed, 2 skipped in 22.83s

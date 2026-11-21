@@ -17,6 +17,7 @@ leads.csv
 *.log
 backups/
 .pytest_cache/
+.scratch/
 .last_working_commit
 
 # Static Generated Files (QRCodes)
@@ -26,3 +27,28 @@ static/qrcodes/*.png
 .vercel
 .vscode/
 .idea/
+
+# ---------------------------------------------------------------------------
+# Backup secrets and artifacts (Phase 18)
+#
+# `docker-compose.prod.yml` mounts the backup encryption key from ./secrets as a file.
+# Phase 17 confirmed neither `secrets/` nor `*.key` was ignored, so `git add -A` would
+# have committed the key that decrypts every tenant backup. Backup artifacts are ignored
+# too: a plaintext dump must never be committable, by accident or otherwise.
+# ---------------------------------------------------------------------------
+secrets/
+*.key
+*.pem
+backup.key
+# encrypted archives and their sidecars
+*.sql.gz
+*.db.gz
+*.sql.gz.enc
+*.db.gz.enc
+*.sha256
+*.meta.json
+# staging / partial artifacts (private working directories, atomic-rename targets)
+.staging-*/
+.restore-*/
+*.partial-*
+*.raw.tmp

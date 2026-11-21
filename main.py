@@ -12,7 +12,11 @@ from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, Response, BackgroundTasks, Query, UploadFile, File, Form, Header, Cookie, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+# P0-01 (B-01): every route builds an explicit JSONResponse, so `default_response_class`
+# alone is not enough. Aliasing the response class makes all 50+ call sites driver-safe
+# (datetime/Decimal/UUID/bytes) without touching each handler.
+from core.serialization import SafeJSONResponse, SafeJSONResponse as JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import httpx
@@ -27,6 +31,8 @@ import executive_bot_service
 import retention_service
 import appointment_service
 from core import security as core_security
+from core import rate_limit as core_rate_limit
+from core import login_identity as core_login_identity
 from core.monitoring import telemetry
 from routers import system_router, automation_router
 
@@ -78,6 +84,17 @@ async def executive_scheduler_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # E-02 Phase 4.1: validate BEFORE serving. In production a missing, blank or too-short
+    # E02_ACCOUNT_KEY_SECRET raises here and the process exits, instead of logging a warning
+    # and silently running with account-level throttling disabled. Development and tests are
+    # unaffected. The secret value is never logged.
+    core_rate_limit.validate_account_key_secret()
+    core_rate_limit.refresh_account_key_secret()
+    # E-02 Phase 6, R11: a production process must not serve with a per-process counter.
+    # Raises RateLimitStoreUnavailable, which aborts startup (uvicorn exits non-zero) rather
+    # than degrading to `limit x workers`. Development/tests are unaffected.
+    core_rate_limit.validate_store_for_startup()
+
     scheduler_task = None
     if os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1":
         scheduler_task = asyncio.create_task(executive_scheduler_loop())
@@ -96,7 +113,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Omnichannel AI Chatbot Agent & Multi-Tenant CRM Platform",
-    lifespan=lifespan
+    lifespan=lifespan,
+    # P0-01 (B-01): normalise driver values (datetime/Decimal/...) before JSON encoding.
+    # FastAPI only runs `jsonable_encoder` for implicit `dict` returns; every explicit
+    # `JSONResponse(...)` bypassed it and raised `TypeError: Object of type datetime is
+    # not JSON serializable` on PostgreSQL, surfacing as HTTP 500.
+    default_response_class=SafeJSONResponse,
 )
 
 app.include_router(system_router.router)
@@ -111,9 +133,10 @@ async def telemetry_and_error_tracking_middleware(request: Request, call_next):
         dur = (time.perf_counter() - t0) * 1000.0
         telemetry.record_request(request.url.path, request.method, resp.status_code, dur, request_id=req_id)
         resp.headers["X-Request-ID"] = req_id
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["X-Frame-Options"] = "DENY"
-        resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        # SEC-03: one source of truth for the header set, shared with the error path below
+        # so the two cannot drift apart.
+        for header, value in core_security.build_security_headers().items():
+            resp.headers[header] = value
         return resp
     except Exception as exc:
         dur = (time.perf_counter() - t0) * 1000.0
@@ -123,21 +146,29 @@ async def telemetry_and_error_tracking_middleware(request: Request, call_next):
             content={"detail": "Internal server error", "request_id": req_id},
             headers={
                 "X-Request-ID": req_id,
-                "X-Content-Type-Options": "nosniff",
-                "X-Frame-Options": "DENY",
-                "Referrer-Policy": "strict-origin-when-cross-origin",
+                **core_security.build_security_headers(),
             },
         )
 
 os.makedirs("static/qrcodes", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# SEC-01 (B-02): explicit origin allowlist. `allow_origins=["*"]` combined with
+# `allow_credentials=True` makes Starlette reflect the caller's Origin, which lets any
+# website read authenticated responses. See core_security.resolve_allowed_origins().
+_ALLOWED_ORIGINS = core_security.resolve_allowed_origins()
+if not _ALLOWED_ORIGINS and core_security.is_production_mode():
+    logger.error(
+        "CORS allowlist is empty in production. Set ALLOWED_ORIGINS "
+        "(e.g. https://app.example.mn). Cross-origin browsers calls will be rejected."
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-ManyChat-Secret", "X-Webhook-Secret"],
 )
 
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "agent_verify_secret_token_123")
@@ -146,8 +177,13 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_MANAGER_CHAT_ID = os.getenv("TELEGRAM_MANAGER_CHAT_ID", "")
 
 # Webhook deduplication & Login rate-limiting state
-_PROCESSED_MIDS: List[str] = []
-_LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
+#: How long a processed Meta `mid` is remembered (SEC-04). Meta retries a failed
+#: delivery for up to ~7 days; 14 days is safely beyond that and keeps the table bounded
+#: because `claim_notification_lock()` deletes expired rows as it goes.
+_WEBHOOK_DEDUP_TTL_SECONDS = 14 * 24 * 60 * 60
+# SEC-07: login attempts are counted in a shared store (Redis when configured), not in
+# a process-local dict, so `--workers 2` no longer doubles the effective limit and a
+# deploy no longer resets it. See `core/rate_limit.py`.
 
 # -------------------------------------------------------------
 # 1. ТУСЛАХ ИЛГЭЭГЧҮҮД (Meta, Telegram, Manager Notification)
@@ -274,13 +310,20 @@ async def get_current_user(
 # -------------------------------------------------------------
 @app.post("/api/auth/login")
 async def auth_login(payload: Dict[str, Any], request: Request, response: Response):
-    client_ip = (request.client.host if request.client else "unknown")
-    now_ts = time.time()
-    attempts = [t for t in _LOGIN_ATTEMPTS.get(client_ip, []) if now_ts - t < 60.0]
-    if len(attempts) >= 10:
+    # E-02 Phase 3: one resolver decides the client IP. `client_ip` is what gets stored in
+    # audit logs and on the session row, so it must be the same value the limiter keys on —
+    # previously it was `request.client.host` while the limiter used a different header
+    # parse, so an attacker could appear as two different clients in one request.
+    client_ip = core_rate_limit.resolve_client_ip(request)
+    limiter = core_rate_limit.get_limiter()
+    limit_hit = limiter.check(
+        "auth_login", client_ip, *core_rate_limit.DEFAULT_LIMITS["auth_login"]
+    )
+    if not limit_hit["allowed"]:
         return JSONResponse(
             {"success": False, "error": "Хэт олон удаа буруу оролдлого хийлээ. 1 минутын дараа дахин оролдоно уу."},
-            status_code=429
+            status_code=429,
+            headers={"Retry-After": str(limit_hit["retry_after"])},
         )
 
     login_type = payload.get("type", "admin")  # 'admin', 'client', 'magic'
@@ -288,7 +331,6 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
     if login_type == "admin":
         password = str(payload.get("password", "")).strip()
         if database.authenticate_admin(password):
-            _LOGIN_ATTEMPTS.pop(client_ip, None)
             token = database.create_session(role="admin", page_id=None, ip_address=client_ip)
             response.set_cookie(
                 key="session_token",
@@ -306,17 +348,60 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
                 "page_id": None,
                 "page_name": "👑 Супер Админ"
             }
-        attempts.append(now_ts)
-        _LOGIN_ATTEMPTS[client_ip] = attempts
         database.record_audit_log("auth.login.failed", actor_role="admin", ip_address=client_ip)
         return JSONResponse({"success": False, "error": "Админы нууц үг буруу байна!"}, status_code=401)
 
     elif login_type in ["client", "magic"]:
         identifier = str(payload.get("identifier") or payload.get("username") or payload.get("token") or "").strip()
         password = payload.get("password")
+
+        # E-02 Phase 4/4.1: account-level throttle, independent of the per-IP limit above.
+        #
+        # Checked BEFORE authentication so a burned budget costs the attacker no password
+        # verification, and so a throttled account cannot be told from a throttled unknown one
+        # by response time.
+        #
+        # Phase 4.1 changes, all of them correctness fixes rather than new policy:
+        #   * the identity is the account's canonical page_id, resolved from the database, so
+        #     the username and page_id aliases of one account share one budget;
+        #   * the counter is incremented here, atomically with its expiry, and admitted
+        #     attempts consume a slot. A failed password keeps that slot; a successful one
+        #     refunds exactly that slot. Nothing deletes the counter, so a failure recorded
+        #     concurrently with a success is never erased.
+        account_hit = core_rate_limit.check_account_login_allowed(identifier)
+        if not account_hit["allowed"]:
+            # E-02 Phase 6, R14: distinguish "throttled" from "throttle could not be enforced"
+            # in the audit trail, but NOT in the response. Both are 429 with Retry-After and the
+            # same body, so an attacker cannot learn whether the store is down — that knowledge
+            # would be an invitation to attack during an outage.
+            if account_hit.get("store_failed"):
+                database.record_audit_log(
+                    "auth.login.throttle_store_failed", actor_role="client", ip_address=client_ip
+                )
+            else:
+                database.record_audit_log(
+                    "auth.login.account_throttled", actor_role="client", ip_address=client_ip
+                )
+            return JSONResponse(
+                {"success": False, "error": core_rate_limit.ACCOUNT_THROTTLE_MESSAGE},
+                status_code=429,
+                headers={"Retry-After": str(account_hit["retry_after"])},
+            )
+
         client_page, err_msg = database.authenticate_client_detailed(identifier, password)
         if client_page:
-            _LOGIN_ATTEMPTS.pop(client_ip, None)
+            # Refund only the slot this successful login consumed. The IP counter is
+            # deliberately untouched, and residual failures from earlier mistyping remain
+            # until the window expires — see clear_account_failures_on_success.
+            # The admission token is passed back so the refund can prove it is reversing the
+            # exact slot this request consumed, in the exact window it consumed it. E-02
+            # Phase 4.2: without it, a login whose password check outlived its window would
+            # decrement the *next* window's counter and erase someone else's failure.
+            core_rate_limit.clear_account_failures_on_success(
+                account_hit["identity"],
+                canonical=account_hit["canonical"],
+                token=account_hit.get("token"),
+            )
             page_id = client_page["page_id"]
             # P0 Fix: Server-authoritative role resolution. User payload 'role' is never trusted.
             resolved_role = core_security.resolve_tenant_login_role(
@@ -344,10 +429,20 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
                 "tokens_used": client_page.get("tokens_used", 0),
                 "monthly_token_limit": client_page.get("monthly_token_limit", 100000)
             }
-        attempts.append(now_ts)
-        _LOGIN_ATTEMPTS[client_ip] = attempts
+        # The slot this attempt consumed at admission stays counted as a failure: a wrong
+        # password is exactly what the counter is for.
+        core_rate_limit.record_account_failure(account_hit["identity"])
+
+        # E-02 Phase 4: uniform failure. `err_msg` distinguishes "no such tenant" from
+        # "wrong password" from "this tenant has no password set" from "no password sent" —
+        # four different oracles in one string, and two of them also name the account.
+        # It is kept for the server-side audit trail below, never for the client.
         database.record_audit_log("auth.login.failed", actor_role="client", actor_id=identifier, ip_address=client_ip)
-        return JSONResponse({"success": False, "error": err_msg or "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"}, status_code=401)
+
+        return JSONResponse(
+            {"success": False, "error": "Харилцагчийн нэр, нууц үг эсвэл холбоос буруу байна!"},
+            status_code=401,
+        )
 
     return JSONResponse({"success": False, "error": "Үл мэдэгдэх төрөл"}, status_code=400)
 
@@ -421,19 +516,57 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
                 if not message or message.get("is_echo"):
                     continue
 
-                # Meta webhook retry deduplication by mid
-                mid = message.get("mid")
-                if mid:
-                    if mid in _PROCESSED_MIDS:
-                        continue
-                    _PROCESSED_MIDS.append(mid)
-                    if len(_PROCESSED_MIDS) > 2000:
-                        del _PROCESSED_MIDS[:500]
-                
                 # Тухайн чат аль Facebook Page рүү ирснийг олох
                 target_page_id = str(recipient_id or entry_page_id or database.DEFAULT_PAGE_ID)
                 page_obj = database.get_page(target_page_id)
-                page_token = page_obj.get("page_access_token") if page_obj else os.getenv("META_PAGE_ACCESS_TOKEN", "")
+
+                # The tenant must exist before anything is written against it.
+                #
+                # `messages.page_id`, `session_states.page_id` and the other tenant columns
+                # are now foreign keys (P1-06), so an unknown page would fail the whole
+                # webhook with a 500 and Meta would retry for days. It must not be created
+                # implicitly either: the page access token is not verified yet, so letting
+                # an arbitrary sender conjure a tenant row would be a tenant-isolation hole.
+                # Unknown pages are dropped with a warning; onboarding goes through the
+                # authenticated admin flow.
+                if not page_obj:
+                    logger.warning(
+                        f"Meta webhook for unregistered page {target_page_id!r}; ignoring event"
+                    )
+                    continue
+
+                page_token = page_obj.get("page_access_token") or os.getenv("META_PAGE_ACCESS_TOKEN", "")
+
+                # Meta webhook retry deduplication by `mid` (SEC-04).
+                #
+                # This used to be a process-local list. Production runs `--workers 2`
+                # plus a separate worker process, so a Meta retry landing on another
+                # process was processed twice and the customer got a duplicate reply.
+                # The list also evicted the oldest 500 entries once it passed 2 000, so a
+                # delayed retry could be re-processed.
+                #
+                # `claim_notification_lock()` is an atomic INSERT against the
+                # `notification_locks` primary key, which works across processes and
+                # survives a restart. A TTL bounds growth; Meta retries for up to ~7 days,
+                # so the window is set well beyond that.
+                mid = message.get("mid")
+                if mid:
+                    dedup_key = f"meta_mid:{mid}"
+                    try:
+                        if not database.claim_notification_lock(
+                            dedup_key, channel="meta_webhook", ttl_seconds=_WEBHOOK_DEDUP_TTL_SECONDS
+                        ):
+                            logger.info(f"Duplicate Meta webhook delivery ignored (mid={mid})")
+                            continue
+                    except Exception:
+                        # Fail *open* for availability: a dedup-store outage must not stop
+                        # every inbound message. The failure is logged with a traceback so
+                        # it is visible, and a duplicate reply is strictly less harmful than
+                        # silently dropping a customer's message.
+                        logger.exception(
+                            f"Webhook dedup unavailable for mid={mid}; processing without dedup"
+                        )
+
 
                 user_text = message.get("text", "")
                 attachments = message.get("attachments", [])
@@ -592,8 +725,15 @@ async def process_meta_comment_event(target_page_id: str, change: Dict[str, Any]
 
 
 @app.get("/r/{code}")
-async def redirect_tracked_link(code: str):
+async def redirect_tracked_link(code: str, request: Request):
     """CTR хяналттай богино холбоос (/r/{code}) — нээлттэй redirect хамгаалалттай"""
+    _limit_hit = core_rate_limit.check_request_limit(request, "tracked_redirect")
+    if _limit_hit:
+        return JSONResponse(
+            {"detail": "Хэт олон хүсэлт илгээлээ. Түр хүлээнэ үү."},
+            status_code=429,
+            headers={"Retry-After": str(_limit_hit["retry_after"])},
+        )
     link_data = database.resolve_and_increment_tracked_link(code)
     if not link_data:
         raise HTTPException(status_code=404, detail="Холбоос олдсонгүй")
@@ -680,6 +820,13 @@ async def get_widget_js():
 
 @app.post("/api/chat")
 async def web_chat_endpoint(payload: Dict[str, Any], request: Request, background_tasks: BackgroundTasks):
+    _limit_hit = core_rate_limit.check_request_limit(request, "api_chat")
+    if _limit_hit:
+        return JSONResponse(
+            {"detail": "Хэт олон хүсэлт илгээлээ. Түр хүлээнэ үү."},
+            status_code=429,
+            headers={"Retry-After": str(_limit_hit["retry_after"])},
+        )
     message = payload.get("message", "").strip()
     sender_id = payload.get("sender_id", "web_user")
     
@@ -776,6 +923,13 @@ async def upload_receipt_endpoint(
     page_id: Optional[str] = Form(database.DEFAULT_PAGE_ID)
 ):
     """Дашбоардын Чат Симулятораас гүйлгээний баримт (Screenshot) шалгах"""
+    _limit_hit = core_rate_limit.check_request_limit(request, "api_upload_receipt")
+    if _limit_hit:
+        return JSONResponse(
+            {"detail": "Хэт олон хүсэлт илгээлээ. Түр хүлээнэ үү."},
+            status_code=429,
+            headers={"Retry-After": str(_limit_hit["retry_after"])},
+        )
     user = await core_security.resolve_current_user(request)
     if user and not core_security.is_admin_role(user.get("role")):
         target_page_id = user["page_id"]
@@ -834,6 +988,43 @@ async def get_page_detail(request: Request, page_id: Optional[str] = None):
         return JSONResponse({"error": "Page not found"}, status_code=404)
     return JSONResponse(p)
 
+def _audit_or_report(action: str, *, operation: str, **fields) -> Optional[JSONResponse]:
+    """Write a mandated audit event, or return the response that says it was not written.
+
+    E-02 Phase 11 (R17). The business write has ALREADY COMMITTED by the time this is
+    called — `save_page`, `delete_page` and `set_client_credentials` each own their
+    transaction. So the one thing the response must never do is imply that the
+    operation failed. Before R17 was fixed, a caller-side TypeError turned a
+    successful create into a bare 500 "Internal server error": the page existed, the
+    caller was told it did not, and no audit row was written.
+
+    Returns None on success (the caller carries on), or a JSONResponse with status
+    500 that states the truth. Auditing is *not* atomic with the business write —
+    that would require threading one connection through three write paths — so this
+    reports the gap instead of pretending it cannot happen.
+    """
+    try:
+        database.record_audit_log(action, **fields)
+        return None
+    except database.AuditLogWriteError as exc:
+        logger.error(
+            "audit write failed for %s after %s had already committed: %s",
+            action, operation, exc,
+        )
+        return JSONResponse(
+            {
+                "error": (
+                    f"{operation} хийгдсэн боловч аудит лог бичигдсэнгүй. "
+                    f"Энэ үйлдлийг гараар шалгана уу."
+                ),
+                "code": "audit_write_failed",
+                "operation_completed": True,
+                "audit_action": action,
+            },
+            status_code=500,
+        )
+
+
 @app.post("/api/pages")
 async def create_or_update_page(payload: Dict[str, Any], request: Request):
     """Шинэ хуудас нэмэх (Зөвхөн Админ эрхтэй — P0-2)"""
@@ -854,17 +1045,44 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
     if not page_id or not name:
         return JSONResponse({"error": "Page ID болон Нэр шаардлагатай"}, status_code=400)
 
-    database.save_page(
+    try:
+        database.save_page(
+            page_id=page_id,
+            name=name,
+            category=category,
+            page_access_token=token,
+            verify_token=verify_token,
+            knowledge_json=k_json,
+            gemini_api_key=gemini_key,
+            monthly_token_limit=monthly_limit
+        )
+    except Exception as exc:
+        # E-02 Phase 10 (R16). A page_id must not equal any other tenant's login
+        # username or page_id, ignoring case and whitespace, and two page_ids that
+        # differ only by case are one login identifier. Revision `0006` enforces
+        # that in the database, so the refusal arrives as a driver IntegrityError.
+        # Translate it into a 409 that names the reason without revealing which
+        # other tenant holds the identifier (same non-disclosure rule as 0005).
+        if core_login_identity.is_identifier_violation(exc):
+            return JSONResponse(
+                {"error": "Энэ Page ID нь өөр салбарын нэвтрэх нэр эсвэл Page ID-тай давхцаж байна",
+                 "code": "identifier_conflict"},
+                status_code=409,
+            )
+        raise
+    audit_error = _audit_or_report(
+        "page.upsert",
+        operation=f"Хуудас ({page_id}) хадгалах",
         page_id=page_id,
-        name=name,
-        category=category,
-        page_access_token=token,
-        verify_token=verify_token,
-        knowledge_json=k_json,
-        gemini_api_key=gemini_key,
-        monthly_token_limit=monthly_limit
+        actor_role="admin",
+        resource_type="page",
+        resource_id=page_id,
+        # Explicitly enumerated, and deliberately excluding `token`, `verify_token` and
+        # `gemini_key`: an audit log that records secrets is itself a disclosure.
+        details={"name": name, "category": category, "is_active": True},
     )
-    database.record_audit_log("page.upsert", page_id=page_id, actor_role="admin", target_type="page", target_id=page_id)
+    if audit_error is not None:
+        return audit_error
     agent.reset_sessions(page_id)
     return {"status": "success", "message": f"{name} хуудас амжилттай хадгалагдлаа!", "page_id": page_id}
 
@@ -881,7 +1099,23 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
     success = database.delete_page(str(target_id))
     if not success:
         return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
-    database.record_audit_log("page.delete", page_id=str(target_id), actor_role="admin", target_type="page", target_id=str(target_id))
+    audit_error = _audit_or_report(
+        "page.delete",
+        operation=f"Хуудас ({target_id}) устгах",
+        # page_id is deliberately None here (E-02 Phase 11, R18). `audit_logs.page_id`
+        # is `ON DELETE SET NULL` so history outlives the tenant it describes, which
+        # means a row may not reference a page that no longer exists. Passing the just-
+        # deleted id made every deletion audit fail with `FOREIGN KEY constraint failed`
+        # -- and R17's TypeError had been masking it, because the request died one line
+        # earlier. The deleted page is still recorded, in `resource_id`.
+        page_id=None,
+        actor_role="admin",
+        resource_type="page",
+        resource_id=str(target_id),
+        details={"deleted_page_id": str(target_id)},
+    )
+    if audit_error is not None:
+        return audit_error
     agent.reset_sessions(str(target_id))
     return {"status": "deleted", "page_id": target_id}
 
@@ -925,8 +1159,90 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
     if not username:
         return JSONResponse({"error": "Хэрэглэгчийн нэр оруулна уу"}, status_code=400)
 
-    res = database.set_client_credentials(str(target_page_id), username, password)
-    database.record_audit_log("page.credentials.updated", page_id=str(target_page_id), actor_role="admin", target_type="page", target_id=str(target_page_id))
+    # E-02 Phase 6, R10: a username owned by another tenant is a conflict, not an update.
+    # Previously this silently rewrote the other tenant's row (cross-tenant takeover). It is
+    # now refused with 409. Only the conflict is reported — never which tenant holds the name,
+    # because that would turn the endpoint into a cross-tenant username oracle.
+    try:
+        res = database.set_client_credentials(str(target_page_id), username, password)
+    except database.CredentialConflictError:
+        # BEST-EFFORT audit, and it must never mask the 409. A refusal is a security
+        # event worth recording, but the caller's correct answer is the 409 from the
+        # Phase 4.1/`0005` non-disclosure contract. Before R17 was fixed the audit call
+        # raised here, so the client saw 500 "Internal server error" instead — the
+        # contract was silently broken and the refusal went unaudited anyway.
+        try:
+            database.record_audit_log(
+                "page.credentials.conflict",
+                page_id=str(target_page_id),
+                actor_role="admin",
+                resource_type="page",
+                resource_id=str(target_page_id),
+                details={"username_length": len(username)},
+            )
+        except database.AuditLogWriteError:
+            logger.error(
+                "audit write failed for page.credentials.conflict; returning 409 anyway",
+                exc_info=True,
+            )
+        return JSONResponse(
+            {"error": "Энэ нэвтрэх нэрийг өөр харилцагч ашиглаж байна. Өөр нэр сонгоно уу."},
+            status_code=409,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    operation_label = f"Хуудас ({target_page_id}) нэвтрэх эрх шинэчлэх"
+    audit_error = _audit_or_report(
+        "page.credentials.updated",
+        operation=operation_label,
+        page_id=str(target_page_id),
+        actor_role="admin",
+        resource_type="page",
+        resource_id=str(target_page_id),
+        # The username may be a phone number or an email, so only its length is
+        # recorded. The password is never touched: it is not in scope here at all.
+        details={"username_length": len(username)},
+    )
+    if audit_error is not None:
+        # E-03 (Phase 12 finding F-C). This endpoint must NOT let the audit gate the
+        # response, and the reason is specific to what `set_client_credentials` does:
+        # it has already rotated `client_magic_token`, revoked every session for the
+        # page, and committed. Returning the audit error alone therefore tells the
+        # caller "nothing was delivered" about a rotation that destroyed the token
+        # they were still holding.
+        #
+        # Measured before this change: during an audit-store outage each retry rotated
+        # the token again and revoked the sessions again, the previously distributed
+        # token stopped working, the replacement was never returned, and only a
+        # password login got the operator back in. Recovery needed the *first*
+        # successful call, which had already happened and been discarded.
+        #
+        # So the new magic token is returned WITH the audit gap reported in the same
+        # body. The caller gets the credential that is now live, and sees the truth
+        # about the audit. Status stays 500 because an invariant genuinely was not
+        # met, and `operation_completed` stays true.
+        #
+        # This changes no token property: same generator, same lifetime, same
+        # revocation behaviour, same authentication path. It only stops discarding a
+        # committed secret because a log write failed.
+        body = {
+            "error": (
+                f"{operation_label} хийгдсэн боловч аудит лог бичигдсэнгүй. "
+                f"Энэ үйлдлийг гараар шалгана уу."
+            ),
+            "code": "audit_write_failed",
+            "operation_completed": True,
+            "audit_action": "page.credentials.updated",
+            # Delivered because it is already the live credential. The previous token
+            # is dead, so withholding this leaves the caller with no working one.
+            "data": res,
+        }
+        logger.error(
+            "audit write failed for page.credentials.updated after %s committed; "
+            "delivering the rotated magic token with the audit gap reported",
+            operation_label,
+        )
+        return JSONResponse(body, status_code=500)
     return {"status": "success", "data": res}
 
 # -------------------------------------------------------------
@@ -946,54 +1262,120 @@ async def get_active_sessions(
         allow_admin_all=True,
         permission="sessions:read",
     )
-    sessions = database.get_active_sessions(page_id=target_page)
+    if target_page:
+        sessions = database.get_active_sessions(page_id=target_page)
+    else:
+        # Admin asked for every branch. E-01 removed the unscoped call, so the cross-tenant
+        # view is now an explicit per-tenant aggregate rather than a silent "all rows" query.
+        sessions = [
+            row
+            for page in database.get_all_pages()
+            for row in database.get_active_sessions(page_id=page["page_id"])
+        ]
+        sessions.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
     sliced = sessions[offset : offset + limit]
     return JSONResponse({"total": len(sessions), "limit": limit, "offset": offset, "data": sliced})
 
 @app.get("/api/sessions/{sender_id}/messages")
-async def get_session_messages(sender_id: str, request: Request):
-    user = await core_security.require_permission(request, "sessions:read")
-    msgs = database.get_conversation_history(sender_id)
-    if msgs:
-        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
+async def get_session_messages(sender_id: str, request: Request, page_id: Optional[str] = Query(None)):
+    """
+    One customer's messages inside ONE tenant.
 
-    is_takeover = database.is_session_human_takeover(sender_id)
-    return JSONResponse({"sender_id": sender_id, "is_human_takeover": is_takeover, "messages": msgs})
+    E-01: tenancy comes from the authenticated context (`enforce_tenant_scope`), never from
+    `msgs[0]` (the oldest message, which may belong to any tenant) and never from the
+    client-supplied `page_id`. The history query is tenant-scoped before any row is read,
+    so a caller cannot even learn whether another tenant has that sender.
+    """
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=False,
+        permission="sessions:read",
+    )
+    if not target_page:
+        raise HTTPException(status_code=403, detail="Салбар тодорхойгүй байна! (Tenant scope required)")
+    msgs = database.get_conversation_history(sender_id, page_id=target_page)
+    is_takeover = database.is_session_human_takeover(sender_id, page_id=target_page)
+    return JSONResponse({"sender_id": sender_id, "page_id": str(target_page), "is_human_takeover": is_takeover, "messages": msgs})
+
 
 @app.post("/api/sessions/{sender_id}/takeover")
-async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool], request: Request):
-    user = await core_security.require_permission(request, "sessions:write")
-    msgs = database.get_conversation_history(sender_id, limit=5)
-    if msgs:
-        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
+async def toggle_human_takeover(sender_id: str, payload: Dict[str, bool], request: Request, page_id: Optional[str] = Query(None)):
+    """
+    E-01: the tenant is resolved from the auth context and must own the session row.
+    Previously ownership was read from the OLDEST message, so a sender who first talked to
+    tenant A let tenant A flip takeover on tenant B's live conversation. A session that
+    does not exist for the caller's tenant is 404, never a silent cross-tenant write.
+    """
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=False,
+        permission="sessions:write",
+    )
+    if not target_page:
+        raise HTTPException(status_code=403, detail="Салбар тодорхойгүй байна! (Tenant scope required)")
+
+    owns_session = database.session_belongs_to_page(sender_id, page_id=target_page)
+    has_history = bool(database.get_conversation_history(sender_id, limit=1, page_id=target_page))
+    if not (owns_session or has_history):
+        raise HTTPException(status_code=404, detail="Сесс олдсонгүй! (Session not found in this tenant)")
+
     takeover = payload.get("takeover", False)
-    database.set_human_takeover(sender_id, takeover)
-    return {"status": "success", "is_human_takeover": takeover}
+    database.set_human_takeover(sender_id, takeover, page_id=target_page)
+    database.record_audit_log(
+        "session.takeover.changed",
+        page_id=str(target_page),
+        resource_type="session",
+        resource_id=str(sender_id),
+    )
+    return {"status": "success", "page_id": str(target_page), "is_human_takeover": takeover}
+
 
 @app.post("/api/sessions/{sender_id}/send")
-async def manager_send_message(sender_id: str, payload: Dict[str, str], request: Request, background_tasks: BackgroundTasks):
+async def manager_send_message(sender_id: str, payload: Dict[str, str], request: Request, background_tasks: BackgroundTasks, page_id: Optional[str] = Query(None)):
+    """
+    E-01: the outbound message is written to, and the conversation read from, the tenant
+    that owns the authenticated session. `payload["page_id"]` is no longer trusted.
+    """
     text = payload.get("message", "").strip()
-    user = await core_security.require_permission(request, "sessions:write")
-    msgs = database.get_conversation_history(sender_id, limit=5)
-    if msgs:
-        core_security.verify_resource_tenant_ownership(user, msgs[0].get("page_id"), require_auth=True)
-    target_page_id = user["page_id"] if not core_security.is_admin_role(user.get("role")) else payload.get("page_id", database.DEFAULT_PAGE_ID)
+    target_page = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        allow_admin_all=False,
+        permission="sessions:write",
+    )
+    if not target_page:
+        raise HTTPException(status_code=403, detail="Салбар тодорхойгүй байна! (Tenant scope required)")
+
+    owns_session = database.session_belongs_to_page(sender_id, page_id=target_page)
+    has_history = bool(database.get_conversation_history(sender_id, limit=1, page_id=target_page))
+    if not (owns_session or has_history):
+        raise HTTPException(status_code=404, detail="Сесс олдсонгүй! (Session not found in this tenant)")
 
     if not text:
         return JSONResponse({"error": "Empty message"}, status_code=400)
 
-    database.log_message(sender_id=sender_id, channel="omni", sender_type="agent", content=text, page_id=target_page_id)
+    # E-01: the message is stored under the AUTHENTICATED tenant, not the request body.
+    database.log_message(sender_id=sender_id, channel="omni", sender_type="agent", content=text, page_id=target_page)
+    database.record_audit_log(
+        "session.message.sent",
+        page_id=str(target_page),
+        resource_type="session",
+        resource_id=str(sender_id),
+    )
 
+    page_obj = database.get_page(target_page)
+    page_token = page_obj.get("page_access_token") if page_obj else None
     if sender_id.startswith("meta_"):
-        meta_id = sender_id.replace("meta_", "")
-        page_obj = database.get_page(target_page_id)
-        page_token = page_obj.get("page_access_token") if page_obj else None
-        background_tasks.add_task(send_meta_message, meta_id, text, page_token)
+        background_tasks.add_task(send_meta_message, sender_id.replace("meta_", ""), text, page_token)
     elif sender_id.startswith("tg_"):
-        tg_id = sender_id.replace("tg_", "")
-        background_tasks.add_task(send_telegram_message, tg_id, text, page_id=target_page_id)
+        background_tasks.add_task(send_telegram_message, sender_id.replace("tg_", ""), text, page_id=target_page)
 
-    return {"status": "sent", "sender_id": sender_id, "message": text}
+    return {"status": "sent", "sender_id": sender_id, "page_id": str(target_page), "message": text}
 
 # -------------------------------------------------------------
 # 9. CRM & LEADS PIPELINE (Client Isolation — P0-3)
@@ -1365,12 +1747,18 @@ async def update_knowledge(payload: Dict[str, Any], request: Request, page_id: O
 async def health_check():
     load_dotenv(override=True)
     rows = database.get_all_registrations()
-    sessions = database.get_active_sessions()
     pages = database.get_all_pages()
+    # E-01: `get_active_sessions` is tenant-scoped, so the cross-tenant total is an
+    # explicit per-tenant aggregate instead of an unscoped "give me everything" call.
+    sessions = [s for p in pages for s in database.get_active_sessions(page_id=p["page_id"])]
     return JSONResponse({
         "status": "healthy",
         "gemini_ready": agent.is_gemini_ready(),
         "model": agent.get_model_name(),
+        # SEC-07: lets an operator confirm limits are actually shared across workers
+        # rather than silently per-process.
+        "rate_limit_backend": core_rate_limit.get_limiter().backend(),
+        "rate_limits_shared_across_workers": core_rate_limit.get_limiter().is_shared(),
         "meta_token_configured": bool(os.getenv("META_PAGE_ACCESS_TOKEN", "").strip()),
         "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip()),
         "total_pages": len(pages),
@@ -1410,14 +1798,39 @@ async def readiness_check():
     except Exception as qe:
         logger.warning(f"Readiness queue stats fallback: {qe}")
         q_stats = {"backend": "unavailable"}
-    status_code = 200 if db_ok else 503
+
+    # E-02 Phase 6, R11. Readiness must not report healthy while the account limiter cannot
+    # enforce its policy: in production that limiter is the shared store, so a Redis outage
+    # means logins are refused (R14 fail-closed) *and* the IP limit is dead. "Healthy" there
+    # would be false in both directions — it would hide an outage, and it would let a load
+    # balancer keep sending traffic to a deployment that cannot authenticate anybody.
+    #
+    # Deliberately NOT in liveness: restarts cannot fix Redis, so making liveness depend on it
+    # would produce a crash-loop during an outage and turn a partial failure into a total one.
+    # Outside production the shared store is optional (the documented memory fallback), so the
+    # check is informational only and never fails readiness.
+    limiter = core_rate_limit.get_limiter()
+    shared_store_required = core_rate_limit.shared_store_required()
+    if shared_store_required:
+        store_ok = limiter.ping()
+    else:
+        store_ok = True
+    store_backend = limiter.backend()
+
+    ready = db_ok and store_ok
+    status_code = 200 if ready else 503
     return JSONResponse(
         status_code=status_code,
         content={
-            "ready": db_ok,
-            "status": "ready" if db_ok else "not_ready",
+            "ready": ready,
+            "status": "ready" if ready else "not_ready",
             "database": "ok" if db_ok else "failed",
             "engine": "postgresql" if db_engine.is_postgres() else "sqlite",
+            # Backend *kind*, never the URL, and no exception text: this endpoint is
+            # unauthenticated and its output is readable by anyone who can reach it.
+            "rate_limit_store": store_backend,
+            "rate_limit_store_required": shared_store_required,
+            "rate_limit_store_ok": store_ok,
             "queue_backend": q_stats.get("backend", "sqlite"),
             "queue_stats": q_stats,
         },
@@ -1500,51 +1913,68 @@ async def serve_payment_page(invoice_id: str, request: Request):
 @app.get("/api/fintech/invoices/{invoice_id}/status")
 async def get_invoice_status_api(invoice_id: str, request: Request):
     """
-    Төлбөрийн төлөвийг шалгах (Real-time Polling & PII Safe):
-    - Public хандалтад PII (утас, sender_id, хувийн мэдээлэл) задруулахгүй.
-    - Зөвхөн allowlist-ийн аюулгүй талбаруудыг буцаана.
-    - Хэрэв нэвтэрсэн Админ эсвэл тухайн салбарын эрхтэй хэрэглэгч бол бүрэн мэдээллийг харна.
+    Төлбөрийн төлөвийг шалгах (Real-time Polling).
+
+    P1-04 (B-05) — Cross-tenant BOLA fix:
+    - Нэвтэрсэн хэрэглэгч зөвхөн ӨӨРИЙН tenant-ийн нэхэмжлэхийг харна; өөр tenant-ийн
+      нэхэмжлэх бол `404` (оршин байгаа эсэхийг ч задруулахгүй — enumeration-ээс сэргийлнэ).
+    - Админ бүх нэхэмжлэхийг харна.
+    - Нэвтрээгүй (public) хандалт нь allowlist-ийн projection авна: төлбөрийн хуудсанд
+      хэрэгтэй талбарууд (`status`, `amount`, `currency`, `description`, `ebarimt`) —
+      энэ нь тестээр баталгаажсан contract
+      (`tests/test_p1_payment_security.py::test_public_invoice_status_filters_pii`).
+    - `sender_id`, утас, `qpay_*`, `callback_verified` зэрэг PII/дотоод талбар хэзээ ч
+      буцахгүй.
+
+    Тэмдэглэл: энэ endpoint нь зөвхөн нээлттэй invoice ID-г мэддэг талд зориулагдсан
+    (төлбөрийн холбоос). Нэвтэрсэн хэрэглэгчийн хувьд tenant хязгаарыг энд хатуу
+    хэрэгжүүлдэг — өөр tenant-ийн нэхэмжлэхийг таах замаар уншиж болохгүй.
     """
     inv = database.get_invoice(invoice_id)
     if not inv:
         return JSONResponse(status_code=404, content={"error": "Invoice not found"})
 
-    # Check whether caller has authorized access to full internal invoice
     user = await core_security.resolve_current_user(request)
-    is_authorized = False
+
     if user:
         role = str(user.get("role") or "").strip().lower()
-        if core_security.is_admin_role(role):
-            is_authorized = True
-        elif user.get("page_id") and str(user.get("page_id")) == str(inv.get("page_id")):
-            is_authorized = True
+        is_admin = core_security.is_admin_role(role)
+        same_tenant = bool(user.get("page_id")) and str(user.get("page_id")) == str(
+            inv.get("page_id")
+        )
+        if not (is_admin or same_tenant):
+            # 404 (not 403): never confirm the existence of another tenant's invoice.
+            return JSONResponse(status_code=404, content={"error": "Invoice not found"})
+        return {
+            "status": inv.get("status", "PENDING"),
+            "invoice": dict(inv),
+            "ebarimt": {
+                "lottery": inv.get("ebarimt_lottery"),
+                "qr_data": inv.get("ebarimt_qr"),
+            },
+        }
 
-    # PII-Safe public representation (Allowlist approach)
-    public_invoice = {
-        "invoice_id": inv.get("invoice_id"),
-        "page_id": inv.get("page_id"),
-        "amount": inv.get("amount"),
-        "currency": inv.get("currency", "MNT"),
-        "description": inv.get("description", "Үйлчилгээний төлбөр"),
-        "status": inv.get("status", "PENDING"),
-        "paid_at": inv.get("paid_at"),
-        "created_at": inv.get("created_at"),
-        "ebarimt_lottery": inv.get("ebarimt_lottery"),
-        "ebarimt_qr": inv.get("ebarimt_qr"),
-    }
-
-    if is_authorized:
-        returned_invoice = dict(inv)
-    else:
-        returned_invoice = public_invoice
-
+    # Unauthenticated polling: allowlisted projection, PII never included.
+    # This shape is a tested contract (tests/test_p1_payment_security.py
+    # ::test_public_invoice_status_filters_pii) and is required for the payment page.
     return {
         "status": inv.get("status", "PENDING"),
-        "invoice": returned_invoice,
+        "invoice": {
+            "invoice_id": inv.get("invoice_id"),
+            "page_id": inv.get("page_id"),
+            "amount": inv.get("amount"),
+            "currency": inv.get("currency", "MNT"),
+            "description": inv.get("description", "Үйлчилгээний төлбөр"),
+            "status": inv.get("status", "PENDING"),
+            "paid_at": inv.get("paid_at"),
+            "created_at": inv.get("created_at"),
+            "ebarimt_lottery": inv.get("ebarimt_lottery"),
+            "ebarimt_qr": inv.get("ebarimt_qr"),
+        },
         "ebarimt": {
             "lottery": inv.get("ebarimt_lottery"),
-            "qr_data": inv.get("ebarimt_qr")
-        }
+            "qr_data": inv.get("ebarimt_qr"),
+        },
     }
 
 @app.get("/api/fintech/qpay/callback")
@@ -1615,12 +2045,22 @@ async def qpay_webhook_callback(request: Request, invoice_id: Optional[str] = Qu
         callback_verified = 1
 
     # 3. Only process payment once provider verification has genuinely passed
-    await fintech_service.process_successful_payment(
+    result = await fintech_service.process_successful_payment(
         inv_id,
         callback_data=body,
         provider_payment_id=provider_payment_id,
         callback_verified=callback_verified,
     )
+    # E-03 (Phase 12 finding F-B). This return value used to be discarded, so the
+    # `audit_recorded` flag Phase 11 added had no consumer at all: a payment could be
+    # settled with no `payment.confirmed` row and the only trace was a log line inside
+    # the service. Report it explicitly against this caller.
+    #
+    # The HTTP answer deliberately does NOT change. QPay retries any non-200, and the
+    # money has already moved; a retry cannot write an audit row that the audit store
+    # refused, and would only re-drive a settled payment. The audit gap is an
+    # operator-reconciliation problem, not a provider-retry problem.
+    fintech_service.report_audit_outcome(result, caller="qpay_callback")
     return Response(content="SUCCESS", media_type="text/plain", status_code=200)
 
 @app.post("/api/fintech/invoices/{invoice_id}/simulate-pay")
@@ -1678,6 +2118,12 @@ async def simulate_invoice_payment_api(invoice_id: str, request: Request):
         provider_payment_id=f"SIMULATED_{int(time.time())}",
         callback_verified=0,
     )
+    # E-03 (Phase 12 finding F-B). Same duty as the webhook caller above: this path
+    # returns the result to an authenticated admin, so the audit outcome is reported
+    # explicitly rather than left for the caller to notice a key it was never told to
+    # look for. `res["audit_recorded"]` is now present on every return path (True /
+    # False / None) instead of only the success path.
+    fintech_service.report_audit_outcome(res, caller="simulate_pay")
     return res
 
 @app.get("/api/fintech/summary")

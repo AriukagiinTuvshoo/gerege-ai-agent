@@ -38,6 +38,9 @@ jobs:
     env:
       ADMIN_PASSWORD: "ci_test_admin_password_2026"
       GEMINI_MODEL: "gemini-3.5-flash-lite"
+      # SEC-01/B-02: explicit CORS allowlist. Production must set this; there is no
+      # wildcard fallback when credentials are enabled.
+      ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000"
 
     steps:
       - name: Checkout repository
@@ -57,21 +60,319 @@ jobs:
 
       - name: Compile & Syntax Verification
         run: |
-          python -m py_compile main.py database.py agent.py worker.py fintech_service.py cargo_service.py appointment_service.py retention_service.py executive_bot_service.py sheets_service.py core/security.py core/db_engine.py core/models.py core/task_queue.py core/backup_service.py core/ai_router.py core/monitoring.py routers/system_router.py routers/automation_router.py scripts/migrate_sqlite_to_postgres.py tests/test_p0_security_role_escalation.py tests/test_postgres_restore_real_rollback.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py
+          python -m py_compile main.py database.py agent.py worker.py fintech_service.py cargo_service.py appointment_service.py retention_service.py executive_bot_service.py sheets_service.py core/security.py core/db_engine.py core/models.py core/task_queue.py core/backup_service.py core/ai_router.py core/monitoring.py core/serialization.py routers/system_router.py routers/automation_router.py scripts/migrate_sqlite_to_postgres.py tests/test_p0_security_role_escalation.py tests/test_postgres_restore_real_rollback.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_stage_b_regressions.py core/schema_manager.py migrations/env.py migrations/versions/0002_schema_authority.py migrations/_schema_targets.py migrations/sqlite_compat.py scripts/migrate.py tests/test_stage_c_schema.py
+
+      - name: Dependency Vulnerability Audit
+        if: ${{ !cancelled() }}
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --progress-spinner off
 
       - name: Initialize SQLite schema & verify zero schema drift
         run: |
-          python -c "import database; database.init_db(); from core import models, db_engine; engine = db_engine.create_sqlalchemy_engine('sqlite:///:memory:'); models.Base.metadata.create_all(bind=engine); drift = db_engine.verify_schema_drift(); assert not drift['has_drift'], drift"
+          # `init_db()` now builds the schema by running the migrations, so this also
+          # proves the migration itself produces a schema identical to core/models.py.
+          python -c "import database; database.init_db()"
+          python - <<'PY'
+          import sys
+          from core.schema_manager import compare_with_models, current_revision, drift_report, head_revision
+
+          report = drift_report()
+          print("revision:", current_revision(), "head:", head_revision())
+          print("drift:", report)
+          problems = []
+          if current_revision() != head_revision():
+              problems.append(f"not at head: {current_revision()} != {head_revision()}")
+          if report["has_drift"]:
+              problems.append(f"drift: {report['by_kind']}")
+              for diff in compare_with_models()[:10]:
+                  print("  DIFF:", diff)
+          if problems:
+              print("FAILED:", "; ".join(problems))
+              sys.exit(1)
+          print("schema drift: 0 diffs, at head", report["head_revision"])
+          PY
+
+      - name: Migration integrity (0001 -> 0002 -> 0001 -> 0002, data preserved)
+        run: |
+          python scripts/verify_migration_0002.py
+
+      - name: Run Stage C schema authority suite (SQLite)
+        run: |
+          python -c "import sys, sqlalchemy, alembic; print(sys.version); print('sqlalchemy', sqlalchemy.__version__, '| alembic', alembic.__version__)"
+          python -c "import database; print('DB_PATH =', database.DB_PATH)"
+          pytest tests/test_stage_c_schema.py -v --tb=short -p no:cacheprovider
+
+      - name: Verify rate limits are shared across workers (SEC-07, live Redis)
+        run: |
+          # The rest of the SQLite-mode suite runs without REDIS_URL, so the two
+          # shared-store assertions skip there. This step is the one that actually proves
+          # the guarantee: two separate interpreter processes against one Redis.
+          REDIS_URL="redis://127.0.0.1:6379/0" pytest tests/test_sec_07_rate_limits.py -v --tb=short
+
+      - name: Run E-02 trusted-proxy & login rate-limit suite (SQLite + live Redis)
+        if: ${{ !cancelled() }}
+        env:
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          # These files were previously absent from the workflow, so their assertions never
+          # ran in CI. E-02 Phase 4 is complete, so the *whole* login rate-limit file runs
+          # here now - the `-k` subset that used to exclude test_11/test_11b/test_12 is gone
+          # because those tests pass. The "|| true" is deliberately NOT used: a failure here
+          # must fail the build.
+          pytest tests/test_e02_trusted_proxy.py -v --tb=short
+          pytest tests/test_e02_login_rate_limit.py -v --tb=short
+
+          # E-02 Phase 4: account-level failed-login protection.
+          #
+          # This runs against the live Redis service defined at the top of this file, which
+          # matters: three of these tests (multi-process shared counter, counter survives a
+          # restart, TTL is bounded) SKIP without REDIS_URL. Skipping is not passing, so the
+          # step asserts they were actually collected and executed rather than relying on a
+          # green tick that could come from skips. The grep fails the build if the summary
+          # shows any skip.
+          set -o pipefail
+          pytest tests/test_e02_phase4_account_protection.py -v --tb=short | tee /tmp/p4.log
+          if grep -qE "[0-9]+ skipped" /tmp/p4.log; then
+            echo "::error::E-02 Phase 4 tests skipped; REDIS_URL must be live for these to run"
+            exit 1
+          fi
+
+          # E-02 Phase 4.1: hardening of the account throttle.
+          #
+          #   A. canonical identity (username and page_id share one budget)
+          #   B. atomic INCR + EXPIRE via Lua
+          #   C. refund-on-success instead of whole-key reset
+          #   D. production refuses to start without E02_ACCOUNT_KEY_SECRET
+          #   E. normalization follows the database, not Python's casefold
+          #
+          # One skip is EXPECTED and legitimate here: test_141 skips on SQLite because
+          # SQLite's LOWER() does not fold Ø/ø, so there is no variant to compare. That is
+          # the engine difference the test exists to document, and it does not run on
+          # SQLite. The guard below is therefore narrower than Phase 4's: it requires the
+          # three shared-store tests to have run (their names must appear as PASSED), rather
+          # than forbidding skips outright, and it fails if any *unexpected* skip appears.
+          pytest tests/test_e02_phase41_hardening.py -v --tb=short | tee /tmp/p41.log
+          for t in test_113_first_increment_sets_a_ttl \
+                   test_114_subsequent_increments_preserve_the_window \
+                   test_115_increment_and_ttl_are_one_atomic_operation \
+                   test_118_concurrent_increments_lose_nothing; do
+            if ! grep -q "$t .*PASSED" /tmp/p41.log; then
+              echo "::error::E-02 Phase 4.1: $t did not pass; REDIS_URL must be live"
+              exit 1
+            fi
+          done
+          unexpected=$(grep -E "SKIPPED" /tmp/p41.log | grep -v "test_141_unicode_variants" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::E-02 Phase 4.1 had an unexpected skip:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: E-02 Phase 4.2 — admission ownership & window-bound refunds
+        if: ${{ !cancelled() }}
+        env:
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase42-account-key-secret-0123456789ab"
+        run: |
+          # E-02 Phase 4.2: a success refunds only the exact admission it consumed.
+          #
+          # The reported race: A admitted in W1 -> W1 expires -> B admitted and fails in W2 ->
+          # A succeeds and refunds -> B's failure must survive. Reproduced on both backends
+          # before the fix (docs/audit/evidence/e02_phase42_before.txt).
+          #
+          # Unlike Phase 4.1, NO skip is legitimate in this file: every case runs on both
+          # backends when REDIS_URL is live, so any skip means the Redis-backed half of the
+          # audit did not execute and the job must fail rather than report a pass.
+          pytest tests/test_e02_phase42_admission_ownership.py -v --tb=short | tee /tmp/p42.log
+          if grep -qE "SKIPPED" /tmp/p42.log; then
+            echo "::error::E-02 Phase 4.2 skipped a case; every case must run with REDIS_URL live:"
+            grep -E "SKIPPED" /tmp/p42.log
+            exit 1
+          fi
+          for t in test_202_refund_from_an_expired_generation_does_not_touch_the_new_window \
+                   test_209_redis_refund_from_an_expired_generation_is_refused \
+                   test_214_both_stores_agree_on_the_stale_refund_decision \
+                   test_204_a_token_cannot_be_refunded_twice; do
+            if ! grep -q "$t .*PASSED" /tmp/p42.log; then
+              echo "::error::E-02 Phase 4.2: $t did not pass"
+              exit 1
+            fi
+          done
+
+      - name: E-02 Phase 4.3 — memory expiry parity & durable single-use refunds
+        if: ${{ !cancelled() }}
+        env:
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase43-account-key-secret-0123456789ab"
+        run: |
+          # E-02 Phase 4.3. Two defects in the Phase 4.2 store, both reproduced before the fix
+          # (docs/audit/evidence/e02_phase43_before.txt):
+          #
+          #   1. the memory store refunded an admission whose window had expired whenever
+          #      nothing had replaced the counter entry, while Redis refused because its TTL
+          #      had already deleted the key;
+          #   2. claims lived in one process-wide set bounded to 10,000 and evicted with
+          #      set.pop(), so unrelated tenants' refunds could evict a live claim and the same
+          #      token could be refunded twice.
+          #
+          # No skip is legitimate here: every case runs on both backends with REDIS_URL live.
+          # The Phase 4.2 step above keeps its own guard and is unchanged.
+          pytest tests/test_e02_phase43_memory_claim_durability.py -v --tb=short | tee /tmp/p43.log
+          if grep -qE "SKIPPED" /tmp/p43.log; then
+            echo "::error::E-02 Phase 4.3 skipped a case; every case must run with REDIS_URL live:"
+            grep -E "SKIPPED" /tmp/p43.log
+            exit 1
+          fi
+          for t in test_301_memory_refund_of_an_expired_admission_is_refused \
+                   test_303_redis_refunds_of_an_expired_admission_are_refused \
+                   test_304_memory_and_redis_agree_when_no_later_window_exists \
+                   test_307_a_live_claim_survives_pressure_from_other_accounts \
+                   test_313_concurrent_refunds_of_one_token_apply_exactly_once \
+                   test_316_token_carries_the_window_it_was_admitted_with; do
+            if ! grep -q "$t .*PASSED" /tmp/p43.log; then
+              echo "::error::E-02 Phase 4.3: $t did not pass"
+              exit 1
+            fi
+          done
+
+      - name: E-02 Phase 4.4 — window consistency & memory capacity security
+        if: ${{ !cancelled() }}
+        env:
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase44-account-key-secret-0123456789ab"
+        run: |
+          # E-02 Phase 4.4. Two defects in the Phase 4.3 store, both reproduced before the fix
+          # (docs/audit/evidence/e02_phase44_before.txt):
+          #
+          #   1. mixed windows: a counter's window was widened by max() on every admission
+          #      while Redis fixes its TTL at creation, so one generation had two lifetimes.
+          #      Scenario A: memory refunded a token Redis refused. Scenario B: the SAME token
+          #      was refused on memory and accepted on Redis.
+          #   2. capacity pressure: _evict_if_needed() dropped the oldest LIVE counter once the
+          #      10,000 cap was reached, so filling the store erased any account's failure
+          #      budget and handed it a fresh one.
+          #
+          # No skip is legitimate here: every case runs on both backends with REDIS_URL live.
+          pytest tests/test_e02_phase44_window_and_capacity.py -v --tb=short | tee /tmp/p44.log
+          if grep -qE "SKIPPED" /tmp/p44.log; then
+            echo "::error::E-02 Phase 4.4 skipped a case; every case must run with REDIS_URL live:"
+            grep -E "SKIPPED" /tmp/p44.log
+            exit 1
+          fi
+          # "Did not execute" must fail as loudly as "did not pass": require the exact collected
+          # count, so a renamed, deselected or silently dropped test cannot pass this guard.
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p44.log | head -1 | grep -oE "[0-9]+")
+          if [ "$collected" != "17" ]; then
+            echo "::error::E-02 Phase 4.4 expected 17 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+          for t in test_401_a_later_longer_window_does_not_extend_the_generation \
+                   test_402_scenario_a_refunds_agree_across_backends \
+                   test_403_a_later_shorter_window_does_not_shorten_the_generation \
+                   test_404_scenario_b_refunds_agree_across_backends \
+                   test_405_the_token_reports_the_generations_effective_expiry \
+                   test_409_a_live_victim_counter_survives_capacity_pressure \
+                   test_410_no_token_is_issued_when_capacity_blocks_a_safe_admission \
+                   test_411_expired_entries_are_reclaimed_so_capacity_becomes_usable \
+                   test_415_the_victim_survives_at_any_insertion_order; do
+            if ! grep -q "$t .*PASSED" /tmp/p44.log; then
+              echo "::error::E-02 Phase 4.4: $t did not pass"
+              exit 1
+            fi
+          done
+          # The Redis-backed path must actually have run: these two cannot pass without it.
+          for t in test_402_scenario_a_refunds_agree_across_backends \
+                   test_404_scenario_b_refunds_agree_across_backends; do
+            grep -q "$t .*PASSED" /tmp/p44.log || {
+              echo "::error::E-02 Phase 4.4: the Redis-backed parity path did not execute ($t)"
+              exit 1
+            }
+          done
+
+      - name: E-02 Phase 6 — R14/R11/R10/R15 remediation security
+        if: ${{ !cancelled() }}
+        env:
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase6-account-key-secret-0123456789abc"
+        run: |
+          # E-02 Phase 6. Remediation of the four Phase 5 findings, each reproduced before the
+          # fix (docs/audit/evidence/e02_phase6_before.txt) and each pinned by a test that was
+          # verified to FAIL against the pre-fix implementation:
+          #
+          #   R14 account limiter failed OPEN on a generic store error (allowed=True)
+          #   R11 production could silently run a per-process counter (limit x workers)
+          #   R10 set_client_credentials could overwrite another tenant's credentials
+          #   R15 get_account_failure_count reported stale counts for non-default windows
+          #
+          # REDIS_URL is live here on purpose: the R11 cases need a real shared store, and the
+          # R15 parity case needs both backends.
+          pytest tests/test_e02_phase6_remediation.py -v --tb=short | tee /tmp/p6.log
+          # Skips are legitimate ONLY for the Redis-dependent cases, which cannot run without
+          # REDIS_URL — and it is set above, so in CI none may skip.
+          if grep -qE "SKIPPED" /tmp/p6.log; then
+            echo "::error::E-02 Phase 6 skipped a case; every case must run with REDIS_URL live:"
+            grep -E "SKIPPED" /tmp/p6.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p6.log | head -1 | grep -oE "[0-9]+")
+          if [ "$collected" != "60" ]; then
+            echo "::error::E-02 Phase 6 expected 60 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+          # The four findings, one named test each, so a rename or deletion cannot pass silently.
+          for t in test_601_account_store_generic_exception_fails_closed \
+                   test_620_production_without_redis_url_refuses_to_start \
+                   test_650_tenant_b_cannot_take_tenant_a_username \
+                   test_670_custom_window_stops_reporting_once_expired; do
+            grep -q "$t .*PASSED" /tmp/p6.log || {
+              echo "::error::E-02 Phase 6: $t did not pass"
+              exit 1
+            }
+          done
+          # The store-failure HTTP path and the readiness/parity paths cannot pass without the
+          # real store, so they double as proof that the Redis-backed branches executed.
+          for t in test_606_store_failure_refuses_the_http_login \
+                   test_625_healthy_production_redis_starts \
+                   test_641_readiness_healthy_with_redis_in_production \
+                   test_678_redis_and_memory_agree_on_expiry; do
+            grep -q "$t .*PASSED" /tmp/p6.log || {
+              echo "::error::E-02 Phase 6: the Redis-backed path did not execute ($t)"
+              exit 1
+            }
+          done
 
       - name: Run Pytest Regression, Enterprise, AI Eval & Failure Suites (SQLite mode)
         run: |
-          pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py -v
+          # Phase 22: this step now reports *which* tests failed, not only an exit status.
+          #
+          # It previously produced nothing but "Process completed with exit code 1": the
+          # annotation keeps only its first line and the job log needs sign-in, so a genuine
+          # failure (a WAL-unsafe `shutil.copy2` of the live database) was undiagnosable
+          # from outside the runner and looked environmental for several runs.
+          #
+          # The failing names go on the annotation's first line, which is the channel that
+          # actually reaches a maintainer. Exit status is pytest's own, via PIPESTATUS[0],
+          # so the reporting can never mask a failure.
+          set +e
+          pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py tests/test_stage_b_regressions.py tests/test_p1_06_foreign_keys.py tests/test_sec_04_webhook_dedup.py tests/test_sec_03_security_headers.py tests/test_sec_07_rate_limits.py tests/test_e01_tenant_isolation.py -v --tb=short 2>&1 | tee /tmp/step17.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            failed_names=$(grep -E "^(FAILED|ERROR)" /tmp/step17.log | sed -E 's/^(FAILED|ERROR) //; s/ - .*//' | paste -sd';' - | cut -c1-350)
+            echo "::error::SQLite-mode suite failed (pytest exit $status): ${failed_names:-no FAILED line captured}"
+            echo "--- failure details ---"
+            sed -n '/=* FAILURES *=*/,/^=* short test summary/p' /tmp/step17.log | head -200 || true
+            exit "$status"
+          fi
+          echo "SQLite-mode suite passed: $(grep -Eo '[0-9]+ passed[^,]*' /tmp/step17.log | tail -1)"
 
       - name: Run SQLite-to-PostgreSQL Dry-Run Verification
+        if: ${{ !cancelled() }}
         run: |
           python scripts/migrate_sqlite_to_postgres.py --dry-run
 
       - name: Verify Postgres Connectivity & Drivers
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
@@ -79,24 +380,1117 @@ jobs:
           python -c "import alembic, psycopg2, sqlalchemy; print('DRIVERS_OK')"
 
       - name: Verify SQLAlchemy Postgres Engine Connection
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
           python -c "from core.db_engine import create_sqlalchemy_engine; e = create_sqlalchemy_engine(); c = e.connect(); c.close(); print('PG_ENGINE_OK')"
 
       - name: Run Alembic Migration on PostgreSQL 16
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
           python -m alembic upgrade head
 
+      - name: E-02 Phase 8 — username uniqueness (R10) on PostgreSQL
+        if: ${{ !cancelled() }}
+        env:
+          # A DEDICATED database, not gerege_crm_test. This suite seeds and deletes rows, and
+          # it runs init_db(); doing that to the shared database corrupts the later
+          # "SQLite-to-PostgreSQL Migration & Checksum Verification" step, which requires a
+          # pristine target — it compares source and target checksums row by row and fails on
+          # any target-only row. Measured: running against gerege_crm_test left a seeded page
+          # and produced status CONFLICT_DETECTED in that step.
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_phase8_test"
+          # Turn a silent SQLite fallback into a hard failure: a "PostgreSQL pass" reported for
+          # a run that actually used SQLite is exactly the false evidence this gate exists to stop.
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase8-account-key-secret-0123456789abc"
+        run: |
+          # E-02 Phase 8. Phase 7 confirmed that the Phase 6 409 was only a SEQUENTIAL guard:
+          # under genuine concurrency two tenants still both committed the same normalized
+          # username (12/12 trials, PostgreSQL 16.2 and SQLite). The remediation is a
+          # database-enforced invariant -- a partial UNIQUE index on LOWER(TRIM(client_username))
+          # -- so the race is now unrepresentable rather than merely re-checked.
+          #
+          # These tests must run on PostgreSQL: the SQLite fallback would not prove the
+          # concurrency behaviour, hence R10_REQUIRE_POSTGRES=1 above.
+          #
+          # Fresh database every run, so the run cannot depend on state a previous step left.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_phase8_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase8_username_uniqueness.py -v --tb=short | tee /tmp/p8.log
+
+          # No skip is legitimate here. Every case can run against PostgreSQL, and a skip would
+          # be the exact silent-coverage-loss the Phase 8 rules forbid.
+          if grep -qE "SKIPPED" /tmp/p8.log; then
+            echo "::error::E-02 Phase 8 skipped a case; every case must run on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/p8.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p8.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 33 ]; then
+            echo "::error::E-02 Phase 8 expected at least 33 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          # Named findings, so a rename or deletion cannot pass silently.
+          for t in test_801_the_unique_index_is_installed_and_correct \
+                   test_802_the_index_rejects_a_duplicate_normalized_username \
+                   test_831_two_tenants_one_username_natural_concurrency \
+                   test_836_repeated_races_never_produce_a_duplicate \
+                   test_851_preflight_detects_a_fabricated_duplicate \
+                   test_856_startup_refuses_a_database_without_the_invariant \
+                   test_870_repair_tool_recreates_a_dropped_index \
+                   test_872_repair_tool_refuses_to_touch_existing_collisions; do
+            grep -q "$t .*PASSED" /tmp/p8.log || {
+              echo "::error::E-02 Phase 8: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertions of the invariant itself -- not a restatement of a test
+          # PASS. A suite that passes while the index is absent or wrong-shaped would be
+          # worthless; this asks the database directly.
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".")
+          import database
+          from core import username_uniqueness as uniq
+          from core.db_engine import is_postgres
+
+          if not is_postgres():
+              sys.exit("::error::Phase 8 gate is not running on PostgreSQL")
+
+          conn = database.get_connection()
+          try:
+              if not uniq.index_is_correct(conn):
+                  sys.exit("::error::the uniqueness invariant is not in force: "
+                           + repr(uniq.describe_index(conn)))
+              dupes = uniq.find_duplicate_usernames(conn)
+              if dupes:
+                  sys.exit("::error::duplicate normalized usernames exist: "
+                           + uniq.duplicate_report_text(dupes))
+          finally:
+              conn.close()
+
+          # The application must refuse to serve without the invariant, and must boot with it.
+          from core.schema_manager import assert_security_invariants
+          assert_security_invariants()
+          print("Phase 8: index shape verified on PostgreSQL, no duplicates, startup guard satisfied.")
+          PY
+
+      - name: E-02 Phase 10 — cross-column login identity (R16) on PostgreSQL
+        if: ${{ !cancelled() }}
+        env:
+          # Dedicated database for the same reason as the Phase 8 step: this suite seeds and
+          # deletes rows and runs init_db(), which corrupts the checksum-verification step
+          # that requires a pristine target.
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_phase10_test"
+          # A "PostgreSQL pass" reported for a run that used SQLite is exactly the false
+          # evidence this gate exists to stop.
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase10-account-key-secret-0123456789ab"
+        run: |
+          # E-02 Phase 10. Login resolves
+          #   LOWER(TRIM(client_username)) = ? OR LOWER(TRIM(page_id)) = ?
+          # so one identifier can be claimed through either column. The Phase 8 index covers
+          # one column, so it cannot see a username equal to another row's page_id, nor two
+          # page_ids differing only by case. Revision 0006 closes both with a projection whose
+          # PRIMARY KEY is the identifier; the engine serialises concurrent claimants.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_phase10_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase10_login_identity.py -v --tb=short | tee /tmp/p10.log
+
+          # One skip IS legitimate and expected on PostgreSQL: the SQLite locking-property
+          # test (test_1046) cannot meaningfully run there. Anything else skipped is a loss.
+          unexpected=$(grep -E "SKIPPED" /tmp/p10.log | grep -v "test_1046_an_unclosed_connection" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::E-02 Phase 10 skipped a case that must run on PostgreSQL:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p10.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 18 ]; then
+            echo "::error::E-02 Phase 10 expected at least 18 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          # Named findings, so a rename or deletion cannot pass silently. Every one of these
+          # asserts REJECTION: the first SQLite trigger used INSERT OR IGNORE and accepted
+          # every collision while the shape checks still passed.
+          for t in test_1001_page_id_equal_to_existing_username_is_refused \
+                   test_1003_username_equal_to_existing_page_id_is_refused \
+                   test_1004_username_equal_to_existing_page_id_reverse_order_is_refused \
+                   test_1011_page_ids_differing_only_by_case_are_refused \
+                   test_1022_a_page_can_update_itself_without_self_colliding \
+                   test_1024_deleting_a_page_releases_its_identifiers \
+                   test_1031_concurrent_opposite_column_claims_do_not_both_win \
+                   test_1032_concurrent_page_id_case_collision_does_not_both_win \
+                   test_1033_concurrent_identical_usernames_still_refused \
+                   test_1044_startup_refuses_a_missing_projection_or_triggers; do
+            grep -q "$t .*PASSED" /tmp/p10.log || {
+              echo "::error::E-02 Phase 10: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertions of the invariant, not a restatement of a test PASS. A suite
+          # that passes while the projection is absent, stale, or untriggered would be useless;
+          # this asks the database directly.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import database
+          from core import login_identity as li
+          from core.db_engine import is_postgres
+
+          if not is_postgres():
+              sys.exit("::error::Phase 10 gate is not running on PostgreSQL")
+
+          conn = database.get_connection()
+          try:
+              if not li.namespace_present(conn):
+                  sys.exit("::error::page_login_namespace is absent")
+              if not li.namespace_is_correct(conn):
+                  sys.exit("::error::the projection does not agree with `pages`")
+              if not li.trigger_present(conn):
+                  sys.exit("::error::the namespace triggers are absent: the projection will drift")
+              collisions = li.find_identifier_collisions(conn)
+              if collisions:
+                  sys.exit("::error::identifier collisions present: "
+                           + li.collision_report_text(collisions))
+          finally:
+              conn.close()
+
+          from core.schema_manager import assert_security_invariants
+          assert_security_invariants()
+          print("Phase 10: projection and triggers verified on PostgreSQL, no collisions, "
+                "startup guard satisfied.")
+          PY
+
+      - name: E-02 Phase 11 — audit-logging contract (R17/R18) on PostgreSQL
+        if: ${{ !cancelled() }}
+        env:
+          # Dedicated database: this suite seeds and deletes rows and runs init_db(), which
+          # corrupts the checksum-verification step that needs a pristine target.
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_phase11_test"
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-phase11-account-key-secret-0123456789a"
+        run: |
+          # E-02 Phase 11. `record_audit_log` has always accepted resource_type/resource_id
+          # and never accepted target_type/target_id, yet five call sites used the latter.
+          # The business write committed first, so three admin endpoints answered 500 while
+          # the page was in fact created or deleted, and no audit row was written. One of the
+          # five sat inside `except Exception: pass`, so payment confirmations were silently
+          # unaudited with no error at all.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_phase11_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase11_audit_contract.py -v --tb=short | tee /tmp/p11.log
+
+          # No skip is legitimate here: every case can run on PostgreSQL.
+          if grep -qE "SKIPPED" /tmp/p11.log; then
+            echo "::error::E-02 Phase 11 skipped a case; every case must run on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/p11.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p11.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 22 ]; then
+            echo "::error::E-02 Phase 11 expected at least 22 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          # Named findings, so a rename or deletion cannot pass silently.
+          for t in test_1101_all_audit_callers_use_the_supported_keyword_names \
+                   test_1111_page_create_succeeds_and_writes_one_audit_row \
+                   test_1112_page_create_audit_details_contain_no_secrets \
+                   test_1121_page_delete_succeeds_and_writes_one_audit_row \
+                   test_1122_audit_row_survives_the_tenant_it_describes \
+                   test_1131_credentials_update_succeeds_and_writes_one_audit_row \
+                   test_1132_credentials_audit_contains_no_password \
+                   test_1133_credential_conflict_returns_409_and_audits_the_refusal \
+                   test_1134_credential_conflict_still_returns_409_when_auditing_fails \
+                   test_1142_record_audit_log_raises_a_typed_error_and_never_leaks_the_connection; do
+            grep -q "$t .*PASSED" /tmp/p11.log || {
+              echo "::error::E-02 Phase 11: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertion that the contract is live, not a restatement of a test PASS:
+          # the signature accepts the documented keywords and rejects the ones that caused R17.
+          python - <<'PY'
+          import inspect, sys
+          sys.path.insert(0, ".")
+          import database
+          from core.db_engine import is_postgres
+
+          if not is_postgres():
+              sys.exit("::error::Phase 11 gate is not running on PostgreSQL")
+
+          params = set(inspect.signature(database.record_audit_log).parameters)
+          for required in ("resource_type", "resource_id"):
+              if required not in params:
+                  sys.exit(f"::error::record_audit_log lost the documented parameter {required}")
+          for forbidden in ("target_type", "target_id"):
+              if forbidden in params:
+                  sys.exit(f"::error::record_audit_log gained {forbidden}; the call sites must not")
+
+          if not issubclass(database.AuditLogWriteError, RuntimeError):
+              sys.exit("::error::AuditLogWriteError is missing; audit failures would be untyped")
+
+          print("Phase 11: audit contract verified on PostgreSQL.")
+          PY
+
+      - name: "E-03 — audit failure contract: acquisition, payment signal, rotation"
+        if: ${{ !cancelled() }}
+        env:
+          # Dedicated database, same reason as the Phase 11 gate above: this suite seeds
+          # and deletes rows and runs init_db(), which corrupts the checksum step.
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e03_test"
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-e03-account-key-secret-0123456789abcdef"
+        run: |
+          # E-03. Three findings from the Phase 12 independent audit:
+          #
+          #   F-A  `get_connection()` sat outside `record_audit_log`'s try, so a failure to
+          #        ACQUIRE a connection escaped untyped and the endpoint answered the bare
+          #        500 "Internal server error" after the business write had committed.
+          #   F-B  `audit_recorded` was produced and read by nobody; both payment callers
+          #        discarded the result.
+          #   F-C  an audit failure on the credentials endpoint discarded a magic token that
+          #        had already been rotated and committed, leaving the caller with only a
+          #        dead one.
+          #
+          # Each suite is gated on PostgreSQL, and each is checked to fail without its fix.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_e03_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase12_audit_acquisition.py -v --tb=short | tee /tmp/e03a.log
+          pytest tests/test_e02_phase12_payment_audit_signal.py -v --tb=short | tee /tmp/e03b.log
+          pytest tests/test_e02_phase12_token_rotation.py -v --tb=short | tee /tmp/e03c.log
+
+          # No skip is legitimate: every case can run on PostgreSQL.
+          if grep -qE "SKIPPED" /tmp/e03a.log /tmp/e03b.log /tmp/e03c.log; then
+            echo "::error::E-03 skipped a case; every case must run on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/e03a.log /tmp/e03b.log /tmp/e03c.log
+            exit 1
+          fi
+
+          for pair in "a:11" "b:11" "c:11"; do
+            log="/tmp/e03${pair%%:*}.log"
+            want="${pair##*:}"
+            got=$(grep -oE "[0-9]+ passed" "$log" | head -1 | grep -oE "[0-9]+")
+            if [ "${got:-0}" -lt "$want" ]; then
+              echo "::error::E-03 expected at least $want passing cases in $log, saw ${got:-none}"
+              exit 1
+            fi
+          done
+
+          # Named findings, so a rename or deletion cannot pass silently.
+          for t in test_1201_acquisition_failure_is_converted_into_the_typed_audit_error \
+                   test_1202_acquisition_failure_preserves_the_original_exception_as_the_cause \
+                   test_1204_page_create_reports_completed_but_unaudited_when_acquisition_fails \
+                   test_1205_page_delete_reports_completed_but_unaudited_when_acquisition_fails \
+                   test_1206_credentials_report_completed_but_unaudited_when_acquisition_fails \
+                   test_1210_get_connection_is_inside_record_audit_logs_protected_region \
+                   test_2001_every_return_path_carries_audit_recorded \
+                   test_2012_settling_call_reports_false_when_the_audit_row_was_not_written \
+                   test_2023_qpay_callback_does_not_answer_non_200_when_the_audit_is_lost \
+                   test_3001_a_committed_rotation_is_delivered_even_when_the_audit_fails \
+                   test_3002_the_delivered_token_is_the_one_the_database_holds \
+                   test_3003_rotation_still_invalidates_the_previously_distributed_token \
+                   test_3004_repeated_retries_during_an_outage_always_hand_back_a_working_token; do
+            grep -qE "$t .*PASSED" /tmp/e03a.log /tmp/e03b.log /tmp/e03c.log || {
+              echo "::error::E-03: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertion that the fixes are live, not a restatement of a test PASS.
+          python - <<'PY'
+          import ast, inspect, sys
+          sys.path.insert(0, ".")
+          import database, fintech_service
+          from core.db_engine import is_postgres
+
+          if not is_postgres():
+              sys.exit("::error::E-03 gate is not running on PostgreSQL")
+
+          # F-A: acquisition must happen INSIDE the protected region, and not before it.
+          # "appears anywhere under the try" is too weak: a regression of the form
+          #     conn = get_connection()
+          #     try:
+          #         conn = conn or get_connection()
+          # satisfies it and is still the defect.
+          func = ast.parse(inspect.getsource(database.record_audit_log).strip()).body[0]
+          outer_try = next((n for n in ast.walk(func) if isinstance(n, ast.Try)), None)
+          if outer_try is None:
+              sys.exit("::error::record_audit_log has no try block")
+
+          def _acquires(node):
+              return any(
+                  isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id == "get_connection"
+                  for n in ast.walk(node)
+              )
+
+          for node in func.body:
+              if node is outer_try:
+                  break
+              if isinstance(node, ast.Assign) and _acquires(node.value):
+                  sys.exit("::error::get_connection() is evaluated before the try (F-A is back)")
+          if not outer_try.body or not _acquires(outer_try.body[0]):
+              sys.exit("::error::the try block does not begin by acquiring the connection (F-A is back)")
+
+          # F-B: the reporter exists and reports a lost audit.
+          captured = []
+
+          class H:
+              pass
+
+          import logging
+
+          logger = logging.getLogger("fintech_service")
+          prev_disabled, prev_level = logger.disabled, logger.level
+          logger.disabled = False
+          logger.setLevel(logging.ERROR)
+          original_error = logger.error
+          logger.error = lambda *a, **k: captured.append(a)
+          try:
+              ok = fintech_service.report_audit_outcome(
+                  {"audit_recorded": False, "invoice": {"invoice_id": "INV-GATE"}},
+                  caller="ci_gate",
+              )
+          finally:
+              logger.error = original_error
+              logger.disabled, logger.level = prev_disabled, prev_level
+          if ok is not False or not captured:
+              sys.exit("::error::a lost payment audit is not reported to its caller (F-B is back)")
+
+          print("E-03: acquisition, payment signal and rotation contracts verified on PostgreSQL.")
+          PY
+
+      - name: "Phase 13 — audit_logs must be append-only (finding F-D)"
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_p13_test"
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-p13-account-key-secret-0123456789abcdef"
+        run: |
+          # Phase 13 (finding F-D). `audit_logs` had no tamper protection: zero triggers
+          # on either engine, and an application-level UPDATE or DELETE succeeded on both.
+          # Revision 0007 installs rejection triggers; a startup guard now refuses to boot
+          # a database where they are missing or mis-wired.
+          #
+          # The threat model is deliberately NOT overstated here. This is tamper
+          # RESISTANCE, not tamper evidence: a database owner or superuser can
+          # DISABLE TRIGGER ALL, SET session_replication_role = replica, or DROP TRIGGER.
+          # All three were measured to bypass it. Closing that needs a non-owner runtime
+          # role plus external anchoring, which is a separate design.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_p13_test 2>/dev/null || true
+          alembic upgrade head
+
+          pytest tests/test_e02_phase13_audit_append_only.py -v --tb=short | tee /tmp/p13.log
+
+          if grep -qE "SKIPPED" /tmp/p13.log; then
+            echo "::error::Phase 13 skipped a case; every case must run on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/p13.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p13.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 21 ]; then
+            echo "::error::Phase 13 expected at least 21 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          for t in test_1301_the_guard_is_installed_with_the_expected_shape \
+                   test_1302_the_update_guard_is_narrowed_to_the_retention_action_only \
+                   test_1311_insert_succeeds \
+                   test_1312_select_succeeds \
+                   test_1321_update_is_rejected_and_the_row_is_unchanged \
+                   test_1322_delete_is_rejected_and_the_rows_survive \
+                   test_1323_truncate_is_rejected_on_postgresql \
+                   test_1324_targeted_delete_cannot_erase_one_incriminating_row \
+                   test_1331_tenant_deletion_still_succeeds_under_the_guard \
+                   test_1332_the_audit_row_survives_with_its_resource_id_intact \
+                   test_1333_the_retention_permission_cannot_be_borrowed_to_rewrite_history \
+                   test_1341_startup_guard_passes_when_the_guard_is_installed \
+                   test_1342_startup_guard_detects_a_missing_trigger \
+                   test_1343_startup_guard_detects_a_wrongly_wired_trigger \
+                   test_1344_the_test_helper_never_leaks_out_of_tests \
+                   test_1351_downgrade_removes_the_guard_and_upgrade_restores_it \
+                   test_1352_backup_and_restore_keep_the_guard_installed; do
+            grep -qE "$t .*PASSED" /tmp/p13.log || {
+              echo "::error::Phase 13: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Independent assertions that the protection is live, rather than a restatement
+          # of a test PASS. Each one tries to tamper for real.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import database
+          from core import audit_integrity
+          from core.db_engine import is_postgres
+          from core.schema_manager import assert_security_invariants
+
+          if not is_postgres():
+              sys.exit("::error::Phase 13 gate is not running on PostgreSQL")
+
+          database.init_db()
+
+          conn = database.get_connection()
+          try:
+              if not audit_integrity.guard_is_correct(conn):
+                  sys.exit("::error::the audit append-only guard is not correctly installed")
+              if not audit_integrity.update_guard_allows_only_retention(conn):
+                  sys.exit("::error::the UPDATE guard is not narrowed to the retention action")
+          finally:
+              conn.close()
+
+          database.record_audit_log("ci.p13", page_id=None, actor_role="system",
+                                    resource_type="probe", resource_id="gate", details={})
+
+          def must_fail(sql, what):
+              c = database.get_connection()
+              try:
+                  cur = c.cursor()
+                  cur.execute(sql)
+                  c.commit()
+                  sys.exit(f"::error::{what} was PERMITTED; the audit trail is not append-only")
+              except SystemExit:
+                  raise
+              except Exception:
+                  try:
+                      c.rollback()
+                  except Exception:
+                      pass
+              finally:
+                  c.close()
+
+          must_fail("UPDATE audit_logs SET action='TAMPERED'", "UPDATE")
+          must_fail("DELETE FROM audit_logs", "DELETE")
+          must_fail("TRUNCATE audit_logs", "TRUNCATE")
+
+          # The startup guard must accept this database and reject a damaged one.
+          assert_security_invariants()
+
+          print("Phase 13: audit_logs is append-only — UPDATE, DELETE and TRUNCATE all refused.")
+          PY
+
+          # The startup guard must actually FAIL when the guard is missing, or it is
+          # decoration. Prove that by dropping one trigger and expecting a refusal.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import database
+          from core import audit_integrity
+          from core.schema_manager import assert_security_invariants
+
+          conn = database.get_connection()
+          try:
+              audit_integrity._exec(conn, f"DROP TRIGGER {audit_integrity.PG_TRIGGER_DELETE} ON audit_logs")
+          finally:
+              conn.close()
+
+          try:
+              assert_security_invariants()
+          except RuntimeError as exc:
+              if "append-only" not in str(exc):
+                  sys.exit(f"::error::startup guard failed for the wrong reason: {exc}")
+              print("Phase 13: startup guard correctly refused a database with no DELETE guard.")
+          else:
+              sys.exit("::error::startup guard accepted a database with no DELETE guard")
+
+          # ...and repair restores it, which is the remedy the message names.
+          import subprocess
+          result = subprocess.run([sys.executable, "scripts/repair_audit_integrity.py"],
+                                  capture_output=True, text=True)
+          if result.returncode != 0:
+              sys.exit("::error::repair_audit_integrity.py could not restore the guard:\n" + result.stdout + result.stderr)
+          assert_security_invariants()
+          print("Phase 13: repair script restored the guard; startup guard passes again.")
+          PY
+
+      - name: "Phase 14 (E-05) — least-privilege runtime role separation"
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e05_test"
+          R10_REQUIRE_POSTGRES: "1"
+          E02_ACCOUNT_KEY_SECRET: "ci-e05-account-key-secret-0123456789abcdef"
+        run: |
+          # E-05. Phase 13 made `audit_logs` append-only with triggers, and measured the
+          # limit honestly: the runtime credential was a superuser, so DROP TRIGGER,
+          # DISABLE TRIGGER and session_replication_role=replica all bypassed it. The
+          # guard was advisory against anyone holding DATABASE_URL.
+          #
+          # This gate proves the split: `gerege_app` owns nothing and runs the app;
+          # `gerege_owner` owns the schema and does maintenance. The adversarial matrix in
+          # the suite attacks the restricted role for real, and the assertions below
+          # re-run the same attacks outside pytest so the gate cannot pass on a
+          # restatement of a test name.
+          PGPASSWORD="ci_pg_password_2026" createdb -h 127.0.0.1 -p 5432 -U gerege gerege_e05_test 2>/dev/null || true
+
+          # Bring the database to head as the bootstrap account, which is exactly what the
+          # `migrate` service does in production. The gate must not assume a pre-migrated
+          # database: a fresh cluster is the case where provisioning is most likely wrong.
+          alembic upgrade head
+
+          pytest tests/test_e02_phase14_least_privilege.py -v --tb=short | tee /tmp/e05.log
+
+          # Every case must actually run. On SQLite 26 of them skip, which is correct for
+          # developers and unacceptable for this gate.
+          if grep -qE "SKIPPED" /tmp/e05.log; then
+            echo "::error::Phase 14 skipped a case; the role split must be verified on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/e05.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/e05.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 42 ]; then
+            echo "::error::Phase 14 expected at least 42 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          for t in test_e05_01_audit_logs_is_the_only_table_narrowed_to_select_insert \
+                   test_e05_11_backup_refuses_a_non_owner_credential_on_postgres \
+                   test_e05_12_destructive_backup_endpoints_are_gone \
+                   test_e05_16_app_role_can_do_every_required_operation \
+                   test_e05_18_self_grant_is_a_noop_not_an_escalation \
+                   test_e05_19_tenant_deletion_retains_audit_evidence \
+                   test_e05_20_owner_role_can_migrate_and_dump \
+                   test_e05_21_backup_refuses_app_and_accepts_owner \
+                   test_e05_22_startup_refuses_owner_and_superuser_but_accepts_app \
+                   test_e05_23_out_of_band_grant_is_detected_and_converge_removes_it \
+                   test_e05_23b_backup_guard_asks_what_the_role_can_do \
+                   test_e05_24_verify_exits_nonzero_when_the_runtime_role_is_missing; do
+            grep -qE "$t .*PASSED" /tmp/e05.log || {
+              echo "::error::Phase 14: $t did not pass"
+              exit 1
+            }
+          done
+
+          python - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, ".")
+          import psycopg2
+          from core import db_privileges
+
+          DB = os.environ["DATABASE_URL"]
+          base = DB.rsplit("/", 1)[0]
+          _norm = lambda u: (u.replace("postgresql+psycopg2://", "postgresql://", 1)
+                              .replace("postgresql+psycopg://", "postgresql://", 1))
+          # Connected to the TARGET database, not /postgres: roles are cluster-wide so
+          # CREATE ROLE works from anywhere, but `ALTER TABLE audit_logs` is per-database
+          # and silently targeted the wrong one in the first version of this gate.
+          admin = psycopg2.connect(_norm(DB))
+          admin.autocommit = True
+          cur = admin.cursor()
+          # The provisioning script must reach least privilege from scratch, and its own
+          # verify must agree — a gate that only ran pytest could pass with a script that
+          # provisions nothing.
+          os.environ["ADMIN_DATABASE_URL"] = DB
+          os.environ["GEREGE_OWNER_PASSWORD"] = "ci_owner_pw_2026"
+          os.environ["GEREGE_APP_PASSWORD"] = "ci_app_pw_2026"
+          from scripts import provision_roles
+
+          if provision_roles.main(["--apply"]) != 0:
+              sys.exit("::error::provision_roles --apply failed")
+          if provision_roles.main(["--verify"]) != 0:
+              sys.exit("::error::provision_roles --verify reports the runtime role is not least-privileged")
+
+          # NEGATIVE CONTROL. Everything above would also pass if the assertion silently
+          # did nothing, so make it fail on purpose: provision a role that owns tables and
+          # confirm the assertion refuses it. Without this, a broken check reads as green.
+          # CLEANUP of a previous run. `DROP OWNED` is per-database, so a leftover grant
+          # in another database still blocks DROP ROLE; `REASSIGN OWNED` + `DROP OWNED` in
+          # each database is the documented sequence, and the drop must not be allowed to
+          # abort the gate before it has done any work.
+          for _db in ("postgres",):
+              try:
+                  _c = psycopg2.connect(_norm(base) + "/" + _db)
+                  _c.autocommit = True
+                  _k = _c.cursor()
+                  _k.execute("DROP OWNED BY e05_control_owner")
+                  _k.close()
+                  _c.close()
+              except Exception:
+                  pass
+          try:
+              cur.execute("DROP OWNED BY e05_control_owner")
+          except Exception:
+              pass
+          cur.execute("DROP ROLE IF EXISTS e05_control_owner")
+          cur.execute("CREATE ROLE e05_control_owner LOGIN PASSWORD 'control_pw_2026' NOINHERIT")
+          cur.execute("GRANT e05_control_owner TO gerege")
+          cur.execute("GRANT USAGE ON SCHEMA public TO e05_control_owner")
+          cur.execute("GRANT SELECT ON ALL TABLES IN SCHEMA public TO e05_control_owner")
+          cur.execute("ALTER TABLE audit_logs OWNER TO e05_control_owner")
+
+          ctl_dsn = (_norm(base) + "/" + DB.rsplit("/", 1)[1]).replace(
+              "gerege:ci_pg_password_2026@", "e05_control_owner:control_pw_2026@"
+          )
+          control = psycopg2.connect(ctl_dsn)
+          try:
+              report = db_privileges.collect_runtime_privileges(control)
+          finally:
+              control.close()
+          violations = db_privileges.evaluate_runtime_privileges(report)
+          if not any("owns" in v for v in violations):
+              sys.exit("::error::negative control failed: a table owner was not flagged")
+          print("Phase 14: negative control confirmed — a table owner is refused.")
+
+          # ...and the app role is accepted by the same evaluator, so the control proves
+          # discrimination rather than blanket rejection.
+          app_conn = psycopg2.connect(ctl_dsn.replace(
+              "e05_control_owner:control_pw_2026", "gerege_app:ci_app_pw_2026"))
+          try:
+              app_report = db_privileges.collect_runtime_privileges(app_conn)
+          finally:
+              app_conn.close()
+          if db_privileges.evaluate_runtime_privileges(app_report):
+              sys.exit("::error::gerege_app is not least-privileged: "
+                       + "; ".join(db_privileges.evaluate_runtime_privileges(app_report)))
+          print("Phase 14: gerege_app accepted by the same check that refuses an owner.")
+
+          # Restore ownership BEFORE dropping the control role. `DROP OWNED BY <role>`
+          # does not just revoke privileges: it DROPS every object that role owns. The
+          # negative control deliberately makes it own `audit_logs`, so skipping this
+          # line deletes the audit table from the test database (observed: alembic still
+          # reported 0007 while `audit_logs` was gone, which is a nasty state to debug).
+          cur.execute("ALTER TABLE audit_logs OWNER TO gerege_owner")
+          cur.execute("DROP OWNED BY e05_control_owner")
+          cur.execute("DROP ROLE IF EXISTS e05_control_owner")
+
+          # Prove the table survived the whole exercise, rather than reporting success
+          # from a database the negative control had already damaged.
+          cur.execute("SELECT to_regclass('public.audit_logs') IS NOT NULL")
+          if not cur.fetchone()[0]:
+              sys.exit("::error::audit_logs was destroyed by the negative control cleanup")
+          cur.execute("SELECT COUNT(*) FROM pg_trigger WHERE NOT tgisinternal "
+                      "AND tgrelid = 'audit_logs'::regclass")
+          if cur.fetchone()[0] < 3:
+              sys.exit("::error::the append-only triggers did not survive the gate")
+          print("Phase 14: audit_logs and its three guard triggers survived the gate.")
+          cur.close()
+          admin.close()
+          PY
+
+      # ---------------------------------------------------------------------
+      # Phase 16 (E-05 audit remediation). Runs on its own fresh database so the
+      # gate cannot inherit state from the Phase 14 job above, and so the HIGH-01
+      # scenario (a database migrated by the bootstrap account, never re-owned) is
+      # reproducible from scratch on every run.
+      # ---------------------------------------------------------------------
+      - name: Phase 16 — deploy sequence, ownership convergence, fail-closed verify
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e05_p16_test"
+        run: |
+          set -euo pipefail
+          export PGPASSWORD="ci_pg_password_2026"
+          createdb -h 127.0.0.1 -p 5432 -U gerege gerege_e05_p16_test 2>/dev/null || true
+
+          # A fresh database, provisioned and migrated the way the `migrate` service
+          # does it: provision -> migrate -> provision (ownership transfer) -> verify.
+          # Starting from a properly converged database is what makes the negative
+          # controls below meaningful: they break exactly one invariant at a time and
+          # require `--verify` to notice. (Starting from a bare `alembic upgrade head`
+          # would leave every relation bootstrap-owned, so the "repair" step would have
+          # nothing to prove.)
+          export GEREGE_OWNER_PASSWORD="$(openssl rand -base64 24)"
+          export GEREGE_APP_PASSWORD="$(openssl rand -base64 24)"
+          export ADMIN_DATABASE_URL="${DATABASE_URL/postgresql+psycopg2:\/\//postgresql://}"
+          python scripts/provision_roles.py --apply
+          alembic upgrade head
+          python scripts/provision_roles.py --apply
+          python scripts/provision_roles.py --verify
+
+          pytest tests/test_e05_phase16_remediation.py -v --tb=short -p no:cacheprovider | tee /tmp/p16.log
+
+          # No skip is legitimate here: every case must run on PostgreSQL.
+          if grep -qE "SKIPPED" /tmp/p16.log; then
+            echo "::error::Phase 16 skipped a case; the remediation must be verified on PostgreSQL:"
+            grep -E "SKIPPED" /tmp/p16.log
+            exit 1
+          fi
+
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p16.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 29 ]; then
+            echo "::error::Phase 16 expected at least 29 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+          # Name-level assertions, for the same reason Phase 14 has them: a rename or
+          # an accidental `skipif` must not silently reduce coverage.
+          for t in test_p16_01_verify_fails_closed_when_it_cannot_set_role \
+                   test_p16_02_verify_passes_again_after_the_grant_is_removed \
+                   test_p16_04_missing_runtime_role_is_detected_not_skipped \
+                   test_p16_06_sequence_escalation_is_detected \
+                   test_p16_07_owner_role_server_powers_are_reported \
+                   test_p16_11_bootstrap_owned_relations_are_detected \
+                   test_p16_12_only_a_full_apply_repairs_ownership \
+                   test_p16_16_unowned_relations_break_the_owner_backup \
+                   test_p16_20_deploy_script_transfers_ownership_with_a_full_apply \
+                   test_p16_21_deploy_orders_provision_after_migration_and_before_start \
+                   test_p16_22_deploy_refuses_without_a_backup \
+                   test_p16_33_encryption_is_fail_closed_without_a_key \
+                   test_p16_35_retention_never_deletes_below_the_floor \
+                   test_p16_40_app_role_cannot_read_the_backups_directory_secrets \
+                   test_p16_41_scheduled_run_refuses_the_runtime_credential \
+                   test_p16_05b_pre_migration_apply_is_not_a_failure \
+                   test_p16_42_status_probe_reports_missing_and_failed_runs; do
+            grep -qE "$t .*PASSED" /tmp/p16.log || {
+              echo "::error::Phase 16: $t did not pass"
+              exit 1
+            }
+          done
+
+          # Negative control 1: a bootstrap-owned relation MUST fail `--verify`.
+          # This is the HIGH-01 end state; if this passes, the ownership check is dead.
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".")
+          import psycopg2
+
+          DB = os.environ["DATABASE_URL"].replace("postgresql+psycopg2://", "postgresql://", 1)
+          admin = psycopg2.connect(DB); admin.autocommit = True
+          cur = admin.cursor()
+          cur.execute("ALTER TABLE appointments OWNER TO gerege")
+          admin.close()
+
+          os.environ["ADMIN_DATABASE_URL"] = DB
+          from scripts import provision_roles
+          rc = provision_roles.main(["--verify"])
+          if rc == 0:
+              sys.exit("::error::NEGATIVE CONTROL FAILED: --verify accepted a "
+                       "bootstrap-owned relation (HIGH-01 is back)")
+          print("Phase 16: --verify refused a bootstrap-owned relation. Control OK.")
+
+          admin = psycopg2.connect(DB); admin.autocommit = True
+          cur = admin.cursor()
+          cur.execute("ALTER TABLE appointments OWNER TO gerege_owner")
+          admin.close()
+          if provision_roles.main(["--verify"]) != 0:
+              sys.exit("::error::--verify did not recover after repair")
+          print("Phase 16: --verify recovered after repair.")
+          PY
+
+          # Negative control 2: out-of-band UPDATE/DELETE on audit_logs MUST fail
+          # `--verify` even when the caller cannot SET ROLE (the MEDIUM-01 false pass).
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".")
+          import psycopg2
+
+          DB = os.environ["DATABASE_URL"].replace("postgresql+psycopg2://", "postgresql://", 1)
+          admin = psycopg2.connect(DB); admin.autocommit = True
+          cur = admin.cursor()
+          cur.execute("GRANT UPDATE, DELETE ON audit_logs TO gerege_app")
+          admin.close()
+
+          os.environ["ADMIN_DATABASE_URL"] = DB
+          from scripts import provision_roles
+          if provision_roles.main(["--verify"]) == 0:
+              sys.exit("::error::NEGATIVE CONTROL FAILED: --verify accepted UPDATE/DELETE "
+                       "on audit_logs (MEDIUM-01 false pass is back)")
+          print("Phase 16: --verify refused mutated audit privileges. Control OK.")
+
+          admin = psycopg2.connect(DB); admin.autocommit = True
+          cur = admin.cursor()
+          cur.execute("REVOKE UPDATE, DELETE ON audit_logs FROM gerege_app")
+          cur.close(); admin.close()
+          if provision_roles.main(["--verify"]) != 0:
+              sys.exit("::error::--verify did not recover after revoking the grant")
+          print("Phase 16: --verify recovered after revoking the grant.")
+          PY
+
+          # The deploy script must remain ordered correctly and must never reintroduce
+          # `--converge-only` after the migration, which is what HIGH-01 was.
+          if grep -E "^\s*python .*provision_roles\.py" scripts/deploy.sh | grep -q -- "--converge-only"; then
+            echo "::error::deploy.sh uses --converge-only; ownership will not converge (HIGH-01)"
+            exit 1
+          fi
+          bash -n scripts/deploy.sh
+          bash -n scripts/rollback.sh
+          echo "Phase 16: deploy.sh and rollback.sh sequences verified."
+      # ---------------------------------------------------------------------
+      # Phase 18 (E-06). Proves the backup lifecycle end to end on PostgreSQL:
+      # encrypted archive -> authenticate -> destroy the database -> restore ->
+      # ownership re-convergence. Phase 17 found every one of these steps broken
+      # individually, and each assertion below corresponds to a specific defect.
+      # ---------------------------------------------------------------------
+      - name: Phase 18 — backup lifecycle, authenticated encryption, restore, rollback
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e05_p18_test"
+          DATABASE_OWNER_URL: "postgresql://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_e05_p18_test"
+          BACKUP_ENCRYPTION: "on"
+          BACKUP_ENCRYPTION_KEY_FILE: "/tmp/p18key"
+          BACKUP_DIR: "/tmp/p18backups"
+        run: |
+          set -euo pipefail
+          export PGPASSWORD="ci_pg_password_2026"
+          dropdb -h 127.0.0.1 -U gerege --if-exists gerege_e05_p18_test
+          createdb -h 127.0.0.1 -U gerege gerege_e05_p18_test
+
+          # `cryptography` must be present, or nothing below is meaningful.
+          python -c "import cryptography; print('cryptography', cryptography.__version__)"
+
+          # A key the way the docs say to make one.
+          head -c 32 /dev/urandom | base64 > /tmp/p18key
+          chmod 0400 /tmp/p18key
+          mkdir -p /tmp/p18backups
+
+          export GEREGE_OWNER_PASSWORD="ci_owner_password_2026"
+          export GEREGE_APP_PASSWORD="ci_app_password_2026"
+          export ADMIN_DATABASE_URL="postgresql://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_e05_p18_test"
+          python scripts/provision_roles.py --apply
+          alembic upgrade head
+          python scripts/provision_roles.py --apply
+          python scripts/provision_roles.py --verify
+
+          psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -q <<'SQL'
+          INSERT INTO pages (page_id,name,category,is_active,knowledge_json,ai_provider,monthly_token_limit,tokens_used,ebarimt_enabled,daily_report_enabled)
+          VALUES ('P18A','TenantA','retail',1,'{}','gemini',1000,0,1,0),
+                 ('P18B','TenantB','service',1,'{}','gemini',1000,0,0,0);
+          INSERT INTO registrations (page_id,name,phone,service,channel,status,created_at)
+          VALUES ('P18A','Alice','99001122','demo','web','new',now());
+          INSERT INTO invoices (invoice_id,page_id,amount,currency,status,created_at)
+          VALUES ('INV-P18','P18A',15000,'MNT','paid',now());
+          INSERT INTO audit_logs (page_id,actor_role,actor_id,action,resource_type,resource_id,details_json,created_at)
+          VALUES ('P18A','admin','u1','payment.confirmed','invoice','INV-P18','{}',now());
+          SQL
+
+          # 1. Encrypted backup through the shipped scheduled entry point.
+          python scripts/maintenance.py backup-run --label ci
+
+          ENC=$(ls /tmp/p18backups/*.enc | head -1)
+          ARCHIVE=$(basename "$ENC")
+
+          # 2. The archive must be authenticated, 0600, and accompanied by a checksum
+          #    of the CIPHERTEXT (Phase 17 had the sidecar hashing the deleted plaintext).
+          test "$(stat -c '%a' "$ENC")" = "600"
+          ( cd /tmp/p18backups && sha256sum -c "$ARCHIVE.sha256" )
+          if ls /tmp/p18backups/*.sql.gz >/dev/null 2>&1; then
+            echo "::error::Phase 18 left a PLAINTEXT dump in the backup directory"
+            ls -la /tmp/p18backups
+            exit 1
+          fi
+
+          # 3. Listing must see the encrypted archive (Phase 17 printed "no backups").
+          python scripts/maintenance.py list | grep -q "$ARCHIVE"
+          python scripts/maintenance.py verify "$ARCHIVE"
+
+          # 4. Tampering must be refused. Flip one bit and require a nonzero exit.
+          cp "$ENC" /tmp/p18backups/tampered.sql.gz.enc
+          python - <<'PY'
+          p = "/tmp/p18backups/tampered.sql.gz.enc"
+          blob = bytearray(open(p, "rb").read())
+          blob[len(blob) // 2] ^= 0x01
+          open(p, "wb").write(bytes(blob))
+          PY
+          if python scripts/maintenance.py verify tampered.sql.gz.enc; then
+            echo "::error::Phase 18 accepted a tampered ciphertext"
+            exit 1
+          fi
+          rm -f /tmp/p18backups/tampered.sql.gz.enc
+
+          # 5. Destroy the database the way an incident would.
+          psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -q \
+            -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+          psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -q \
+            -c "GRANT USAGE, CREATE ON SCHEMA public TO gerege_owner; GRANT USAGE ON SCHEMA public TO gerege_app;"
+
+          # 6. Restore the ENCRYPTED archive with the shipped command. This is the
+          #    Phase 17 CRITICAL-1 defect: it used to be impossible.
+          python scripts/maintenance.py restore "$ARCHIVE" --yes
+
+          # 7. Validate content, audit trail, triggers and ownership.
+          PAGES=$(psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -tAc "SELECT count(*) FROM pages")
+          AUDIT=$(psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -tAc "SELECT count(*) FROM audit_logs")
+          TRIGGERS=$(psql -h 127.0.0.1 -U gerege -d gerege_e05_p18_test -tAc \
+            "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'audit_logs_%' AND tgenabled='O'")
+          test "$PAGES" = "2"   || { echo "::error::Phase 18 restored $PAGES pages, expected 2"; exit 1; }
+          test "$AUDIT" = "1"   || { echo "::error::Phase 18 restored $AUDIT audit rows, expected 1"; exit 1; }
+          test "$TRIGGERS" = "3" || { echo "::error::Phase 18 restored $TRIGGERS audit triggers, expected 3"; exit 1; }
+          python scripts/provision_roles.py --verify
+
+          # 8. The pre-restore snapshot must ALSO be encrypted -- Phase 18 found the
+          #    rollback path writing a plaintext dump into the backup directory.
+          if ls /tmp/p18backups/*.sql.gz >/dev/null 2>&1; then
+            echo "::error::Phase 18 restore left a PLAINTEXT pre-restore snapshot"
+            ls -la /tmp/p18backups
+            exit 1
+          fi
+
+          # 9. Rollback discovery: the encrypted pre_deploy snapshot must be findable,
+          #    and a missing snapshot must be fatal (Phase 17 silently skipped it).
+          python scripts/maintenance.py backup-run --label pre_deploy
+          PRE=$(python scripts/maintenance.py list | grep pre_deploy | head -1 | awk '{print $1}')
+          test -n "$PRE" || { echo "::error::Phase 18 rollback cannot discover its snapshot"; exit 1; }
+          python scripts/maintenance.py restore "$PRE" --yes
+
+          echo "Phase 18: encrypted backup -> tamper refused -> destroy -> restore -> verify OK."
+          rm -f /tmp/p18key
+      - name: Phase 18 — Phase 17 regression suite (crypto, staging, retention, secrets)
+        if: ${{ !cancelled() }}
+        env:
+          UPGRADE: "1"
+        run: |
+          set -euo pipefail
+          pytest tests/test_e06_phase18_backup_recovery.py -v --tb=short -p no:cacheprovider | tee /tmp/p18suite.log
+          if grep -qE "SKIPPED" /tmp/p18suite.log; then
+            echo "::error::Phase 18 skipped a case; the remediation must be verified:"
+            grep -E "SKIPPED" /tmp/p18suite.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p18suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 32 ]; then
+            echo "::error::Phase 18 expected at least 32 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+      - name: Phase 20 — backup confidentiality, offsite integrity, locking
+        if: ${{ !cancelled() }}
+        env:
+          UPGRADE: "1"
+          # Two cases in this module deliberately empty `public` to prove the rollback's
+          # schema reset is not a silent no-op, so they cannot share a database with the
+          # rest of the suite. This step owns a disposable database, which is why the
+          # opt-in belongs here and nowhere else.
+          GEREGE_DESTRUCTIVE_TESTS: "1"
+        run: |
+          set -euo pipefail
+          pytest tests/test_e06_phase20_backup_remediation.py -v --tb=short -p no:cacheprovider | tee /tmp/p20suite.log
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p20suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 24 ]; then
+            echo "::error::Phase 20 expected at least 24 passing cases, saw ${collected:-none}"
+            exit 1
+          fi
+
+      # Phase 20: the critical property, asserted against the REAL CLI rather than a
+      # mocked service. Phase 19 found that `maintenance.py backup` published plaintext
+      # with BACKUP_ENCRYPTION=on; a unit test that monkeypatches the backup service
+      # would happily miss a regression that reintroduced it. This runs the command an
+      # operator actually runs, and fails if a single plaintext archive appears.
+      # Phase 24: the operational-hardening suites. None of these needs a live database or
+      # systemd - the scheduler lifecycle is exercised against disposable directories with an
+      # injected systemctl, redaction and alert retry against a local HTTP sink, and archive
+      # containment against symlinks in a temporary backup directory. They are gated here
+      # because a suite that only ever runs on a developer's machine rots.
+      - name: Phase 24 — scheduler lifecycle, redaction, alert delivery, archive containment
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          export BACKUP_ALERT_WEBHOOK=""
+          pytest tests/test_e07_phase24_scheduler.py \
+                 tests/test_e07_phase24_redaction.py \
+                 tests/test_e07_phase24_alerting.py \
+                 tests/test_e07_phase24_archive_containment.py \
+                 tests/test_e07_phase24_key_permissions.py \
+                 -v --tb=short -p no:cacheprovider | tee /tmp/p24suite.log
+          if grep -qE "SKIPPED" /tmp/p24suite.log; then
+            echo "::error::a Phase 24 case was skipped; the hardening must be verified:"
+            grep -E "SKIPPED" /tmp/p24suite.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p24suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 98 ]; then
+            echo "::error::only ${collected:-0} Phase 24 tests passed, expected at least 98"
+            exit 1
+          fi
+
+      # The scheduler lifecycle must also hold against the REAL filesystem locations it
+      # would use, with --unit-dir redirected. The CI step above proves the logic; this
+      # proves the CLI wiring and that a dry-run leaves no trace under a realistic path.
+      - name: Phase 24 — scheduler CLI dry-run writes nothing under a realistic path
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          target=/tmp/p24-ci-units
+          rm -rf "$target"
+          python scripts/maintenance.py scheduler validate --unit-dir "$target"
+          python scripts/maintenance.py scheduler dry-run --unit-dir "$target" --env-file /tmp/p24-ci.env
+          if [ -e "$target" ]; then
+            echo "::error::scheduler dry-run created $target; a preview must not touch the filesystem"
+            ls -la "$target"
+            exit 1
+          fi
+          # A real install into a disposable directory, then a clean uninstall.
+          printf 'DATABASE_OWNER_URL=postgresql://owner:pw@127.0.0.1:5432/db\n' > /tmp/p24-ci.env
+          chmod 600 /tmp/p24-ci.env
+          python scripts/maintenance.py scheduler install --unit-dir "$target" --env-file /tmp/p24-ci.env --yes || true
+          test -f "$target/gerege-backup.service"
+          test -f "$target/gerege-backup.timer"
+          grep -q "maintenance.py backup-run" "$target/gerege-backup.service"
+          grep -q "Unit=gerege-backup.service" "$target/gerege-backup.timer"
+          python scripts/maintenance.py scheduler uninstall --unit-dir "$target" --env-file /tmp/p24-ci.env
+          test ! -f "$target/gerege-backup.service"
+          test ! -f "$target/gerege-backup.timer"
+          # The environment file holds a credential and must survive.
+          test -f /tmp/p24-ci.env
+          echo "scheduler lifecycle: dry-run clean, install wrote both units, uninstall removed them, env file kept"
+
+      - name: Phase 20 — no CLI path may publish a plaintext archive
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          export BACKUP_ENCRYPTION=on
+          export BACKUP_ENCRYPTION_KEY_FILE=/tmp/p20-ci.key
+          head -c 32 /dev/urandom > "$BACKUP_ENCRYPTION_KEY_FILE"
+          chmod 600 "$BACKUP_ENCRYPTION_KEY_FILE"
+
+          for label in manual pre_deploy pre_migrate; do
+            dir="/tmp/p20-cli-$label"
+            rm -rf "$dir"; mkdir -p "$dir"
+            BACKUP_DIR="$dir" python scripts/maintenance.py backup --label "$label" >/tmp/p20-cli.log 2>&1 \
+              || { echo "::error::backup --label $label failed"; cat /tmp/p20-cli.log; exit 1; }
+
+            if ls "$dir"/*.sql.gz "$dir"/*.db.gz 2>/dev/null | grep -q .; then
+              echo "::error::backup --label $label published a PLAINTEXT archive"
+              ls -la "$dir"; exit 1
+            fi
+            ls "$dir"/*.enc >/dev/null 2>&1 \
+              || { echo "::error::backup --label $label produced no encrypted archive"; exit 1; }
+
+            # The archive must classify as authenticated, not merely end in .enc.
+            BACKUP_DIR="$dir" python scripts/verify_backup_confidentiality.py
+          done
+
+          # Fail closed: with encryption required and no key, nothing may be written.
+          dir=/tmp/p20-cli-nokey; rm -rf "$dir"; mkdir -p "$dir"
+          if BACKUP_DIR="$dir" BACKUP_ENCRYPTION=on BACKUP_ENCRYPTION_KEY_FILE= \
+               python scripts/maintenance.py backup --label nokey >/dev/null 2>&1; then
+            echo "::error::backup succeeded with encryption required and no key"; exit 1
+          fi
+          if [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+            echo "::error::a failed backup still wrote into the backup directory"
+            ls -la "$dir"; exit 1
+          fi
+          echo "No CLI path published plaintext; fail-closed verified."
+
       - name: Run SQLite-to-PostgreSQL Migration & Checksum Verification
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
           python scripts/migrate_sqlite_to_postgres.py --postgres-url "$DATABASE_URL"
 
       - name: Run PostgreSQL Cursor Regression Suite (Live PostgreSQL 16)
+        if: ${{ !cancelled() }}
         env:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
         run: |
@@ -174,6 +1568,54 @@ jobs:
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
           pytest tests/test_ai_eval_suite.py -v --tb=short
+
+      - name: Run Stage B P0/P1 Regression Suite (Live PostgreSQL 16)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          pytest tests/test_stage_b_regressions.py -v --tb=short
+
+      - name: Verify zero schema drift on Live PostgreSQL 16
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          # Type-aware drift check against the live PostgreSQL schema.
+          python scripts/migrate.py --verify --no-backup
+
+      - name: Verify foreign keys exist (Live PostgreSQL 16) — P1-06
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+        run: |
+          python -c "
+          import os, sqlalchemy as sa
+          from core.models import Base
+          from core.schema_manager import compare_with_models
+          e = sa.create_engine(os.environ['DATABASE_URL'])
+          with e.connect() as c:
+              n = c.execute(sa.text(
+                  \"select count(*) from information_schema.table_constraints \"
+                  \"where constraint_type='FOREIGN KEY' and table_schema='public'\"
+              )).scalar()
+          expected = sum(len(col.foreign_keys) for t in Base.metadata.tables.values() for col in t.columns)
+          print(f'foreign keys in database: {n} (models declare {expected})')
+          assert n >= expected, f'expected at least {expected} foreign keys, found {n}'
+          diffs = compare_with_models()
+          assert not diffs, diffs[:5]
+          print('schema still matches models after adding constraints')
+          "
+
+      - name: Run Stage C schema authority suite (Live PostgreSQL 16)
+        if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          python -c "import database; print('DB_PATH =', database.DB_PATH)"
+          pytest tests/test_stage_c_schema.py -v --tb=short -p no:cacheprovider
 
       - name: Run Failure Scenarios Suite (Live PostgreSQL 16 & Redis 7)
         if: ${{ !cancelled() }}

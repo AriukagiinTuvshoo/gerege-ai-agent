@@ -294,13 +294,13 @@ class AIAgent:
         database.log_message(sender_id=sender_id, channel=channel, sender_type="user", content=log_content, page_id=page_id)
 
         # 0. Хүн удирдаж байгаа эсэх (Takeover check)
-        if database.is_session_human_takeover(sender_id):
+        if database.is_session_human_takeover(sender_id, page_id=page_id):
             return {"reply": "", "human_takeover": True, "registered": False, "model": "human_paused"}
 
         # 1. Эскалаци
         text_lower = text.lower() if text else ""
         if any(kw in text_lower for kw in ESCALATION_KEYWORDS):
-            database.set_human_takeover(sender_id, True)
+            database.set_human_takeover(sender_id, True, page_id=page_id)
             reply = f"Менежер рүү холбож байна. {page_name}-ийн харилцагчийн ажилтан тантай одоо шууд холбогдож хариу өгөх болно. Түр хүлээнэ үү! 👤"
             database.log_message(sender_id=sender_id, channel=channel, sender_type="bot", content=reply, page_id=page_id)
             return {"reply": reply, "human_takeover": True, "registered": False, "model": "escalated"}
@@ -707,7 +707,7 @@ class AIAgent:
             try:
                 user_memory = database.get_user_memory(page_id, sender_id)
                 sys_inst = build_system_instruction_for_page(page_data, user_memory=user_memory)
-                hist = database.get_conversation_history(sender_id=sender_id, limit=8)
+                hist = database.get_conversation_history(sender_id=sender_id, limit=8, page_id=page_id)
                 alt_reply = ai_router.call_openai_compatible_fallback(sys_inst, text, hist) or ai_router.call_anthropic_fallback(sys_inst, text, hist)
                 if alt_reply:
                     eval_alt = ai_router.evaluate_ai_response(alt_reply, page_id=page_id)

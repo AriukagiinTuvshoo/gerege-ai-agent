@@ -1,0 +1,62 @@
+test_31_same_account_same_ip_is_throttled FAILED [  2%]
+test_32_same_account_different_ips_is_throttled FAILED [  5%]
+test_33_rotating_x_forwarded_for_still_hits_the_account_limit FAILED [  8%]
+test_34_rotating_other_forwarding_headers_still_hits_the_account_limit[X-Real-IP] FAILED [ 11%]
+test_34_rotating_other_forwarding_headers_still_hits_the_account_limit[Forwarded] FAILED [ 14%]
+test_35_different_accounts_do_not_share_a_counter FAILED [ 17%]
+test_36_username_spelling_variants_share_one_budget[Acme-Mn0] FAILED [ 20%]
+test_36_username_spelling_variants_share_one_budget[acme-mn] FAILED [ 23%]
+test_36_username_spelling_variants_share_one_budget[ACME-MN] FAILED [ 26%]
+test_36_username_spelling_variants_share_one_budget[  Acme-Mn  ] FAILED [ 29%]
+test_36_username_spelling_variants_share_one_budget[Acme-Mn1] FAILED [ 32%]
+test_36_username_spelling_variants_share_one_budget[aCME-mN] FAILED [ 35%]
+test_37_normalization_does_not_merge_distinct_accounts FAILED [ 38%]
+test_38_empty_and_malformed_identifiers_do_not_crash_the_limiter PASSED [ 41%]
+test_39_account_key_contains_no_plaintext_username FAILED [ 44%]
+test_40_account_key_is_keyed_and_differs_from_a_plain_hash FAILED [ 47%]
+test_41_no_usable_secret_means_no_account_keying FAILED [ 50%]
+test_42_failed_login_increments_the_account_counter FAILED [ 52%]
+test_43_threshold_produces_temporary_throttling_not_lockout FAILED [ 55%]
+test_44_counter_expires FAILED [ 58%]
+test_45_successful_login_resets_the_account_counter FAILED [ 61%]
+test_46_successful_login_does_not_reset_the_ip_counter FAILED [ 64%]
+test_47_unknown_username_is_also_counted FAILED [ 67%]
+test_48_concurrent_failures_are_counted_atomically FAILED [ 70%]
+test_49_account_counter_is_shared_across_processes SKIPPED [ 73%]
+test_50_account_counter_survives_a_restart SKIPPED [ 76%]
+test_51_reset_does_not_erase_a_newer_failure FAILED [ 79%]
+test_52_counters_are_bounded_and_expire SKIPPED [ 82%]
+test_53_unknown_account_and_wrong_password_are_indistinguishable FAILED [ 85%]
+test_54_throttled_response_does_not_reveal_account_existence FAILED [ 88%]
+test_55_password_verification_time_does_not_reveal_existence FAILED [ 91%]
+test_56_logs_do_not_contain_plaintext_usernames PASSED [ 94%]
+test_57_ip_limit_still_works_with_account_protection_in_place PASSED [ 97%]
+test_58_successful_login_is_unaffected PASSED [100%]
+FAILED test_31_same_account_same_ip_is_throttled
+FAILED test_32_same_account_different_ips_is_throttled
+FAILED test_33_rotating_x_forwarded_for_still_hits_the_account_limit
+FAILED test_34_rotating_other_forwarding_headers_still_hits_the_account_limit[X-Real-IP]
+FAILED test_34_rotating_other_forwarding_headers_still_hits_the_account_limit[Forwarded]
+FAILED test_35_different_accounts_do_not_share_a_counter
+FAILED test_36_username_spelling_variants_share_one_budget[Acme-Mn0]
+FAILED test_36_username_spelling_variants_share_one_budget[acme-mn]
+FAILED test_36_username_spelling_variants_share_one_budget[ACME-MN]
+FAILED test_36_username_spelling_variants_share_one_budget[  Acme-Mn  ]
+FAILED test_36_username_spelling_variants_share_one_budget[Acme-Mn1]
+FAILED test_36_username_spelling_variants_share_one_budget[aCME-mN]
+FAILED test_37_normalization_does_not_merge_distinct_accounts
+FAILED test_39_account_key_contains_no_plaintext_username
+FAILED test_40_account_key_is_keyed_and_differs_from_a_plain_hash
+FAILED test_41_no_usable_secret_means_no_account_keying
+FAILED test_42_failed_login_increments_the_account_counter
+FAILED test_43_threshold_produces_temporary_throttling_not_lockout
+FAILED test_44_counter_expires
+FAILED test_45_successful_login_resets_the_account_counter
+FAILED test_46_successful_login_does_not_reset_the_ip_counter
+FAILED test_47_unknown_username_is_also_counted
+FAILED test_48_concurrent_failures_are_counted_atomically
+FAILED test_51_reset_does_not_erase_a_newer_failure
+FAILED test_53_unknown_account_and_wrong_password_are_indistinguishable
+FAILED test_54_throttled_response_does_not_reveal_account_existence
+FAILED test_55_password_verification_time_does_not_reveal_existence
+=================== 27 failed, 4 passed, 3 skipped in 13.84s ===================

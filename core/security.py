@@ -2,7 +2,7 @@ import os
 import hmac
 import hashlib
 import logging
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, List, Optional, Set
 from fastapi import Request, HTTPException
 
 import database
@@ -223,6 +223,58 @@ def is_query_token_allowed() -> bool:
     if is_production_mode():
         return os.getenv("ALLOW_QUERY_TOKEN", "").strip() == "1"
     return True
+
+
+# ---------------------------------------------------------------------------
+# CORS origin allowlist (finding SEC-01 / B-02)
+# ---------------------------------------------------------------------------
+_DEV_DEFAULT_ORIGINS = (
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
+
+
+def resolve_allowed_origins() -> List[str]:
+    """
+    CORS-д зөвшөөрөгдөх origin-уудын жагсаалтыг буцаана.
+
+    Яагаад: `allow_origins=["*"]` ба `allow_credentials=True` хослолд Starlette нь
+    дуудагчийн `Origin`-ыг шууд буцаадаг ("reflect") тул дурын вэбсайт нэвтэрсэн
+    хэрэглэгчийн cookie-той хүсэлт илгээж хариуг уншиж чаддаг байсан (SEC-01).
+
+    Дүрэм:
+      * `ALLOWED_ORIGINS` (таслалаар тусгаарласан) байвал түүнийг л ашиглана.
+      * Wildcard (`*`) зөвхөн production БИШ үед зөвшөөрөгдөнө.
+      * Production/strict горимд жагсаалт хоосон бол аюулгүй default (өөрөө) —
+        хэзээ ч `*` руу буцахгүй (fail-closed).
+      * `null` origin-ыг хэзээ ч зөвшөөрөхгүй.
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    prod = is_production_mode()
+
+    if raw:
+        origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+        cleaned: List[str] = []
+        for origin in origins:
+            if origin == "*":
+                # Never permit credentialed wildcard, in any mode.
+                continue
+            if origin.lower() == "null":
+                continue
+            if origin not in cleaned:
+                cleaned.append(origin)
+        if cleaned:
+            return cleaned
+    elif not prod:
+        return list(_DEV_DEFAULT_ORIGINS)
+
+    # Production (or an unusable config): bind to the app's own origins only.
+    self_origin = os.getenv("APP_ORIGIN", "").strip().rstrip("/")
+    if self_origin and self_origin.lower() != "null":
+        return [self_origin]
+    return []
 
 
 def extract_token_from_request(
@@ -451,3 +503,89 @@ def verify_manychat_webhook_secret(request: Request, page_id: Optional[str] = No
         return False
 
     return hmac.compare_digest(header_secret, expected)
+
+
+# ---------------------------------------------------------------------------
+# Security response headers (finding SEC-03 / P2-04)
+# ---------------------------------------------------------------------------
+#: Third-party origins the dashboard actually loads. Kept explicit rather than a
+#: wildcard: a CDN compromise is the exact scenario CSP is meant to bound, so the policy
+#: only names the hosts the product really uses. If an asset is added to the templates,
+#: add its origin here or the browser will block it.
+CSP_SCRIPT_SRC = (
+    "'self'",
+    "https://cdn.tailwindcss.com",
+    "https://cdnjs.cloudflare.com",
+    "https://cdn.jsdelivr.net",
+    "https://unpkg.com",
+)
+CSP_STYLE_SRC = (
+    "'self'",
+    "https://cdn.tailwindcss.com",
+    "https://cdnjs.cloudflare.com",
+    "https://fonts.googleapis.com",
+)
+CSP_FONT_SRC = ("'self'", "https://fonts.gstatic.com", "data:")
+CSP_IMG_SRC = ("'self'", "data:", "blob:", "https:")
+CSP_CONNECT_SRC = ("'self'",)
+#: Nothing is embedded in an iframe today — `docs.google.com` and `sheets.new` in
+#: `dashboard.html` are plain navigation links, which CSP does not govern. If a widget is
+#: ever embedded, add its origin here.
+CSP_FRAME_SRC = ("'none'",)
+
+
+def build_content_security_policy() -> str:
+    """
+    Build the Content-Security-Policy header value.
+
+    Honest note on `'unsafe-inline'` and `'unsafe-eval'`: `dashboard.html` (a single
+    310 kB file) uses 118 inline `onclick=` handlers and four inline `<script>` blocks, and
+    `cdn.tailwindcss.com` compiles CSS in the browser at runtime, which requires
+    `eval`. A policy without these directives would break the entire dashboard, so they
+    are present for now.
+
+    That makes this policy a **partial** mitigation, not a full one: it still removes the
+    ability to load script from an arbitrary attacker-controlled origin, and it bounds
+    `object-src`, `base-uri`, `frame-ancestors` and form targets, which is where most
+    injected-markup attacks start. It does *not* stop an injected inline handler from
+    running. Removing the inline handlers is tracked separately as frontend work
+    (`docs/audit/ROADMAP.md`); only then can `'unsafe-inline'` be dropped for a nonce.
+
+    `'unsafe-eval'` is granted only for the Tailwind CDN; it is the price of runtime
+    compilation, and self-hosting a compiled stylesheet would let it be removed.
+    """
+    script_src = tuple(CSP_SCRIPT_SRC) + ("'unsafe-inline'", "'unsafe-eval'")
+    directives = {
+        "default-src": ("'self'",),
+        "script-src": script_src,
+        "style-src": tuple(CSP_STYLE_SRC) + ("'unsafe-inline'",),
+        "img-src": CSP_IMG_SRC,
+        "font-src": CSP_FONT_SRC,
+        "connect-src": CSP_CONNECT_SRC,
+        "frame-src": CSP_FRAME_SRC,
+        "object-src": ("'none'",),
+        "base-uri": ("'self'",),
+        "form-action": ("'self'",),
+        "frame-ancestors": ("'none'",),
+    }
+    return "; ".join(f"{name} {' '.join(sources)}" for name, sources in directives.items())
+
+
+def build_security_headers() -> Dict[str, str]:
+    """
+    Response headers applied to every response, success or error.
+
+    HSTS is emitted **only** in production: sending it from a local HTTP dev server would
+    pin `localhost` to HTTPS in the developer's browser for a year and is a well-known way
+    to break a workstation. `X-Frame-Options` remains alongside the CSP
+    `frame-ancestors` directive because older browsers do not implement the latter.
+    """
+    headers: Dict[str, str] = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "Content-Security-Policy": build_content_security_policy(),
+    }
+    if is_production_mode():
+        headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return headers

@@ -1,0 +1,121 @@
+===============================================================================
+E-02 Phase 4.2 — LIVE evidence: two real Uvicorn workers + shared Redis
+Two real worker processes, one shared Redis, real Redis TTL expiry.
+Implementation commit: 74d736b (evidence captured pre-commit)
+Date: 2026-11-17T04:06:44Z
+===============================================================================
+seeded 2 accounts (username != page_id) into /home/user/gerege-ai-agent/.scratch/sim42.db
+
+==============================================================================
+Setup
+==============================================================================
+2 workers, port 8172, Redis redis://127.0.0.1:6379/0
+health: 200
+distinct worker pids that SERVED requests: ['68633', '68634']
+  [PASS] two distinct workers actually served requests  — pids=['68633', '68634']
+
+==============================================================================
+A. Store arm: expired admission refund must not erase the next window's failure
+==============================================================================
+  W1 admission count        : 1
+  W2 admission count        : 1
+  count after real expiry   : 0
+  count before A's refund   : 1
+  A's refund accepted       : False
+  count after A's refund    : 1
+  generation W1 != W2       : True
+  elapsed                   : 2.81s
+  [PASS] window really expired (count returned to 0)
+  [PASS] stale refund was REFUSED
+  [PASS] the newer window's failure survived  — count=1
+  [PASS] generations differ across windows
+
+==============================================================================
+B. Store arm: the same token cannot be refunded twice across processes
+==============================================================================
+  count before refund : 5
+  first refund        : True  -> count 4
+  replayed refund     : False -> count 4
+  [PASS] first refund applied
+  [PASS] replayed refund refused
+  reconstructed token replayed: first=True again=False count=3
+  [PASS] a reconstructed token is still single-use
+
+==============================================================================
+C. Store arm: account A's refund cannot move account B's counter
+==============================================================================
+  Globex count before/after Acme refund: 1/1
+  Acme token used against Globex       : False
+  [PASS] another account's counter untouched
+  [PASS] cross-account token refused
+
+==============================================================================
+D. Redis key shape: TTL present, generation present, no plaintext identifier
+==============================================================================
+  7 account keys
+  counter keys: 2   generation keys: 2
+    ratelimit:auth_account:64678c756de6ada81d8e7b38156b8967  value=1  ttl=60
+    ratelimit:auth_account:c6c78fabf073e8999b403bbcb0828948  value=1  ttl=60
+    ratelimit:auth_account:64678c756de6ada81d8e7b38156b8967:gen  ttl=60
+    ratelimit:auth_account:c6c78fabf073e8999b403bbcb0828948:gen  ttl=60
+  [PASS] no plaintext identifier in any account key  — leaked=[]
+  [PASS] every counter key has a TTL
+  [PASS] every generation key has a TTL
+  [PASS] every live counter has a generation marker
+  sample generation value: '333aa4e159040f29' (opaque, no identifier)
+
+==============================================================================
+E. Worker arm: end-to-end across both processes, real HTTP
+==============================================================================
+  codes: [401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 401, 429, 429, 429, 429]
+  first 429 at attempt: 21 (threshold 20)
+  [PASS] threshold enforced across workers and aliases  — first_429=21
+  key=ratelimit:auth_account:c6c78fabf073e8999b403bbcb0828948 value=24 ttl=899
+  [PASS] counter has a TTL while live  — ttl=899
+  [PASS] counter value matches attempts  — value=24
+  successful login status: 200
+  count before success: 5  after: 5
+  [PASS] successful login still works
+  [PASS] a success leaves the counter unchanged (its own +1 and -1 cancel)  — 5 -> 5
+  isolated refund: 3 -> 2 (applied=True)
+  [PASS] one refund removes exactly one slot  — 3 -> 2
+
+==============================================================================
+F. Production refuses to start without E02_ACCOUNT_KEY_SECRET
+==============================================================================
+  exit code: 3
+    RuntimeError: E02_ACCOUNT_KEY_SECRET is required when running in production: without it the account-level failed-login throttle would be silently disabled and one account could be guessed against by rotating source IPs. Generate one with 'python -c "import secrets; print(secrets.token_urlsafe(48))"' and set it in the environment. See docs/deployment/PRODUCTION_DEPLOYMENT.md section 1.2.
+    
+    ERROR:    Application startup failed. Exiting.
+  [PASS] startup refused without the account secret
+
+==============================================================================
+RESULT: ALL CHECKS PASSED
+==============================================================================
+
+--- worker output (tail) ---
+INFO:     127.0.0.11:35811 - "POST /api/auth/login HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.12:38719 - "POST /api/auth/login HTTP/1.1" 429 Too Many Requests
+INFO:     127.0.0.10:44789 - "POST /api/auth/login HTTP/1.1" 429 Too Many Requests
+INFO:     127.0.0.11:41113 - "POST /api/auth/login HTTP/1.1" 429 Too Many Requests
+INFO:     127.0.0.12:47441 - "POST /api/auth/login HTTP/1.1" 429 Too Many Requests
+INFO:     127.0.0.1:41912 - "POST /api/auth/login HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:41924 - "POST /api/auth/login HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:41940 - "POST /api/auth/login HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:41956 - "POST /api/auth/login HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:41966 - "POST /api/auth/login HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:41980 - "POST /api/auth/login HTTP/1.1" 200 OK
+INFO:     Received SIGTERM, exiting.
+INFO:     Terminated child process [68633]
+INFO:     Terminated child process [68634]
+INFO:     Waiting for child process [68633]
+INFO:     Shutting down
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [68633]
+INFO:     Waiting for child process [68634]
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [68634]
+INFO:     Stopping parent process [68631]

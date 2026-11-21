@@ -248,7 +248,7 @@ def test_phase1_ai_receipt_does_not_confirm_payment_alone(monkeypatch):
 # PHASE 2: DATABASE, REPOSITORIES, ALEMBIC & BACKUPS (P1) TESTS
 # =============================================================
 def test_phase2_sqlalchemy_models_and_repositories():
-    """SQLAlchemy Declarative Models (15 хүснэгт) болон Repository давхарга бүрэн ажиллаж байгааг шалгах"""
+    """SQLAlchemy Declarative Models (18 хүснэгт) болон Repository давхарга бүрэн ажиллаж байгааг шалгах"""
     import ast
     pages = TenantRepository.list_pages(mask_secrets=True)
     assert len(pages) >= 1
@@ -263,9 +263,13 @@ def test_phase2_sqlalchemy_models_and_repositories():
         "marketing_campaigns", "sent_followups", "appointments",
         "notification_locks", "task_jobs", "audit_logs",
         "comment_automations", "tracked_links",
+        # E-02 Phase 10 (R16): the cross-column login-identity projection. Added
+        # deliberately, not as an escape hatch -- this set exists so an *undeclared*
+        # table cannot appear silently, and a new table must be declared here by hand.
+        "page_login_namespace",
     }
 
-    # Verify core/models.py AST defines all 17 tables
+    # Verify core/models.py AST defines all 18 tables
     models_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "core", "models.py"))
     with open(models_path, "r", encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename="core/models.py")

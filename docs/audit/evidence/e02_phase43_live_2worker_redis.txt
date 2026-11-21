@@ -1,0 +1,97 @@
+===============================================================================
+E-02 Phase 4.3 — LIVE evidence: two real Uvicorn workers + shared Redis
+Implementation commit: e3d5a1b (working tree, pre-commit)
+Date: 2026-11-17T04:39:56Z
+===============================================================================
+seeded 2 accounts into /home/user/gerege-ai-agent/.scratch/sim43.db
+
+==============================================================================
+Setup
+==============================================================================
+2 workers, port 8174, Redis redis://127.0.0.1:6379/0
+health: 200
+distinct worker pids that SERVED requests: ['78024', '78025']
+  [PASS] two distinct workers served requests  — pids=['78024', '78025']
+
+==============================================================================
+A. Expired admission is REFUSED (memory parity with Redis), no W2 created
+==============================================================================
+  token.window_seconds      : 2
+  MEMORY refund of expired  : False  (count 0)
+  REDIS  refund of expired  : False  (count 0)
+  [PASS] memory refuses an expired admission
+  [PASS] redis refuses an expired admission
+  [PASS] memory and redis AGREE
+
+==============================================================================
+B. A live claim survives pressure from other accounts
+==============================================================================
+  victim count before replay : 2
+  replay after 2000 foreign refunds -> False
+  victim count after replay  : 2   claims held: 1
+  [PASS] live claim survived foreign pressure
+  [PASS] the replayed refund changed nothing
+  [PASS] claim set is per-counter and bounded  — claims=1
+
+==============================================================================
+C. Double refund refused across processes (Redis)
+==============================================================================
+  first refund True / reconstructed replay False / count 3
+  [PASS] first refund applied
+  [PASS] reconstructed token replay refused
+  [PASS] counter reflects exactly one refund
+
+==============================================================================
+D. Cross-account and old-generation tokens refused
+==============================================================================
+  A token used on B -> False (B count 1)
+  old-generation token -> False
+  [PASS] cross-account token refused
+  [PASS] other account's counter untouched
+  [PASS] old-generation token refused
+
+==============================================================================
+E. Redis key/TTL shape
+==============================================================================
+  counters=2 gen=2 claims=1
+    ratelimit:auth_account:2389eefd6f517ae16b2224f302ef2a10 value=1 ttl=60
+    ratelimit:auth_account:78a4990b62a6db83ea21d3c965770acd value=1 ttl=58
+    ratelimit:auth_account:2389eefd6f517ae16b2224f302ef2a10:gen:refunded:dcb97c8e280ec051:6d3cd1974005dbca ttl=58
+  [PASS] no plaintext identifier in any key  — leaked=[]
+  [PASS] every counter has a TTL
+  [PASS] every claim key has a TTL (no accumulation)
+
+==============================================================================
+F. Worker arm: end-to-end across both processes
+==============================================================================
+  first 429 at attempt 21 (threshold 20)
+  [PASS] threshold enforced across workers  — got 21
+  successful login status: 200
+  [PASS] login still works
+  [PASS] other account unaffected
+
+==============================================================================
+G. Serving process refuses to start without E02_ACCOUNT_KEY_SECRET
+==============================================================================
+  exit code: 3
+    
+    ERROR:    Application startup failed. Exiting.
+  [PASS] startup refused without the secret
+
+==============================================================================
+RESULT: ALL CHECKS PASSED
+==============================================================================
+
+--- worker output (tail) ---
+INFO:     Terminated child process [78025]
+INFO:     Waiting for child process [78024]
+INFO:     Shutting down
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [78025]
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [78024]
+INFO:     Waiting for child process [78025]
+INFO:     Stopping parent process [78021]

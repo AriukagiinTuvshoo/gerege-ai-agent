@@ -381,13 +381,13 @@ def call_anthropic_fallback(
     return None
 
 
-def format_persistent_conversation_context(sender_id: str, limit: int = 8) -> str:
+def format_persistent_conversation_context(sender_id: str, limit: int = 8, page_id: Optional[str] = None) -> str:
     """
     Баазад хадгалагдсан өмнөх харилцан ярианы түүхийг (Persistent Conversation Memory)
     сервер унтарч ассан ч алдахгүйгээр сэргээж контекст болгох
     """
     try:
-        rows = database.get_conversation_history(sender_id=sender_id, limit=limit)
+        rows = database.get_conversation_history(sender_id=sender_id, limit=limit, page_id=page_id)
     except Exception:
         return ""
     if not rows:

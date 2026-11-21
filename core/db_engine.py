@@ -1,8 +1,8 @@
 import os
 import re
-import ast
 import sqlite3
 import logging
+import threading
 from typing import Optional, Any, List, Sequence, Dict, Set
 from dotenv import load_dotenv
 
@@ -65,7 +65,7 @@ def create_sqlalchemy_engine(db_url: Optional[str] = None):
 
         return engine
     else:
-        return create_engine(
+        engine = create_engine(
             url,
             pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
             max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
@@ -74,6 +74,52 @@ def create_sqlalchemy_engine(db_url: Optional[str] = None):
             pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
             future=True,
         )
+
+        @event.listens_for(engine, "connect")
+        def _set_pg_session_bounds(dbapi_connection, connection_record):
+            """Bound every pooled session, not just the maintenance ones.
+
+            Phase 22 (P21-09). `core.db_bounds` bounds the backup/restore path, but the
+            application pool had all three timeouts at `0`. That matters because ~53
+            helpers acquire a connection and close it without `try/finally`; when an
+            exception unwinds and something retains the traceback (logging with
+            `exc_info`, an exception group, a stored test failure), the frame keeps the
+            connection alive. Reproduced: 5 such failures held 5 connections in
+            `idle in transaction`, retaining their row locks for as long as the traceback
+            lived - and with `idle_in_transaction_session_timeout = 0` nothing on the
+            server reclaims them. That is the exact mechanism that blocked the
+            `_reset_public_schema` ACCESS EXCLUSIVE lock and turned a recoverable restore
+            rollback into a hang.
+
+            The server-side bounds are the backstop for the client-side leak: a connection
+            that is abandoned mid-transaction is now rolled back by PostgreSQL after
+            `idle_in_transaction_session_timeout`, releasing its locks. `statement_timeout`
+            additionally stops a single pathological query from pinning a pool slot.
+
+            Values are generous enough not to alter behaviour under normal load, and each
+            is overridable. Set any of them to 0 to disable that bound (not recommended).
+            """
+            statements = (
+                ("idle_in_transaction_session_timeout",
+                 os.getenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "60000")),
+                ("statement_timeout", os.getenv("DB_STATEMENT_TIMEOUT_MS", "300000")),
+                ("lock_timeout", os.getenv("DB_LOCK_TIMEOUT_MS", "30000")),
+            )
+            cursor = dbapi_connection.cursor()
+            try:
+                for name, value in statements:
+                    cursor.execute(f"SET {name} = {int(value)}")
+                cursor.execute("SELECT 1")
+            except Exception:
+                # A session that refuses these SETs must not break every connection; the
+                # pool would become unusable. Report and continue unbounded rather than
+                # fail closed here, because this is a defence-in-depth backstop and the
+                # product must still serve traffic.
+                logger.warning("could not apply PostgreSQL session bounds")
+            finally:
+                cursor.close()
+
+        return engine
 
 
 def get_shared_engine():
@@ -144,6 +190,16 @@ class CompatRow(dict):
         return self._columns
 
 
+# Tables that carry an auto-increment `id` primary key.
+#
+# P1-01 (B-03): this used to be a hand-maintained set that omitted
+# `comment_automations` and `tracked_links`, so on PostgreSQL `lastrowid` stayed
+# `None` and callers received rows with `id: None`.
+#
+# The set is now only a *bootstrap cache*. `_has_serial_id_column()` resolves the
+# truth from the live catalog, so adding a table can never silently reintroduce the
+# bug. The static set is kept so the compat layer still works for a table created
+# inside the same transaction (before the catalog cache is refreshed).
 _SERIAL_ID_TABLES = {
     "registrations",
     "messages",
@@ -156,7 +212,75 @@ _SERIAL_ID_TABLES = {
     "appointments",
     "task_jobs",
     "audit_logs",
+    "comment_automations",
+    "tracked_links",
 }
+
+# Cache of tables verified (via information_schema) to have a serial `id`.
+_VERIFIED_SERIAL_TABLES: Set[str] = set()
+_SERIAL_CACHE_LOCK = threading.Lock()
+
+
+def _has_serial_id_column(table: str, conn=None) -> bool:
+    """
+    Тухайн хүснэгтэд auto-increment `id` багана байгаа эсэхийг каталог/схемээс тодорхойл.
+
+    `RETURNING id`-г зөвхөн үнэхээр `id` баганатай хүснэгтэд нэмнэ. Эс бөгөөс
+    PostgreSQL "column id does not exist" алдаа шидэж, INSERT бүхэлдээ унана.
+    """
+    tbl = str(table or "").strip().lower()
+    if not tbl:
+        return False
+
+    with _SERIAL_CACHE_LOCK:
+        if tbl in _VERIFIED_SERIAL_TABLES:
+            return True
+
+    probe_conn = conn
+    own_conn = False
+    try:
+        if probe_conn is None:
+            probe_conn = get_db_connection()
+            own_conn = True
+        cur = probe_conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = %s
+                  AND column_name = 'id'
+                LIMIT 1
+                """,
+                (tbl,),
+            )
+            found = cur.fetchone() is not None
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+    except Exception:
+        # Catalog unavailable (e.g. mid-DDL): fall back to the static bootstrap set.
+        return tbl in _SERIAL_ID_TABLES
+    finally:
+        if own_conn and probe_conn is not None:
+            try:
+                probe_conn.close()
+            except Exception:
+                pass
+
+    if found:
+        with _SERIAL_CACHE_LOCK:
+            _VERIFIED_SERIAL_TABLES.add(tbl)
+    return bool(found)
+
+
+def reset_serial_table_cache() -> None:
+    """Test helper: forget catalog lookups (used after schema changes)."""
+    with _SERIAL_CACHE_LOCK:
+        _VERIFIED_SERIAL_TABLES.clear()
 
 
 def translate_sql_for_postgres(sql: str) -> str:
@@ -254,7 +378,7 @@ class PostgresCompatCursor:
         added_returning = False
         if m_ins:
             tbl = m_ins.group(1).lower()
-            if tbl in _SERIAL_ID_TABLES and "RETURNING " not in pg_sql.upper():
+            if _has_serial_id_column(tbl) and "RETURNING " not in pg_sql.upper():
                 pg_sql = pg_sql.rstrip().rstrip(";") + " RETURNING id"
                 added_returning = True
 
@@ -346,6 +470,19 @@ class PostgresCompatConnection:
         if not self._closed:
             self._closed = True
             try:
+                # Phase 20: `close()` used to hand the raw connection straight back to the
+                # SQLAlchemy pool WITHOUT rolling back. psycopg2 opens a transaction on the
+                # first statement, so a reader that only ever SELECTed handed the pool a
+                # connection that was still `idle in transaction` — holding its locks until
+                # the next borrower happened to end the transaction. Nothing noticed until
+                # a DDL operation needed ACCESS EXCLUSIVE: `_reset_public_schema` waited out
+                # `lock_timeout`, and the restore rollback that exists to undo a bad restore
+                # could not run. Rolling back first matches `sqlite3.Connection.close()`,
+                # which discards the pending transaction, and releases the locks immediately.
+                self._conn.rollback()
+            except Exception:
+                pass
+            try:
                 self._conn.close()
             except Exception:
                 pass
@@ -361,6 +498,30 @@ class PostgresCompatConnection:
                 self.rollback()
         finally:
             self.close()
+
+    def __del__(self):
+        # Phase 20: last-resort release. `database.py` has dozens of helpers shaped
+        # ```conn = get_connection(); ...; conn.close()``` with no `try/finally`, so an
+        # exception anywhere in the middle skips `close()` and the connection goes back to
+        # the pool — except it never goes back, it stays checked out and, because psycopg2
+        # opened a transaction on the first statement, it is `idle in transaction` holding
+        # its row locks. Those locks outlive the failed call for the life of the process.
+        #
+        # This is not theoretical: it is what made the restore rollback hang. A restore test
+        # raised a foreign-key error, leaked one such connection, and the rollback that
+        # followed could not take ACCESS EXCLUSIVE on `pages` — so the atomic rollback that
+        # exists to undo a bad restore reported ROLLBACK_FAILED, and the suite waited out a
+        # 180 s psql timeout. Reproduced by lock inspection: the blocking session's last
+        # statement was `RELEASE SAVEPOINT sp_gerege_120`, i.e. one of these cursors.
+        #
+        # CPython releases the frame's locals deterministically when the exception unwinds,
+        # so this reclaims the connection at the same moment `try/finally` would have. It is
+        # a net, not a substitute: new code should still use `try/finally` or `with`.
+        if not getattr(self, "_closed", True):
+            try:
+                self.close()
+            except Exception:
+                pass
 
 
 def get_db_connection(sqlite_path: Optional[str] = None):
@@ -387,62 +548,30 @@ def get_db_connection(sqlite_path: Optional[str] = None):
 
 
 def verify_schema_drift() -> Dict[str, Any]:
+    """Compare the live database with `core/models.py`, types included.
+
+    **This used to be blind.** The previous implementation AST-parsed
+    `core/models.py` and `0001_initial_enterprise_schema.py` and compared the set of
+    column *names*, so it reported "no drift" for two schemas whose column types and
+    nullability disagreed on 58 columns, and it never looked at the live database at
+    all (P2-01).
+
+    It now delegates to `core.schema_manager.drift_report()`, which uses Alembic's
+    autogenerate machinery with `compare_type=True` against the real database.
+
+    Returns a dict; `has_drift` is False only when the database matches the models
+    exactly, including types, indexes, and constraints.
     """
-    `core/models.py`, `migrations/versions/0001_initial_enterprise_schema.py` болон
-    ажиллаж буй өгөгдлийн сангийн 15 хүснэгт ба баганыг тулгаж Schema Drift байгаа эсэхийг шалгах.
-    """
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    models_path = os.path.join(root_dir, "core", "models.py")
-    mig_path = os.path.join(root_dir, "migrations", "versions", "0001_initial_enterprise_schema.py")
+    from core.schema_manager import drift_report
 
-    # 1. Extract tables & columns from core/models.py via AST
-    models_tree = ast.parse(open(models_path, "r", encoding="utf-8").read(), filename="core/models.py")
-    model_tables: Dict[str, Set[str]] = {}
-    for node in models_tree.body:
-        if isinstance(node, ast.ClassDef):
-            tname = None
-            cols: Set[str] = set()
-            for item in node.body:
-                if isinstance(item, ast.Assign):
-                    for target in item.targets:
-                        if isinstance(target, ast.Name):
-                            if target.id == "__tablename__" and isinstance(item.value, ast.Constant):
-                                tname = str(item.value.value)
-                            elif isinstance(item.value, ast.Call):
-                                func = item.value.func
-                                fname = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-                                if fname == "Column":
-                                    cols.add(target.id)
-            if tname:
-                model_tables[tname] = cols
-
-    # 2. Extract tables & columns from Alembic 0001_initial_enterprise_schema.py via AST
-    mig_tree = ast.parse(open(mig_path, "r", encoding="utf-8").read(), filename="0001_initial_enterprise_schema.py")
-    mig_tables: Dict[str, Set[str]] = {}
-    for node in ast.walk(mig_tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "create_table":
-            if node.args and isinstance(node.args[0], ast.Constant):
-                tname = str(node.args[0].value)
-                cols = set()
-                for arg in node.args[1:]:
-                    if isinstance(arg, ast.Call) and getattr(arg.func, "attr", "") == "Column":
-                        if arg.args and isinstance(arg.args[0], ast.Constant):
-                            cols.add(str(arg.args[0].value))
-                mig_tables[tname] = cols
-
-    # 3. Compare model_tables vs mig_tables
-    drift_details: Dict[str, Any] = {}
-    for tname, m_cols in model_tables.items():
-        a_cols = mig_tables.get(tname, set())
-        if m_cols != a_cols:
-            drift_details[tname] = {
-                "in_models_only": sorted(m_cols - a_cols),
-                "in_alembic_only": sorted(a_cols - m_cols),
-            }
-
+    report = drift_report()
     return {
-        "has_drift": bool(drift_details) or (set(model_tables.keys()) != set(mig_tables.keys())),
-        "table_count": len(model_tables),
-        "tables": sorted(model_tables.keys()),
-        "drift_details": drift_details,
+        "has_drift": report.get("has_drift", True),
+        "table_count": 0,  # retained for backward compatibility
+        "tables": [],  # retained for backward compatibility
+        "drift_details": report.get("by_kind", {}),
+        "diff_count": report.get("count", 0),
+        "current_revision": report.get("current_revision"),
+        "head_revision": report.get("head_revision"),
+        "comparison": "alembic.autogenerate(compare_type=True)",
     }
