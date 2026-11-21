@@ -652,6 +652,12 @@ def verify_backup(filename: str, key_file: Optional[str] = None) -> Dict[str, An
         return {"valid": False, "error": "Backup file not found"}
     if not backup_archive.is_archive_name(clean_name):
         return {"valid": False, "error": "Unsupported backup file extension"}
+    # Phase 24 (F-1): the plaintext branch below never went through resolve(), so a symlink
+    # out of BACKUP_DIR was accepted here even after resolve() was guarded.
+    try:
+        backup_archive.assert_contained(BACKUP_DIR, clean_name)
+    except backup_archive.ArchiveError as exc:
+        return {"valid": False, "error": str(exc)}
     if os.path.getsize(fpath) == 0:
         return {"valid": False, "error": "Backup file is empty (0 bytes)"}
 

@@ -102,6 +102,35 @@ def _engine_of(inner_name: str) -> str:
     return "postgresql"
 
 
+def assert_contained(directory: str, name: str) -> str:
+    """Return the joined path, or raise if it resolves outside ``directory``.
+
+    Phase 24 (F-1). `resolve()` guarded only the encrypted path; `verify_backup` and the
+    plaintext restore path joined `BACKUP_DIR + name` directly and followed symlinks
+    without question, so a symlink to a valid dump elsewhere on the filesystem was accepted
+    and executed by `psql`. Reproduced on a disposable database.
+
+    `realpath` rather than `islink`: a link pointing *inside* the directory is harmless and
+    refusing it would break legitimate layouts.
+    """
+    clean = os.path.basename(name)
+    path = os.path.join(directory, clean)
+    real_directory = os.path.realpath(directory)
+    real_path = os.path.realpath(path)
+    try:
+        contained = os.path.commonpath([real_directory, real_path]) == real_directory
+    except ValueError:
+        # Different drives / an unmergeable path pair: treat as escaping.
+        contained = False
+    if not contained:
+        raise ArchiveError(
+            f"archive {clean} resolves to {real_path}, which is outside the backup "
+            f"directory {real_directory}; refusing to use it. Backups must live inside "
+            "BACKUP_DIR - a link pointing elsewhere could substitute arbitrary SQL."
+        )
+    return path
+
+
 def resolve(directory: str, name: str, key_file: Optional[str] = None) -> ResolvedArchive:
     """Turn ``directory/name`` into a plaintext view, decrypting when necessary.
 
@@ -112,6 +141,9 @@ def resolve(directory: str, name: str, key_file: Optional[str] = None) -> Resolv
     path = os.path.join(directory, clean)
     if not os.path.exists(path):
         raise ArchiveError(f"archive not found: {clean}")
+
+    # Phase 24 (F-1): refuse an archive whose real path escapes the backup directory.
+    assert_contained(directory, clean)
 
     if is_plaintext_name(clean):
         return ResolvedArchive(clean, path, _engine_of(clean), "plaintext")
