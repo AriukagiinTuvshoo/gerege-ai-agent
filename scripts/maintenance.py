@@ -73,7 +73,16 @@ def _describe_connection(service) -> None:
         return
     from core.db_engine import get_db_connection
 
-    conn = get_db_connection()
+    # Phase 24 (D-8): this banner is diagnostic only, but it opened a connection with no
+    # handler. An unreachable database therefore produced a raw psycopg2 traceback from
+    # `raw_connection()` before the backup had even started - the operator got 20 frames of
+    # SQLAlchemy internals instead of "I cannot reach the database". The banner must never
+    # be able to abort the command; whatever it cannot determine is simply not printed.
+    try:
+        conn = get_db_connection()
+    except Exception as exc:  # noqa: BLE001
+        print(f"engine: postgresql   (cannot describe connection: {type(exc).__name__})")
+        return
     try:
         cur = conn.cursor()
         cur.execute(
@@ -83,6 +92,9 @@ def _describe_connection(service) -> None:
         )
         user, owned = cur.fetchone()
         cur.close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"engine: postgresql   (cannot read role: {type(exc).__name__})")
+        return
     finally:
         try:
             conn.close()
@@ -674,4 +686,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Phase 24 (D-8): `MaintenanceCredentialRequired` is a deliberate precondition, not a
+    # crash - it names the wrong role, the empty schema, or an unreachable database. Letting
+    # it escape produced a 20-frame psycopg2/SQLAlchemy traceback that buries the one line
+    # an operator needs. It is reported, with exit 15 ("not configured"), which is the code
+    # the table already assigns to a run that cannot be performed correctly.
+    #
+    # Every other exception is left alone: an unexpected failure of unknown shape should
+    # keep its traceback, because that is what a bug report needs.
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001
+        from core.backup_service import MaintenanceCredentialRequired
+
+        if isinstance(exc, MaintenanceCredentialRequired):
+            print(f"cannot run: {exc}", file=sys.stderr)
+            sys.exit(15)
+        raise
