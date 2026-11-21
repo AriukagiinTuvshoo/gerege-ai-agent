@@ -65,7 +65,7 @@ def create_sqlalchemy_engine(db_url: Optional[str] = None):
 
         return engine
     else:
-        return create_engine(
+        engine = create_engine(
             url,
             pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
             max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
@@ -74,6 +74,52 @@ def create_sqlalchemy_engine(db_url: Optional[str] = None):
             pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
             future=True,
         )
+
+        @event.listens_for(engine, "connect")
+        def _set_pg_session_bounds(dbapi_connection, connection_record):
+            """Bound every pooled session, not just the maintenance ones.
+
+            Phase 22 (P21-09). `core.db_bounds` bounds the backup/restore path, but the
+            application pool had all three timeouts at `0`. That matters because ~53
+            helpers acquire a connection and close it without `try/finally`; when an
+            exception unwinds and something retains the traceback (logging with
+            `exc_info`, an exception group, a stored test failure), the frame keeps the
+            connection alive. Reproduced: 5 such failures held 5 connections in
+            `idle in transaction`, retaining their row locks for as long as the traceback
+            lived - and with `idle_in_transaction_session_timeout = 0` nothing on the
+            server reclaims them. That is the exact mechanism that blocked the
+            `_reset_public_schema` ACCESS EXCLUSIVE lock and turned a recoverable restore
+            rollback into a hang.
+
+            The server-side bounds are the backstop for the client-side leak: a connection
+            that is abandoned mid-transaction is now rolled back by PostgreSQL after
+            `idle_in_transaction_session_timeout`, releasing its locks. `statement_timeout`
+            additionally stops a single pathological query from pinning a pool slot.
+
+            Values are generous enough not to alter behaviour under normal load, and each
+            is overridable. Set any of them to 0 to disable that bound (not recommended).
+            """
+            statements = (
+                ("idle_in_transaction_session_timeout",
+                 os.getenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "60000")),
+                ("statement_timeout", os.getenv("DB_STATEMENT_TIMEOUT_MS", "300000")),
+                ("lock_timeout", os.getenv("DB_LOCK_TIMEOUT_MS", "30000")),
+            )
+            cursor = dbapi_connection.cursor()
+            try:
+                for name, value in statements:
+                    cursor.execute(f"SET {name} = {int(value)}")
+                cursor.execute("SELECT 1")
+            except Exception:
+                # A session that refuses these SETs must not break every connection; the
+                # pool would become unusable. Report and continue unbounded rather than
+                # fail closed here, because this is a defence-in-depth backstop and the
+                # product must still serve traffic.
+                logger.warning("could not apply PostgreSQL session bounds")
+            finally:
+                cursor.close()
+
+        return engine
 
 
 def get_shared_engine():
