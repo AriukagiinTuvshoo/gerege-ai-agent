@@ -126,6 +126,59 @@ def clear_audit_logs_for_test(conn=None):
 
 
 # ---------------------------------------------------------------------------
+# Copying a live SQLite database (Phase 22, CI step 17 root cause)
+# ---------------------------------------------------------------------------
+# `shutil.copy2(database.DB_PATH, dest)` is **not** a faithful copy of a live database.
+# The application opens SQLite in WAL mode, so committed data can still live in the
+# `-wal` sidecar; copying only the main file yields a database that may be missing entire
+# tables. That is not a rare race - it depends on when SQLite last checkpointed, which
+# differs between machines.
+#
+# Reproduced: a WAL-mode database with an open connection, one committed `CREATE TABLE`
+# plus rows, copied with `shutil.copy2`, produced a copy with **no tables at all**, and the
+# caller's next statement failed with `sqlite3.OperationalError: no such table: pages`.
+# That is exactly how CI step 17 failed while passing locally 151/151: the same test
+# copies `database.DB_PATH`, and CI's checkpoint timing left the schema in the WAL.
+#
+# `sqlite3.Connection.backup()` is the API for this: it reads through the WAL. The product
+# already uses it in `scripts/migrate_sqlite_to_postgres.create_sqlite_snapshot`; these
+# helpers give tests the same guarantee instead of relying on checkpoint luck.
+def copy_sqlite_database(source_path: str, dest_path: str) -> str:
+    """Copy a live SQLite database consistently, including anything still in the WAL.
+
+    Returns ``dest_path``. Raises if the source does not exist, so a caller never gets a
+    silently empty database.
+    """
+    import sqlite3
+
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"SQLite database not found: {source_path}")
+    src = sqlite3.connect(source_path)
+    dst = sqlite3.connect(dest_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return dest_path
+
+
+@pytest.fixture()
+def sqlite_db_copy(tmp_path):
+    """Factory returning consistent copies of the live database.
+
+    Usage: ``copy = sqlite_db_copy("src.db")``. Prefer this over `shutil.copy2` in any test
+    that reads the database through a second connection.
+    """
+    import database as _database
+
+    def _make(name: str) -> str:
+        return copy_sqlite_database(_database.DB_PATH, str(tmp_path / name))
+
+    return _make
+
+
+# ---------------------------------------------------------------------------
 # Backup encryption test configuration (Phase 20)
 # ---------------------------------------------------------------------------
 #: Test-only AES-256 key. Obviously not a secret; production supplies its own through

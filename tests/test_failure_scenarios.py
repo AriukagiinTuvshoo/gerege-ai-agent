@@ -29,6 +29,7 @@ from core import backup_service
 from core.task_queue import TaskQueue, task_queue
 from core.monitoring import telemetry, redact_secrets
 from scripts import migrate_sqlite_to_postgres as mig
+from tests.conftest import copy_sqlite_database as conftest_copy_sqlite_database
 
 database.init_db()
 client = TestClient(main.app)
@@ -193,8 +194,13 @@ def test_scenario_11_migration_conflict_detected_and_aborted_without_overwrite()
     try:
         src_path = os.path.join(tmp_dir, "src.db")
         dst_path = os.path.join(tmp_dir, "dst.db")
-        shutil.copy2(database.DB_PATH, src_path)
-        shutil.copy2(database.DB_PATH, dst_path)
+        # NOT `shutil.copy2`. The application runs SQLite in WAL mode, so committed data
+        # can still be in the `-wal` sidecar; copying the main file alone produced a copy
+        # with no tables and this test failed with `no such table: pages` whenever SQLite
+        # had not checkpointed yet - which is why it passed locally and failed in CI.
+        # `sqlite3.Connection.backup()` reads through the WAL.
+        conftest_copy_sqlite_database(database.DB_PATH, src_path)
+        conftest_copy_sqlite_database(database.DB_PATH, dst_path)
 
         # Tamper with one row in dst_path so it conflicts with src_path
         conn = sqlite3.connect(dst_path)
