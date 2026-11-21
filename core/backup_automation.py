@@ -348,22 +348,46 @@ def copy_offsite(src: str, target: str) -> Tuple[bool, str]:
 
 
 def notify(webhook: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
-    """POST a JSON status. Best-effort, bounded, and never raises.
+    """POST a JSON status. Best-effort, bounded, retried, and never raises.
 
     An alerting failure must not turn a successful backup into a failed one, and must
     not mask a failed backup — it is reported in the status file instead.
+
+    Phase 22: the call is retried a bounded number of times with a fixed short backoff.
+    A single attempt meant one dropped TCP packet or one transient 503 from a webhook
+    receiver silently lost the alert for a failed backup — the failure it was reporting
+    stayed invisible. The retry count and delay are deliberately small and constant: an
+    alert that has to wait for a long exponential backoff is nearly as lost as one that
+    was never sent, and every attempt is bounded by its own timeout so the total wait is
+    bounded too (attempts × timeout + backoff).
+
+    Only transient failures are retried. A 4xx means the request itself is wrong and
+    repeating it cannot help, so it is reported immediately.
     """
+    import time as _time
+    import urllib.error
     import urllib.request
 
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        webhook, data=body, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return (200 <= resp.status < 300), f"http {resp.status}"
-    except Exception as exc:
-        return False, f"notification failed: {type(exc).__name__}"
+    attempts = max(1, min(int(os.getenv("BACKUP_ALERT_RETRIES", "3")), 10))
+    backoff = max(0.0, min(float(os.getenv("BACKUP_ALERT_BACKOFF_S", "1")), 10.0))
+    last = "notification failed"
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(
+            webhook, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return (200 <= resp.status < 300), f"http {resp.status}"
+        except urllib.error.HTTPError as exc:
+            last = f"notification failed: HTTP {exc.code}"
+            if 400 <= exc.code < 500:
+                return False, last          # not retryable: the request is the problem
+        except Exception as exc:
+            last = f"notification failed: {type(exc).__name__}"
+        if attempt < attempts and backoff:
+            _time.sleep(backoff)
+    return False, f"{last} (after {attempts} attempts)"
 
 
 # ---------------------------------------------------------------------------
