@@ -52,6 +52,11 @@ EXIT_CREDENTIAL_INVALID = 13
 EXIT_OFFSITE_FAILED = 14
 EXIT_NOT_CONFIGURED = 15
 EXIT_LOCKED = 16
+#: Phase 23 (D-7): a configured bound was exceeded (database or pg_dump timeout). 17 is
+#: reserved for `maintenance.py legacy` reporting plaintext on disk, so a timeout needs its
+#: own code - and it needs to be *named* here, because alerting and `status` read these
+#: constants, and a bare 18 in `backup_service.py` was invisible to them.
+EXIT_TIMEOUT = 18
 
 ENCRYPTED_SUFFIX = ".enc"
 DEFAULT_RETENTION_DAYS = 14
@@ -553,8 +558,20 @@ def _run_scheduled_backup_locked(label: str, directory: str, result: Dict[str, A
             return result
 
         if not created.get("success"):
-            result.update(success=False, exit_code=EXIT_BACKUP_FAILED,
-                          error=str(created.get("error") or "backup failed"))
+            # Phase 23 (D-7): preserve the code the service chose. This overwrote every
+            # failure with EXIT_BACKUP_FAILED (10), so the *scheduled* path - the one a
+            # timer actually runs - reported a lock timeout as a generic backup failure
+            # while `maintenance.py backup` correctly exited 18. The documented code table
+            # promised an operator could tell "exceeded a bound" from "the backup failed";
+            # for the scheduled path that promise was false. A default is correct here, an
+            # override is not - the same shape as the `create_backup` bug Phase 22 fixed.
+            result.update(
+                success=False,
+                exit_code=created.get("exit_code") or EXIT_BACKUP_FAILED,
+                error=str(created.get("error") or "backup failed"),
+            )
+            if created.get("timeout"):
+                result["timeout"] = True
             _finish(result, directory)
             return result
 

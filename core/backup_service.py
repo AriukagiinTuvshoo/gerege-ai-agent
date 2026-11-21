@@ -961,8 +961,17 @@ def _verify_restored_sqlite(db_path: str, expected_counts: Dict[str, int]) -> Di
                 "verified": False,
                 "error": f"Restored SQLite row count mismatch: {mismatches}",
                 "table_counts": actual_counts,
+                "row_counts_checked": True,
             }
-        return {"verified": True, "table_counts": actual_counts}
+        # Phase 23: `verified` here means "the structure is intact". It does NOT mean the
+        # row counts were compared - with an empty `expected_counts` the loop above skips
+        # every table, so nothing was compared at all. Callers that report a *verified
+        # restore* to an operator must not treat this as proof of content.
+        return {
+            "verified": True,
+            "table_counts": actual_counts,
+            "row_counts_checked": bool(expected_counts),
+        }
     finally:
         conn.close()
 
@@ -1018,8 +1027,15 @@ def _verify_restored_postgres(pg_url: str, expected_counts: Dict[str, int]) -> D
                     "verified": False,
                     "error": f"Restored PostgreSQL row count mismatch: {mismatches}",
                     "table_counts": actual_counts,
+                    "row_counts_checked": True,
                 }
-            return {"verified": True, "table_counts": actual_counts}
+            # Phase 23: see the SQLite twin. Structure intact, but with no expectations
+            # nothing was compared.
+            return {
+                "verified": True,
+                "table_counts": actual_counts,
+                "row_counts_checked": bool(expected_counts),
+            }
     finally:
         engine.dispose()
 
@@ -1481,12 +1497,29 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
                 except Exception:
                     pass
 
+        # Phase 23: `post_restore_verified` must not be True when nothing was compared.
+        # An archive with no manifest (older than the manifest, or published despite the
+        # "could not publish the backup manifest" warning) leaves `expected_counts` empty,
+        # and the verifier then compares no table. Reporting True was a vacuous pass - the
+        # exact consequence Phase 22's N-2 claimed to have removed.
+        #
+        # The restore still SUCCEEDS. Failing it would make disaster recovery impossible for
+        # any pre-manifest archive, and `cmd_restore` gates on `success`, so it would also
+        # trigger a pointless rollback over a database that is actually fine. The claim is
+        # narrowed instead of the operation being blocked.
+        _counts_checked = bool(live_check.get("row_counts_checked"))
         return {
             "success": True,
             "engine": "sqlite",
             "restored_from": clean_name,
             "pre_restore_snapshot": pre_snap.get("filename"),
-            "post_restore_verified": True,
+            "post_restore_verified": _counts_checked,
+            "row_counts_checked": _counts_checked,
+            "verification_note": None if _counts_checked else (
+                "Structure was verified, but row counts were NOT compared: this archive "
+                "has no manifest (expected_counts was empty). Data loss inside the restored "
+                "tables cannot be ruled out."
+            ),
             "rolled_back": False,
             "atomic_rollback": False,
             "restored_table_counts": live_check.get("table_counts", {}),
@@ -1744,12 +1777,21 @@ def _restore_resolved(resolved, clean_name: str, encrypted: bool, target_db_url,
         # Restore and verification both succeeded!
         # Phase 20: destroy the decrypted snapshot copy if one was staged for replay.
         pre_stage.cleanup()
+        # Phase 23: see the SQLite twin - a restore whose row counts were never compared
+        # must not report itself as verified.
+        _counts_checked = bool(pg_check.get("row_counts_checked"))
         return {
             "success": True,
             "engine": "postgresql",
             "restored_from": clean_name,
             "pre_restore_snapshot": pre_name,
-            "post_restore_verified": True,
+            "post_restore_verified": _counts_checked,
+            "row_counts_checked": _counts_checked,
+            "verification_note": None if _counts_checked else (
+                "Structure was verified, but row counts were NOT compared: this archive "
+                "has no manifest (expected_counts was empty). Data loss inside the restored "
+                "tables cannot be ruled out."
+            ),
             "rolled_back": False,
             "atomic_rollback": False,
             "restored_table_counts": pg_check.get("table_counts", {}),

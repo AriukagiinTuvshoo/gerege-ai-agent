@@ -315,6 +315,18 @@ def cmd_restore(filename: str, assume_yes: bool) -> int:
         )
         counts = result.get("restored_table_counts") or {}
         print(f"  rows: audit_logs={counts.get('audit_logs')} pages={counts.get('pages')}")
+        # Phase 23: do not let "restore OK" imply the contents were checked when the
+        # archive carried no manifest. The restore is still correct to keep; the claim
+        # about it is what has to shrink.
+        if not result.get("row_counts_checked", True):
+            print(
+                "\n  WARNING: row counts were NOT verified. " + str(result.get("verification_note") or ""),
+                file=sys.stderr,
+            )
+            print(
+                "  Inspect the restored data before restarting the application.",
+                file=sys.stderr,
+            )
         note = result.get("grant_note")
         if note:
             print(f"\ngrants: {note}")

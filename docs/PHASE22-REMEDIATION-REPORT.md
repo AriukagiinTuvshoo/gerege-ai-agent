@@ -22,8 +22,14 @@ found them is the reason the rest of it can be believed.
 | Baseline HEAD at Phase 22 start | `31de90e9ecf0a8971e88650c6170cae2e2d1af60` |
 | Baseline CI run | `44654588622` — **success**, 54/54 steps |
 | PR #1 | **OPEN**, mergeable, from this branch only |
-| Final HEAD (this report) | `10227a2` |
-| Final CI | run `44870665596` — **success**, 54/54 steps, **0 failures** |
+| Final HEAD (this report) | `10227a2`; the branch later advanced to `50c47d3` (docs only) |
+| Final CI | `10227a2` → run `44870188807` **success**, 54/54, 0 failures · `50c47d3` → run `44870697565` **success** |
+
+> **Corrected in Phase 23.** An earlier revision of this table cited CI run `44870665596`,
+> which **does not exist** — the Actions API returns 404 for it. The same audit found this
+> report listing `b9c4f28` as successful when it actually failed at step 29. Section 11 now
+> carries the authoritative run-by-run table; `docs/PHASE23-FINAL-VERIFICATION.md` records
+> the audit that found the discrepancy.
 
 The baseline matched the Phase 21 audit's description, so no stop-and-report condition was
 triggered.
@@ -156,7 +162,7 @@ Each was reproduced before being fixed.
 | # | Finding | Severity | Disposition |
 |---|---|---|---|
 | N-1 | **`verify_schema_drift()` checked the wrong database.** The rollback invariant called it with no argument, so it inspected `DATABASE_URL` — SQLite — while a column had just been added to the PostgreSQL target, and reported "no drift". A check that can pass without looking at its subject | HIGH | Fixed: the restore target is passed explicitly |
-| N-2 | **Encrypted backups published no manifest.** Written into staging, never published on the encrypted path, so `_load_expected_counts()` returned `{}` for every encrypted archive and post-restore verification had nothing to compare — a restore that dropped every row would pass | HIGH | Fixed: manifest published, rewritten to name the ciphertext |
+| N-2 | **Encrypted backups published no manifest.** Written into staging, never published on the encrypted path, so `_load_expected_counts()` returned `{}` for every encrypted archive and post-restore verification had nothing to compare — a restore that dropped every row would pass | HIGH | **Partially fixed.** Manifest now published and named after the ciphertext — but see **D-6**: the verifier still passed vacuously when no manifest was present. Phase 23 closed that. |
 | N-3 | **`prune()` deleted files it could not classify.** An `.enc` with an unknown header was aged and deleted; could be a newer format or a different key | MEDIUM | Fixed: unknown files are never auto-deleted |
 | N-4 | **Successful quarantine reported failure.** Exit status computed from the pre-move list, so `legacy --quarantine --yes` moved everything and still exited 17 | LOW | Fixed: status describes the directory as it now stands |
 | N-5 | **Exit code 17 meant two things.** Timeout in the backup path, "plaintext present" in `legacy` | MEDIUM | Fixed: timeouts are 18; table documented |
@@ -169,6 +175,7 @@ Each was reproduced before being fixed.
 | N-12 | **Alerting made a single attempt** — one dropped packet lost the alert for a failed backup | MEDIUM | Fixed: bounded retry, 4xx not retried |
 | N-13 | **CI could not report which test failed** | MEDIUM | Fixed: names on the annotation's first line |
 | N-14 | **The N-8 key check was itself wrong**, and broke CI: it duplicated `load_key`'s accepted lengths as a byte-count set, omitted the newline the documented `base64` generator writes, and refused the 45-byte key CI uses — step 29, exit 11 | HIGH (self-inflicted) | Fixed: the policy asks `load_key` instead of restating its rules |
+| **D-6** | **Restore verification passed vacuously without a manifest** (found in Phase 23). Both verifiers skip any table not in `expected_counts`, so an empty manifest compared *nothing* and still returned `verified: True`. Reproduced by deleting `*.meta.json` and restoring: `post_restore_verified: True`. This is the consequence N-2 claimed to remove | HIGH | Fixed in Phase 23: `row_counts_checked` distinguishes "structure checked" from "counts compared"; an uncompared restore reports `post_restore_verified: False` plus a reason, while still succeeding so pre-manifest archives stay recoverable |
 
 Two of these (N-1, N-9) were defects *in Phase 22's own work*, caught by Phase 22's own
 negative controls. They are listed because the controls working is the point.
@@ -347,7 +354,7 @@ SHA-256 matched against a locally recorded digest.
 
 ## 11. Git and CI
 
-**Commits (19), baseline `31de90e` → HEAD `10227a2`:**
+**Commits (21), baseline `31de90e` → HEAD `50c47d3`** (20 through `10227a2`):
 
 ```
 10227a2 fix(policy): ask the key loader instead of restating its rules
@@ -375,14 +382,36 @@ fbcf933 fix(backup): bound every backup database operation (P21-10)
 Pushed **only** to `arena/d78ebf88-gerege-ai-agent`. `main` untouched. PR #1 open, not
 merged. No force-push, no history rewrite, no deployment, no production access.
 
-**CI runs on this branch:** `e6fd261`, `81a628a`, `6291da3`, `4a88af3`, `b9c4f28` all
-**success**, 54/54 steps. The four commits before `e6fd261` failed step 17 for the reason in
-§2. - `cf19bea` **failed step 29 at exit 11** for N-14. Step 29 was extracted from `ci.yml`
-  and run locally in the CI environment before the next push (exit 0), then `10227a2` was
-  green on the full workflow.
+**CI history, corrected.** The earlier revision of this section claimed `b9c4f28` was a
+success and that "the four commits before `e6fd261`" failed step 17. Both were wrong. The
+authoritative history, taken from the Actions API:
 
-Final run `44870665596` on `10227a2`: **54/54 steps, 0 failures**, and the reported
-failures count from the API is `0`.
+| Commit | Run | Result |
+|---|---|---|
+| `56ab3cb` … `fc83a1c` (6 commits) | **none** | **never ran in CI** (`total_count=0`) |
+| `a1db789` | `44762160502` | failure — step 17 |
+| `15287a3` | `44766838374` | failure — step 17 |
+| `18e73f9` | `44769999587` | failure — step 17 |
+| `715480c` | `44863835098` | failure — step 17 |
+| `f2b3aeb` | `44864441744` | failure — step 17 |
+| `88c1adc` | `44864968615` | failure — step 17 |
+| `e6fd261` | `44866192167` | **success** — 54/54 (the WAL fix) |
+| `81a628a` | `44867084989` | success |
+| `f78533c` | `44867720999` | success |
+| `6291da3` | `44867816666` | success |
+| `4a88af3` | `44867924898` | success |
+| `b9c4f28` | `44868935540` | **failure — step 29, exit 11** (N-14) |
+| `cf19bea` | `44869060836` | failure — step 29, exit 11 |
+| `10227a2` | `44870188807` | **success** — 54/54, 0 failures |
+| `50c47d3` | `44870697565` | **success** — 54/54, 0 failures |
+
+Two corrections worth stating plainly rather than burying:
+
+1. **Six commits were never gated by CI at all.** `56ab3cb` through `fc83a1c` — including
+   P21-01 (production encryption) and P21-10 (DB bounds) — have no workflow run. Their
+   correctness rested on local test evidence only. Phase 23 re-verified them independently.
+2. **Six runs failed on step 17, not four**, and `b9c4f28`'s failure was a *regression this
+   phase introduced*, not a pre-existing condition.
 
 ---
 
@@ -393,9 +422,9 @@ failures count from the API is `0`.
 | **SECURITY** | **CONDITIONAL GO** | Production plaintext bypass closed and verified at zero DB contact; secrets kept out of logs and alerts. Residual: the 53 unguarded helpers are contained by server-side bounds, not eliminated. |
 | **ENCRYPTION** | **GO** | AEAD v2 with bound chunk index/length/version; reorder, truncation, replay, downgrade all rejected; v1 readable with its weakness documented. |
 | **BACKUP** | **GO** | Bounded, fail-closed, encrypted, manifest-published, verified by decrypting before publish. |
-| **RESTORE** | **GO** | Rejects corrupt archives; verifies row counts and three invariants; idempotent. |
+| **RESTORE** | **CONDITIONAL GO** | Rejects corrupt archives; verifies row counts and three invariants; idempotent. **Condition:** as originally shipped it could report a verified restore having compared nothing (D-6). Closed in Phase 23 — an uncompared restore now reports `post_restore_verified: false` and names why. |
 | **ROLLBACK** | **GO** | Only claims success when all invariants pass; `RECOVERY_REQUIRED` otherwise. |
-| **RECOVERY** | **GO** | Pre-restore snapshot preserved; drift, ownership and grants checked; failure injection at each stage. |
+| **RECOVERY** | **CONDITIONAL GO** | Pre-restore snapshot preserved; drift, ownership and grants checked; failure injection at each stage. **Condition:** recovery relied on a verification signal that could be vacuous (D-6); the narrowed claim is what makes "recovered and verified" mean something. |
 | **OFFSITE** | **NOT VERIFIED** | Complete pagination, digest verification, four-state reporting — proven only against a local S3-compatible server. No real provider has been exercised. |
 | **SCHEDULER** | **NOT CONFIGURED** | Templates exist; nothing is installed. Reported as such by `status`. |
 | **ALERTING** | **NOT CONFIGURED** | Mechanism implemented, retried and tested; no destination is configured. |
