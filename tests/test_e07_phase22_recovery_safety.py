@@ -76,12 +76,23 @@ def _require_disposable_database(name: str) -> None:
         conn.close()
 
 
-def _dsn(name: str, role: str = "gerege_owner", password: str = "p22_owner") -> str:
-    return f"postgresql+psycopg2://{role}:{password}@127.0.0.1:5432/{name}"
+# Credentials for the throwaway PostgreSQL these tests create and drop. The defaults match
+# the disposable local cluster; P22_PG_PASSWORD overrides them so the value never has to be
+# correct for a real environment, and no credential is committed for one.
+_P22_OWNER_PASSWORD = os.getenv("P22_PG_PASSWORD", "p22_owner")
 
 
-def _libpq(name: str, role: str = "gerege_owner", password: str = "p22_owner") -> str:
-    return f"postgresql://{role}:{password}@127.0.0.1:5432/{name}"
+def _dsn(name: str, role: str = "gerege_owner", password: str = "") -> str:
+    return (
+        f"postgresql+psycopg2://{role}:{password or _P22_OWNER_PASSWORD}"
+        f"@127.0.0.1:5432/{name}"
+    )
+
+
+def _libpq(name: str, role: str = "gerege_owner", password: str = "") -> str:
+    return (
+        f"postgresql://{role}:{password or _P22_OWNER_PASSWORD}@127.0.0.1:5432/{name}"
+    )
 
 
 def _database_name_from_env() -> Optional[str]:
