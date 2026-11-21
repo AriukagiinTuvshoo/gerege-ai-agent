@@ -22,8 +22,8 @@ found them is the reason the rest of it can be believed.
 | Baseline HEAD at Phase 22 start | `31de90e9ecf0a8971e88650c6170cae2e2d1af60` |
 | Baseline CI run | `44654588622` — **success**, 54/54 steps |
 | PR #1 | **OPEN**, mergeable, from this branch only |
-| Final HEAD (this report) | `b9c4f28` |
-| Final CI | see §11 |
+| Final HEAD (this report) | `10227a2` |
+| Final CI | run `44870665596` — **success**, 54/54 steps, **0 failures** |
 
 The baseline matched the Phase 21 audit's description, so no stop-and-report condition was
 triggered.
@@ -347,9 +347,11 @@ SHA-256 matched against a locally recorded digest.
 
 ## 11. Git and CI
 
-**Commits (18), baseline `31de90e` → HEAD `b9c4f28`:**
+**Commits (19), baseline `31de90e` → HEAD `10227a2`:**
 
 ```
+10227a2 fix(policy): ask the key loader instead of restating its rules
+cf19bea docs(phase22): the remediation report...
 b9c4f28 fix(backup): make the documented exit codes the codes actually emitted
 4a88af3 fix(offsite): let the documented path reach a local S3 server...
 6291da3 fix(alerting): retry delivery...
@@ -375,8 +377,12 @@ merged. No force-push, no history rewrite, no deployment, no production access.
 
 **CI runs on this branch:** `e6fd261`, `81a628a`, `6291da3`, `4a88af3`, `b9c4f28` all
 **success**, 54/54 steps. The four commits before `e6fd261` failed step 17 for the reason in
-§2. `cf19bea` failed **step 29 at exit 11** for N-14; `cf19bea`'s successor fixes it and was
-verified with step 29 run locally (exit 0) before being pushed.
+§2. - `cf19bea` **failed step 29 at exit 11** for N-14. Step 29 was extracted from `ci.yml`
+  and run locally in the CI environment before the next push (exit 0), then `10227a2` was
+  green on the full workflow.
+
+Final run `44870665596` on `10227a2`: **54/54 steps, 0 failures**, and the reported
+failures count from the API is `0`.
 
 ---
 
