@@ -147,6 +147,24 @@ head -c 32 /dev/urandom | base64 > /etc/gerege/backup.key
 chmod 0400 /etc/gerege/backup.key
 ```
 
+### Installing the timer
+
+`deploy/systemd/` and `deploy/cron/` are templates. As of Phase 24 there is a lifecycle
+command that installs them safely, reports `installed`/`enabled`/`active` separately, and can
+remove them again without touching archives or the environment file:
+
+```bash
+python scripts/maintenance.py scheduler dry-run     # plan only, writes nothing
+python scripts/maintenance.py scheduler status
+sudo python scripts/maintenance.py scheduler install
+```
+
+Full procedure, prerequisites and the exit-code table: **[SCHEDULER-SETUP.md](../SCHEDULER-SETUP.md)**.
+Alerting: **[ALERTING-SETUP.md](../ALERTING-SETUP.md)**. Offsite and how to earn `VERIFIED`:
+**[OFFSITE-BACKUP-SETUP.md](../OFFSITE-BACKUP-SETUP.md)**.
+
+---
+
 ## 6. Operator requirements — NOT CONFIGURED in this repository
 
 Everything in this section is infrastructure and **none of it is configured here**. Do
@@ -154,7 +172,9 @@ not mark backups as operational until each line is true in the target environmen
 
 - [ ] **Scheduler installed and enabled** — `deploy/systemd/gerege-backup.timer`
       (hourly `OnCalendar`) or `deploy/cron/gerege-backup.cron`. Present in the repo as
-      a template; **not installed on any host by this repository**.
+      templates. `maintenance.py scheduler install` will install them, but **nothing is
+      installed on any host by this repository**, and the installer has not been run
+      against a live systemd. See [SCHEDULER-SETUP.md](../SCHEDULER-SETUP.md).
 - [ ] **Failure notification endpoint** — `BACKUP_ALERT_WEBHOOK` pointed at a real
       destination. Without it, failures are recorded in the status file and in the
       journal, and **nobody is told**.

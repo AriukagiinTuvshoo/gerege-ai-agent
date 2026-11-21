@@ -27,6 +27,13 @@
   `scripts/maintenance.py restore` with the owner credential (E-05 removed the restore
   HTTP endpoint). The only defensible RTO figure is one measured in a restore drill on
   the real dataset — see §3.2. The previous "≤ 5 minutes" was never measured.
+- **Measured in Phase 24 — and what it does not tell you.** On a disposable 19-table
+  PostgreSQL 16 fixture with a 7.5 KB archive: backup 0.11–0.33 s, archive verify
+  < 0.01 s, restore 0.25–0.27 s. These are real observations from
+  `tests/test_e07_phase24_disaster_recovery.py`, recorded so a regression is visible. They
+  are **not** an RTO and must not be quoted as one: the fixture is tiny, local, and has no
+  network latency to the backup directory or offsite target. A real RTO is the wall-clock
+  time of §3.2 on the actual dataset, which has never been run.
 - **Retention Policy:** age-based (`BACKUP_RETENTION_DAYS`, default 14) with a hard
   count floor (`BACKUP_MIN_KEEP`, default 7), so a retention bug cannot delete every
   archive. Enforced by `maintenance.py backup-run` and available manually via

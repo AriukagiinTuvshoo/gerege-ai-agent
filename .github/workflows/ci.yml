@@ -1386,6 +1386,63 @@ jobs:
       # with BACKUP_ENCRYPTION=on; a unit test that monkeypatches the backup service
       # would happily miss a regression that reintroduced it. This runs the command an
       # operator actually runs, and fails if a single plaintext archive appears.
+      # Phase 24: the operational-hardening suites. None of these needs a live database or
+      # systemd - the scheduler lifecycle is exercised against disposable directories with an
+      # injected systemctl, redaction and alert retry against a local HTTP sink, and archive
+      # containment against symlinks in a temporary backup directory. They are gated here
+      # because a suite that only ever runs on a developer's machine rots.
+      - name: Phase 24 — scheduler lifecycle, redaction, alert delivery, archive containment
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          export BACKUP_ALERT_WEBHOOK=""
+          pytest tests/test_e07_phase24_scheduler.py \
+                 tests/test_e07_phase24_redaction.py \
+                 tests/test_e07_phase24_alerting.py \
+                 tests/test_e07_phase24_archive_containment.py \
+                 -v --tb=short -p no:cacheprovider | tee /tmp/p24suite.log
+          if grep -qE "SKIPPED" /tmp/p24suite.log; then
+            echo "::error::a Phase 24 case was skipped; the hardening must be verified:"
+            grep -E "SKIPPED" /tmp/p24suite.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p24suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 88 ]; then
+            echo "::error::only ${collected:-0} Phase 24 tests passed, expected at least 88"
+            exit 1
+          fi
+
+      # The scheduler lifecycle must also hold against the REAL filesystem locations it
+      # would use, with --unit-dir redirected. The CI step above proves the logic; this
+      # proves the CLI wiring and that a dry-run leaves no trace under a realistic path.
+      - name: Phase 24 — scheduler CLI dry-run writes nothing under a realistic path
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          target=/tmp/p24-ci-units
+          rm -rf "$target"
+          python scripts/maintenance.py scheduler validate --unit-dir "$target"
+          python scripts/maintenance.py scheduler dry-run --unit-dir "$target" --env-file /tmp/p24-ci.env
+          if [ -e "$target" ]; then
+            echo "::error::scheduler dry-run created $target; a preview must not touch the filesystem"
+            ls -la "$target"
+            exit 1
+          fi
+          # A real install into a disposable directory, then a clean uninstall.
+          printf 'DATABASE_OWNER_URL=postgresql://owner:pw@127.0.0.1:5432/db\n' > /tmp/p24-ci.env
+          chmod 600 /tmp/p24-ci.env
+          python scripts/maintenance.py scheduler install --unit-dir "$target" --env-file /tmp/p24-ci.env --yes || true
+          test -f "$target/gerege-backup.service"
+          test -f "$target/gerege-backup.timer"
+          grep -q "maintenance.py backup-run" "$target/gerege-backup.service"
+          grep -q "Unit=gerege-backup.service" "$target/gerege-backup.timer"
+          python scripts/maintenance.py scheduler uninstall --unit-dir "$target" --env-file /tmp/p24-ci.env
+          test ! -f "$target/gerege-backup.service"
+          test ! -f "$target/gerege-backup.timer"
+          # The environment file holds a credential and must survive.
+          test -f /tmp/p24-ci.env
+          echo "scheduler lifecycle: dry-run clean, install wrote both units, uninstall removed them, env file kept"
+
       - name: Phase 20 — no CLI path may publish a plaintext archive
         if: ${{ !cancelled() }}
         run: |
