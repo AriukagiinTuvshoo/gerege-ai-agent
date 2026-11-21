@@ -378,16 +378,23 @@ def notify(webhook: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
     backoff = max(0.0, min(float(os.getenv("BACKUP_ALERT_BACKOFF_S", "1")), 10.0))
     last = "notification failed"
     for attempt in range(1, attempts + 1):
-        req = urllib.request.Request(
-            webhook, data=body, headers={"Content-Type": "application/json"}, method="POST"
-        )
+        # Phase 24: build the Request inside the try. A malformed webhook ("not-a-url",
+        # "http://") raised ValueError from here, outside every handler, so a typo in
+        # BACKUP_ALERT_WEBHOOK crashed the scheduled run instead of being reported. The
+        # whole point of this function is that alerting cannot break a backup.
         try:
+            req = urllib.request.Request(
+                webhook, data=body, headers={"Content-Type": "application/json"}, method="POST"
+            )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return (200 <= resp.status < 300), f"http {resp.status}"
         except urllib.error.HTTPError as exc:
             last = f"notification failed: HTTP {exc.code}"
-            if 400 <= exc.code < 500:
-                return False, last          # not retryable: the request is the problem
+            # 429 is a throttle, not a malformed request: the same payload sent a moment
+            # later is exactly what the receiver asked for. Every other 4xx means the
+            # request itself is wrong, and retrying cannot fix it.
+            if 400 <= exc.code < 500 and exc.code != 429:
+                return False, last
         except Exception as exc:
             last = f"notification failed: {type(exc).__name__}"
         if attempt < attempts and backoff:
@@ -748,6 +755,22 @@ def _finish(result: Dict[str, Any], directory: str) -> None:
             "warnings": result.get("warnings"),
             "finished_at": result.get("finished_at"),
         }
+        # Phase 24: redact before the payload leaves the process. The error and warning
+        # strings are assembled from several layers, one of which interpolates a raw
+        # exception; nothing in them is scrubbed by construction, and the destination is
+        # outside the trust boundary. See core/redaction.py - this is defence in depth, not
+        # a response to an observed leak.
+        try:
+            from core import redaction
+
+            payload = redaction.sanitize_payload(
+                payload, secret_values=redaction.collect_secret_values()
+            )
+        except Exception:  # noqa: BLE001 - alerting must never break a backup run
+            payload = {
+                "event": payload.get("event", "unknown"),
+                "error": "<payload suppressed: redaction failed>",
+            }
         ok, detail = notify(webhook, payload)
         if not ok:
             result.setdefault("warnings", []).append(detail)
