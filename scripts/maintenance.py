@@ -454,6 +454,113 @@ def cmd_prune(days: int) -> int:
     return 0
 
 
+def cmd_scheduler(args) -> int:
+    """Scheduler lifecycle (Phase 24): status / validate / dry-run / install / uninstall.
+
+    Writes only the systemd unit files this installer owns, and only when asked. `--dry-run`
+    computes the identical plan and prints it without touching anything.
+    """
+    from core import scheduler_setup as sched
+
+    unit_dir = args.unit_dir or sched.DEFAULT_UNIT_DIR
+    env_file = args.env_file or sched.DEFAULT_ENV_FILE
+    emit = lambda message: print(f"  {message}")
+
+    if args.action == "status":
+        state = sched.status(unit_dir=unit_dir, env_file=env_file)
+        print(f"unit directory: {state['unit_dir']}")
+        print(f"  service installed: {'yes' if state['service']['installed'] else 'NO'}"
+              f" ({'ours' if state['service']['is_ours'] else 'not ours' if state['service']['installed'] else '-'})")
+        print(f"  timer installed:   {'yes' if state['timer']['installed'] else 'NO'}"
+              f" ({'ours' if state['timer']['is_ours'] else 'not ours' if state['timer']['installed'] else '-'})")
+        print(f"  env file:          {'present' if state['env_file_present'] else 'MISSING'}"
+              f"{' mode ' + state['env_file_mode'] if state['env_file_mode'] else ''}")
+        print(f"  systemd available: {'yes' if state['systemd_available'] else 'NO'}")
+        # Three separate facts. "installed" does not imply "enabled" or "active".
+        print(f"  installed:         {'yes' if state['installed'] else 'NO'}")
+        print(f"  enabled:           {'yes' if state['enabled'] else 'NO' if state['systemd_available'] else 'unknown (no systemd)'}")
+        print(f"  active:            {'yes' if state['active'] else 'NO' if state['systemd_available'] else 'unknown (no systemd)'}")
+        if state["systemd_detail"]:
+            print(f"  systemd:           {state['systemd_detail']}")
+        if not state["installed"]:
+            print("\n  The scheduler is NOT installed on this host. Backups only happen when",
+                  file=sys.stderr)
+            print("  someone runs them. See docs/SCHEDULER-SETUP.md.", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.action == "validate":
+        problems = sched.validate_config(
+            exec_start=args.exec_start, working_dir=args.working_dir, env_file=env_file,
+            timeout_s=args.timeout, on_calendar=args.on_calendar,
+            randomized_delay_s=args.randomized_delay, unit_dir=unit_dir,
+        )
+        if problems:
+            for problem in problems:
+                print(f"  PROBLEM: {problem}", file=sys.stderr)
+            return 1
+        print("  configuration is installable")
+        return 0
+
+    if args.action in ("dry-run", "install"):
+        plan = sched.plan_install(
+            exec_start=args.exec_start, working_dir=args.working_dir, env_file=env_file,
+            timeout_s=args.timeout, on_calendar=args.on_calendar,
+            randomized_delay_s=args.randomized_delay, persistent=not args.no_persistent,
+            unit_dir=unit_dir, force=args.force,
+        )
+        if not plan.ok:
+            print("  cannot install: the plan has problems", file=sys.stderr)
+            for problem in plan.problems:
+                print(f"  PROBLEM: {problem}", file=sys.stderr)
+            return 1
+        for note in plan.notes:
+            print(f"  note: {note}")
+        for item in plan.files:
+            print(f"  {item.action:9s} {item.path} ({oct(item.mode)}) - {item.reason}")
+
+        if args.action == "dry-run":
+            print("\n  dry-run: nothing was written, no unit was enabled, no service started.")
+            return 0
+
+        if not args.yes:
+            if not sys.stdin.isatty():
+                print("  refusing to install without confirmation: pass --yes", file=sys.stderr)
+                return 2
+            answer = input("Install these files? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("  aborted; nothing was changed.")
+                return 2
+
+        result = sched.install(plan, enable=not args.no_enable, assume_yes=args.yes, log=emit)
+        if not result.get("success"):
+            print(f"  install FAILED: {result.get('error')}", file=sys.stderr)
+            return 1
+        print(f"  installed: {len(result['written'])} file(s)")
+        print(f"  enabled:   {'yes' if result['enabled'] else 'NO'}")
+        print(f"  detail:    {result['enable_detail']}")
+        if not result["enabled"]:
+            print("\n  Files are installed but the timer is NOT enabled. Run:",
+                  file=sys.stderr)
+            print(f"    sudo systemctl daemon-reload && sudo systemctl enable --now {sched.UNIT_TIMER}",
+                  file=sys.stderr)
+            return 1
+        return 0
+
+    if args.action == "uninstall":
+        result = sched.uninstall(unit_dir=unit_dir, env_file=env_file,
+                                 force=args.force, dry_run=args.dry_run, log=emit)
+        action = "would remove" if result["dry_run"] else "removed"
+        targets = result.get("would_remove") if result["dry_run"] else result.get("removed")
+        print(f"  {action}: {len(targets)} file(s)")
+        for note in result.get("notes", []):
+            print(f"  note: {note}")
+        return 0
+
+    print(f"  unknown action {args.action}", file=sys.stderr)
+    return 2
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Owner-credentialed maintenance (E-05).")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -496,6 +603,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_run.add_argument("--label", default="scheduled")
     sub.add_parser("status", help="report the last scheduled run (monitoring probe)")
 
+    # Phase 24: scheduler lifecycle. Paths are injectable so the whole lifecycle can be
+    # exercised without touching a real systemd installation.
+    p_sched = sub.add_parser("scheduler", help="install/validate/remove the backup timer")
+    p_sched.add_argument(
+        "action",
+        choices=("status", "validate", "dry-run", "install", "uninstall"),
+    )
+    p_sched.add_argument("--unit-dir", help=f"systemd unit directory (default {('%(default)s')})")
+    p_sched.add_argument("--env-file", help="environment file the unit reads")
+    p_sched.add_argument(
+        "--exec-start",
+        default=(
+            "/usr/bin/docker compose -f docker-compose.prod.yml run --rm --no-deps "
+            "maintenance python scripts/maintenance.py backup-run --label scheduled"
+        ),
+        help="command the unit runs",
+    )
+    p_sched.add_argument("--working-dir", default="/opt/gerege")
+    p_sched.add_argument("--timeout", type=int, default=2 * 3600, help="TimeoutStartSec")
+    p_sched.add_argument("--on-calendar", default="hourly")
+    p_sched.add_argument("--randomized-delay", type=int, default=300)
+    p_sched.add_argument("--no-persistent", action="store_true")
+    p_sched.add_argument("--no-enable", action="store_true", help="write files, do not enable")
+    p_sched.add_argument("--force", action="store_true", help="replace a differing existing unit")
+    p_sched.add_argument("--dry-run", action="store_true", help="for uninstall: show only")
+    p_sched.add_argument("--yes", action="store_true", help="required for noninteractive install")
+
     args = parser.parse_args(argv)
 
     url = _owner_url()
@@ -531,6 +665,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_legacy(args.quarantine, args.yes)
     if args.command == "backup-run":
         return cmd_backup_run(args.label)
+    if args.command == "scheduler":
+        return cmd_scheduler(args)
     if args.command == "status":
         return cmd_status()
     parser.error("unknown command")
