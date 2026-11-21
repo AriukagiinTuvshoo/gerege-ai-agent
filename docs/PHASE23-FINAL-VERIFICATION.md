@@ -22,6 +22,10 @@ the documentation errors are corrected in place.
 
 No stop-and-report condition. Nothing was overwritten or discarded.
 
+**CI on the final HEAD of this audit:** run `44882670865` on `603be1a` — **success, 54/54
+steps, 0 failures**, including step 17 (the original Phase 22 defect) and step 29 (the
+regression Phase 22 introduced).
+
 ---
 
 ## 2. Reconciling the Phase 22 report's commit and CI claims
