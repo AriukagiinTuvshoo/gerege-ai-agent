@@ -1400,6 +1400,7 @@ jobs:
                  tests/test_e07_phase24_redaction.py \
                  tests/test_e07_phase24_alerting.py \
                  tests/test_e07_phase24_archive_containment.py \
+                 tests/test_e07_phase24_key_permissions.py \
                  -v --tb=short -p no:cacheprovider | tee /tmp/p24suite.log
           if grep -qE "SKIPPED" /tmp/p24suite.log; then
             echo "::error::a Phase 24 case was skipped; the hardening must be verified:"
@@ -1407,8 +1408,8 @@ jobs:
             exit 1
           fi
           collected=$(grep -oE "[0-9]+ passed" /tmp/p24suite.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 88 ]; then
-            echo "::error::only ${collected:-0} Phase 24 tests passed, expected at least 88"
+          if [ "${collected:-0}" -lt 98 ]; then
+            echo "::error::only ${collected:-0} Phase 24 tests passed, expected at least 98"
             exit 1
           fi
 

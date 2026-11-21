@@ -37,6 +37,7 @@ Design rules:
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from typing import Optional
 
@@ -297,6 +298,35 @@ def evaluate() -> BackupSecurityPolicy:
         production=production,
         reason="authenticated encryption enabled",
         code="ENCRYPTED",
+        warning=_key_permission_warning(path),
+    )
+
+
+def _key_permission_warning(key_file: str) -> str:
+    """Warn when the key is readable by group or others. Never denies.
+
+    Phase 24 (F-2). A key with mode 0644 is readable by every local account, which is
+    enough to decrypt every archive on the host - the encryption stops protecting against
+    local users entirely. Refusing to proceed would also refuse to *restore* during the
+    incident the key exists for, and a key that is too permissive is not a reason to be
+    unable to recover. So this is reported, not enforced.
+
+    POSIX-only in effect: on Windows ``st_mode`` does not carry these bits meaningfully.
+    """
+    try:
+        mode = os.stat(key_file).st_mode
+    except OSError:
+        return ""
+    if not hasattr(os, "getuid"):
+        return ""
+    exposed = mode & (stat.S_IRWXG | stat.S_IRWXO)
+    if not exposed:
+        return ""
+    return (
+        f"encryption key file {os.path.basename(key_file)} is accessible to group/others "
+        f"(mode {stat.S_IMODE(mode):03o}); every local account that can read it can decrypt "
+        "every archive on this host. Recommended: chmod 600. This does not block backup or "
+        "restore - it is reported because recovery must not depend on fixing it first."
     )
 
 
