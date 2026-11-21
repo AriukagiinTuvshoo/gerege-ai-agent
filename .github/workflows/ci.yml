@@ -380,10 +380,31 @@ jobs:
           if [ "$status" -ne 0 ]; then
             echo "::error::SQLite-mode suite failed (pytest exit $status). Failing tests:"
             grep -E "^(FAILED|ERROR)" /tmp/step17.log | head -40 || true
-            echo "--- failure details ---"
-            sed -n '/=* FAILURES *=*/,/^=* short test summary/p' /tmp/step17.log | head -200 || true
+            # Annotations truncate at the first newline and the job log needs sign-in, so
+            # the diagnostic that survives is the step summary, which renders as markdown
+            # on the run page. Written unconditionally so it is present either way.
+            {
+              echo "## SQLite-mode suite: pytest exit $status"
+              echo
+              echo "### Failing tests"
+              echo '```'
+              grep -E "^(FAILED|ERROR)" /tmp/step17.log | head -40 || echo "(none reported)"
+              echo '```'
+              echo
+              echo "### Environment"
+              echo '```'
+              python -VV || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit "$status"
           fi
+          {
+            echo "## SQLite-mode suite: pass"
+            echo
+            echo '```'
+            grep -E "passed|failed|skipped" /tmp/step17.log | tail -3
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run SQLite-to-PostgreSQL Dry-Run Verification
         if: ${{ !cancelled() }}
