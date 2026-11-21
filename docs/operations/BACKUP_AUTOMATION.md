@@ -113,7 +113,11 @@ failed, `13` credential invalid, `14` offsite failed, `15` not configured,
 | `DATABASE_OWNER_URL` | **yes** | `gerege_owner` DSN. Never set on `web`/`worker`. |
 | `BACKUP_ENCRYPTION` | no (default `on`) | `off` only for development. In production, leaving it on with no key fails the run. |
 | `BACKUP_ENCRYPTION_KEY_FILE` | **yes when encryption is on** | Path to a 32-byte key file, mode `0400`, owned by the maintenance user. **Back this up separately** — without it every archive is unreadable. |
-| `BACKUP_OFFSITE_PATH` | recommended | Independent mount/volume. A path on the same disk as `BACKUP_DIR` provides no independent failure protection. |
+| `BACKUP_OFFSITE_PATH` | one of these | Independent mount/volume. A path on the same disk as `BACKUP_DIR` provides no independent failure protection. |
+| `BACKUP_OFFSITE_URL` | one of these | S3-compatible URL, `https://<endpoint>/<bucket>/<prefix>`. Must be `https`; plain `http` is refused (see the loopback exception below). |
+| `BACKUP_OFFSITE_ACCESS_KEY` / `BACKUP_OFFSITE_SECRET_KEY` | with `_URL` | Credentials for the bucket. Use a role limited to `PutObject`/`GetObject`/`DeleteObject` on that prefix. |
+| `BACKUP_OFFSITE_REGION` | with `_URL` | Signing region; defaults to `us-east-1`. |
+| `BACKUP_OFFSITE_ALLOW_INSECURE_LOOPBACK` | test only | `1` permits a plain-`http` **loopback** endpoint, so offsite can be verified against a local S3-compatible server. Refused when `ENV=production`, ignored for any non-loopback host, and requires exactly `1`. |
 | `BACKUP_RETENTION_DAYS` | no (14) | Age-based pruning. |
 | `BACKUP_MIN_KEEP` | no (7) | Count floor that overrides the age rule. |
 | `BACKUP_ALERT_WEBHOOK` | recommended | JSON POST on success/failure. |
@@ -137,8 +141,13 @@ not mark backups as operational until each line is true in the target environmen
 - [ ] **Failure notification endpoint** — `BACKUP_ALERT_WEBHOOK` pointed at a real
       destination. Without it, failures are recorded in the status file and in the
       journal, and **nobody is told**.
-- [ ] **Independent storage** — `BACKUP_OFFSITE_PATH` on a different device, or an
-      object-store sync outside this repository.
+- [ ] **Independent storage** — `BACKUP_OFFSITE_PATH` on a different device, or
+      `BACKUP_OFFSITE_URL` pointed at an object store. Offsite status distinguishes
+      `OFFSITE_NOT_CONFIGURED`, `OFFSITE_CONFIGURED`, `OFFSITE_VERIFIED` and
+      `OFFSITE_FAILED`; **configured is not verified.** `VERIFIED` is only claimed after an
+      upload is downloaded back and its SHA-256 matched against the locally recorded digest,
+      and it is never claimed against a provider this repository has not actually run
+      against. As shipped, offsite is **NOT VERIFIED**.
 - [ ] **Key stored off-host** — a copy of `backup.key` in the secret manager. Losing it
       loses every backup.
 - [ ] **Monitoring wired to the probe** — schedule `maintenance.py status` (exit 1 =

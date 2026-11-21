@@ -823,6 +823,32 @@ class LocalOffsite(OffsiteProvider):
             return False, type(exc).__name__
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _plaintext_transport_allowed(url: str, env: Dict[str, str]) -> bool:
+    """Whether a plain-http offsite URL is permitted for this host. See the call site.
+
+    Returns False for anything that is not provably a local test endpoint, and False in
+    production unconditionally.
+    """
+    if (env.get("BACKUP_OFFSITE_ALLOW_INSECURE_LOOPBACK") or "").strip() != "1":
+        return False
+    environment = (env.get("ENV") or env.get("APP_ENV") or "").strip().lower()
+    if environment in ("production", "prod"):
+        return False
+    try:
+        netloc = urllib.parse.urlsplit(url).netloc
+    except Exception:
+        return False
+    host = netloc.rsplit("@", 1)[-1]
+    if host.startswith("["):
+        host = host[1:host.find("]")] if "]" in host else host
+    else:
+        host = host.split(":", 1)[0]
+    return host.strip().lower() in _LOOPBACK_HOSTS
+
+
 def provider_from_env(env: Optional[Dict[str, str]] = None) -> Optional[OffsiteProvider]:
     """Build the configured provider, or ``None`` when offsite storage is NOT CONFIGURED.
 
@@ -838,7 +864,24 @@ def provider_from_env(env: Optional[Dict[str, str]] = None) -> Optional[OffsiteP
         if url.startswith("http://"):
             # Refuse plaintext transport outright: a backup crossing the network in the
             # clear is worse than one that never left the host.
-            raise OffsiteError("BACKUP_OFFSITE_URL must use https://; refusing plaintext transport")
+            #
+            # Phase 22 (Phase 12 requirement): there is exactly one sanctioned exception,
+            # because "verify offsite against a local S3-compatible server" cannot be met
+            # otherwise - every such server is plain HTTP. It is deliberately narrow and
+            # cannot be reached by accident:
+            #
+            #   * the opt-in variable must be set to the literal "1";
+            #   * the host must be a loopback address, so it can never be a remote bucket;
+            #   * it is refused outright when ENV is production, so a production host
+            #     cannot be configured to ship backups in the clear even deliberately.
+            #
+            # Without all three, plaintext transport is refused exactly as before.
+            if not _plaintext_transport_allowed(url, env):
+                raise OffsiteError(
+                    "BACKUP_OFFSITE_URL must use https://; refusing plaintext transport "
+                    "(a loopback test endpoint may be allowed with "
+                    "BACKUP_OFFSITE_ALLOW_INSECURE_LOOPBACK=1 outside production)"
+                )
         parsed = urllib.parse.urlsplit(url)
         bucket = parsed.path.strip("/").split("/")[0]
         prefix = "/".join(parsed.path.strip("/").split("/")[1:])
