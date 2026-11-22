@@ -205,7 +205,7 @@ def _collect_db_table_counts(
         try:
             for tbl in _COUNTED_TABLES:
                 dl.check()
-                cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                cur.execute(f"SELECT COUNT(*) FROM {tbl}")  # nosec B608 - Phase 26: table name is a module constant (_COUNTED_TABLES / _REQUIRED_RESTORE_TABLES)
                 row = cur.fetchone()
                 counts[tbl] = int(row[0] or 0) if row else 0
         finally:
@@ -903,7 +903,7 @@ def _rollback_invariants(pg_url: str) -> Dict[str, Any]:
                 ).scalar()
                 if exists:
                     can_select = conn.execute(text(
-                        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "  # nosec B608 - Phase 26: table name is a module constant (_COUNTED_TABLES / _REQUIRED_RESTORE_TABLES)
                         "WHERE n.nspname='public' AND c.relkind='r' "
                         f"AND has_table_privilege(:r, c.oid, 'SELECT')"
                     ), {"r": runtime_role}).scalar()
@@ -953,7 +953,7 @@ def _verify_restored_sqlite(db_path: str, expected_counts: Dict[str, int]) -> Di
         actual_counts: Dict[str, int] = {}
         mismatches: Dict[str, Any] = {}
         for t in _REQUIRED_RESTORE_TABLES:
-            cnt = int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] or 0)
+            cnt = int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] or 0)  # nosec B608 - Phase 26: table name is a module constant (_COUNTED_TABLES / _REQUIRED_RESTORE_TABLES)
             actual_counts[t] = cnt
             if t in expected_counts:
                 exp = expected_counts[t]
@@ -1019,7 +1019,7 @@ def _verify_restored_postgres(pg_url: str, expected_counts: Dict[str, int]) -> D
             actual_counts: Dict[str, int] = {}
             mismatches: Dict[str, Any] = {}
             for t in _REQUIRED_RESTORE_TABLES:
-                cnt = int(conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0)
+                cnt = int(conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() or 0)  # nosec B608 - Phase 26: table name is a module constant (_COUNTED_TABLES / _REQUIRED_RESTORE_TABLES)
                 actual_counts[t] = cnt
                 if t in expected_counts:
                     exp = expected_counts[t]

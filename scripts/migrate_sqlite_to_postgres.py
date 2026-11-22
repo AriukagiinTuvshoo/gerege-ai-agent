@@ -49,6 +49,65 @@ TIMESTAMP_COLUMNS = {
     "locked_at",
 }
 
+#: Table and column names that may appear in generated SQL.
+#:
+#: Phase 26. `MIGRATION_TABLES` is a constant, but the *column* list is not: it is read at
+#: runtime from `PRAGMA table_info` of whichever SQLite file the operator points `--sqlite-path`
+#: at, and interpolated straight into `SELECT ... FROM ...`. SQLite stores ANY string as a
+#: column name when it is quoted, so a source database can carry
+#:
+#:     CREATE TABLE invoices (invoice_id TEXT, "a\" , (SELECT 1) --" TEXT)
+#:
+#: and the ETL then builds `SELECT invoice_id, a" , (SELECT 1) -- FROM invoices`. That exact
+#: payload is a syntax error, not an exploit - `--` needs a newline to terminate. The
+#: balanced form is the one that executes:
+#:
+#:     column name:  a, (SELECT 1) AS injected
+#:     built SQL:    SELECT invoice_id, a, (SELECT 1) AS injected FROM invoices
+#:
+#: which runs the subquery. The migration connects with the owner credential on the target -
+#: the privilege context that exists precisely because the runtime role is too restricted to
+#: restore - so an injected expression executes as a role that can read and write every
+#: tenant's rows. Row-returning injection is the realistic consequence; stacked statements
+#: are not, because `sqlite3`/DBAPI `execute()` refuses more than one statement.
+#:
+#: Identifiers cannot be parameterised - `SELECT :col FROM t` binds a value, not a name - so
+#: they are validated instead. Every sink goes through `_q_ident()` / `_q_ident_list()`.
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _q_ident(name: Any) -> str:
+    """Validate one identifier and return it quoted for the engine in use.
+
+    Rejects anything that is not a plain identifier, so a name carrying a quote, a
+    parenthesis, a semicolon or a comment marker never reaches a SQL string. Quoting is
+    not sufficient on its own: the caller builds syntax around this value, and an
+    unbalanced quote would still break out. Validation first, quoting second.
+
+    Quoting is engine-specific - SQLite and PostgreSQL both accept `"x"`, but the escape
+    for an embedded quote differs (SQLite doubles it, PostgreSQL doubles it too, but a
+    MySQL-style backtick is valid in neither). The value is validated before quoting, so
+    no embedded quote can reach the quoting step.
+    """
+    text = str(name)
+    if not _IDENT_RE.match(text):
+        # Do not echo the name back: it is attacker-controlled, and a rejected identifier is
+        # still a string that will be written to a log, a terminal or an alert. A newline or
+        # an escape sequence here is a log-injection primitive. Describe it instead.
+        raise ValueError(
+            "refusing to build SQL with an unsafe identifier "
+            f"({len(text)} character(s), first byte 0x{text.encode('utf-8', 'replace')[:1].hex() or '00'}): "
+            "a table or column name must match [A-Za-z_][A-Za-z0-9_$]*. A source database "
+            "with an unusual column name must be normalised before migration."
+        )
+    return '"' + text + '"'
+
+
+def _q_ident_list(names: Any) -> List[str]:
+    """Validate and quote a list of identifiers."""
+    return [_q_ident(n) for n in names]
+
+
 MIGRATION_TABLES: List[Dict[str, Any]] = [
     {"table": "pages", "pk_cols": ["page_id"]},
     {"table": "registrations", "pk_cols": ["id"], "has_serial_id": True},
@@ -196,9 +255,12 @@ def inspect_sqlite_snapshot(snap_path: str) -> Dict[str, Any]:
         if tname not in existing_tables:
             table_stats[tname] = {"exists": False, "row_count": 0, "columns": [], "checksum": ""}
             continue
-        cols = [r[1] for r in cur.execute(f"PRAGMA table_info({tname})").fetchall()]
-        order_clause = ", ".join(pk_cols)
-        rows = [dict(r) for r in cur.execute(f"SELECT * FROM {tname} ORDER BY {order_clause}").fetchall()]
+        # Phase 26: `tname` is a constant but `pk_cols` is written in the same constant;
+        # both are validated so a future entry cannot introduce an unquoted name.
+        qtname = _q_ident(tname)
+        cols = [r[1] for r in cur.execute(f"PRAGMA table_info({qtname})").fetchall()]
+        order_clause = ", ".join(_q_ident_list(pk_cols))
+        rows = [dict(r) for r in cur.execute(f"SELECT * FROM {qtname} ORDER BY {order_clause}").fetchall()]  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
         tbl_checksum = compute_table_checksum(rows, cols, pk_cols)
         table_stats[tname] = {
             "exists": True,
@@ -293,18 +355,18 @@ def run_migration(
             tgt_raw_conn.commit()
 
             def _tgt_fetch_one(q_cols: List[str], tname: str, pk_cols: List[str], pk_vals: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                w_sql = " AND ".join(f"{c} = ?" for c in pk_cols)
+                w_sql = " AND ".join(f"{_q_ident(c)} = ?" for c in pk_cols)
                 row = tgt_raw_conn.execute(
-                    f"SELECT {', '.join(q_cols)} FROM {tname} WHERE {w_sql}",
+                    f"SELECT {', '.join(_q_ident_list(q_cols))} FROM {_q_ident(tname)} WHERE {w_sql}",  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                     tuple(pk_vals[c] for c in pk_cols),
                 ).fetchone()
                 return dict(row) if row is not None else None
 
             def _tgt_insert(tname: str, q_cols: List[str], row_dict: Dict[str, Any]) -> None:
-                c_list = ", ".join(q_cols)
+                c_list = ", ".join(_q_ident_list(q_cols))
                 q_marks = ", ".join("?" for _ in q_cols)
                 tgt_raw_conn.execute(
-                    f"INSERT INTO {tname} ({c_list}) VALUES ({q_marks})",
+                    f"INSERT INTO {_q_ident(tname)} ({c_list}) VALUES ({q_marks})",  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                     tuple(row_dict.get(c) for c in q_cols),
                 )
 
@@ -312,7 +374,7 @@ def run_migration(
                 q_cols: List[str], tname: str, order_clause: str, limit: int, offset: int
             ) -> List[Dict[str, Any]]:
                 rows = tgt_raw_conn.execute(
-                    f"SELECT {', '.join(q_cols)} FROM {tname} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+                    f"SELECT {', '.join(_q_ident_list(q_cols))} FROM {_q_ident(tname)} ORDER BY {order_clause} LIMIT ? OFFSET ?",  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                     (limit, offset),
                 ).fetchall()
                 return [dict(r) for r in rows]
@@ -341,18 +403,18 @@ def run_migration(
             pg_trans = pg_conn.begin()
 
             def _tgt_fetch_one(q_cols: List[str], tname: str, pk_cols: List[str], pk_vals: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                w_sql = " AND ".join(f"{c} = :{c}" for c in pk_cols)
+                w_sql = " AND ".join(f"{_q_ident(c)} = :{c}" for c in pk_cols)
                 row = pg_conn.execute(
-                    text(f"SELECT {', '.join(q_cols)} FROM {tname} WHERE {w_sql}"),
+                    text(f"SELECT {', '.join(_q_ident_list(q_cols))} FROM {_q_ident(tname)} WHERE {w_sql}"),  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                     pk_vals,
                 ).mappings().first()
                 return dict(row) if row is not None else None
 
             def _tgt_insert(tname: str, q_cols: List[str], row_dict: Dict[str, Any]) -> None:
-                c_list = ", ".join(q_cols)
+                c_list = ", ".join(_q_ident_list(q_cols))
                 b_list = ", ".join(f":{c}" for c in q_cols)
                 pg_conn.execute(
-                    text(f"INSERT INTO {tname} ({c_list}) VALUES ({b_list})"),
+                    text(f"INSERT INTO {_q_ident(tname)} ({c_list}) VALUES ({b_list})"),  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                     row_dict,
                 )
 
@@ -362,8 +424,8 @@ def run_migration(
                 rows = (
                     pg_conn.execute(
                         text(
-                            f"SELECT {', '.join(q_cols)} FROM {tname} ORDER BY {order_clause} "
-                            f"LIMIT :lim OFFSET :off"
+                            f"SELECT {', '.join(_q_ident_list(q_cols))} FROM {_q_ident(tname)} "  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
+                            f"ORDER BY {order_clause} LIMIT :lim OFFSET :off"
                         ),
                         {"lim": limit, "off": offset},
                     )
@@ -378,8 +440,8 @@ def run_migration(
             def _tgt_reset_seq(tname: str) -> None:
                 pg_conn.execute(
                     text(
-                        f"SELECT setval(pg_get_serial_sequence('{tname}', 'id'), "
-                        f"COALESCE((SELECT MAX(id) FROM {tname}), 1), true)"
+                        f"SELECT setval(pg_get_serial_sequence('{_q_ident(tname)}', 'id'), "  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
+                        f"COALESCE((SELECT MAX(id) FROM {_q_ident(tname)}), 1), true)"
                     )
                 )
 
@@ -397,7 +459,7 @@ def run_migration(
                 pk_cols = item["pk_cols"]
                 tinfo = source_summary["tables"].get(tname, {})
                 if not tinfo.get("exists"):
-                    tgt_cnt_empty = _tgt_scalar(f"SELECT COUNT(*) FROM {tname}")
+                    tgt_cnt_empty = _tgt_scalar(f"SELECT COUNT(*) FROM {_q_ident(tname)}")  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                     report["migrated_tables"][tname] = {
                         "source_rows": 0,
                         "target_rows": tgt_cnt_empty,
@@ -414,7 +476,7 @@ def run_migration(
                     continue
 
                 cols = tinfo["columns"]
-                order_clause = ", ".join(pk_cols)
+                order_clause = ", ".join(_q_ident_list(pk_cols))
                 total_src_rows = tinfo["row_count"]
 
                 inserted_count = 0
@@ -426,7 +488,7 @@ def run_migration(
                     batch_rows = [
                         dict(r)
                         for r in src_cur.execute(
-                            f"SELECT * FROM {tname} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+                            f"SELECT * FROM {_q_ident(tname)} ORDER BY {order_clause} LIMIT ? OFFSET ?",  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                             (batch_size, offset),
                         ).fetchall()
                     ]
@@ -469,7 +531,7 @@ def run_migration(
                 # Bounded-memory batch-based streaming verification:
                 # 1) Stream source batches -> verify every PK & row hash exists identically on target
                 # 2) Stream target batches -> detect any target-only extra rows
-                target_count = _tgt_scalar(f"SELECT COUNT(*) FROM {tname}")
+                target_count = _tgt_scalar(f"SELECT COUNT(*) FROM {_q_ident(tname)}")  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                 missing_rows = 0
                 verify_conflicts = 0
                 src_stream_hasher = hashlib.sha256()
@@ -480,7 +542,7 @@ def run_migration(
                     src_batch = [
                         dict(r)
                         for r in src_cur.execute(
-                            f"SELECT * FROM {tname} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+                            f"SELECT * FROM {_q_ident(tname)} ORDER BY {order_clause} LIMIT ? OFFSET ?",  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                             (batch_size, v_offset),
                         ).fetchall()
                     ]
@@ -504,7 +566,7 @@ def run_migration(
 
                 target_only_rows = 0
                 extra_target_samples: List[Dict[str, Any]] = []
-                pk_where_src = " AND ".join(f"{c} = ?" for c in pk_cols)
+                pk_where_src = " AND ".join(f"{_q_ident(c)} = ?" for c in pk_cols)
                 tgt_offset = 0
                 while True:
                     tgt_batch = _tgt_fetch_batch(cols, tname, order_clause, batch_size, tgt_offset)
@@ -513,7 +575,7 @@ def run_migration(
                     for trow in tgt_batch:
                         pk_tuple = tuple(trow.get(c) for c in pk_cols)
                         exists_in_src = src_cur.execute(
-                            f"SELECT 1 FROM {tname} WHERE {pk_where_src} LIMIT 1",
+                            f"SELECT 1 FROM {_q_ident(tname)} WHERE {pk_where_src} LIMIT 1",  # nosec B608 - Phase 26: identifiers go through _q_ident()/_q_ident_list(); values are bound
                             pk_tuple,
                         ).fetchone()
                         if exists_in_src is None:

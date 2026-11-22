@@ -1420,6 +1420,26 @@ jobs:
       # literal as JSON, so a reverted `tojson` fails on a syntax error rather than passing on
       # a substring check; the fixture-password tests assert the value never appears outside
       # tests/ and is not a documented default. Runs with no database.
+      # Phase 26: SQL injection audit. The important assertion is behavioural - a crafted
+      # SQLite schema must be refused, not executed - and it runs without a database. The
+      # suppression guard fails if a bare `# nosec` appears anywhere, so a future finding
+      # cannot be silenced without a reason.
+      - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          pytest tests/test_e07_phase26_sql_injection.py -v --tb=short -p no:cacheprovider | tee /tmp/p26suite.log
+          if grep -qE "SKIPPED" /tmp/p26suite.log; then
+            echo "::error::a Phase 26 case was skipped; the audit must be verified:"
+            grep -E "SKIPPED" /tmp/p26suite.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p26suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 59 ]; then
+            echo "::error::only ${collected:-0} Phase 26 tests passed, expected at least 59"
+            exit 1
+          fi
+
       - name: Phase 25 — Jinja2 autoescaping, doc credential, fixture-password classification
         if: ${{ !cancelled() }}
         run: |

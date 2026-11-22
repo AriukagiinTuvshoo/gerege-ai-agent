@@ -1738,11 +1738,11 @@ def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
     params = (str(page_id),) if page_id else ()
     
     # Нийт төлөгдсөн дүн
-    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PAID'", params)
+    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PAID'", params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
     paid_sum, paid_count = cursor.fetchone()
     
     # Хүлээгдэж буй нэхэмжлэхүүд
-    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PENDING'", params)
+    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PENDING'", params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
     pending_sum, pending_count = cursor.fetchone()
     
     # Өнөөдрийн орлого (P1-03: LIKE биш, хязгаарын харьцуулалт)
@@ -1755,7 +1755,7 @@ def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
         if page_id
         else " WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?"
     )
-    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{today_where}", today_params)
+    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{today_where}", today_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
     today_sum, today_count = cursor.fetchone()
 
     conn.close()
@@ -2008,28 +2008,28 @@ def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optiona
 
     # 1. Шинэ харилцагч / Leads
     cursor.execute(
-        f"SELECT COUNT(id) FROM registrations WHERE created_at >= ? AND created_at < ?{p_cond}",
+        f"SELECT COUNT(id) FROM registrations WHERE created_at >= ? AND created_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         tuple(p_params),
     )
     leads_count = cursor.fetchone()[0] or 0
 
     # 2. Чат харилцан ярианууд
     cursor.execute(
-        f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at >= ? AND created_at < ?{p_cond}",
+        f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at >= ? AND created_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         tuple(p_params),
     )
     chats_count = cursor.fetchone()[0] or 0
 
     # 3. Карго ачаанууд (ирсэн)
     cursor.execute(
-        f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at >= ? AND arrived_at < ?{p_cond}",
+        f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at >= ? AND arrived_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         tuple(p_params),
     )
     cargo_arrived = cursor.fetchone()[0] or 0
 
     # 4. QPay төлбөрүүд
     cursor.execute(
-        f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices "
+        f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices "  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         f"WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?{p_cond}",
         tuple(p_params),
     )
@@ -2038,11 +2038,11 @@ def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optiona
     # 5. Хүлээгдэж буй карго ачаа (төлөгдөөгүй)
     pending_p_cond = " WHERE page_id = ?" if page_id else ""
     pending_params = (str(page_id),) if page_id else ()
-    cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(price_amount), 0) FROM cargo_packages{pending_p_cond} {'AND' if page_id else 'WHERE'} status = 'ARRIVED_UB' AND price_amount > 0", pending_params)
+    cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(price_amount), 0) FROM cargo_packages{pending_p_cond} {'AND' if page_id else 'WHERE'} status = 'ARRIVED_UB' AND price_amount > 0", pending_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
     pending_cargo_count, pending_cargo_amount = cursor.fetchone()
     
     # 6. Эскалаци / Хүнтэй ярих хүсэлт гаргасан
-    cursor.execute("SELECT COUNT(sender_id) FROM session_states WHERE is_human_takeover = 1" + (" AND page_id = ?" if page_id else ""), ((str(page_id),) if page_id else ()))
+    cursor.execute("SELECT COUNT(sender_id) FROM session_states WHERE is_human_takeover = 1" + (" AND page_id = ?" if page_id else ""), ((str(page_id),) if page_id else ()))  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
     escalated_count = cursor.fetchone()[0] or 0
     
     conn.close()
@@ -2432,7 +2432,7 @@ def list_appointments(
     if status:
         conditions.append("status = ?")
         params.append(status)
-    query = f"SELECT * FROM appointments WHERE {' AND '.join(conditions)} ORDER BY appointment_date ASC, appointment_time ASC LIMIT ?"
+    query = f"SELECT * FROM appointments WHERE {' AND '.join(conditions)} ORDER BY appointment_date ASC, appointment_time ASC LIMIT ?"  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
     params.append(limit)
     cursor.execute(query, tuple(params))
     rows = [dict(r) for r in cursor.fetchall()]
@@ -2584,7 +2584,7 @@ def list_comment_automations(page_id: Optional[str] = None, active_only: bool = 
         if active_only:
             conds.append("is_active = 1")
         where_sql = (" WHERE " + " AND ".join(conds)) if conds else ""
-        cursor.execute(f"SELECT * FROM comment_automations{where_sql} ORDER BY id DESC", tuple(params))
+        cursor.execute(f"SELECT * FROM comment_automations{where_sql} ORDER BY id DESC", tuple(params))  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         return [dict(r) for r in cursor.fetchall()]
     finally:
         if cursor is not None:
@@ -2819,30 +2819,30 @@ def get_roi_analytics(page_id: Optional[str] = None, seconds_per_reply: float = 
         p_where = " WHERE page_id = ?" if page_id else ""
         p_params = (str(page_id),) if page_id else ()
 
-        cursor.execute(f"SELECT COUNT(DISTINCT sender_id) FROM messages{p_where}", p_params)
+        cursor.execute(f"SELECT COUNT(DISTINCT sender_id) FROM messages{p_where}", p_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         unique_contacts = int(cursor.fetchone()[0] or 0)
 
         msg_bot_where = " WHERE page_id = ? AND sender_type = 'bot'" if page_id else " WHERE sender_type = 'bot'"
-        cursor.execute(f"SELECT COUNT(id) FROM messages{msg_bot_where}", p_params)
+        cursor.execute(f"SELECT COUNT(id) FROM messages{msg_bot_where}", p_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         bot_messages = int(cursor.fetchone()[0] or 0)
 
-        cursor.execute(f"SELECT COALESCE(SUM(trigger_count), 0), COUNT(id) FROM comment_automations{p_where}", p_params)
+        cursor.execute(f"SELECT COALESCE(SUM(trigger_count), 0), COUNT(id) FROM comment_automations{p_where}", p_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         ca_row = cursor.fetchone()
         comment_replies = int(ca_row[0] or 0)
         automations_total = int(ca_row[1] or 0)
 
         active_where = " WHERE page_id = ? AND is_active = 1" if page_id else " WHERE is_active = 1"
-        cursor.execute(f"SELECT COUNT(id) FROM comment_automations{active_where}", p_params)
+        cursor.execute(f"SELECT COUNT(id) FROM comment_automations{active_where}", p_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         automations_active = int(cursor.fetchone()[0] or 0)
 
-        cursor.execute(f"SELECT COALESCE(SUM(clicks_count), 0) FROM tracked_links{p_where}", p_params)
+        cursor.execute(f"SELECT COALESCE(SUM(clicks_count), 0) FROM tracked_links{p_where}", p_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         link_clicks = int(cursor.fetchone()[0] or 0)
 
-        cursor.execute(f"SELECT COUNT(id) FROM invoices{p_where}", p_params)
+        cursor.execute(f"SELECT COUNT(id) FROM invoices{p_where}", p_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         invoices_created = int(cursor.fetchone()[0] or 0)
 
         paid_where = " WHERE page_id = ? AND status = 'PAID'" if page_id else " WHERE status = 'PAID'"
-        cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices{paid_where}", p_params)
+        cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices{paid_where}", p_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
         paid_row = cursor.fetchone()
         invoices_paid = int(paid_row[0] or 0)
         paid_revenue_mnt = int(paid_row[1] or 0)
