@@ -1416,6 +1416,26 @@ jobs:
       # The scheduler lifecycle must also hold against the REAL filesystem locations it
       # would use, with --unit-dir redirected. The CI step above proves the logic; this
       # proves the CLI wiring and that a dry-run leaves no trace under a realistic path.
+      # Phase 25: the AidoLab Critical triage. The autoescape tests parse the emitted JS
+      # literal as JSON, so a reverted `tojson` fails on a syntax error rather than passing on
+      # a substring check; the fixture-password tests assert the value never appears outside
+      # tests/ and is not a documented default. Runs with no database.
+      - name: Phase 25 — Jinja2 autoescaping, doc credential, fixture-password classification
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          pytest tests/test_e07_phase25_aidolab_critical.py -v --tb=short -p no:cacheprovider | tee /tmp/p25suite.log
+          if grep -qE "SKIPPED" /tmp/p25suite.log; then
+            echo "::error::a Phase 25 case was skipped; the findings must be verified:"
+            grep -E "SKIPPED" /tmp/p25suite.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p25suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 42 ]; then
+            echo "::error::only ${collected:-0} Phase 25 tests passed, expected at least 42"
+            exit 1
+          fi
+
       - name: Phase 24 — scheduler CLI dry-run writes nothing under a realistic path
         if: ${{ !cancelled() }}
         run: |

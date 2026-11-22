@@ -1883,6 +1883,39 @@ async def update_keys(payload: Dict[str, str], request: Request):
 # -------------------------------------------------------------
 # 8. ФИНТЕК & ТӨЛБӨРИЙН АВТОМАТЖУУЛАЛТ (QPAY v2, DEEP LINKS, E-BARIMT)
 # -------------------------------------------------------------
+def _html_template_env() -> "jinja2.Environment":
+    """The Jinja2 environment for the two server-rendered pages.
+
+    Phase 25: both sites previously built `jinja2.Environment(loader=...)` with the default
+    `autoescape=False`, so every value interpolated into `payment.html` and `scanner.html`
+    was emitted verbatim. `scanner.html` renders `page_id` straight from a query parameter
+    into a JavaScript string, and `/scanner` requires no authentication:
+
+        GET /scanner?page_id=%22;alert(document.cookie)//
+
+    rendered `const pageId = "";alert(document.cookie)//";` - arbitrary script execution in
+    any browser that followed a crafted link. `payment.html` additionally interpolated the
+    invoice description and company name into HTML.
+
+    `select_autoescape` covers the HTML sinks; `|tojson` (see the templates) covers the two
+    values that land inside a `<script>` block, where HTML escaping is the wrong tool and
+    `tojson` is the right one.
+
+    One constructor rather than two: a security setting duplicated at two call sites is a
+    setting that will eventually be applied to only one of them.
+    """
+    import jinja2
+
+    return jinja2.Environment(
+        loader=jinja2.FileSystemLoader(searchpath="templates"),
+        autoescape=jinja2.select_autoescape(
+            enabled_extensions=("html", "htm", "xml"),
+            default_for_string=True,
+            default=True,
+        ),
+    )
+
+
 @app.get("/pay/{invoice_id}", response_class=HTMLResponse)
 async def serve_payment_page(invoice_id: str, request: Request):
     """QPay төлбөрийн интерфэйс хуудас (QR код, банкны апп товчлуурууд, И-Баримт)"""
@@ -1896,9 +1929,7 @@ async def serve_payment_page(invoice_id: str, request: Request):
     page = database.get_page(inv["page_id"]) or {}
     company_name = page.get("name", "Гэрэгэ Системс")
 
-    import jinja2
-    template_loader = jinja2.FileSystemLoader(searchpath="templates")
-    template_env = jinja2.Environment(loader=template_loader)
+    template_env = _html_template_env()
     template = template_env.get_template("payment.html")
     rendered = template.render(
         invoice_id=inv["invoice_id"],
@@ -2211,9 +2242,7 @@ async def create_invoice_manual_api(
 async def serve_warehouse_scanner(request: Request, page_id: Optional[str] = Query(None)):
     """Гар утасны агуулахын камертай баркод сканнер"""
     pid = page_id or database.DEFAULT_PAGE_ID
-    import jinja2
-    template_loader = jinja2.FileSystemLoader(searchpath="templates")
-    template_env = jinja2.Environment(loader=template_loader)
+    template_env = _html_template_env()
     template = template_env.get_template("scanner.html")
     rendered = template.render(page_id=pid)
     return HTMLResponse(content=rendered)

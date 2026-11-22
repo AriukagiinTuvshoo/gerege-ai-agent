@@ -69,9 +69,11 @@ python scripts/migrate_sqlite_to_postgres.py --sqlite-path registrations.db --dr
 
 ### 4.2 Live Migration to PostgreSQL
 ```bash
+# Export the target URL instead of passing it on the command line. A password in argv is
+# visible to every local user through `ps` and is written to your shell history.
+export DATABASE_URL="postgresql://gerege:$(cat /run/secrets/gerege_db_password)@localhost:5432/gerege_db"
 python scripts/migrate_sqlite_to_postgres.py \
   --sqlite-path registrations.db \
-  --postgres-url "postgresql://gerege:STRONG_PASS@localhost:5432/gerege_db" \
   --report backups/migration_report.json
 ```
 

@@ -210,7 +210,12 @@
   </footer>
 
   <script>
-    const invoiceId = "{{ invoice_id }}";
+    // Phase 25: tojson, not "{{ invoice_id }}". A value interpolated into a JS string
+    // literal needs JS escaping; HTML escaping turns `"` into `&#34;`, which the JS
+    // parser still reads as a quote terminator in some positions and which the browser
+    // displays wrong in text contexts. tojson also escapes `<` as \u003c, closing the
+    // `</script>` breakout.
+    const invoiceId = {{ invoice_id|tojson }};
     let isPaid = false;
 
     // Subtle audio chime on success (Web Audio API - no external mp3 needed)
