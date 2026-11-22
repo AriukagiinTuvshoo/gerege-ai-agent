@@ -36,8 +36,23 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 # 1. The exit-code masking defect
 # ===========================================================================
 
+def _require_yaml():
+    try:
+        import yaml
+    except ImportError:  # pragma: no cover - only reachable if requirements drift
+        raise AssertionError(
+            "PyYAML is required to validate the workflow and is declared in "
+            "requirements.txt; install it rather than skipping this suite"
+        )
+    return yaml
+
+
 def _steps():
-    yaml = pytest.importorskip("yaml")
+    # A hard requirement, not `importorskip`: this suite exists to catch tests that do not
+    # actually run, so a silently skipped CI-integrity test would be self-refuting. PyYAML
+    # is declared in requirements.txt (Phase 29) - it was missing there, which is how CI
+    # came to fail with "PyYAML is required" from the validator.
+    yaml = _require_yaml()
     with open(CI, encoding="utf-8") as handle:
         doc = yaml.safe_load(handle)
     steps = []

@@ -14,3 +14,9 @@ psycopg2-binary>=2.9.9,<3.0.0
 redis>=5.0.0,<6.0.0
 pytest>=9.0.3,<10.0.0
 cryptography>=42.0.0,<56.0.0
+# Phase 29: scripts/validate_workflows.py (run by CI) and tests/test_e29_ci_integrity.py
+# parse the workflow to enforce the pytest exit-code guard. Both were written against a
+# developer environment that happened to have PyYAML installed; CI did not, so the
+# validator exited 2 with "PyYAML is required" and the step failed. Declared here rather
+# than installed inline in the step, so a local run and CI agree.
+PyYAML>=6.0,<7.0
