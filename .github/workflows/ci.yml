@@ -1561,6 +1561,17 @@ jobs:
           # there would report a pass for a control that never ran.
           python scripts/check_pytest_log.py /tmp/p30suite.log --min-collected 36 --require-summary
 
+      - name: Phase 31 — proxy-bypass closure and final pinning review
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # Every case binds a loopback server or a mock proxy and patches the resolver; no
+          # test in this file touches the network, so it needs no database and no service.
+          pytest tests/test_e31_proxy_and_pinning_review.py -v --tb=short -p no:cacheprovider | tee /tmp/p31suite.log
+          # Strict. A skipped case here means the proxy bypass was not exercised, which is the
+          # whole reason the file exists - F-31-1 shipped in Phase 30 with a green suite.
+          python scripts/check_pytest_log.py /tmp/p31suite.log --min-collected 15 --require-summary
+
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
         run: |

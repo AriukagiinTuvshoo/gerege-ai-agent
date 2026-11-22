@@ -396,7 +396,12 @@ def test_the_repository_workflow_passes_its_own_validator():
 # ===========================================================================
 
 def test_every_security_phase_suite_is_executed_by_ci():
-    """Phases 25-29 must each be wired in, by name, or a regression in them ships unchecked."""
+    """Each security phase must be wired in, by name, or a regression ships unchecked.
+
+    Phase 31 extended this list. It stopped at 29, so the Phase 30 SSRF/rebinding suite and
+    the Phase 31 proxy-bypass suite would have been added to `tests/` and never executed -
+    exactly the class of gap this test exists to close, and it had re-opened itself.
+    """
     text = CI.read_text(encoding="utf-8")
     for suite in (
         "tests/test_e07_phase25_aidolab_critical.py",
@@ -404,6 +409,8 @@ def test_every_security_phase_suite_is_executed_by_ci():
         "tests/test_e07_phase27_network_tempfiles.py",
         "tests/test_e07_phase28_ssrf_and_tempfiles.py",
         "tests/test_e29_ci_integrity.py",
+        "tests/test_e30_ssrf_pinning.py",
+        "tests/test_e31_proxy_and_pinning_review.py",
     ):
         assert suite in text, f"{suite} is not run by CI"
 

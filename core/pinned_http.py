@@ -25,6 +25,25 @@ integrity of *destination* but not of *content*. The webhook path keeps a docume
 plaintext escape for local test sinks; that path is pinned too, and its remaining
 weakness is the absence of transport confidentiality, which is stated rather than fixed.
 
+**Proxy policy: no environment proxy (Phase 31, F-31-1).** Phase 30 handled the HTTPS case
+and missed the plaintext one. `_tunnel_host` is set when `urllib` CONNECTs through a proxy,
+so `PinnedHTTPSConnection` refused those - but `ProxyHandler.proxy_open` serves a plaintext
+request *before* any connection handler runs, so `PinnedHTTPConnection.connect()` was never
+called and the pin was silently unused. Measured with `HTTP_PROXY` pointing at a local mock:
+the proxy received `GET http://pinned.example/hook` and fetched it itself. The pin protected
+nothing there, and no Phase 30 test noticed because none of them set a proxy variable.
+
+The fix removes `ProxyHandler` from every opener this module builds, unconditionally. That
+is Policy A: the application controls the destination, and the proxy is not part of the
+trusted path. Neither caller needs one - the webhook posts to an operator-configured public
+URL, and the sheet fetch is allowlisted to `docs.google.com`. An operator behind a mandatory
+egress proxy gets a clear connection error rather than a quietly unpinned request.
+
+**Residual risk, stated rather than hidden.** Environments that *require* an outbound proxy
+will not work with these two paths. Supporting one safely needs an explicitly configured
+trusted proxy (Policy B) with its own address validation and credential handling - a
+deployment decision, not something to infer from `HTTP_PROXY`.
+
 **What is deliberately refused.** A proxy: `_tunnel_host` is set when `urllib` decides to
 CONNECT through one, and honouring the pin while a proxy is configured would dial the
 proxy instead of the validated address. Refusing is the safe reading - an operator who
@@ -43,7 +62,6 @@ from __future__ import annotations
 
 import socket
 import ssl
-import urllib.error
 import urllib.error
 import urllib.request
 from http.client import HTTPConnection, HTTPSConnection
@@ -245,7 +263,10 @@ class PinnedOpenerDirector(urllib.request.OpenerDirector):
     built, and redirects re-enter here, so every hop is covered.
     """
 
-    pinned_scheme = "https"
+    #: No default on purpose. A default of "https" let a mis-built plaintext opener look
+    #: correct while the guard never fired; requiring it means the only way to obtain this
+    #: class is through a builder that states the scheme it pinned.
+    pinned_scheme: Optional[str] = None
 
     def open(self, fullurl, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         request = (
@@ -253,13 +274,41 @@ class PinnedOpenerDirector(urllib.request.OpenerDirector):
             if isinstance(fullurl, urllib.request.Request)
             else urllib.request.Request(fullurl, data=data)
         )
-        if request.type.lower() != self.pinned_scheme:
+        scheme = self.pinned_scheme
+        if scheme is None:
+            raise PinnedAddressError(
+                "refusing request: this opener was built without a pinned scheme, so it "
+                "cannot tell whether the request would be served by a pinned handler"
+            )
+        if request.type.lower() != scheme:
             raise PinnedAddressError(
                 f"refusing {request.type} request: this opener is pinned for "
                 f"{self.pinned_scheme} only, and an unpinned scheme would resolve the "
                 "destination a second time"
             )
         return super().open(request, data, timeout)
+
+
+def _build_without_proxy(*handlers) -> urllib.request.OpenerDirector:
+    """`build_opener`, with the environment proxy disabled.
+
+    `build_opener` installs a `ProxyHandler` whenever `getproxies()` is non-empty, and
+    `ProxyHandler.proxy_open` claims a plaintext request before any connection handler runs -
+    so with a proxy variable set, `PinnedHTTPConnection.connect()` is never called and the
+    pin is unused. See the module docstring for the measurement (F-31-1).
+
+    `ProxyHandler({})` is the stdlib's own way to say "no proxies". It suppresses the
+    environment-reading default, and because `__init__` only registers a `*_open` method per
+    configured scheme, an empty mapping registers none - so it claims nothing and the pinned
+    handler keeps the dispatch slot. Verified by reading `ProxyHandler.__init__`.
+
+    Two earlier attempts are worth recording so they are not repeated: deleting the handler
+    from `handlers` alone left `proxy_open` still claiming http; deleting it from
+    `handle_open` as well left the scheme with no connection handler at all, and
+    re-registering the survivors hung because `add_handler` does a `bisect.insort` into the
+    very list being iterated.
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), *handlers)
 
 
 def build_pinned_opener(
@@ -291,8 +340,9 @@ def build_pinned_opener(
     # `build_opener` suppresses its default handler for a scheme when a handler instance is
     # a subclass of it (`isinstance(check, klass)`), which is exactly what Pinned*Handler is.
     # Verified by reading the source rather than assumed: relying on an extra suppression
-    # mechanism here would have been dead code.
-    return urllib.request.build_opener(*handlers)
+    # mechanism here would have been dead code. The proxy handler is not suppressed by that
+    # mechanism, which is why it is removed explicitly.
+    return _build_without_proxy(*handlers)
 
 
 def build_pinned_opener_from(
@@ -317,7 +367,7 @@ def build_pinned_opener_from(
         handlers = list(extra_handlers) + [PinnedHTTPHandler(pin)]
     else:
         handlers = list(extra_handlers) + [PinnedHTTPSHandler(pin, context=context)]
-    base = urllib.request.build_opener(*handlers)
+    base = _build_without_proxy(*handlers)
     opener = PinnedOpenerDirector()
     opener.pinned_scheme = scheme
     for handler in base.handlers:
