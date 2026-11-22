@@ -1428,6 +1428,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
+          # The suite verifies that its own suppressions take effect by invoking bandit, so
+          # the scanner that produced the finding must be present. Pinned to the version the
+          # audit was performed with; installed here rather than in requirements.txt because
+          # nothing outside this step uses it.
+          python -m bandit --version >/dev/null 2>&1 || pip install --quiet "bandit==1.9.4"
           pytest tests/test_e07_phase26_sql_injection.py -v --tb=short -p no:cacheprovider | tee /tmp/p26suite.log
           if grep -qE "SKIPPED" /tmp/p26suite.log; then
             echo "::error::a Phase 26 case was skipped; the audit must be verified:"
