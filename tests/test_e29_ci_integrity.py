@@ -177,15 +177,54 @@ def test_the_guard_keeps_a_steps_documented_skip_exception_narrow(tmp_path):
     assert other.returncode == 1, "a skip other than the named exception must still fail"
 
 
-def test_no_step_disables_the_skip_check_where_it_had_one():
-    """The skip assertion must not be traded away for the exit-code assertion."""
-    steps = {index: step for _job, index, step in _steps()}
-    for index, step in steps.items():
-        run = str(step.get("run") or "")
-        if "--no-skip-check" not in run:
-            continue
-        # Only the Phase 29 backup step may use it, and its comment must say why.
-        assert "p29backup" in run, f"step {index} disables the skip check without justification"
+def test_each_steps_skip_policy_is_preserved_exactly():
+    """The guard must reproduce the assertion the step already made - no more, no less.
+
+    Phase 29 got this wrong on the first attempt in both directions, and CI caught it:
+
+    * `/tmp/p20suite.log` was given a *stricter* rule than it had (phase 20 never asserted
+      "no skips"), so a step that had always been allowed to skip began failing;
+    * `/tmp/p10.log` lost its documented exception, so an allowed skip began failing.
+
+    The rule asserted here: a log gets `--no-skip-check` only if the pre-Phase-29 step did
+    not assert "no SKIPPED" for it, and it carries exactly the `--allow-skip` names the old
+    step allowed by name.
+    """
+    import subprocess
+    import yaml
+
+    before = yaml.safe_load(
+        subprocess.run(["git", "show", "c31f6fe:.github/workflows/ci.yml"],
+                       capture_output=True, text=True, cwd=str(REPO_ROOT)).stdout
+    )
+    policy = {}
+    for step in before["jobs"]["test-and-security-audit"]["steps"]:
+        run = step.get("run") or ""
+        for line in run.splitlines():
+            stripped = line.strip()
+            if "SKIPPED" in stripped and ("if grep" in stripped or "unexpected=" in stripped):
+                for log in re.findall(r"/tmp/[\w]+\.log", stripped):
+                    policy[log] = {
+                        "asserts": True,
+                        "exceptions": re.findall(r'grep -v "([^"]+)"', stripped),
+                    }
+
+    after = CI.read_text(encoding="utf-8")
+    checked = 0
+    for log, rules in policy.items():
+        match = re.search(
+            re.escape(log) + r"[^\n]*",
+            "\n".join(l for l in after.splitlines() if "check_pytest_log.py" in l),
+        )
+        assert match, f"no guard line for {log}"
+        line = match.group(0)
+        assert "--no-skip-check" not in line, f"{log} had a skip assertion; it must stay on"
+        for exception in rules["exceptions"]:
+            assert f"--allow-skip {exception}" in line, (
+                f"{log} lost its documented exception {exception!r}"
+            )
+        checked += 1
+    assert checked >= 18, f"expected at least 18 guarded logs, checked {checked}"
 
 
 def test_the_guard_requires_a_summary_where_the_step_asks_for_one(tmp_path):
