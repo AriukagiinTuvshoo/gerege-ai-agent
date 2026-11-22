@@ -3,6 +3,8 @@ import io
 import json
 import re
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Dict, List, Any, Optional
@@ -10,6 +12,49 @@ from typing import Dict, List, Any, Optional
 # In-memory cache to avoid hammering Google Sheets on every message (TTL = 60 seconds)
 _SHEET_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 60
+
+
+#: Hosts the CSV fetch may contact. Checked before the request AND after any redirect.
+_ALLOWED_SHEET_HOST = "docs.google.com"
+
+
+class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when it stays on the allowlisted host.
+
+    Phase 27 (B310). `normalize_sheet_csv_url()` validates the URL the operator supplies,
+    but `urlopen` then followed whatever the server sent back. The final URL was never
+    re-checked, so validation covered only the first hop.
+
+    What that is and is not worth, stated precisely because both directions matter:
+
+    * `urllib` already refuses a redirect to `file:`/`ftp:` - it raises "Redirection to url
+      is not allowed" for any non-http(s) scheme. So the classic scheme downgrade was not
+      reachable here, and this is not described as a fix for it.
+    * What `urllib` *does* follow is an http(s) redirect to any host, including
+      `169.254.169.254` (cloud metadata) and RFC1918 addresses. Verified against a local
+      server: the client reached the target and returned its 401. That is the actual
+      SSRF surface, and pinning the host is the control that closes it.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(newurl)
+        if parsed.scheme not in ("https", "http") or parsed.hostname != _ALLOWED_SHEET_HOST:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                f"refusing redirect to {parsed.scheme}://{parsed.netloc}: the sheet fetch may "
+                f"only contact {_ALLOWED_SHEET_HOST}",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _sheet_opener() -> urllib.request.OpenerDirector:
+    """An opener that applies the host allowlist to every hop."""
+    return urllib.request.build_opener(_SameHostRedirectHandler)
 
 
 def normalize_sheet_csv_url(sheet_url: str) -> str:
@@ -22,7 +67,7 @@ def normalize_sheet_csv_url(sheet_url: str) -> str:
     url = sheet_url.strip()
     from urllib.parse import urlparse
     parsed = urlparse(url)
-    if parsed.scheme not in ("https", "http") or parsed.hostname != "docs.google.com":
+    if parsed.scheme not in ("https", "http") or parsed.hostname != _ALLOWED_SHEET_HOST:
         raise ValueError("Зөвхөн docs.google.com дээрх Google Sheets холбоос зөвшөөрөгдөнө (SSRF хамгаалалт).")
 
     if "output=csv" in url or "/export?format=csv" in url:
@@ -60,7 +105,14 @@ def fetch_sheet_rows(sheet_url: str, force_refresh: bool = False) -> List[Dict[s
             "User-Agent": "Mozilla/5.0 (compatible; GeregeBot/2.0)"
         }
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    # Phase 27: an opener that re-checks the host on every redirect, rather than trusting
+    # the first-hop validation above.
+    with _sheet_opener().open(req, timeout=10) as resp:
+        final_host = urllib.parse.urlsplit(resp.geturl()).hostname
+        if final_host != _ALLOWED_SHEET_HOST:
+            raise ValueError(
+                f"sheet fetch ended at {final_host!r}, which is not {_ALLOWED_SHEET_HOST}"
+            )
         raw_bytes = resp.read()
 
     text = raw_bytes.decode("utf-8-sig", errors="replace")

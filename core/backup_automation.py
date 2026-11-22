@@ -371,6 +371,7 @@ def notify(webhook: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
     """
     import time as _time
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     body = json.dumps(payload).encode("utf-8")
@@ -383,6 +384,21 @@ def notify(webhook: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
         # BACKUP_ALERT_WEBHOOK crashed the scheduled run instead of being reported. The
         # whole point of this function is that alerting cannot break a backup.
         try:
+            # Phase 27 (B310): the webhook URL was passed to urlopen with no scheme check.
+            # BACKUP_ALERT_WEBHOOK is operator configuration rather than an attacker-supplied
+            # value, so this is not remote code execution - but `file://` is accepted by
+            # urlopen and a GET response body read back, and a typo or a copied value is
+            # a realistic way to reach it. Alerting should contact an HTTP endpoint or fail.
+            scheme = urllib.parse.urlsplit(webhook).scheme.lower()
+            if scheme not in ("http", "https"):
+                # A wrong scheme cannot be fixed by retrying, so return rather than loop.
+                # Reporting "after 2 attempts" for a failure that was never attempted would
+                # be a small lie in exactly the place an operator looks to diagnose a typo.
+                return (
+                    False,
+                    f"notification failed: webhook scheme {scheme or '(none)'!r} is not "
+                    "http/https; refusing to open it",
+                )
             req = urllib.request.Request(
                 webhook, data=body, headers={"Content-Type": "application/json"}, method="POST"
             )

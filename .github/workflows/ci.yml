@@ -1424,6 +1424,25 @@ jobs:
       # SQLite schema must be refused, not executed - and it runs without a database. The
       # suppression guard fails if a bare `# nosec` appears anywhere, so a future finding
       # cannot be silenced without a reason.
+      # Phase 27: network binding, URL scheme, temp-file safety. The redirect tests run a
+      # real local HTTP server and assert the redirect target is never contacted - a mocked
+      # client would pass even with the guard removed. No database, no network egress.
+      - name: Phase 27 — redirect/SSRF containment, webhook scheme allowlist, temp-file safety
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          pytest tests/test_e07_phase27_network_tempfiles.py -v --tb=short -p no:cacheprovider | tee /tmp/p27suite.log
+          if grep -qE "SKIPPED" /tmp/p27suite.log; then
+            echo "::error::a Phase 27 case was skipped; the findings must be verified:"
+            grep -E "SKIPPED" /tmp/p27suite.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p27suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 35 ]; then
+            echo "::error::only ${collected:-0} Phase 27 tests passed, expected at least 35"
+            exit 1
+          fi
+
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
         run: |

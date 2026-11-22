@@ -2730,6 +2730,27 @@ async def serve_branch_portal_or_page(branch_slug: str):
 
 if __name__ == "__main__":
     import uvicorn
+
+    # Phase 27 (B104). `python main.py` is the developer entrypoint; it used to bind
+    # 0.0.0.0 with reload=True, which is `--reload`'s watch-everything behaviour applied to
+    # a server reachable from the whole local network. Nothing in the deployment path uses
+    # this block - the container runs `uvicorn main:app` directly (see Dockerfile) - so
+    # binding loopback by default costs nothing and closes the "I ran it on my laptop at a
+    # cafe" case, where development mode also means dev CORS and dev auth.
+    #
+    # The deployment genuinely needs 0.0.0.0 *inside the container*, because there is no
+    # reverse proxy in this topology (docker-compose.prod.yml publishes port 8000 directly).
+    # That is unchanged, and it is set by the Dockerfile, not by this block. Anyone who
+    # needs to reach this entrypoint from another machine sets HOST explicitly and knows
+    # what they are doing.
+    host = os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = int(os.getenv("PORT", 8000))
-    print(f"Гэрэгэ — Харилцааны Ухаалаг Систем: http://localhost:{port}")
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    reload_flag = os.getenv("RELOAD", "1") not in ("0", "false", "False", "no")
+    shown = "localhost" if host in ("127.0.0.1", "::1") else host
+    print(f"Гэрэгэ — Харилцааны Ухаалаг Систем: http://{shown}:{port}")
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        print(
+            f"warning: binding {host} exposes the development server, with reload enabled, "
+            "to every interface on this machine. Do not use this entrypoint in production."
+        )
+    uvicorn.run("main:app", host=host, port=port, reload=reload_flag)
