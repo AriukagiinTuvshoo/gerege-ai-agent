@@ -33,6 +33,7 @@ import appointment_service
 from core import security as core_security
 from core import rate_limit as core_rate_limit
 from core import login_identity as core_login_identity
+from core.pinned_http import download_remote_image
 from core.monitoring import telemetry
 from routers import system_router, automation_router
 
@@ -576,14 +577,28 @@ async def meta_webhook_events(request: Request, background_tasks: BackgroundTask
                     if att.get("type") == "image":
                         img_url = att.get("payload", {}).get("url")
                         if img_url:
+                            # Phase 30: this fetched a URL taken straight from the webhook
+                            # body with no scheme, address or redirect validation - the one
+                            # genuinely attacker-influenced URL in the codebase. Reproduced:
+                            # an unsigned webhook (META_APP_SECRET unset, non-production)
+                            # naming http://127.0.0.1:<port>/internal/admin/token caused this
+                            # process to GET it. A signed Meta delivery is still only as
+                            # trustworthy as the URL Meta was given, so the fetch itself is
+                            # what gets constrained, not just the caller.
                             try:
-                                async with httpx.AsyncClient() as client:
-                                    img_resp = await client.get(img_url, timeout=15.0)
-                                    if img_resp.status_code == 200:
-                                        image_bytes = img_resp.content
-                                        logger.info(f"Image downloaded from Meta: {len(image_bytes)} bytes (Page: {target_page_id})")
+                                fetched = await download_remote_image(
+                                    img_url, max_bytes=8 * 1024 * 1024
+                                )
+                                if fetched is not None:
+                                    image_bytes = fetched
+                                    logger.info(
+                                        f"Image downloaded from Meta: {len(image_bytes)} bytes "
+                                        f"(Page: {target_page_id})"
+                                    )
                             except Exception as e:
-                                logger.error(f"Image download error: {e}")
+                                # The type only. A URL here can carry a signed query token, and
+                                # an error message is what ends up in a log or an alert.
+                                logger.error(f"Image download error: {type(e).__name__}")
                         break
 
                 if (user_text or image_bytes) and sender_id:

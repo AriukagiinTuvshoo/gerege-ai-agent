@@ -80,7 +80,22 @@ def _check_pytest_exit_code(path: str, job_name: str, index: int, step: dict) ->
     run = str(step.get("run") or "")
     if not _PIPED_PYTEST_RE.search(run):
         return []
-    if "pipefail" in run or "check_pytest_log.py" in run:
+
+    # Phase 30 audit finding F-30-3: this check used `"pipefail" in run`, so a step whose
+    # only mention of pipefail was a *comment* passed. Reproduced: a step containing
+    # `# never mind pipefail, this is only a comment` plus `pytest ... | tee` validated
+    # clean, and running it returned 0 with a failing test - the precise failure this
+    # function exists to refuse. Comments are stripped before the guard is looked for, and
+    # the guard must appear as an actual command, not as any substring.
+    effective = "\n".join(
+        line.split("#", 1)[0] for line in run.splitlines()
+    )
+    # `set -euo pipefail` / `set -o pipefail` / `set -eu -o pipefail`, as a real command.
+    has_pipefail = bool(re.search(r"^\s*set\s+.*\bpipefail\b", effective, re.M))
+    has_log_guard = bool(
+        re.search(r"^\s*[\w./-]*python[\w./-]*\s+scripts/check_pytest_log\.py", effective, re.M)
+    )
+    if has_pipefail or has_log_guard:
         return []
     name = step.get("name", "<unnamed>")
     return [

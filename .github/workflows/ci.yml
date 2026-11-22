@@ -1549,6 +1549,18 @@ jobs:
           # exactly the failure mode this step exists to prevent.
           python scripts/check_pytest_log.py /tmp/p29suite.log --require-summary
 
+      - name: Phase 30 — SSRF DNS-rebinding containment and address pinning
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # Every case binds a loopback server and patches the resolver; no test in this file
+          # touches the network, so this step needs no database and no service.
+          pytest tests/test_e30_ssrf_pinning.py -v --tb=short -p no:cacheprovider | tee /tmp/p30suite.log
+          # Strict. A skipped Phase 30 case means the containment was not exercised: the
+          # rebinding, TLS and pinning assertions are the whole point of the file, and a skip
+          # there would report a pass for a control that never ran.
+          python scripts/check_pytest_log.py /tmp/p30suite.log --min-collected 36 --require-summary
+
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
         run: |

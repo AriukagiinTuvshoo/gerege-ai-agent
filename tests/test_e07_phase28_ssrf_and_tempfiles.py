@@ -519,11 +519,14 @@ def test_a_public_https_webhook_is_still_attempted(clean_alert_env, monkeypatch)
         def __exit__(self, *args):
             return False
 
-    def _fake_urlopen(request, timeout=None):
+    def _fake_deliver(opener, request, *, timeout):
         delivered.append(request.full_url)
         return _Response()
 
-    monkeypatch.setattr(backup_automation.urllib.request, "urlopen", _fake_urlopen)
+    # Phase 30 moved alert delivery onto a pinned opener, so the old `urlopen` stub no longer
+    # sits on the path: the request is made by `_open_pinned`. The seam is stubbed instead,
+    # and the assertion is unchanged - a permitted public destination is still attempted.
+    monkeypatch.setattr(backup_automation, "_open_pinned", _fake_deliver)
     monkeypatch.setattr(
         backup_automation, "_webhook_destination_refusal", lambda url: ""
     )

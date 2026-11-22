@@ -43,6 +43,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from core import outbound_http
+
 # Exit codes: distinct per failure class so a systemd unit, a cron wrapper or an
 # alerting rule can distinguish "no credential" from "disk full" without parsing text.
 EXIT_OK = 0
@@ -375,17 +377,26 @@ BACKUP_ALERT_ALLOW_INSECURE_ENV = "BACKUP_ALERT_ALLOW_INSECURE"
 
 def _webhook_destination_refusal(webhook: str) -> str:
     """Why this webhook destination must be refused, or "" when it is acceptable."""
-    from core import outbound_http
+    return _webhook_destination_check(webhook)[0]
 
+
+def _webhook_destination_check(webhook: str) -> "tuple[str, list]":
+    """`(refusal, addresses)` - the verdict AND the addresses it was reached from.
+
+    Phase 30: the addresses are returned so the caller can pin the connection to the exact
+    set this function validated. Returning only the verdict forced the caller to resolve
+    again, and the second resolution is the one an attacker controls - the race would have
+    been moved rather than closed. One resolution, one verdict, one pin.
+    """
     parsed = urllib.parse.urlsplit(webhook)
     scheme = parsed.scheme.lower()
     host = parsed.hostname
     if not host:
-        return f"webhook {webhook!r} has no host"
+        return f"webhook {webhook!r} has no host", []
     try:
         port = parsed.port or (443 if scheme == "https" else 80)
     except ValueError:
-        return f"webhook {host!r} has an invalid port"
+        return f"webhook {host!r} has an invalid port", []
 
     production = os.getenv("ENV", "").strip().lower() in ("production", "prod")
     allow_insecure = os.getenv(BACKUP_ALERT_ALLOW_INSECURE_ENV, "").strip() == "1"
@@ -394,26 +405,36 @@ def _webhook_destination_refusal(webhook: str) -> str:
         if production:
             return (
                 "plain http webhook refused in production: an alert body carries backup "
-                "names, failure text and an exit code. Use https."
+                "names, failure text and an exit code. Use https.",
+                [],
             )
         if not allow_insecure:
             return (
                 "plain http webhook refused: set BACKUP_ALERT_ALLOW_INSECURE=1 outside "
-                "production to permit a local test sink."
+                "production to permit a local test sink.",
+                [],
             )
+
+    # Resolve exactly once. Everything below judges this one answer, and the caller pins
+    # to it, so no second lookup exists for a resolver to steer.
+    addresses = outbound_http.resolve_host(host, port)
 
     if port not in outbound_http.DEFAULT_ALLOWED_PORTS:
         # A loopback test sink may legitimately use an ephemeral port; a real destination
-        # has no reason to use anything but 80/443.
-        if not (allow_insecure and not production and _resolves_to_loopback(host, port)):
+        # has no reason to use anything but 80/443. Judged from the same resolution.
+        all_loopback = bool(addresses) and all(
+            (outbound_http.parse_ip(a) is not None and outbound_http.parse_ip(a).is_loopback)
+            for _f, a in addresses
+        )
+        if not (allow_insecure and not production and all_loopback):
             return (
                 f"webhook port {port} is not allowed; use 443 (or 80 with the insecure "
-                "opt-in outside production)"
+                "opt-in outside production)",
+                [],
             )
 
-    addresses = outbound_http.resolve_host(host, port)
     if not addresses:
-        return f"webhook host {host!r} did not resolve"
+        return f"webhook host {host!r} did not resolve", []
     for _family, address in addresses:
         if outbound_http.is_public_address(address):
             continue
@@ -423,23 +444,36 @@ def _webhook_destination_refusal(webhook: str) -> str:
         return (
             f"webhook host {host!r} resolves to {address}, which is not a public address. "
             "Alert destinations must be reachable on the public internet; a private or "
-            "metadata address is never a webhook."
+            "metadata address is never a webhook.",
+            [],
         )
-    return ""
+    return "", addresses
 
 
-def _resolves_to_loopback(host: str, port: int) -> bool:
-    """True when every address this host resolves to is loopback (the documented test path)."""
-    from core import outbound_http
+def _open_pinned(opener, request, *, timeout):
+    """The single point where an alert request is actually sent.
 
-    addresses = outbound_http.resolve_host(host, port)
-    if not addresses:
-        return False
-    for _family, raw in addresses:
-        parsed = outbound_http.parse_ip(raw)
-        if parsed is None or not parsed.is_loopback:
-            return False
-    return True
+    Named so a test can assert *that a permitted destination is attempted* without a
+    network, which is what the Phase 28 test did by stubbing `urlopen`. That stub stopped
+    working when the webhook moved to a pinned opener - the request no longer goes through
+    `urlopen`, so the test failed with `URLError` instead of recording a delivery. A test
+    that has to know the transport is testing the transport; this keeps the seam explicit.
+
+    The timeout is a required argument rather than a default here so that every attempt's
+    bound is stated where the attempt is made, which is what the Phase 22 test checks for.
+    """
+    return opener.open(request, timeout=timeout)
+
+
+def _loopback_sink_allowed() -> bool:
+    """Whether the documented non-production loopback sink exception is in force.
+
+    Single source of truth for that decision: the destination check and the pinned
+    connection both read it, so they cannot disagree about whether 127.0.0.1 is permitted.
+    """
+    production = os.getenv("ENV", "").strip().lower() in ("production", "prod")
+    allow_insecure = os.getenv(BACKUP_ALERT_ALLOW_INSECURE_ENV, "").strip() == "1"
+    return allow_insecure and not production
 
 
 def notify(webhook: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
@@ -492,13 +526,34 @@ def notify(webhook: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
             # Phase 28: destination policy. The scheme check above decides how the bytes
             # travel; this decides *where* they go. Both are permanent failures, so both
             # return rather than retry.
-            refusal = _webhook_destination_refusal(webhook)
+            # Phase 30: ONE resolution decides both the verdict and the pinned address.
+            # Resolving twice was the bug the pin was supposed to fix: the second answer is
+            # the one an attacker controls.
+            refusal, addresses = _webhook_destination_check(webhook)
             if refusal:
                 return False, f"notification failed: {refusal}"
+
+            from core import pinned_http
+
+            parsed = urllib.parse.urlsplit(webhook)
+            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+            loopback_ok = _loopback_sink_allowed()
+            try:
+                opener = pinned_http.build_pinned_opener_from(
+                    addresses,
+                    scheme=parsed.scheme.lower(),
+                    extra_handlers=(pinned_http.SamePolicyRedirectHandler,),
+                    require_public=not loopback_ok,
+                    allow_loopback=loopback_ok,
+                )
+            except Exception as exc:
+                # Permanent: a destination that will not resolve or pin cannot be fixed by
+                # retrying. Reported in the same shape as the other permanent refusals.
+                return False, f"notification failed: {type(exc).__name__}"
             req = urllib.request.Request(
                 webhook, data=body, headers={"Content-Type": "application/json"}, method="POST"
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with _open_pinned(opener, req, timeout=10) as resp:
                 return (200 <= resp.status < 300), f"http {resp.status}"
         except urllib.error.HTTPError as exc:
             last = f"notification failed: HTTP {exc.code}"

@@ -57,8 +57,37 @@ class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _sheet_opener() -> urllib.request.OpenerDirector:
-    """An opener that applies the host allowlist to every hop."""
-    return urllib.request.build_opener(_SameHostRedirectHandler)
+    """An opener that applies the host allowlist to every hop, and pins the connection.
+
+    Phase 30. The host allowlist and the per-hop redirect guard already constrained *where*
+    the fetch could go, and TLS hostname verification already meant a rebound address could
+    not impersonate docs.google.com without a valid certificate for it. What was still true
+    is that the hostname was resolved twice - once to validate, once to connect - so this
+    pins the connection to the address the validation actually saw. Cheap, and it removes
+    the second lookup rather than reasoning about whether it is reachable.
+
+    The pin is best-effort by design: if resolution fails here the call raises, and the
+    caller already treats a failed sheet fetch as an ordinary failure. It must never turn a
+    working sheet fetch into a refusal, so a host that resolves to an address the pin will
+    not accept (which for docs.google.com should be impossible) is a hard error rather than
+    a silent fallback to an unpinned connection.
+    """
+    from core import pinned_http
+
+    try:
+        addresses = pinned_http.outbound_http.resolve_host(
+            _ALLOWED_SHEET_HOST, 443
+        )
+    except Exception:
+        addresses = []
+    if not addresses:
+        # Same shape as before the change: let the default machinery run and fail loudly on
+        # its own terms rather than converting a resolver blip into a different error.
+        return urllib.request.build_opener(_SameHostRedirectHandler)
+    return pinned_http.build_pinned_opener_from(
+        addresses,
+        extra_handlers=(_SameHostRedirectHandler,),
+    )
 
 
 def normalize_sheet_csv_url(sheet_url: str) -> str:
