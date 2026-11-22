@@ -115,6 +115,7 @@ jobs:
         env:
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
+          set -euo pipefail
           # These files were previously absent from the workflow, so their assertions never
           # ran in CI. E-02 Phase 4 is complete, so the *whole* login rate-limit file runs
           # here now - the `-k` subset that used to exclude test_11/test_11b/test_12 is gone
@@ -169,12 +170,20 @@ jobs:
             exit 1
           fi
 
+          # Phase 29: pipefail already fails the step; this reads the log too so the
+          # annotation names the failing test instead of only a line number.
+          python scripts/check_pytest_log.py /tmp/p4.log
+          # Phase 29: --allow-skip mirrors the exception this step already made above
+          # (the unicode variant test), rather than disabling the skip check wholesale.
+          python scripts/check_pytest_log.py /tmp/p41.log --allow-skip test_141_unicode_variants
+
       - name: E-02 Phase 4.2 — admission ownership & window-bound refunds
         if: ${{ !cancelled() }}
         env:
           REDIS_URL: "redis://127.0.0.1:6379/0"
           E02_ACCOUNT_KEY_SECRET: "ci-phase42-account-key-secret-0123456789ab"
         run: |
+          set -euo pipefail
           # E-02 Phase 4.2: a success refunds only the exact admission it consumed.
           #
           # The reported race: A admitted in W1 -> W1 expires -> B admitted and fails in W2 ->
@@ -206,6 +215,7 @@ jobs:
           REDIS_URL: "redis://127.0.0.1:6379/0"
           E02_ACCOUNT_KEY_SECRET: "ci-phase43-account-key-secret-0123456789ab"
         run: |
+          set -euo pipefail
           # E-02 Phase 4.3. Two defects in the Phase 4.2 store, both reproduced before the fix
           # (docs/audit/evidence/e02_phase43_before.txt):
           #
@@ -242,6 +252,7 @@ jobs:
           REDIS_URL: "redis://127.0.0.1:6379/0"
           E02_ACCOUNT_KEY_SECRET: "ci-phase44-account-key-secret-0123456789ab"
         run: |
+          set -euo pipefail
           # E-02 Phase 4.4. Two defects in the Phase 4.3 store, both reproduced before the fix
           # (docs/audit/evidence/e02_phase44_before.txt):
           #
@@ -262,7 +273,7 @@ jobs:
           fi
           # "Did not execute" must fail as loudly as "did not pass": require the exact collected
           # count, so a renamed, deselected or silently dropped test cannot pass this guard.
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p44.log | head -1 | grep -oE "[0-9]+")
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p44.log | head -1 | grep -oE "[0-9]+" || true)
           if [ "$collected" != "17" ]; then
             echo "::error::E-02 Phase 4.4 expected 17 passing cases, saw ${collected:-none}"
             exit 1
@@ -296,6 +307,7 @@ jobs:
           REDIS_URL: "redis://127.0.0.1:6379/0"
           E02_ACCOUNT_KEY_SECRET: "ci-phase6-account-key-secret-0123456789abc"
         run: |
+          set -euo pipefail
           # E-02 Phase 6. Remediation of the four Phase 5 findings, each reproduced before the
           # fix (docs/audit/evidence/e02_phase6_before.txt) and each pinned by a test that was
           # verified to FAIL against the pre-fix implementation:
@@ -315,7 +327,7 @@ jobs:
             grep -E "SKIPPED" /tmp/p6.log
             exit 1
           fi
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p6.log | head -1 | grep -oE "[0-9]+")
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p6.log | head -1 | grep -oE "[0-9]+" || true)
           if [ "$collected" != "60" ]; then
             echo "::error::E-02 Phase 6 expected 60 passing cases, saw ${collected:-none}"
             exit 1
@@ -344,6 +356,7 @@ jobs:
 
       - name: Run Pytest Regression, Enterprise, AI Eval & Failure Suites (SQLite mode)
         run: |
+          set -euo pipefail
           # Phase 22: this step now reports *which* tests failed, not only an exit status.
           #
           # It previously produced nothing but "Process completed with exit code 1": the
@@ -358,7 +371,7 @@ jobs:
           pytest tests/test_p0_security_role_escalation.py tests/test_p0_connection_pool_leak.py tests/test_p1_payment_security.py tests/test_noflow_features.py tests/test_postgres_cursor_regression.py tests/test_migration_and_restore_verification.py tests/test_enterprise_phases.py tests/test_ai_eval_suite.py tests/test_failure_scenarios.py tests/test_stage_b_regressions.py tests/test_p1_06_foreign_keys.py tests/test_sec_04_webhook_dedup.py tests/test_sec_03_security_headers.py tests/test_sec_07_rate_limits.py tests/test_e01_tenant_isolation.py -v --tb=short 2>&1 | tee /tmp/step17.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            failed_names=$(grep -E "^(FAILED|ERROR)" /tmp/step17.log | sed -E 's/^(FAILED|ERROR) //; s/ - .*//' | paste -sd';' - | cut -c1-350)
+            failed_names=$(grep -E "^(FAILED|ERROR)" /tmp/step17.log | sed -E 's/^(FAILED|ERROR) //; s/ - .*//' | paste -sd';' - | cut -c1-350 || true)
             echo "::error::SQLite-mode suite failed (pytest exit $status): ${failed_names:-no FAILED line captured}"
             echo "--- failure details ---"
             sed -n '/=* FAILURES *=*/,/^=* short test summary/p' /tmp/step17.log | head -200 || true
@@ -408,6 +421,7 @@ jobs:
           R10_REQUIRE_POSTGRES: "1"
           E02_ACCOUNT_KEY_SECRET: "ci-phase8-account-key-secret-0123456789abc"
         run: |
+          set -euo pipefail
           # E-02 Phase 8. Phase 7 confirmed that the Phase 6 409 was only a SEQUENTIAL guard:
           # under genuine concurrency two tenants still both committed the same normalized
           # username (12/12 trials, PostgreSQL 16.2 and SQLite). The remediation is a
@@ -431,11 +445,11 @@ jobs:
             exit 1
           fi
 
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p8.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 33 ]; then
-            echo "::error::E-02 Phase 8 expected at least 33 passing cases, saw ${collected:-none}"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p8.log --min-passed 33 --require-summary
 
           # Named findings, so a rename or deletion cannot pass silently.
           for t in test_801_the_unique_index_is_installed_and_correct \
@@ -495,6 +509,7 @@ jobs:
           R10_REQUIRE_POSTGRES: "1"
           E02_ACCOUNT_KEY_SECRET: "ci-phase10-account-key-secret-0123456789ab"
         run: |
+          set -euo pipefail
           # E-02 Phase 10. Login resolves
           #   LOWER(TRIM(client_username)) = ? OR LOWER(TRIM(page_id)) = ?
           # so one identifier can be claimed through either column. The Phase 8 index covers
@@ -515,11 +530,11 @@ jobs:
             exit 1
           fi
 
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p10.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 18 ]; then
-            echo "::error::E-02 Phase 10 expected at least 18 passing cases, saw ${collected:-none}"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p10.log --min-passed 18 --require-summary
 
           # Named findings, so a rename or deletion cannot pass silently. Every one of these
           # asserts REJECTION: the first SQLite trigger used INSERT OR IGNORE and accepted
@@ -583,6 +598,7 @@ jobs:
           R10_REQUIRE_POSTGRES: "1"
           E02_ACCOUNT_KEY_SECRET: "ci-phase11-account-key-secret-0123456789a"
         run: |
+          set -euo pipefail
           # E-02 Phase 11. `record_audit_log` has always accepted resource_type/resource_id
           # and never accepted target_type/target_id, yet five call sites used the latter.
           # The business write committed first, so three admin endpoints answered 500 while
@@ -601,11 +617,11 @@ jobs:
             exit 1
           fi
 
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p11.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 22 ]; then
-            echo "::error::E-02 Phase 11 expected at least 22 passing cases, saw ${collected:-none}"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p11.log --min-passed 22 --require-summary
 
           # Named findings, so a rename or deletion cannot pass silently.
           for t in test_1101_all_audit_callers_use_the_supported_keyword_names \
@@ -658,6 +674,7 @@ jobs:
           R10_REQUIRE_POSTGRES: "1"
           E02_ACCOUNT_KEY_SECRET: "ci-e03-account-key-secret-0123456789abcdef"
         run: |
+          set -euo pipefail
           # E-03. Three findings from the Phase 12 independent audit:
           #
           #   F-A  `get_connection()` sat outside `record_audit_log`'s try, so a failure to
@@ -687,7 +704,7 @@ jobs:
           for pair in "a:11" "b:11" "c:11"; do
             log="/tmp/e03${pair%%:*}.log"
             want="${pair##*:}"
-            got=$(grep -oE "[0-9]+ passed" "$log" | head -1 | grep -oE "[0-9]+")
+            got=$(grep -oE "[0-9]+ passed" "$log" | head -1 | grep -oE "[0-9]+" || true)
             if [ "${got:-0}" -lt "$want" ]; then
               echo "::error::E-03 expected at least $want passing cases in $log, saw ${got:-none}"
               exit 1
@@ -778,6 +795,16 @@ jobs:
           print("E-03: acquisition, payment signal and rotation contracts verified on PostgreSQL.")
           PY
 
+          # Phase 29: pipefail already fails the step; this reads the log too so the
+          # annotation names the failing test instead of only a line number.
+          python scripts/check_pytest_log.py /tmp/e03a.log
+          # Phase 29: pipefail already fails the step; this reads the log too so the
+          # annotation names the failing test instead of only a line number.
+          python scripts/check_pytest_log.py /tmp/e03b.log
+          # Phase 29: pipefail already fails the step; this reads the log too so the
+          # annotation names the failing test instead of only a line number.
+          python scripts/check_pytest_log.py /tmp/e03c.log
+
       - name: "Phase 13 — audit_logs must be append-only (finding F-D)"
         if: ${{ !cancelled() }}
         env:
@@ -785,6 +812,7 @@ jobs:
           R10_REQUIRE_POSTGRES: "1"
           E02_ACCOUNT_KEY_SECRET: "ci-p13-account-key-secret-0123456789abcdef"
         run: |
+          set -euo pipefail
           # Phase 13 (finding F-D). `audit_logs` had no tamper protection: zero triggers
           # on either engine, and an application-level UPDATE or DELETE succeeded on both.
           # Revision 0007 installs rejection triggers; a startup guard now refuses to boot
@@ -806,11 +834,11 @@ jobs:
             exit 1
           fi
 
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p13.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 21 ]; then
-            echo "::error::Phase 13 expected at least 21 passing cases, saw ${collected:-none}"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p13.log --min-passed 21 --require-summary
 
           for t in test_1301_the_guard_is_installed_with_the_expected_shape \
                    test_1302_the_update_guard_is_narrowed_to_the_retention_action_only \
@@ -930,6 +958,7 @@ jobs:
           R10_REQUIRE_POSTGRES: "1"
           E02_ACCOUNT_KEY_SECRET: "ci-e05-account-key-secret-0123456789abcdef"
         run: |
+          set -euo pipefail
           # E-05. Phase 13 made `audit_logs` append-only with triggers, and measured the
           # limit honestly: the runtime credential was a superuser, so DROP TRIGGER,
           # DISABLE TRIGGER and session_replication_role=replica all bypassed it. The
@@ -957,11 +986,11 @@ jobs:
             exit 1
           fi
 
-          collected=$(grep -oE "[0-9]+ passed" /tmp/e05.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 42 ]; then
-            echo "::error::Phase 14 expected at least 42 passing cases, saw ${collected:-none}"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/e05.log --min-passed 42 --require-summary
 
           for t in test_e05_01_audit_logs_is_the_only_table_narrowed_to_select_insert \
                    test_e05_11_backup_refuses_a_non_owner_credential_on_postgres \
@@ -1127,11 +1156,11 @@ jobs:
             exit 1
           fi
 
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p16.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 29 ]; then
-            echo "::error::Phase 16 expected at least 29 passing cases, saw ${collected:-none}"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p16.log --min-passed 29 --require-summary
 
           # Name-level assertions, for the same reason Phase 14 has them: a rename or
           # an accidental `skipif` must not silently reduce coverage.
@@ -1357,11 +1386,11 @@ jobs:
             grep -E "SKIPPED" /tmp/p18suite.log
             exit 1
           fi
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p18suite.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 32 ]; then
-            echo "::error::Phase 18 expected at least 32 passing cases, saw ${collected:-none}"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p18suite.log --min-passed 32 --require-summary
 
       - name: Phase 20 — backup confidentiality, offsite integrity, locking
         if: ${{ !cancelled() }}
@@ -1375,11 +1404,11 @@ jobs:
         run: |
           set -euo pipefail
           pytest tests/test_e06_phase20_backup_remediation.py -v --tb=short -p no:cacheprovider | tee /tmp/p20suite.log
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p20suite.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 24 ]; then
-            echo "::error::Phase 20 expected at least 24 passing cases, saw ${collected:-none}"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p20suite.log --min-passed 24 --require-summary
 
       # Phase 20: the critical property, asserted against the REAL CLI rather than a
       # mocked service. Phase 19 found that `maintenance.py backup` published plaintext
@@ -1407,11 +1436,11 @@ jobs:
             grep -E "SKIPPED" /tmp/p24suite.log
             exit 1
           fi
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p24suite.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 98 ]; then
-            echo "::error::only ${collected:-0} Phase 24 tests passed, expected at least 98"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p24suite.log --min-passed 98 --require-summary
 
       # The scheduler lifecycle must also hold against the REAL filesystem locations it
       # would use, with --unit-dir redirected. The CI step above proves the logic; this
@@ -1437,11 +1466,11 @@ jobs:
             grep -E "SKIPPED" /tmp/p27suite.log
             exit 1
           fi
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p27suite.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 35 ]; then
-            echo "::error::only ${collected:-0} Phase 27 tests passed, expected at least 35"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p27suite.log --min-passed 35 --require-summary
 
       # Phase 28: address-level destination policy, DNS-rebinding scope, temp-file
       # lifecycle. The classifier table is the core assertion - it covers the three values
@@ -1459,11 +1488,50 @@ jobs:
             grep -E "SKIPPED" /tmp/p28suite.log
             exit 1
           fi
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p28suite.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 62 ]; then
-            echo "::error::only ${collected:-0} Phase 28 tests passed, expected at least 62"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p28suite.log --min-passed 62 --require-summary
+
+      # Phase 29: the backup-security suites below were green but never executed by CI -
+      # 227 tests across 16 files, including alerting, offsite integrity and restore
+      # verification. They are grouped in one step because they share the same prerequisite:
+      # the PostgreSQL client binaries, which step 2 installs.
+      - name: Phase 22/23/24 — backup security, alerting, offsite integrity, restore
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          pytest tests/test_e07_phase22_alerting.py tests/test_e07_phase22_backup_policy.py \
+                 tests/test_e07_phase22_offsite_integrity.py \
+                 tests/test_e07_phase22_aead_binding.py \
+                 tests/test_e07_phase22_connection_bounds.py \
+                 tests/test_e07_phase22_db_bounds.py \
+                 tests/test_e07_phase22_offsite_pagination.py \
+                 tests/test_e07_phase22_offsite_status.py \
+                 tests/test_e07_phase22_recovery_safety.py \
+                 tests/test_e07_phase22_retention_plaintext.py \
+                 tests/test_e07_phase22_wal_copy_safety.py \
+                 tests/test_e07_phase23_alert_redaction.py \
+                 tests/test_e07_phase23_exit_codes.py \
+                 tests/test_e07_phase23_restore_verification.py \
+                 tests/test_e07_phase24_disaster_recovery.py \
+                 tests/test_e07_phase24_offsite_integration.py \
+                 -v --tb=short -p no:cacheprovider | tee /tmp/p29backup.log
+          # `--no-skip-check` is NOT passed: three of these files skip a case by design on
+          # PostgreSQL (WAL mode is SQLite-only, and one test is a SQLite locking property).
+          # Those skips carry a reason in the test itself and are asserted there.
+          python scripts/check_pytest_log.py /tmp/p29backup.log --min-passed 227 --no-skip-check
+
+      - name: Phase 29 — CI test integrity (exit codes, log guard, workflow validator)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # The structural check on this very workflow: no piped pytest without an
+          # exit-code guard. A check nobody runs is documentation.
+          python scripts/validate_workflows.py .github/workflows/ci.yml
+          pytest tests/test_e29_ci_integrity.py -v --tb=short -p no:cacheprovider | tee /tmp/p29suite.log
+          python scripts/check_pytest_log.py /tmp/p29suite.log --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
@@ -1480,11 +1548,11 @@ jobs:
             grep -E "SKIPPED" /tmp/p26suite.log
             exit 1
           fi
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p26suite.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 59 ]; then
-            echo "::error::only ${collected:-0} Phase 26 tests passed, expected at least 59"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p26suite.log --min-passed 59 --require-summary
 
       - name: Phase 25 — Jinja2 autoescaping, doc credential, fixture-password classification
         if: ${{ !cancelled() }}
@@ -1496,11 +1564,11 @@ jobs:
             grep -E "SKIPPED" /tmp/p25suite.log
             exit 1
           fi
-          collected=$(grep -oE "[0-9]+ passed" /tmp/p25suite.log | head -1 | grep -oE "[0-9]+")
-          if [ "${collected:-0}" -lt 42 ]; then
-            echo "::error::only ${collected:-0} Phase 25 tests passed, expected at least 42"
-            exit 1
-          fi
+          # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
+          # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
+          # the count assertion is kept so a suite that silently under-collects (a
+          # renamed file, a wrong selection) is caught too.
+          python scripts/check_pytest_log.py /tmp/p25suite.log --min-passed 42 --require-summary
 
       - name: Phase 24 — scheduler CLI dry-run writes nothing under a realistic path
         if: ${{ !cancelled() }}

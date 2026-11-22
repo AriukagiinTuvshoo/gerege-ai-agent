@@ -23,6 +23,35 @@ the sheets fetch, which is HTTPS-only, they matter considerably less than they w
 **Address pinning closes the remainder** for clients that can support it: resolve once,
 validate the address, then connect to that exact address while keeping the hostname as the
 TLS identity. That removes the second lookup entirely.
+
+Phase 29 assessment, per caller, so the strength of each control is stated rather than
+implied:
+
+* **Sheets CSV fetch - strong for its threat model, with a documented residual.** The host
+  is the constant `docs.google.com` with no environment override, so an attacker cannot
+  choose the destination at all: they must first compromise DNS *or* TLS. The fetch is
+  https-only, so a rebound address still has to present a certificate for
+  `docs.google.com`. What remains is the resolve/connect window: `reject_reason` resolves
+  once and `urlopen` resolves again, and a resolver that answers public first and private
+  second would pass the check and connect to the private address - but only if it can also
+  complete a TLS handshake as `docs.google.com`. Exploiting that means breaking a public CA.
+* **Webhook - defence in depth, not a boundary.** `BACKUP_ALERT_WEBHOOK` is operator
+  configuration, so the realistic failure is a copied staging URL or a typo, which the
+  scheme allowlist and address check do stop. An attacker who can already write the
+  environment does not need SSRF.
+* **`core/backup_offsite.py` - deliberately out of scope.** It takes a caller-provided S3
+  endpoint and signs requests with SigV4; blocking private addresses there would break
+  MinIO and on-prem object storage, which is a supported deployment. It carries its own
+  narrower control instead (`_plaintext_transport_allowed`: https required, a loopback
+  exception only outside production and only with an explicit opt-in).
+
+The prerequisite for any full pinning implementation: a custom `HTTPConnection` subclass
+whose `connect()` dials the validated address while keeping `server_hostname` as the TLS
+identity, wired in through `urllib`'s handlers. That was prototyped and works (verified
+against a real self-signed TLS server, including that hostname verification still rejects a
+mismatched certificate), but it replaces the transport for every call site and needs its
+own redirect, timeout and connection-pooling behaviour re-verified. That is an
+architectural change, so it is recommended rather than improvised here.
 """
 
 from __future__ import annotations
