@@ -24,7 +24,7 @@ import sys
 
 USAGE = (
     "usage: check_pytest_log.py <logfile> [--min-passed N] [--require-summary] "
-    "[--allow-skip TESTNAME] [--no-skip-check]"
+    "[--allow-skip TESTNAME] [--no-skip-check] [--min-collected N]"
 )
 
 #: Lines pytest writes for a failed or errored test. `-v` prints "FAILED path::test" and
@@ -49,6 +49,17 @@ def main(argv: list[str]) -> int:
     ]
     min_passed = None
     require_summary = "--require-summary" in argv
+    # `--min-collected N` asserts how many cases were *collected*, which is stable across
+    # environments, unlike `--min-passed`: a suite whose skips depend on a live service
+    # reports fewer passes in CI than locally while collecting exactly the same tests.
+    min_collected = None
+    if "--min-collected" in argv:
+        index = argv.index("--min-collected")
+        try:
+            min_collected = int(argv[index + 1])
+        except (IndexError, ValueError):
+            print(f"--min-collected needs an integer\n{USAGE}", file=sys.stderr)
+            return 2
     if "--min-passed" in argv:
         index = argv.index("--min-passed")
         try:
@@ -89,7 +100,19 @@ def main(argv: list[str]) -> int:
     if skip_lines and allowed_skips:
         print(f"  {log_path}: {len(skip_lines)} documented skip(s) allowed")
 
+
     matches = _PASSED_RE.findall(text)
+    skipped = len(re.findall(r"SKIPPED\s*\[", text))
+
+    if min_collected is not None:
+        collected_total = (int(matches[-1]) if matches else 0) + skipped
+        if collected_total < min_collected:
+            print(
+                f"::error::{log_path}: only {collected_total} collected "
+                f"(passed+skipped), expected at least {min_collected}"
+            )
+            return 1
+        print(f"  {log_path}: {collected_total} collected (>= {min_collected})")
     if not matches:
         if require_summary:
             print(f"::error::{log_path}: no pytest summary line; the run did not complete")

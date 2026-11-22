@@ -190,24 +190,40 @@ def test_each_steps_skip_policy_is_preserved_exactly():
     not assert "no SKIPPED" for it, and it carries exactly the `--allow-skip` names the old
     step allowed by name.
     """
-    import subprocess
-    import yaml
-
-    before = yaml.safe_load(
-        subprocess.run(["git", "show", "c31f6fe:.github/workflows/ci.yml"],
-                       capture_output=True, text=True, cwd=str(REPO_ROOT)).stdout
-    )
-    policy = {}
-    for step in before["jobs"]["test-and-security-audit"]["steps"]:
-        run = step.get("run") or ""
-        for line in run.splitlines():
-            stripped = line.strip()
-            if "SKIPPED" in stripped and ("if grep" in stripped or "unexpected=" in stripped):
-                for log in re.findall(r"/tmp/[\w]+\.log", stripped):
-                    policy[log] = {
-                        "asserts": True,
-                        "exceptions": re.findall(r'grep -v "([^"]+)"', stripped),
-                    }
+    # The policy is read from the workflow as it stands, not from `git show c31f6fe`:
+    # CI checks out shallow, so that commit is not present and the test failed there while
+    # passing locally. A test that only works with full history is a test that fails where
+    # it matters. The mapping below is the c31f6fe policy, transcribed, and the assertion
+    # is that the current workflow still honours it.
+    EXPECTED_POLICY = {
+        # log: (asserted "no SKIPPED" at c31f6fe, exceptions allowed by name)
+        "/tmp/p4.log": (False, []),
+        "/tmp/p41.log": (True, ["test_141_unicode_variants"]),
+        "/tmp/p42.log": (True, []),
+        "/tmp/p43.log": (True, []),
+        "/tmp/p44.log": (True, []),
+        "/tmp/p6.log": (True, []),
+        "/tmp/p8.log": (True, []),
+        "/tmp/p10.log": (True, ["test_1046_an_unclosed_connection"]),
+        "/tmp/p11.log": (True, []),
+        "/tmp/e03a.log": (True, []),
+        "/tmp/e03b.log": (True, []),
+        "/tmp/e03c.log": (True, []),
+        "/tmp/p13.log": (True, []),
+        "/tmp/e05.log": (True, []),
+        "/tmp/p16.log": (True, []),
+        "/tmp/p18suite.log": (True, []),
+        "/tmp/p20suite.log": (False, []),
+        "/tmp/p24suite.log": (True, []),
+        "/tmp/p27suite.log": (True, []),
+        "/tmp/p28suite.log": (True, []),
+        "/tmp/p26suite.log": (True, []),
+        "/tmp/p25suite.log": (True, []),
+    }
+    policy = {
+        log: {"asserts": asserts, "exceptions": excs}
+        for log, (asserts, excs) in EXPECTED_POLICY.items()
+    }
 
     after = CI.read_text(encoding="utf-8")
     checked = 0
@@ -218,13 +234,53 @@ def test_each_steps_skip_policy_is_preserved_exactly():
         )
         assert match, f"no guard line for {log}"
         line = match.group(0)
-        assert "--no-skip-check" not in line, f"{log} had a skip assertion; it must stay on"
+        if rules["asserts"]:
+            # The step asserted "no SKIPPED" before Phase 29, so it must still do so.
+            assert "--no-skip-check" not in line, f"{log} had a skip assertion; it must stay on"
+        else:
+            # The step never asserted it, so imposing one would be a new requirement - and
+            # is exactly how CI run 45008517419 failed on Phase 20's always-allowed skip.
+            assert "--no-skip-check" in line, (
+                f"{log} had no skip assertion at c31f6fe; adding one changes the step's "
+                "contract rather than enforcing it"
+            )
         for exception in rules["exceptions"]:
             assert f"--allow-skip {exception}" in line, (
                 f"{log} lost its documented exception {exception!r}"
             )
         checked += 1
     assert checked >= 18, f"expected at least 18 guarded logs, checked {checked}"
+
+
+def test_the_guard_can_assert_collection_rather_than_passes(tmp_path):
+    """`--min-collected` is stable where `--min-passed` is not.
+
+    The backup-security step skips 79 cases without a live S3 endpoint, so it reported 184
+    passes here and 148 in CI while collecting the same 227. A pass floor failed CI on a
+    difference that said nothing about the code; a collection floor catches the case that
+    does matter - a file quietly dropping out of the run.
+    """
+    log = tmp_path / "log.txt"
+    log.write_text(
+        "".join(f"t{i} PASSED\n" for i in range(148))
+        + "".join(f"SKIPPED [1] x.py:{i}: no endpoint\n" for i in range(79))
+        + "\n148 passed, 79 skipped in 30s\n",
+        encoding="utf-8",
+    )
+    ok = subprocess.run(
+        [sys.executable, str(GUARD), str(log), "--min-collected", "227", "--no-skip-check"],
+        capture_output=True, text=True,
+    )
+    assert ok.returncode == 0, ok.stdout
+
+    low = tmp_path / "low.txt"
+    low.write_text("100 passed, 50 skipped in 1s\n", encoding="utf-8")
+    bad = subprocess.run(
+        [sys.executable, str(GUARD), str(low), "--min-collected", "227", "--no-skip-check"],
+        capture_output=True, text=True,
+    )
+    assert bad.returncode == 1
+    assert "collected" in bad.stdout
 
 
 def test_the_guard_requires_a_summary_where_the_step_asks_for_one(tmp_path):
