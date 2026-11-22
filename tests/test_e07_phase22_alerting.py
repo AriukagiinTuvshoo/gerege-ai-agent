@@ -57,7 +57,26 @@ class _Receiver:
 
 
 @pytest.fixture()
-def receiver():
+def receiver(monkeypatch):
+    """A loopback HTTP sink for alert delivery.
+
+    Phase 28 added a destination policy to `notify()`: https only outside development, and
+    no private or loopback addresses. A local sink is neither of those, so it is permitted
+    only through the documented development opt-in, which is set here.
+
+    This is not a weakening of the control. The policy refuses the same loopback sink in
+    production regardless of this flag, including over https, and that refusal is asserted
+    in tests/test_e07_phase28_ssrf_and_tempfiles.py
+    (test_the_insecure_opt_in_cannot_be_used_in_production).
+
+    Several tests in this file also set ENV=production to describe the run they are
+    modelling. Before Phase 28 nothing in `backup_automation` read ENV, so that was
+    provenance only; the fixture deletes it so the local sink keeps working, and the tests
+    still assert exactly what they did before - the payload, the retry behaviour and the
+    error masking.
+    """
+    monkeypatch.setenv("BACKUP_ALERT_ALLOW_INSECURE", "1")
+    monkeypatch.delenv("ENV", raising=False)
     r = _Receiver()
     try:
         yield r
@@ -79,8 +98,11 @@ def test_notification_is_delivered(receiver):
     assert receiver.attempts == 1
 
 
-def test_transient_failure_is_retried_then_succeeds():
+def test_transient_failure_is_retried_then_succeeds(monkeypatch):
     """A 5xx is transient: retrying is the difference between an alert and silence."""
+    # Loopback sink: see the `receiver` fixture for why the documented opt-in is needed.
+    monkeypatch.setenv("BACKUP_ALERT_ALLOW_INSECURE", "1")
+    monkeypatch.delenv("ENV", raising=False)
     r = _Receiver(statuses=[503, 503, 200])
     try:
         from core import backup_automation
@@ -92,8 +114,10 @@ def test_transient_failure_is_retried_then_succeeds():
         r.close()
 
 
-def test_client_error_is_not_retried():
+def test_client_error_is_not_retried(monkeypatch):
     """A 4xx means the request is wrong; repeating it cannot help."""
+    monkeypatch.setenv("BACKUP_ALERT_ALLOW_INSECURE", "1")
+    monkeypatch.delenv("ENV", raising=False)
     r = _Receiver(statuses=[400, 400, 400])
     try:
         from core import backup_automation
@@ -164,7 +188,10 @@ def test_a_database_failure_does_not_leak_the_dsn(receiver, monkeypatch, tmp_pat
     """
     monkeypatch.setenv("BACKUP_ALERT_WEBHOOK", receiver.url)
     monkeypatch.setenv("BACKUP_DIR", str(tmp_path))
-    monkeypatch.setenv("ENV", "production")
+    # ENV is not set to production: the sink is loopback http, which the destination policy
+    # permits only outside production. Nothing asserted here depends on ENV - the test is
+    # about the DSN not reaching the alert body.
+    monkeypatch.setenv("BACKUP_ALERT_ALLOW_INSECURE", "1")
     monkeypatch.delenv("BACKUP_ENCRYPTION", raising=False)
     monkeypatch.setenv(
         "DATABASE_URL",

@@ -39,6 +39,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -352,6 +353,95 @@ def copy_offsite(src: str, target: str) -> Tuple[bool, str]:
         return False, f"offsite copy failed: {type(exc).__name__}"
 
 
+#: Hosts and ports a webhook may reach, and the one environment variable that relaxes it.
+#:
+#: Phase 28. The scheme allowlist added in Phase 27 decides how the payload travels; this
+#: decides where it lands. The distinction matters because the value is operator
+#: configuration, not attacker input - a hostile webhook needs a compromised or careless
+#: operator - so the policy is proportionate rather than absolute:
+#:
+#:   * https is required outside development;
+#:   * plain http is allowed only when BACKUP_ALERT_ALLOW_INSECURE=1 AND ENV is not
+#:     production, which is what lets the local test sinks work without weakening a
+#:     deployed host (the same shape used for the offsite loopback opt-in in Phase 22);
+#:   * the destination must resolve only to public addresses, which refuses loopback,
+#:     RFC1918, link-local and - the specific case worth naming - 169.254.169.254.
+#:
+#: Refusing is not a security boundary against an operator who can edit the environment
+#: file. It stops the realistic failures: a copied staging URL, a typo resolving to a
+#: typo-squatted internal name, and a value that quietly points at cloud metadata.
+BACKUP_ALERT_ALLOW_INSECURE_ENV = "BACKUP_ALERT_ALLOW_INSECURE"
+
+
+def _webhook_destination_refusal(webhook: str) -> str:
+    """Why this webhook destination must be refused, or "" when it is acceptable."""
+    from core import outbound_http
+
+    parsed = urllib.parse.urlsplit(webhook)
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname
+    if not host:
+        return f"webhook {webhook!r} has no host"
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return f"webhook {host!r} has an invalid port"
+
+    production = os.getenv("ENV", "").strip().lower() in ("production", "prod")
+    allow_insecure = os.getenv(BACKUP_ALERT_ALLOW_INSECURE_ENV, "").strip() == "1"
+
+    if scheme == "http":
+        if production:
+            return (
+                "plain http webhook refused in production: an alert body carries backup "
+                "names, failure text and an exit code. Use https."
+            )
+        if not allow_insecure:
+            return (
+                "plain http webhook refused: set BACKUP_ALERT_ALLOW_INSECURE=1 outside "
+                "production to permit a local test sink."
+            )
+
+    if port not in outbound_http.DEFAULT_ALLOWED_PORTS:
+        # A loopback test sink may legitimately use an ephemeral port; a real destination
+        # has no reason to use anything but 80/443.
+        if not (allow_insecure and not production and _resolves_to_loopback(host, port)):
+            return (
+                f"webhook port {port} is not allowed; use 443 (or 80 with the insecure "
+                "opt-in outside production)"
+            )
+
+    addresses = outbound_http.resolve_host(host, port)
+    if not addresses:
+        return f"webhook host {host!r} did not resolve"
+    for _family, address in addresses:
+        if outbound_http.is_public_address(address):
+            continue
+        if allow_insecure and not production and outbound_http.parse_ip(address).is_loopback:
+            # The documented test path: a local sink on this machine.
+            continue
+        return (
+            f"webhook host {host!r} resolves to {address}, which is not a public address. "
+            "Alert destinations must be reachable on the public internet; a private or "
+            "metadata address is never a webhook."
+        )
+    return ""
+
+
+def _resolves_to_loopback(host: str, port: int) -> bool:
+    """True when every address this host resolves to is loopback (the documented test path)."""
+    from core import outbound_http
+
+    addresses = outbound_http.resolve_host(host, port)
+    if not addresses:
+        return False
+    for _family, raw in addresses:
+        parsed = outbound_http.parse_ip(raw)
+        if parsed is None or not parsed.is_loopback:
+            return False
+    return True
+
+
 def notify(webhook: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
     """POST a JSON status. Best-effort, bounded, retried, and never raises.
 
@@ -399,6 +489,12 @@ def notify(webhook: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
                     f"notification failed: webhook scheme {scheme or '(none)'!r} is not "
                     "http/https; refusing to open it",
                 )
+            # Phase 28: destination policy. The scheme check above decides how the bytes
+            # travel; this decides *where* they go. Both are permanent failures, so both
+            # return rather than retry.
+            refusal = _webhook_destination_refusal(webhook)
+            if refusal:
+                return False, f"notification failed: {refusal}"
             req = urllib.request.Request(
                 webhook, data=body, headers={"Content-Type": "application/json"}, method="POST"
             )

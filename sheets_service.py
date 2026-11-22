@@ -6,6 +6,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from core import outbound_http
 import uuid
 from typing import Dict, List, Any, Optional
 
@@ -40,7 +42,9 @@ class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
         from urllib.parse import urlparse
 
         parsed = urlparse(newurl)
-        if parsed.scheme not in ("https", "http") or parsed.hostname != _ALLOWED_SHEET_HOST:
+        # https only: a downgrade to plain http would discard the certificate check that
+        # makes the rest of this defence meaningful.
+        if parsed.scheme != "https" or parsed.hostname != _ALLOWED_SHEET_HOST:
             raise urllib.error.HTTPError(
                 req.full_url,
                 code,
@@ -67,7 +71,13 @@ def normalize_sheet_csv_url(sheet_url: str) -> str:
     url = sheet_url.strip()
     from urllib.parse import urlparse
     parsed = urlparse(url)
-    if parsed.scheme not in ("https", "http") or parsed.hostname != _ALLOWED_SHEET_HOST:
+    # Phase 28: https only. `http` was accepted, and the pass-through branch below returned
+    # an http URL unchanged - so the fetch ran in plaintext, where nothing binds the
+    # connection to the hostname. That matters because TLS is the control that actually
+    # defeats DNS rebinding: to serve docs.google.com from a rebound internal address an
+    # attacker must present a certificate for docs.google.com. Over plain http they need
+    # only answer the request.
+    if parsed.scheme != "https" or parsed.hostname != _ALLOWED_SHEET_HOST:
         raise ValueError("Зөвхөн docs.google.com дээрх Google Sheets холбоос зөвшөөрөгдөнө (SSRF хамгаалалт).")
 
     if "output=csv" in url or "/export?format=csv" in url:
@@ -105,6 +115,23 @@ def fetch_sheet_rows(sheet_url: str, force_refresh: bool = False) -> List[Dict[s
             "User-Agent": "Mozilla/5.0 (compatible; GeregeBot/2.0)"
         }
     )
+    # Phase 28: resolve the allowlisted host and refuse if it is not globally routable.
+    #
+    # Honest scope, because overstating this would be worse than not doing it: this is a
+    # second layer, not the primary control. It rejects an environment where docs.google.com
+    # is hijacked by /etc/hosts or a poisoned resolver, and it rejects a host whose
+    # resolution includes any private address. It does NOT close the race between this
+    # lookup and the socket connect inside `urlopen` - only pinning the address would, and
+    # that requires a custom HTTP client. What closes the race in practice is TLS: the
+    # connection is https-only (enforced above), so a rebound address must still present a
+    # valid certificate for docs.google.com.
+    _refusal = outbound_http.reject_reason(_ALLOWED_SHEET_HOST, 443)
+    if _refusal:
+        raise ValueError(
+            f"refusing to fetch a sheet: {_ALLOWED_SHEET_HOST} {_refusal}. This host must "
+            "resolve only to public addresses."
+        )
+
     # Phase 27: an opener that re-checks the host on every redirect, rather than trusting
     # the first-hop validation above.
     with _sheet_opener().open(req, timeout=10) as resp:

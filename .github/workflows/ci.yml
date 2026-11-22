@@ -1443,6 +1443,28 @@ jobs:
             exit 1
           fi
 
+      # Phase 28: address-level destination policy, DNS-rebinding scope, temp-file
+      # lifecycle. The classifier table is the core assertion - it covers the three values
+      # where the obvious ipaddress check gives the wrong answer (multicast x2, IPv4-mapped
+      # loopback). The temp tests exercise the shipped cleanup function, extracted from
+      # api/index.py rather than reimplemented, and the TLS test would fail on a loosened
+      # verification step. No database, no network egress.
+      - name: Phase 28 — SSRF address policy, rebinding scope, temp-dir lifecycle
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          pytest tests/test_e07_phase28_ssrf_and_tempfiles.py -v --tb=short -p no:cacheprovider | tee /tmp/p28suite.log
+          if grep -qE "SKIPPED" /tmp/p28suite.log; then
+            echo "::error::a Phase 28 case was skipped; the findings must be verified:"
+            grep -E "SKIPPED" /tmp/p28suite.log
+            exit 1
+          fi
+          collected=$(grep -oE "[0-9]+ passed" /tmp/p28suite.log | head -1 | grep -oE "[0-9]+")
+          if [ "${collected:-0}" -lt 62 ]; then
+            echo "::error::only ${collected:-0} Phase 28 tests passed, expected at least 62"
+            exit 1
+          fi
+
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
         run: |

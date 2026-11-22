@@ -17,6 +17,7 @@ import sys
 import threading
 import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,87 @@ def redirect_server():
     thread.start()
     try:
         yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture(scope="module")
+def tls_cert(tmp_path_factory):
+    """A self-signed certificate for 127.0.0.1, generated once for this module.
+
+    Phase 28 made the sheets first hop https-only, so the "a legitimate multi-hop fetch
+    still works" property can no longer be exercised over plain http. Serving the redirect
+    chain over TLS keeps the test honest instead of deleting it. Generated here rather than
+    committed: a checked-in key is a key everybody has.
+    """
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    directory = tmp_path_factory.mktemp("tls")
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(__import__("ipaddress").ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = directory / "cert.pem"
+    key_path = directory / "key.pem"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    return str(cert_path), str(key_path)
+
+
+@pytest.fixture()
+def tls_redirect_server(tls_cert):
+    """The same redirect behaviour, over TLS, on a self-signed certificate.
+
+    Yields (port, ca_bundle_path, url_scheme).
+    """
+    import ssl
+
+    cert_path, key_path = tls_cert
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+
+    class _TLSHandler(_RedirectHandler):
+        def do_GET(self):  # noqa: N802 - http.server API
+            if self.path.startswith("/to-same-host"):
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"https://127.0.0.1:{self.server.server_address[1]}/ok"
+                )
+                self.end_headers()
+                return
+            super().do_GET()
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), _TLSHandler)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield port, cert_path
     finally:
         server.shutdown()
         server.server_close()
@@ -156,13 +238,31 @@ def test_a_redirect_to_a_file_scheme_is_refused(redirect_server):
         _sheet_opener().open(f"http://127.0.0.1:{redirect_server}/to-file", timeout=4)
 
 
-def test_a_same_host_redirect_is_still_allowed(redirect_server, monkeypatch):
-    """The control must not break a legitimate multi-hop fetch on the allowed host."""
+def test_a_same_host_redirect_is_still_allowed(tls_redirect_server, monkeypatch):
+    """The control must not break a legitimate multi-hop fetch on the allowed host.
+
+    Phase 28 moved this onto TLS. The property being protected is unchanged - a redirect
+    that stays on the allowlisted host is still followed - but the first hop must now be
+    https, so a plain-http chain would only be testing the scheme rule instead.
+    """
+    import ssl
+
     import sheets_service
 
+    port, ca_bundle = tls_redirect_server
     monkeypatch.setattr(sheets_service, "_ALLOWED_SHEET_HOST", "127.0.0.1")
-    with sheets_service._sheet_opener().open(
-        f"http://127.0.0.1:{redirect_server}/to-same-host", timeout=4
+
+    def _trusting_opener():
+        # Passing the handler to build_opener *replaces* the default HTTPSHandler, which an
+        # `add_handler` call after construction does not reliably do.
+        return urllib.request.build_opener(
+            sheets_service._SameHostRedirectHandler,
+            urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=ca_bundle)),
+        )
+
+    monkeypatch.setattr(sheets_service, "_sheet_opener", _trusting_opener)
+    with _trusting_opener().open(
+        f"https://127.0.0.1:{port}/to-same-host", timeout=4
     ) as response:
         assert response.read().startswith(b"csv,data")
 
@@ -253,10 +353,18 @@ def test_a_refused_scheme_is_not_retried():
     assert "attempts" not in detail
 
 
-def test_http_webhooks_are_still_attempted(redirect_server):
-    """The allowlist must not block a real delivery."""
+def test_http_webhooks_are_still_attempted(redirect_server, monkeypatch):
+    """The controls must not block a real delivery.
+
+    Phase 28 added a destination policy on top of the Phase 27 scheme allowlist. A loopback
+    sink is now permitted only through the documented development opt-in, so this test sets
+    it - the same path an operator's local test sink uses. The production refusal is tested
+    separately in tests/test_e07_phase28_ssrf_and_tempfiles.py.
+    """
     from core import backup_automation
 
+    monkeypatch.setenv("BACKUP_ALERT_ALLOW_INSECURE", "1")
+    monkeypatch.delenv("ENV", raising=False)
     ok, detail = backup_automation.notify(
         f"http://127.0.0.1:{redirect_server}/ok", {"event": "test"}
     )

@@ -68,9 +68,19 @@ class Sink:
 
 @pytest.fixture()
 def fast_retry(monkeypatch):
-    """Keep the retry backoff out of the test's runtime."""
+    """Keep the retry backoff out of the test's runtime.
+
+    Phase 28 also opted this file into the documented loopback sink path: every sink here
+    is ``http://127.0.0.1:<port>/hook``, which the new destination policy refuses unless
+    BACKUP_ALERT_ALLOW_INSECURE=1 is set outside production. That is not a relaxation of
+    the control - the same policy refuses loopback in production regardless of this flag,
+    and Phase 28's own tests assert exactly that (see
+    tests/test_e07_phase28_ssrf_and_tempfiles.py::test_the_insecure_opt_in_cannot_be_used_in_production).
+    """
     monkeypatch.setenv("BACKUP_ALERT_RETRIES", "3")
     monkeypatch.setenv("BACKUP_ALERT_BACKOFF_S", "0.01")
+    monkeypatch.setenv("BACKUP_ALERT_ALLOW_INSECURE", "1")
+    monkeypatch.delenv("ENV", raising=False)
 
 
 # ---------------------------------------------------------------------------
