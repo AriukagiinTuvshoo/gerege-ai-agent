@@ -129,17 +129,26 @@ class TestDockerfilePinning:
         match = re.search(r"^FROM\s+(\S+)", content, re.MULTILINE)
         assert match, "no FROM line"
         image = match.group(1)
-        assert "@sha256:" in image, (
-            f"base image {image!r} is a mutable tag; pin it by digest"
+
+        # The image is supplied through `ARG BASE_IMAGE=...`, so the FROM line itself is
+        # `FROM ${BASE_IMAGE}`. What matters is the default that a plain `docker build`
+        # would use, because that is what CI builds.
+        default_match = re.search(r"^ARG\s+BASE_IMAGE=(\S+)", content, re.MULTILINE)
+        assert default_match, (
+            "the Dockerfile must declare ARG BASE_IMAGE so the base image can be pinned "
+            "at build time without editing the file"
         )
-        if "REPLACE_ME_WITH_RESOLVED_DIGEST" in image:
+        default_image = default_match.group(1)
+
+        assert ":" in default_image, f"base image {default_image!r} has no tag"
+        if "@sha256:" not in default_image:
             pytest.xfail(
-                "base-image digest is a documented placeholder: Docker Hub is outside "
-                "this environment's egress allowlist, so the digest could not be "
-                "resolved. Resolve it before the first staging build with\n"
-                "  docker buildx imagetools inspect python:3.12-slim "
-                "--format '{{.Manifest.Digest}}'\n"
-                "and paste it into the Dockerfile. This test passes once it is real."
+                f"the default base image {default_image!r} is a mutable tag, not a digest. "
+                "Docker Hub is outside this environment's egress allowlist, so the digest "
+                "could not be resolved, and a fabricated digest makes FROM unpullable "
+                "(an earlier placeholder broke the CI image build). Pin it at build time "
+                "with --build-arg BASE_IMAGE=python:3.12-slim@sha256:<digest>, or change "
+                "the ARG default. This test passes once the default carries a digest."
             )
 
     def test_other_images_in_compose_are_tag_pinned(self):

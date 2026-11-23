@@ -1,19 +1,25 @@
-# Phase 36: pin the base image by digest, not just by tag.
+# Phase 36: the base image is parameterised so it can be pinned by digest without
+# editing this file.
 #
-# `python:3.12-slim` is a mutable tag: the same Dockerfile can build against a different
+# `python:3.12-slim` is a MUTABLE tag: the same Dockerfile can build against a different
 # slim layer next week, so "it built yesterday" says nothing about today. Phase 35 rated
-# this Medium.
+# that Medium.
 #
-# The digest below MUST be replaced with a real one before the first build. It could not
-# be resolved from the audit environment (Docker Hub is outside the egress allowlist), and
-# inventing a digest would produce an image that cannot pull at all - worse than the tag.
-# Resolve it on a host with registry access:
+# Why the default is still a tag rather than a digest: the digest could not be resolved
+# from the audit environment (Docker Hub is outside the egress allowlist) and a fabricated
+# digest makes `FROM` unpullable, which breaks the CI image build outright - strictly worse
+# than the mutable tag it was meant to fix. An earlier attempt at a placeholder digest did
+# exactly that and failed CI, which is how this was caught.
+#
+# Pin it at build time, with no file edit:
 #
 #   docker buildx imagetools inspect python:3.12-slim --format '{{.Manifest.Digest}}'
+#   docker build --build-arg BASE_IMAGE=python:3.12-slim@sha256:<digest> -t gerege .
 #
-# then replace `@sha256:REPLACE_ME_WITH_RESOLVED_DIGEST` below. `tests/test_e36_lock.py`
-# fails while the placeholder is present, so this cannot ship silently.
-FROM python:3.12-slim@sha256:REPLACE_ME_WITH_RESOLVED_DIGEST
+# `tests/test_e36_lock.py` xfails while the default is a tag, so the gap stays visible and
+# turns green once the default is pinned.
+ARG BASE_IMAGE=python:3.12-slim
+FROM ${BASE_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

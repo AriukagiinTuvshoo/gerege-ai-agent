@@ -1607,11 +1607,16 @@ jobs:
       - name: Phase 36 — connection budget, lockfile, health separation, worker heartbeat
         if: ${{ !cancelled() }}
         env:
-          # The suite isolates itself by rebinding `database.DB_PATH`; no service and no
-          # PostgreSQL is required. The F-36-1 connect-timeout case talks to an unroutable
-          # address (10.255.255.1) and never reaches a server, so this performs no real
-          # network I/O and needs no Redis beyond the optional heartbeat cases.
+          # The suite isolates itself by rebinding `database.DB_PATH`; no PostgreSQL is
+          # required. The F-36-1 connect-timeout case talks to an unroutable address
+          # (10.255.255.1) and never reaches a server, so it performs no real network I/O.
+          #
+          # REDIS_URL is set because the worker-heartbeat tests need a real Redis: the
+          # whole point of a TTL key is that it expires, and a fake would prove nothing.
+          # Without it those nine cases SKIP, and the gate below refuses skips - correctly,
+          # because a skipped liveness test is indistinguishable from a passing one.
           DB_PATH: ${{ github.workspace }}/p36_suite.db
+          REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
           set -euo pipefail
           pytest tests/test_e36_phase36_infra.py tests/test_e36_lock.py \
