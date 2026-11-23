@@ -1,5 +1,15 @@
 version: "3.9"
 
+# Phase 39 (F-39-C): explicit project name.
+#
+# Without this, Compose derives the project name from the directory the file lives in.
+# `docker-compose.staging.yml` sets `name: gerege-staging`, so staging is pinned — but
+# production was not. On a host where both stacks are checked out under a similar path
+# (or where the directory is renamed), production's volumes (`pgdata`, `redisdata`,
+# `caddy_data`) and staging's would resolve to the same project and the two stacks would
+# share a database volume. Pinning it makes that impossible rather than unlikely.
+name: gerege-production
+
 # ---------------------------------------------------------------------------
 # E-05: two credentials, two planes.
 #
@@ -288,6 +298,28 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    healthcheck:
+      # Phase 39 (F-39-B): production's worker had NO healthcheck. Phase 37 fixed this
+      # for staging and the fix was never mirrored, so in production a wedged worker
+      # (a hung handler, a dead loop, an exhausted Redis connection) kept
+      # `restart: unless-stopped` from ever restarting it and looked healthy to
+      # `docker compose ps`. The container would sit there consuming nothing and
+      # processing nothing, with no signal anywhere.
+      #
+      # This reads the same Redis key worker.py writes via core.worker_heartbeat, which
+      # /api/admin/worker/health also reports, so the probe and the API cannot disagree.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - >-
+          import sys;
+          from core.worker_heartbeat import read;
+          sys.exit(0 if read()["status"] == "alive" else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     deploy:
       resources:
         limits:

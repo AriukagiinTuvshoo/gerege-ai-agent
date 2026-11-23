@@ -17,9 +17,19 @@
 # NOT a production file. Do not point this at production data.
 #
 # Start:  docker compose -f docker-compose.staging.yml up -d
-# Proxy:  enabled by default below; if TLS cannot be issued (no DNS yet), run
-#         `--profile no-proxy` and use deploy/Caddyfile.local instead. Never expose
-#         port 8000 to the internet to work around a certificate problem.
+# Proxy:  always enabled — not switchable, by design. An earlier version of this comment
+#         named a bypass profile and a local Caddyfile that were never added to the repo,
+#         which sent a DNS-less operator hunting for a flag and a file that do not exist.
+#
+#         The proxy cannot be switched off by design. Caddy refuses to start when
+#         STAGING_DOMAIN is unset (it gets an empty site address), and compose refuses to
+#         start without STAGING_DOMAIN, ACME_EMAIL, TRUSTED_PROXIES and the credentials.
+#         So the first-boot prerequisite is real: point DNS at the host BEFORE starting,
+#         as docs/deployment/STAGING_DEPLOYMENT.md §1 states.
+#
+#         Never work around a certificate problem by publishing port 8000. That skips TLS
+#         entirely, and a `Secure` session cookie is silently dropped over http://, so the
+#         symptom (re-login on every request) has nothing to do with the certificate.
 
 name: gerege-staging
 
@@ -49,6 +59,11 @@ services:
       retries: 3
 
   # ------------------------------------------------------------------ application
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
   web:
     build: .
     restart: unless-stopped
@@ -106,6 +121,11 @@ services:
       timeout: 5s
       retries: 4
       start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 768M
 
   worker:
     build: .
@@ -162,6 +182,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
 
   # ------------------------------------------------------------------ one-shot migrate
   migrate:
@@ -193,6 +218,13 @@ services:
     build: .
     profiles: ["maintenance"]
     restart: "no"
+    # One-shot operator/backup container: it runs pg_dump and a restore, so it needs
+    # room for a whole archive, but not a core's worth of CPU.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
     environment:
       ENV: production
       DB_PROCESS_ROLE: "maintenance"
@@ -217,6 +249,11 @@ services:
         condition: service_healthy
 
   # ------------------------------------------------------------------ data plane
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
   db:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -238,6 +275,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1024M
 
   redis:
     image: redis:7-alpine
@@ -257,6 +299,11 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
 
 volumes:
   pgdata:

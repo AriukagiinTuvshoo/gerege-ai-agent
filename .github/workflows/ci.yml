@@ -1625,6 +1625,7 @@ jobs:
                  tests/test_e36_backup_operations.py tests/test_e36_worker_health.py \
                  tests/test_e37_phase37_readiness.py tests/test_e37_lock_integrity.py \
                  tests/test_e38_production_architecture.py \
+                 tests/test_e39_staging_operational_readiness.py \
                  -v --tb=short -p no:cacheprovider | tee /tmp/p36suite.log
           # Strict, and deliberately so. These files are the only thing standing between a
           # future change and the four defects Phase 36 closed: an unbounded pool connect,
@@ -1636,10 +1637,14 @@ jobs:
           #
           # Phase 37 added tests/test_e37_phase37_readiness.py (34) and
           # tests/test_e37_lock_integrity.py (8). Phase 38 added
-          # tests/test_e38_production_architecture.py (47).
-          # Measured collection is 233; the floor keeps the 4-case margin used since
-          # Phase 36: 233 - 4 = 229.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 229 --require-summary
+          # tests/test_e38_production_architecture.py (47). Phase 39 added
+          # tests/test_e39_staging_operational_readiness.py (60).
+          #
+          # Measured collection AFTER Phase 39 is 294. The previously recorded 233 was
+          # already stale by one before this phase: a clean checkout of the Phase 38
+          # commit collects 234. The explicit file list, not the number, is the authority;
+          # the floor exists to catch a suite silently dropping out of the run.
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 290 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
@@ -1891,6 +1896,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           docker build -t gerege-ai-agent:ci .
+
+      - name: Phase 39 — staging deployment rehearsal (real containers, disposable stack)
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          # The audit environment has no Docker, so this is the ONLY place the staging
+          # architecture is executed rather than parsed. The logic lives in a script
+          # because an inline version with Python heredocs broke the workflow's YAML,
+          # which fails the whole pipeline before any step runs.
+          #
+          # No TLS and no DNS: STAGING_DOMAIN is a .invalid name, so no ACME endpoint is
+          # contacted. The Caddyfiles are validated separately by `caddy validate`.
+          bash scripts/p39_staging_rehearsal.sh
 
       - name: Validate the Caddyfiles with Caddy itself (Phase 38)
         if: ${{ !cancelled() }}

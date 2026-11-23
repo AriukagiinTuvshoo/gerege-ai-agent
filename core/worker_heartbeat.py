@@ -49,6 +49,10 @@ ALLOWED_EXTRA_KEYS = frozenset({
     "stale_recovered",
     "reports_sent",
     "reminders_sent",
+    # Phase 39 (F-39-D): a scheduler step raised during the tick. The worker can be
+    # perfectly alive with a broken scheduler; without this counter that state was
+    # invisible over HTTP.
+    "scheduler_errors",
 })
 
 

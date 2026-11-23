@@ -65,7 +65,16 @@ async def run_worker_tick(loop_count: int) -> dict:
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
     current_hm = now.strftime("%H:%M")
-    stats = {"queue_processed": 0, "stale_recovered": 0, "reports_sent": 0, "reminders_sent": 0}
+    stats = {
+        "queue_processed": 0,
+        "stale_recovered": 0,
+        "reports_sent": 0,
+        "reminders_sent": 0,
+        # Phase 39 (F-39-D): a scheduler step that raised during this tick. Non-zero
+        # means something is broken even though the worker itself is alive; before this
+        # the only evidence was a log line nobody was watching.
+        "scheduler_errors": 0,
+    }
 
     # 0. Гацсан (PROCESSING visibility timeout хэтэрсэн) даалгавруудыг сэргээх
     stats["stale_recovered"] = task_queue.recover_stale_jobs()
@@ -74,28 +83,62 @@ async def run_worker_tick(loop_count: int) -> dict:
     stats["queue_processed"] = await task_queue.process_pending_jobs(batch_size=25)
 
     # 2. Өглөөний 08:30 Эзний тайлан (Idempotent lock-оор давхцалаас хамгаалсан)
-    pages = database.get_all_pages()
-    for p in pages:
-        pid = p.get("page_id")
-        if not pid:
-            continue
-        enabled = p.get("daily_report_enabled", 1)
-        target_time = p.get("daily_report_time", "08:30")
-        if enabled and current_hm == target_time:
-            lock_key = f"daily_exec_report:{pid}:{today_str}"
-            if database.claim_notification_lock(lock_key, page_id=pid, channel="telegram", ttl_seconds=86400):
-                logger.info(f"Sending daily executive report for {pid} ({today_str})")
-                await executive_bot_service.send_executive_report(page_id=pid)
-                stats["reports_sent"] += 1
+    # ---------------------------------------------------------------------------
+    # Phase 39 (F-39-D): every scheduler step is now isolated.
+    #
+    # Before this, steps 2-4 ran unguarded in one sequence inside the tick, and the tick
+    # is called from a loop that catches everything and continues. The combination meant
+    # one broken scheduler call:
+    #
+    #   * aborted the REST of the tick, so appointment reminders stopped even when due;
+    #   * aborted steps 2-4 on every later tick, since the loop just called the same
+    #     function again;
+    #   * and because `beat()` is deliberately the LAST statement of the tick, the
+    #     heartbeat was never written. A LIVE process therefore looked DEAD, the
+    #     container went unhealthy, Docker restarted it, and it wedged again.
+    #
+    # Measured before the fix: three consecutive ticks against a scheduler call that
+    # always raises left `worker_heartbeat.read()["status"] == "missing"` while the
+    # process was alive and logging errors.
+    #
+    # Now each step fails independently, the failure is counted, and the tick completes
+    # so the heartbeat is written. `scheduler_errors` is exposed through the heartbeat,
+    # so a broken step is visible over HTTP instead of only in the log.
+    # ---------------------------------------------------------------------------
+    try:
+        pages = database.get_all_pages()
+        for p in pages:
+            pid = p.get("page_id")
+            if not pid:
+                continue
+            enabled = p.get("daily_report_enabled", 1)
+            target_time = p.get("daily_report_time", "08:30")
+            if enabled and current_hm == target_time:
+                lock_key = f"daily_exec_report:{pid}:{today_str}"
+                if database.claim_notification_lock(lock_key, page_id=pid, channel="telegram", ttl_seconds=86400):
+                    logger.info(f"Sending daily executive report for {pid} ({today_str})")
+                    await executive_bot_service.send_executive_report(page_id=pid)
+                    stats["reports_sent"] += 1
+    except Exception as exc:
+        stats["scheduler_errors"] += 1
+        logger.error(f"daily report step failed: {type(exc).__name__}: {exc}")
 
-    # 3. 5 минут тутамд автомат сэргээгч (Abandoned chat, Cargo pickup, Retention) - TTL lock-той
-    if loop_count % 20 == 0:
-        retention_lock = f"scheduler:retention:{now.strftime('%Y-%m-%d %H:%M')}"
-        if database.claim_notification_lock(retention_lock, channel="system", ttl_seconds=240):
-            await retention_service.run_automated_retention_checks()
+    try:
+        # 3. 5 минут тутамд автомат сэргээгч (Abandoned chat, Cargo pickup, Retention) - TTL lock-той
+        if loop_count % 20 == 0:
+            retention_lock = f"scheduler:retention:{now.strftime('%Y-%m-%d %H:%M')}"
+            if database.claim_notification_lock(retention_lock, channel="system", ttl_seconds=240):
+                await retention_service.run_automated_retention_checks()
+    except Exception as exc:
+        stats["scheduler_errors"] += 1
+        logger.error(f"retention step failed: {type(exc).__name__}: {exc}")
 
-    # 4. Цаг захиалгын 2 цагийн өмнөх сануулга
-    stats["reminders_sent"] = await appointment_service.check_and_dispatch_appointment_reminders()
+    try:
+        # 4. Цаг захиалгын 2 цагийн өмнөх сануулга
+        stats["reminders_sent"] = await appointment_service.check_and_dispatch_appointment_reminders()
+    except Exception as exc:
+        stats["scheduler_errors"] += 1
+        logger.error(f"appointment reminder step failed: {type(exc).__name__}: {exc}")
 
     # 5. Automatic daily backup REMOVED (E-05).
     #
@@ -120,6 +163,7 @@ async def run_worker_tick(loop_count: int) -> dict:
             "stale_recovered": stats.get("stale_recovered", 0),
             "reports_sent": stats.get("reports_sent", 0),
             "reminders_sent": stats.get("reminders_sent", 0),
+            "scheduler_errors": stats.get("scheduler_errors", 0),
         })
     except Exception as beat_exc:
         # Redis down is survivable: the queue falls back to DB polling.
