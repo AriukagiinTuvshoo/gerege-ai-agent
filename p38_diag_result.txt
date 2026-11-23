@@ -1,0 +1,31 @@
+docker:
+29.4.2
+=== staging ===
+Unable to find image 'caddy:2.8-alpine' locally
+2.8-alpine: Pulling from library/caddy
+4f4fb700ef54: Pulling fs layer
+60177795cab3: Pulling fs layer
+6ccef1045412: Pulling fs layer
+b44c500748de: Pulling fs layer
+63b69af3dc55: Pulling fs layer
+4f4fb700ef54: Already exists
+63b69af3dc55: Download complete
+60177795cab3: Download complete
+6ccef1045412: Download complete
+91d5cceee199: Download complete
+789bb96d2ef6: Download complete
+b44c500748de: Download complete
+63b69af3dc55: Pull complete
+60177795cab3: Pull complete
+6ccef1045412: Pull complete
+b44c500748de: Pull complete
+4f4fb700ef54: Pull complete
+Digest: sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
+Status: Downloaded newer image for caddy:2.8-alpine
+{"level":"info","ts":1795433194.6641662,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}
+{"level":"warn","ts":1795433194.6647532,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433194.664764,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433194.6647675,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Host: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433194.6650581,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433194.6650617,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream"}
+Error: adapting config using caddyfile: parsing caddyfile tokens for 'log': wrong argument count or unexpected line ending after 'filter', at /etc/caddy/Caddyfile:144
