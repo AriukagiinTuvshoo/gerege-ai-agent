@@ -1,0 +1,79 @@
+===== ENV / PYTEST EXIT =====
+python 3.12.16 (main, Oct 26 2026, 02:48:44) [GCC 15.2.0]
+E02 set: False
+REDIS_URL: redis://127.0.0.1:6379/0
+PYTEST_EXIT=0
+
+===== PYTEST FAILURES AND SKIPS =====
+
+===== PYTEST TAIL =====
+    f"CASE WHEN btrim({col}::text) ~ '^[+-]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$' "
+
+tests/test_e39_staging_operational_readiness.py::TestWorkerTickSurvivesASchedulerFailure::test_a_healthy_tick_reports_zero_scheduler_errors
+tests/test_e39_staging_operational_readiness.py::TestWorkerTickSurvivesASchedulerFailure::test_a_raising_scheduler_step_still_publishes_an_alive_heartbeat
+  /opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/contextlib.py:144: SAWarning: Table '_alembic_tmp_session_states' specifies columns 'sender_id' as primary_key=True, not matching locally specified columns 'page_id', 'sender_id'; setting the current primary key columns to 'page_id', 'sender_id'. This warning may become an exception in a future release
+    next(self.gen)
+
+tests/test_e39_staging_operational_readiness.py::TestWorkerTickSurvivesASchedulerFailure::test_a_healthy_tick_reports_zero_scheduler_errors
+tests/test_e39_staging_operational_readiness.py::TestWorkerTickSurvivesASchedulerFailure::test_a_raising_scheduler_step_still_publishes_an_alive_heartbeat
+  /home/runner/work/gerege-ai-agent/gerege-ai-agent/database.py:338: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    now_utc = datetime.utcnow()
+
+tests/test_e36_worker_health.py::TestWorkerHealthEndpoint::test_does_not_disclose_redis_url
+tests/test_e36_worker_health.py::TestWorkerHealthEndpoint::test_reports_that_the_scheduler_lives_in_the_worker
+tests/test_e36_worker_health.py::TestWorkerHealthEndpoint::test_admin_gets_a_report
+tests/test_e36_worker_health.py::TestWorkerHealthEndpoint::test_status_code_follows_liveness
+tests/test_e36_worker_health.py::TestWorkerHealthEndpoint::test_includes_queue_backlog_and_dead_letter
+  /home/runner/work/gerege-ai-agent/gerege-ai-agent/database.py:212: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    expires_at = datetime.utcnow() + timedelta(hours=hours)
+
+tests/test_e38_production_architecture.py::TestProductionProxyTopology::test_only_the_proxy_publishes_host_ports
+  /opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/site-packages/_pytest/fixtures.py:1392: PytestRemovedIn10Warning: Class-scoped fixtures defined as instance methods are deprecated.
+  Instance attributes set in the 'prod' fixture will NOT be visible to test methods,
+  as each test gets a new instance while the fixture runs only once per class.
+  Use a @classmethod decorator below @pytest.fixture and set attributes on cls instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#class-scoped-fixture-as-instance-method
+    fixturefunc = resolve_fixture_function(fixturedef, request)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================= 304 passed, 1 xfailed, 22 warnings in 17.61s =================
+
+===== REHEARSAL =====
+
+=== 0. preflight ===
+  [ok]   docker present: Docker version 29.4.2, build 055a478
+  [ok]   compose present: 5.1.3
+
+=== 1. negative control - a missing secret must abort ===
+
+[FATAL] the rehearsal stopped unexpectedly at line 137 (status 1)
+[FATAL] this is a bug in the script or a missing prerequisite, not a product failure
+  [ok]   missing ADMIN_PASSWORD rejected with exit 1
+  [ok]   the refusal names the variable: error while interpolating services.web.environment.ADMIN_PASSWORD: required variable ADMIN_PASSWORD is missing a value: ADMIN_PASSWORD is required
+
+=== 2. compose config accepts a complete environment ===
+  [ok]   compose config OK (275 lines)
+
+=== 3. topology - only the proxy may publish host ports ===
+published ports: proxy:80,443,443
+  [ok]   no service publishes 8000/5432/6379
+
+=== 4. postgres, redis and the migration job ===
+  [ok]   all nine required variables are non-empty in the rehearsal shell
+  [ok]   postgres reported ready
+  [ok]   redis answered PING
+
+[FATAL] the rehearsal stopped unexpectedly at line 231 (status 1)
+[FATAL] this is a bug in the script or a missing prerequisite, not a product failure
+
+=== teardown ===
+ Network p39rehearsal_default Removing 
+ Network p39rehearsal_default Removed 
+ Volume p39rehearsal_pgdata Removed 
+ Volume p39rehearsal_qrcodes Removed 
+ Volume p39rehearsal_redisdata Removed 
+  [ok]   stack removed
+REHEARSAL_EXIT=1
+error while interpolating services.maintenance.environment.DATABASE_OWNER_URL: required variable POSTGRES_OWNER_PASSWORD is missing a value: POSTGRES_OWNER_PASSWORD is required
+error while interpolating services.proxy.environment.STAGING_DOMAIN: required variable STAGING_DOMAIN is missing a value: STAGING_DOMAIN is required (the real hostname)
+error while interpolating services.proxy.environment.STAGING_DOMAIN: required variable STAGING_DOMAIN is missing a value: STAGING_DOMAIN is required (the real hostname)
