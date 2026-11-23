@@ -2,40 +2,36 @@ name: Phase 38 Caddy diagnostic
 on:
   push:
     branches: ["arena/d78ebf88-gerege-ai-agent"]
+permissions:
+  contents: write
 jobs:
   diag:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run caddy validate and capture everything to a file
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run caddy validate and commit the output
+        continue-on-error: true
         run: |
           set -uo pipefail
-          {
-            echo "=== docker version ==="
-            docker version --format '{{.Server.Version}}' || true
-            echo "=== pull caddy ==="
-            docker pull caddy:2.8-alpine 2>&1 | tail -3 || true
-            echo "=== staging validate ==="
-            docker run --rm -e STAGING_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
-              -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
-              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1
-            echo "STAGING_EXIT=$?"
-            echo "=== prod validate ==="
-            docker run --rm -e PRODUCTION_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
-              -v "$PWD/deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
-              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1
-            echo "PROD_EXIT=$?"
-            echo "=== repeated-format control ==="
-            printf '{$DOMAIN} {\n\tlog {\n\t\tformat json\n\t\tformat json\n\t}\n\treverse_proxy web:8000\n}\n' > /tmp/bad
-            docker run --rm -e DOMAIN=ci-validate.example.mn \
-              -v /tmp/bad:/etc/caddy/Caddyfile:ro caddy:2.8-alpine \
-              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1
-            echo "BAD_EXIT=$?"
-          } > /tmp/diag.txt 2>&1
-          cp /tmp/diag.txt "$GITHUB_WORKSPACE/p38_diag_result.txt"
-      - name: Upload result
+          exec > >(tee /tmp/diag.txt) 2>&1
+          echo "docker:"; docker version --format '{{.Server.Version}}' || true
+          echo "=== staging ==="
+          docker run --rm -e STAGING_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          echo "STAGING_EXIT=$?"
+          echo "=== prod ==="
+          docker run --rm -e PRODUCTION_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
+            -v "$PWD/deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          echo "PROD_EXIT=$?"
+      - name: Commit the diagnostic
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: p38-diag
-          path: p38_diag_result.txt
+        run: |
+          cp /tmp/diag.txt p38_diag_result.txt || true
+          git config user.name "diag-bot"; git config user.email "diag@example.invalid"
+          git add p38_diag_result.txt || true
+          git commit -m "temp: caddy diagnostic output" || true
+          git push origin HEAD:arena/d78ebf88-gerege-ai-agent || true
