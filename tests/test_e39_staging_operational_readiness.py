@@ -61,6 +61,86 @@ def _mem_mb(value: str) -> float:
 
 
 # --------------------------------------------------------------------------------------
+# A compose file must be ACCEPTED by compose, not merely parseable by PyYAML
+# --------------------------------------------------------------------------------------
+
+
+def _strict_load(rel: str):
+    """Parse with duplicate mapping keys rejected.
+
+    PyYAML silently merges duplicates, so a test written against ``yaml.safe_load`` cannot
+    see them. This is not hypothetical: a Phase 39 edit left a second ``deploy:`` key in
+    the maintenance service, ``yaml.safe_load`` reported a complete limit, every YAML test
+    passed, and ``docker compose`` refused the whole file with
+    ``mapping key "deploy" already defined``. The container rehearsal found it; nothing
+    else could have.
+    """
+    import yaml
+
+    class Strict(yaml.SafeLoader):
+        pass
+
+    def no_duplicates(loader, node, deep=False):
+        seen: dict = {}
+        for key_node, _ in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise ValueError(
+                    f"{rel}: duplicate mapping key {key!r} at line {key_node.start_mark.line + 1} "
+                    f"(first defined at line {seen[key]})"
+                )
+            seen[key] = key_node.start_mark.line + 1
+        return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+    Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, no_duplicates)
+    with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as handle:
+        return yaml.load(handle, Loader=Strict)
+
+
+class TestComposeFilesHaveNoDuplicateKeys:
+    @pytest.mark.parametrize("rel", [STAGING, PROD], ids=["staging", "production"])
+    def test_the_file_has_no_duplicate_mapping_keys(self, rel):
+        doc = _strict_load(rel)
+        assert isinstance(doc, dict) and doc.get("services"), f"{rel} did not load as a stack"
+
+    @pytest.mark.parametrize("rel", [STAGING, PROD], ids=["staging", "production"])
+    def test_every_service_has_at_most_one_deploy_block(self, rel):
+        """Each service is a mapping, so a duplicate `deploy:` is by definition merged."""
+        doc = _strict_load(rel)
+        for name, service in (doc.get("services") or {}).items():
+            assert isinstance(service, dict), name
+            if "deploy" in service:
+                assert set(service["deploy"]) <= {"resources", "restart_policy", "labels", "mode"}, (
+                    f"{name}.deploy has unexpected keys: {sorted(service['deploy'])}"
+                )
+
+    @pytest.mark.parametrize("rel", [STAGING, PROD], ids=["staging", "production"])
+    def test_no_key_is_indented_under_the_wrong_parent(self, rel):
+        """The stray block that broke compose was indented as if it belonged to a service
+        but followed a top-level comment, leaving a service with two parents' worth of
+        keys. Every service must contain only compose's service keywords."""
+        allowed = {
+            "build", "image", "command", "entrypoint", "environment", "env_file", "volumes",
+            "ports", "expose", "depends_on", "healthcheck", "restart", "deploy", "profiles",
+            "user", "working_dir", "networks", "labels", "logging", "security_opt",
+            "read_only", "tmpfs", "shm_size", "stop_grace_period", "init", "ulimits",
+        }
+        doc = _strict_load(rel)
+        for name, service in (doc.get("services") or {}).items():
+            unexpected = set(service) - allowed
+            assert not unexpected, f"{name} has non-service keys: {sorted(unexpected)}"
+
+    def test_the_maintenance_plane_is_one_coherent_service(self):
+        """The original breakage: a second `deploy:` landed after `depends_on` was complete,
+        so `maintenance` had a dangling block and then a second limit."""
+        maintenance = _strict_load(STAGING)["services"]["maintenance"]
+        limits = maintenance["deploy"]["resources"]["limits"]
+        assert limits.get("cpus") and limits.get("memory"), limits
+        assert maintenance.get("depends_on"), "maintenance lost its db dependency"
+        assert maintenance.get("profiles") == ["maintenance"]
+
+
+# --------------------------------------------------------------------------------------
 # F-39-A — staging resources were unbounded
 # --------------------------------------------------------------------------------------
 
@@ -599,11 +679,20 @@ class TestTheRehearsalScriptIsRealAndWired:
             return
 
         # Docker is present here. The refusal must still exist and must precede any work.
+        #
+        # Look for the first INVOCATION of compose, not the first mention of the word:
+        # an earlier version of this test compared against
+        # `COMPOSE=(docker compose -f ...)`, a plain variable definition near the top of
+        # the file, so the assertion failed on CI for a reason that had nothing to do with
+        # the guard. The guard is genuinely the first thing that can run.
         script = _read(self.SCRIPT)
         guard = script.index("command -v docker")
-        first_compose = script.index("$COMPOSE")
+        first_invocation = script.index('"${COMPOSE[@]}"')
         assert script[guard:].count("exit 1") >= 1, "there is no exit after the docker guard"
-        assert guard < first_compose, "the docker guard must precede any compose invocation"
+        assert guard < first_invocation, "the docker guard must precede any compose invocation"
+        assert "docker info" in script[guard : guard + 400], (
+            "the guard must also check that the daemon is reachable, not merely installed"
+        )
 
     def test_it_has_a_preflight_guard_for_docker(self, script):
         assert "command -v docker" in script

@@ -249,11 +249,11 @@ services:
         condition: service_healthy
 
   # ------------------------------------------------------------------ data plane
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 512M
+  #
+  # Exactly ONE `deploy:` key per service. A Phase 39 edit left a stray second block
+  # here; PyYAML merges duplicate mapping keys silently, so a yaml-based test still saw
+  # a complete limit while `docker compose` refused the entire file with
+  # `mapping key "deploy" already defined`. Only the container rehearsal caught it.
   db:
     image: postgres:16-alpine
     restart: unless-stopped
