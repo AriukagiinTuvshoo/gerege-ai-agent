@@ -571,20 +571,39 @@ class TestTheRehearsalScriptIsRealAndWired:
         assert result.returncode == 0, result.stderr
 
     def test_it_refuses_to_claim_success_without_docker(self):
-        """A missing Docker must be reported as BLOCKED, never as a pass. Executed here:
-        this environment genuinely has no Docker, so this is a real negative control."""
+        """A missing Docker must be reported as BLOCKED, never as a pass.
+
+        This is the negative control for the BLOCKED path. It does NOT skip when Docker
+        is present: the suite is gated by `check_pytest_log.py`, which treats a skip as a
+        failure ("skipping is not passing"), and rightly so.
+
+        * No Docker (the audit sandbox): execute the script and require a non-zero exit
+          plus the word BLOCKED. This is a real execution of the refusal path.
+        * Docker present (a CI runner): the refusal path cannot be reached, so the
+          guarantee is asserted structurally instead of pretending to test it.
+        """
         import subprocess
 
-        if subprocess.run(["bash", "-c", "command -v docker"], capture_output=True).returncode == 0:
-            pytest.skip("docker is present here, so the BLOCKED path cannot be exercised")
+        docker_available = (
+            subprocess.run(["bash", "-c", "command -v docker"], capture_output=True).returncode == 0
+        )
 
-        result = subprocess.run(
-            ["bash", self.SCRIPT], cwd=REPO_ROOT, capture_output=True, text=True, timeout=120
-        )
-        assert result.returncode != 0, (
-            "the rehearsal exited 0 without Docker, so a green CI run would prove nothing"
-        )
-        assert "BLOCKED" in result.stdout, result.stdout
+        if not docker_available:
+            result = subprocess.run(
+                ["bash", self.SCRIPT], cwd=REPO_ROOT, capture_output=True, text=True, timeout=120
+            )
+            assert result.returncode != 0, (
+                "the rehearsal exited 0 without Docker, so a green CI run would prove nothing"
+            )
+            assert "BLOCKED" in result.stdout, result.stdout
+            return
+
+        # Docker is present here. The refusal must still exist and must precede any work.
+        script = _read(self.SCRIPT)
+        guard = script.index("command -v docker")
+        first_compose = script.index("$COMPOSE")
+        assert script[guard:].count("exit 1") >= 1, "there is no exit after the docker guard"
+        assert guard < first_compose, "the docker guard must precede any compose invocation"
 
     def test_it_has_a_preflight_guard_for_docker(self, script):
         assert "command -v docker" in script

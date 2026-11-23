@@ -175,14 +175,21 @@ done
 redis_pong="$("${COMPOSE[@]}" exec -T redis redis-cli ping 2>/dev/null | tr -d '\r')"
 [ "$redis_pong" = "PONG" ] && note "redis answered PING" || bad "redis did not answer PING (got '$redis_pong')"
 
-"${COMPOSE[@]}" up -d migrate >/dev/null 2>&1 || bad "the migrate service failed to start"
+# `web` and `worker` both depend on `migrate` with condition
+# service_completed_successfully, so compose itself will run the migration job as part of
+# `up -d web worker`. Bringing the job up first and then starting the application plane
+# would make compose re-check a dependency that has already finished, so do NOT do that:
+# one `up` runs migrate and then the application, in the right order.
+"${COMPOSE[@]}" up -d web worker >/tmp/p39_up.log 2>&1 \
+    || { bad "the application plane failed to start"; tail -30 /tmp/p39_up.log; }
+
+# Read the migration job's own exit status rather than trusting that `up` succeeded.
 migrate_exit="$("${COMPOSE[@]}" wait migrate 2>/dev/null | tr -d '\r')"
-note "migrate exited $migrate_exit"
 if [ "$migrate_exit" != "0" ]; then
-    bad "migrations did not exit 0"
+    bad "the migration job exited $migrate_exit"
     "${COMPOSE[@]}" logs --tail 40 migrate || true
 else
-    note "migrations applied"
+    note "migration job exited 0"
 fi
 
 # Confirm the schema is actually there rather than trusting the exit code.
@@ -196,8 +203,6 @@ fi
 
 # --------------------------------------------------------------- 5. application plane
 hdr "5. the API answers its own health endpoints"
-"${COMPOSE[@]}" up -d web worker >/dev/null 2>&1 || bad "web/worker failed to start"
-
 web_ok=0
 for _ in $(seq 1 60); do
     if "${COMPOSE[@]}" exec -T web python -c \
