@@ -628,6 +628,67 @@ class TestTheRehearsalScriptIsRealAndWired:
 
 
 # --------------------------------------------------------------------------------------
+# F-39-F — the staging env template named a variable no code reads
+# --------------------------------------------------------------------------------------
+
+
+class TestEnvTemplatesNameVariablesTheCodeReads:
+    """A template is a contract. A name that appears only in documentation configures
+    nothing, and with BACKUP_ENCRYPTION=on the failure is a refusal at every backup."""
+
+    TEMPLATES = (".env.staging.example", "docs/deployment/PRODUCTION_ENV_TEMPLATE.env", ".env.example")
+
+    def test_the_backup_key_variable_matches_the_code(self):
+        """The only name consulted by the backup plane."""
+        import inspect
+
+        from core import backup_policy
+
+        source = inspect.getsource(backup_policy)
+        assert 'os.getenv("BACKUP_ENCRYPTION_KEY_FILE"' in source
+
+        for template in self.TEMPLATES:
+            text = _read(template)
+            assert "BACKUP_ENCRYPTION_KEY_FILE" in text, f"{template} never names the real variable"
+            assert not re.search(r"^BACKUP_KEY_FILE\s*=", text, re.MULTILINE), (
+                f"{template} sets BACKUP_KEY_FILE, which no code reads"
+            )
+
+    def test_encryption_on_always_has_a_key_path_configured(self):
+        """BACKUP_ENCRYPTION=on with no key path is a guaranteed refusal (exit 15)."""
+        for template in self.TEMPLATES:
+            text = _read(template)
+            if not re.search(r"^BACKUP_ENCRYPTION\s*=\s*on", text, re.MULTILINE):
+                continue
+            assert re.search(r"^BACKUP_ENCRYPTION_KEY_FILE\s*=\S+", text, re.MULTILINE), (
+                f"{template} enables encryption without configuring a key path"
+            )
+
+    def test_every_variable_the_staging_stack_requires_is_in_the_template(self):
+        """Copying the template must be sufficient to satisfy every `:?` in the compose file."""
+        required = set(re.findall(r"\$\{([A-Z0-9_]+):\?", _read(STAGING)))
+        template = _read(".env.staging.example")
+        provided = set(re.findall(r"^([A-Z0-9_]+)=", template, re.MULTILINE))
+        missing = required - provided
+        assert not missing, f"the staging template omits required variables: {sorted(missing)}"
+
+    def test_the_staging_template_provides_no_real_credentials(self):
+        """Placeholders must be empty; a populated default would be a committed secret."""
+        for line in _read(".env.staging.example").splitlines():
+            if line.lstrip().startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            name = name.strip()
+            value = value.strip()
+            if not value or "$" in value or value.isdigit():
+                continue
+            if re.search(r"PASSWORD|SECRET|TOKEN|KEY(?:_FILE)?$", name):
+                assert not re.search(r"[A-Za-z0-9]{16,}", value), (
+                    f"{name} in the staging template looks like a real credential"
+                )
+
+
+# --------------------------------------------------------------------------------------
 # Phase 38's zero-tolerance invariants still hold
 # --------------------------------------------------------------------------------------
 
