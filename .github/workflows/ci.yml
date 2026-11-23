@@ -1623,15 +1623,20 @@ jobs:
                  tests/test_e36_health_monitoring.py tests/test_e36_migration_safety.py \
                  tests/test_e36_staging_config.py tests/test_e36_reverse_proxy.py \
                  tests/test_e36_backup_operations.py tests/test_e36_worker_health.py \
+                 tests/test_e37_phase37_readiness.py tests/test_e37_lock_integrity.py \
                  -v --tb=short -p no:cacheprovider | tee /tmp/p36suite.log
           # Strict, and deliberately so. These files are the only thing standing between a
           # future change and the four defects Phase 36 closed: an unbounded pool connect,
           # an over-subscribed connection budget, http:// payment URLs behind TLS, and a
           # worker nobody could observe. A skip means one of those regressed silently.
           # The one expected exception is the base-image digest, which is an xfail until it
-          # is resolved - so the floor below is the measured 144 collected minus that one
-          # xfail, with a small margin, rather than a guessed number.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 140 --require-summary
+          # is resolved - so the floor is the measured collected count minus that one xfail,
+          # with a small margin, rather than a guessed number.
+          #
+          # Phase 37 added tests/test_e37_phase37_readiness.py (20 cases) and
+          # tests/test_e37_lock_integrity.py (8 cases) to the selection above, so the
+          # measured floor rises by 28: 144 -> 172 collected, minus the xfail, minus margin.
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 168 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
@@ -1883,3 +1888,45 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           docker build -t gerege-ai-agent:ci .
+
+      - name: Validate the Caddyfile structure (Phase 37)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # NOT a substitute for `caddy validate`, which needs the Caddy binary and remains
+          # a staging gate. This catches the specific class of error that shipped in Phase
+          # 36: a repeated `log` subdirective (a hard Caddyfile error that stops the proxy
+          # from starting) and a `header` block that overwrites the application's values
+          # without `defer`. Both are stated rules in Caddy's own directive documentation.
+          python scripts/check_caddyfile.py
+
+      - name: Report pinned base-image digests (advisory, never fails the build)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          # Phase 37. The Dockerfile's base image is a mutable tag because a digest cannot
+          # be resolved from the audit environment (Docker Hub is outside its egress
+          # allowlist). This step resolves the real digests on a runner that *can* reach
+          # the registry, and prints them ready to paste.
+          #
+          # It is advisory on purpose:
+          #   * `continue-on-error: true` means a registry outage cannot turn a green
+          #     pipeline red for a cosmetic reason;
+          #   * it never writes to the Dockerfile, so it cannot introduce a digest that
+          #     later becomes unpullable (which is exactly how an earlier placeholder
+          #     broke the image build).
+          #
+          # Copy the value for `python:3.12-slim` into ARG BASE_IMAGE (or pass it as
+          # --build-arg) to close the last reproducibility gap.
+          set -uo pipefail
+          for image in python:3.12-slim caddy:2.8-alpine postgres:16-alpine redis:7-alpine; do
+            digest=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+            if [ -n "${digest}" ]; then
+              echo "::notice title=digest ${image}::${image}@${digest}"
+              echo "PIN ${image}@${digest}"
+            else
+              echo "::warning title=digest unavailable::could not resolve a digest for ${image}"
+            fi
+          done
+          # Deliberately no `exit 1`: advisory.
+          exit 0

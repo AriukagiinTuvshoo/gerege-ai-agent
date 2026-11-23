@@ -39,14 +39,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends postgresql-clie
 # ship different code. `requirements.lock` pins all 46 packages in the transitive closure
 # to the versions that pass the suite in CI, so a rebuild installs the same code.
 #
-# `--require-hashes` is deliberately NOT used here. It was, and it broke this build: the
-# lock's hashes were generated on CPython 3.11 (cp311 wheels) while this image is 3.12,
-# and pip refuses any wheel whose hash is not listed — so nothing was installable. See the
-# header of requirements.lock for the full explanation and the command that regenerates
-# hashes on the correct interpreter. Reproducible by *version* today; hash-verified once
-# that is done.
+# Phase 37: hash-verified. `--require-hashes` was removed in Phase 36 because the lock's
+# hashes described cp311 wheels while this image is 3.12, so nothing was installable.
+# The hashes are now resolved for this image's interpreter (cp312) across a
+# manylinux_2_28 / 2_27 / 2014 / 2_17 platform matrix, which the header of
+# requirements.lock documents. Verified before enabling: with
+# `--require-hashes` and a cp312 target, pip matched all 46 packages, and the resolved
+# wheel versions are identical to the pins.
+#
+# `--no-deps` stays: the lock already contains the full transitive closure, so pip should
+# never resolve anything the lock does not mention.
 COPY requirements.lock .
-RUN pip install --no-cache-dir --no-deps -r requirements.lock
+RUN pip install --no-cache-dir --no-deps --require-hashes -r requirements.lock
 
 # requirements.txt is still copied for the dev/test path and for auditability; the
 # production layer above does not read it.

@@ -50,10 +50,19 @@ class TestLockfile:
         assert entries, "no pins found in the lock"
         assert len(entries) == 46, f"expected 46 production pins, found {len(entries)}"
         assert "NO HASH CAPTURED" not in lock_text, "remove stale hash markers"
-        # Either every pin has a hash or none does. A partial set is the dangerous state:
-        # it looks hash-verified while silently leaving packages unverified.
+        # Phase 37 resolved this: hashes were regenerated for the image's interpreter
+        # (cp312) across a manylinux platform matrix, so the lock is now genuinely
+        # hash-verified and every pin carries at least one digest. A partial set is still
+        # the dangerous state - it looks hash-verified while leaving packages unverified.
+        blocks = re.split(r"\n(?=[a-zA-Z0-9_.\-]+==)", lock_text)
+        unhashed = []
+        for block in blocks:
+            match = re.match(r"([a-zA-Z0-9_.\-]+)==", block)
+            if match and "--hash=sha256:" not in block:
+                unhashed.append(match.group(1))
+        assert not unhashed, f"pins without any hash: {unhashed}"
         hashes = lock_text.count("--hash=sha256:")
-        assert hashes in (0, len(entries)), (
+        assert hashes >= len(entries), (
             f"{hashes} hashes for {len(entries)} pins: a partial hash set is worse than none"
         )
 
@@ -123,7 +132,11 @@ class TestDockerfilePinning:
         """The image must install exact versions, not ranges."""
         content = _read("Dockerfile")
         assert "requirements.lock" in content
-        assert "pip install --no-cache-dir --no-deps -r requirements.lock" in content
+        # Phase 37 restored --require-hashes once the digests were correct for cp312.
+        assert (
+            "pip install --no-cache-dir --no-deps --require-hashes -r requirements.lock"
+            in content
+        )
 
     def test_hash_flag_matches_hash_coverage(self):
         """The Dockerfile and the lock must agree about whether hashes exist.

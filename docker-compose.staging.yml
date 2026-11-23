@@ -139,12 +139,29 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      # No HTTP surface; the worker writes a heartbeat that /api/admin/worker/health reads.
-      test: ["CMD", "python", "-c", "import sys,datetime,pathlib; p=pathlib.Path('/tmp/worker_heartbeat'); sys.exit(0 if p.exists() and (datetime.datetime.now().timestamp()-p.stat().st_mtime)<180 else 1)"]
+      # No HTTP surface, so probe the heartbeat the worker actually writes.
+      #
+      # Phase 37 (F-37-4): the Phase 36 version of this line polled a file at
+      # /tmp/worker_heartbeat. Nothing in the codebase ever creates that file -- the
+      # heartbeat is a Redis key (core/worker_heartbeat.py) -- so the probe returned 1
+      # forever and the container would have been permanently "unhealthy". Verified by
+      # running the old command: exit 1 with no key present and no way to ever create one.
+      #
+      # This reads the same Redis key the worker writes and that
+      # /api/admin/worker/health reports, so the container probe and the API cannot
+      # disagree. TTL is 180s; anything under that means a tick completed recently.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - >-
+          import sys;
+          from core.worker_heartbeat import read;
+          sys.exit(0 if read()["status"] == "alive" else 1)
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   # ------------------------------------------------------------------ one-shot migrate
   migrate:
