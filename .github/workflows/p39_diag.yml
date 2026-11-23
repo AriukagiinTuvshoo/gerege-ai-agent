@@ -61,6 +61,8 @@ jobs:
                  -v --tb=long -p no:cacheprovider -rs > /tmp/p36suite.log 2>&1
           echo "PYTEST_EXIT=$?" >> /tmp/env_dump.txt
       - name: run the rehearsal and capture everything
+        if: ${{ !cancelled() }}
+        continue-on-error: true
         run: |
           set +e
           bash scripts/p39_staging_rehearsal.sh > /tmp/rehearsal.log 2>&1
@@ -69,6 +71,8 @@ jobs:
           docker compose -f docker-compose.staging.yml -p p39rehearsal logs --tail 60 >> /tmp/rehearsal.log 2>&1
           docker compose -f docker-compose.staging.yml -p p39rehearsal down -v >> /tmp/rehearsal.log 2>&1
       - name: commit the captured output to the branch
+        if: ${{ !cancelled() }}
+        continue-on-error: true
         run: |
           set -e
           {
