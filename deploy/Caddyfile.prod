@@ -141,14 +141,18 @@
 	# visible (so the log still shows a token was used) but the values are replaced.
 	log {
 		output stdout
-		format json {
-			time_format wall_unix
-			filter {
-				request>uri query {
-					replace token "REDACTED"
-					replace auth_token "REDACTED"
-					replace client_token "REDACTED"
-				}
+		# `format filter` — NOT `format json { ... filter { ... } ... }`.
+		# The nesting was wrong until Phase 38 ran a real `caddy validate`:
+		#   "wrong argument count or unexpected line ending after 'filter'"
+		# `filter` is a *format* module that wraps an encoder; it is not a
+		# subdirective of the json encoder. `wrap json` selects the encoder so the
+		# output stays machine-parsable.
+		format filter {
+			wrap json
+			request>uri query {
+				replace token "REDACTED"
+				replace auth_token "REDACTED"
+				replace client_token "REDACTED"
 			}
 		}
 	}
