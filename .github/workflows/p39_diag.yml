@@ -10,6 +10,9 @@ on:
     branches:
       - arena/d78ebf88-gerege-ai-agent
 
+permissions:
+  contents: write
+
 jobs:
   diag:
     runs-on: ubuntu-latest
@@ -73,6 +76,8 @@ jobs:
       - name: commit the captured output to the branch
         if: ${{ !cancelled() }}
         continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           {
@@ -92,4 +97,10 @@ jobs:
           git config user.email "diag-bot@users.noreply.github.com"
           git add p39_diag_result.txt
           git commit -m "temp: p39 diagnostics" || echo "nothing to commit"
-          git push origin HEAD:arena/d78ebf88-gerege-ai-agent || echo "push failed"
+          # `git push` from a workflow has no repo write credential by default (the
+          # checkout token is read-only unless `permissions: contents: write` is set), and
+          # the previous attempt failed silently because of a trailing `|| echo`. Use the
+          # token that IS exported to the job, and let a failure be visible.
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:arena/d78ebf88-gerege-ai-agent 2>&1 | tail -5
+          echo "PUSH_EXIT=${PIPESTATUS[0]}"
