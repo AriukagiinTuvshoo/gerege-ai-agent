@@ -1930,25 +1930,22 @@ jobs:
           }
           validate_one deploy/Caddyfile STAGING_DOMAIN
           validate_one deploy/Caddyfile.prod PRODUCTION_DOMAIN
-          # Negative control, so this gate is proven able to fail. Without it, a step that
-          # silently validates the wrong file (a typo in the mount, an empty Caddyfile)
-          # would look green forever. A duplicate `format` in one `log` block is a hard
-          # Caddyfile error, and it is the exact defect that shipped in Phase 36 (F-37-1).
-          cat > /tmp/Caddyfile.bad <<'BAD'
-          {$DOMAIN} {
-          	log {
-          		format json
-          		format json
-          	}
-          	reverse_proxy web:8000
-          }
-          BAD
-          echo "--- negative control: a broken Caddyfile MUST be rejected ---"
-          # NOTE: this must NOT be written as `if docker run ... | tee ...; then`.
-          # The exit status of a pipeline is the status of its LAST command, so `tee`
-          # decides the branch and `tee` always succeeds. That version made the negative
-          # control fire on every run and failed CI on a correct Caddyfile — caught only
-          # by actually running it. Use `set +e` and read the status directly.
+          # Negative control, so this gate is proven able to fail. Measured against
+          # caddy:2.8-alpine during Phase 38:
+          #
+          #   duplicate `format json` in one log block  -> exit 0  ACCEPTED
+          #   `reverse_proxy` with no upstream          -> exit 0  ACCEPTED
+          #   empty `header` block                      -> exit 0  ACCEPTED
+          #   unknown directive                         -> exit 1  rejected
+          #   unclosed brace                            -> exit 1  rejected
+          #   arbitrary non-Caddyfile text              -> exit 1  rejected
+          #
+          # The duplicate-`format` case was used here first and is INVALID as a control:
+          # Caddy accepts it, so the control fired on every run and failed CI on a correct
+          # Caddyfile. It also means Phase 37's F-37-1 was described wrongly — the docs say
+          # repeating a subdirective "is an error", but the binary does not reject it.
+          # An unknown directive is a real parse failure and is what this asserts.
+          printf '%s\n' '{$DOMAIN} {' '\tnot_a_real_directive foo' '\treverse_proxy web:8000' '}' > /tmp/Caddyfile.bad
           set +e
           docker run --rm \
                -e DOMAIN=ci-validate.example.mn \
@@ -1962,14 +1959,11 @@ jobs:
             echo "::error title=validator is broken::caddy accepted an invalid Caddyfile"
             exit 1
           fi
-          # The message text differs between Caddy versions and between the JSON-adapt and
-          # directive paths, so do not pin a phrase. What must hold is that Caddy said
-          # *something* rather than dying silently with a non-zero status.
-          if [ ! -s /tmp/bad.log ]; then
-            echo "::error title=validator is broken::rejected with no diagnostic output"
+          if ! grep -qi "unrecognized directive" /tmp/bad.log; then
+            echo "::error title=validator is broken::rejected without naming the directive"
             exit 1
           fi
-          echo "OK: the validator rejects a repeated log subdirective (exit $bad_status)"
+          echo "OK: the validator rejects an unknown directive (exit $bad_status)"
           exit "$fail"
 
       - name: Validate the Caddyfile structure (Phase 37)

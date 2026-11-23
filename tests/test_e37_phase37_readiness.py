@@ -4,9 +4,14 @@ Phase 36 produced these files and graded itself. Phase 37 read them again from s
 and found four defects that the Phase 36 tests could not see, because those tests
 asserted that a *string was present* rather than that a *behaviour was correct*:
 
-  F-37-1 (HIGH)   Caddyfile had `format json` twice inside one `log` block. Caddy's docs:
-                  "each subdirective may only be specified once per `log` block ...
-                  repeating one is an error." The proxy would not have started.
+  F-37-1 (LOW, originally reported HIGH)  Caddyfile had `format json` twice inside one
+                  `log` block. Caddy's docs say "each subdirective may only be specified
+                  once per `log` block ... repeating one is an error."
+                  Phase 38 CORRECTED THE SEVERITY: a real `caddy validate` against
+                  caddy:2.8-alpine accepts the duplicate with exit 0. The proxy would
+                  NOT have failed to start, so this was a latent ambiguity, not an
+                  outage. The test below is kept because which duplicate wins is
+                  unspecified and a future Caddy may reject it.
   F-37-2 (MEDIUM) The access log recorded full request URIs while the app accepts session
                   tokens via `?token=` query parameters (main.py), so live session tokens
                   would have been written to container logs.
@@ -63,11 +68,15 @@ class TestCaddyLogBlock:
     """The block that would have stopped Caddy from starting."""
 
     def test_log_block_declares_format_once(self):
-        """Repeating `format` inside one `log` block is a Caddyfile error.
+        """Repeating `format` in one `log` block is discouraged, but NOT a Caddy error.
 
-        Verified against Caddy's own directive documentation, which states that other
-        than `hostnames`, "each subdirective may only be specified once per `log` block
-        ... repeating one is an error".
+        Caddy's directive documentation states that other than `hostnames`, "each
+        subdirective may only be specified once per `log` block ... repeating one is an
+        error". Phase 38 measured the binary and found that claim misleading: caddy
+        2.8-alpine validates a duplicate with exit 0, silently ignoring the second.
+
+        The assertion is kept so the file stays unambiguous, but it must not be described
+        as preventing a boot failure — that was the Phase 37 overstatement.
         """
         body = _caddyfile_excluding_comments()
         # Isolate the log block: from the `log {` line to its matching closing brace.

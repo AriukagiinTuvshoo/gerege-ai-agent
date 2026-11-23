@@ -11,8 +11,15 @@
 #
 #   1. `format json` appeared TWICE inside one `log` block. The docs are explicit:
 #      "Other than `hostnames`, each subdirective may only be specified once per `log`
-#      block ... repeating one is an error." That is a hard Caddyfile error — the proxy
-#      would have refused to start, and staging could never have booted.
+#      block ... repeating one is an error."
+#
+#      CORRECTED in Phase 38. That severity claim was wrong, and a real `caddy validate`
+#      against caddy:2.8-alpine proved it: a `log` block containing two `format json`
+#      lines validates with exit 0. The documentation calls it an error; the binary
+#      accepts it (the second is ignored). So this was a latent ambiguity, NOT the
+#      "proxy refuses to boot" outage Phase 37 described. It is still worth not having:
+#      which of the two directives wins is an implementation detail, and a future Caddy
+#      may start rejecting it. Do not repeat `format`.
 #   2. The access log recorded full request URIs. Session tokens are accepted as
 #      `?token=` / `?auth_token=` / `?client_token=` query parameters (main.py), so those
 #      would have been written verbatim into container logs. The old comment claimed the
@@ -129,7 +136,9 @@
 	respond /healthz 200
 
 	# ---------------------------------------------------------------- access log
-	# One `format` subdirective, not two — repeating it is a Caddyfile error (F-37-1).
+	# One `format` subdirective, not two. Phase 37 called repeating it a hard error that
+	# would stop Caddy from booting; a real validate in Phase 38 showed Caddy 2.8 accepts
+	# it (exit 0). Still avoided: which duplicate wins is unspecified.
 	#
 	# The filter removes credential-bearing query keys before the entry is written.
 	# `main.py` accepts a session token as `?token=`, `?auth_token=` or `?client_token=`,

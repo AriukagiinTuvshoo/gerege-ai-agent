@@ -131,7 +131,9 @@
 	respond /healthz 200
 
 	# ---------------------------------------------------------------- access log
-	# One `format` subdirective, not two — repeating it is a Caddyfile error (F-37-1).
+	# One `format` subdirective, not two. Phase 37 called repeating it a hard error that
+	# would stop Caddy from booting; a real validate in Phase 38 showed Caddy 2.8 accepts
+	# it (exit 0). Still avoided: which duplicate wins is unspecified.
 	#
 	# The filter removes credential-bearing query keys before the entry is written.
 	# `main.py` accepts a session token as `?token=`, `?auth_token=` or `?client_token=`,
