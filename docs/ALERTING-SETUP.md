@@ -97,8 +97,28 @@ Prefer a redaction rule that fires too rarely to one that hides the reason a bac
    ```bash
    BACKUP_ENCRYPTION_KEY_FILE=/nonexistent python scripts/maintenance.py backup-run --label alert-test
    ```
-   Expect exit **15** and an alert whose `event` is `backup.failure` and whose `exit_code` is
-   15.
+   Expect exit **11** (`ENCRYPTION_KEY_MISSING`) and an alert whose `event` is
+   `backup.failure` and whose `exit_code` is **11**.
+
+   > **Corrected in Phase 38.** This step used to say "expect exit 15". A missing key has
+   > always been **11** — `core/backup_policy.py` states the split explicitly ("the
+   > documented codes are 11 (encryption failed) and 15 (not configured), and a missing key
+   > has always been 11"). The wrong number mattered: an operator following this page would
+   > have seen 11, concluded the alerting path was broken, and "fixed" a working system.
+   >
+   > Phase 38 also found that this command delivered **no alert at all** before the fix
+   > (F-38-A): the CLI's pre-flight refusal returned before the alerting code ran. If you
+   > are reading this on a commit before `f38`, this step cannot pass.
+
+4b. Confirm the *silent* path is also loud — with no webhook configured, a failure must say
+   so:
+   ```bash
+   BACKUP_ALERT_WEBHOOK= BACKUP_ENCRYPTION_KEY_FILE=/nonexistent \
+     python scripts/maintenance.py backup-run --label no-hook-test
+   ```
+   Expect exit 11 **and** `warning: BACKUP_ALERT_WEBHOOK is not configured: nobody is
+   notified of a failure`. Without that line an operator has no way to tell "alerting is
+   fine" from "alerting was never configured".
 
 ## 6. Evidence required before calling alerting "configured"
 

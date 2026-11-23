@@ -260,21 +260,25 @@ class TestPortExposure:
             assert "ports" not in staging_compose["services"][name]
             # `expose` is documentation-only and harmless; a host `ports` mapping is not.
 
-    def test_production_compose_port_exposure_is_recorded(self):
-        """Production still publishes plaintext 8000 and has no proxy.
+    def test_production_compose_no_longer_publishes_plaintext(self):
+        """Phase 37 recorded that production published 8000 with no proxy. Phase 38 fixed it.
 
-        Phase 36 hardened *staging* only. This asserts the fact rather than leaving it
-        implicit, so the production verdict cannot quietly assume TLS exists.
+        This test was written in Phase 37 to assert the *defect* so the verdict could not
+        silently assume TLS existed; its own failure message said "the TLS finding is
+        closed and the verdict must be revisited". Phase 38 closed it, so the assertion is
+        inverted here rather than deleted: the property worth guarding is that production
+        is never served over plaintext, and that is what it now checks.
         """
         prod = yaml.safe_load(_read("docker-compose.prod.yml"))
         web_ports = prod["services"]["web"].get("ports", [])
-        assert any("8000" in str(p) for p in web_ports), (
-            "production no longer publishes 8000; update the Phase 37 verdict"
+        assert not any("8000" in str(p) for p in web_ports), (
+            "production publishes the application port again, bypassing TLS"
         )
-        assert "proxy" not in prod["services"], (
-            "production now has a proxy service; the TLS finding is closed and the "
-            "verdict must be revisited"
+        assert "proxy" in prod["services"], (
+            "production has no proxy service, so it would be served over plaintext"
         )
+        publishers = {n for n, s in prod["services"].items() if s.get("ports")}
+        assert publishers == {"proxy"}, f"unexpected port publishers: {publishers}"
 
 
 # ------------------------------------------------- Caddyfile structural checker (P4)

@@ -31,7 +31,11 @@ import re
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+#: Both deployment targets are checked. A fix applied to one and not the other is exactly
+#: how staging and production drift apart, which is what Phase 38 found.
 CADDYFILE = os.path.join(REPO_ROOT, "deploy", "Caddyfile")
+PROD_CADDYFILE = os.path.join(REPO_ROOT, "deploy", "Caddyfile.prod")
 
 #: Subdirectives that Caddy permits at most once per `log` block.
 #: Docs: "Other than `hostnames`, each subdirective may only be specified once per `log`
@@ -89,8 +93,14 @@ def check() -> list:
             f"unbalanced braces: {text.count('{')} open, {text.count('}')} close"
         )
 
-    if "$STAGING_DOMAIN" not in text:
-        problems.append("the site address is not driven by $STAGING_DOMAIN")
+    # Each file must use its own domain variable, and the production file must not
+    # silently inherit the staging name.
+    is_prod = os.path.basename(CADDYFILE) == "Caddyfile.prod"
+    expected_domain = "$PRODUCTION_DOMAIN" if is_prod else "$STAGING_DOMAIN"
+    if expected_domain not in text:
+        problems.append(f"the site address is not driven by {expected_domain}")
+    if is_prod and "$STAGING_DOMAIN" in text.replace("{$STAGING_DOMAIN}`", ""):
+        problems.append("the production Caddyfile still references $STAGING_DOMAIN")
     if re.search(r"^\s*:80\s*\{", text, re.MULTILINE):
         problems.append("a :80-only site block would serve plaintext")
     if "auto_https off" in text:
@@ -147,14 +157,26 @@ def check() -> list:
 
 
 def main() -> int:
-    problems = check()
-    if problems:
-        print(f"{CADDYFILE}: {len(problems)} problem(s)")
-        for problem in problems:
-            print(f"  - {problem}")
-        return 1
-    print(f"{CADDYFILE}: structural checks passed (NOT a substitute for `caddy validate`)")
-    return 0
+    global CADDYFILE
+    targets = [CADDYFILE]
+    if os.path.exists(PROD_CADDYFILE):
+        targets.append(PROD_CADDYFILE)
+    failed = 0
+    for target in targets:
+        CADDYFILE = target
+        if not os.path.exists(target):
+            print(f"{target}: MISSING")
+            failed += 1
+            continue
+        problems = check()
+        if problems:
+            print(f"{target}: {len(problems)} problem(s)")
+            for problem in problems:
+                print(f"  - {problem}")
+            failed += 1
+        else:
+            print(f"{target}: structural checks passed (NOT a substitute for `caddy validate`)")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

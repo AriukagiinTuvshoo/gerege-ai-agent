@@ -491,26 +491,46 @@ def test_the_development_entrypoint_warns_when_exposed():
 
 
 def test_production_binding_is_unchanged_and_justified():
-    """The deployment binds 0.0.0.0 because there is no reverse proxy. That must not change.
+    """The container still binds 0.0.0.0, and for a still-valid reason.
 
-    Replacing it with 127.0.0.1 would make the container unreachable from the published
-    port - a deployment outage dressed up as a security fix.
+    Phase 27 justified the wide bind by "there is no reverse proxy". Phase 38 added one,
+    which changes the *reason* but not the *requirement*: on a Docker bridge network the
+    proxy reaches `web` from another container, so binding 127.0.0.1 inside the container
+    would make it unreachable from the proxy — the same outage the Phase 27 test warned
+    about, now with a different cause.
+
+    What must NOT come back is a published host port. That is asserted separately, and
+    negatively: `web` publishing 8000 again would bypass TLS entirely.
     """
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert '"--host", "0.0.0.0"' in dockerfile
     compose = (REPO_ROOT / "docker-compose.prod.yml").read_text(encoding="utf-8")
-    # The port really is published directly, which is why the container must bind widely.
-    assert '"${PORT:-8000}:8000"' in compose
-    assert "no reverse proxy in this topology" in compose
+    # The app port must NOT be published now that a proxy fronts it.
+    assert '"${PORT:-8000}:8000"' not in compose, (
+        "production publishes the app port again, bypassing the TLS proxy"
+    )
+    # ...and the proxy must exist, since the wide bind is only safe behind it.
+    assert "proxy:" in compose
 
 
 def test_the_production_entrypoint_disables_proxy_headers():
     """If 0.0.0.0 is accepted, the client-address policy has to be sound."""
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "--no-proxy-headers" in dockerfile
+    assert "--no-proxy-headers" in dockerfile, (
+        "uvicorn's own proxy-header handling must stay off; the app decides, via "
+        "TRUSTED_PROXIES, so there is exactly one authority"
+    )
     compose = (REPO_ROOT / "docker-compose.prod.yml").read_text(encoding="utf-8")
-    # Trusting nothing by default is the correct pairing with a directly-published port.
-    assert "TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}" in compose
+    # Phase 38: a proxy now exists, so the allowlist can no longer default to empty —
+    # an empty list would make the app ignore X-Forwarded-Proto and mint http:// payment
+    # URLs. Required, so the stack refuses rather than silently producing plaintext URLs.
+    assert "TRUSTED_PROXIES: ${TRUSTED_PROXIES:?" in compose, (
+        "TRUSTED_PROXIES must be required now that a proxy fronts the app"
+    )
+    assert "TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}" not in compose, (
+        "TRUSTED_PROXIES still defaults to empty, which silently disables forwarded-scheme "
+        "trust behind a proxy"
+    )
 
 
 def test_cors_allowlist_refuses_wildcard_in_production():

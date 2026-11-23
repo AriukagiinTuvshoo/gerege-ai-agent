@@ -103,7 +103,20 @@ sleep 3
 # `SELECT 1` plus the queue and limiter checks (~6 ms) and is what the container
 # healthcheck and the load balancer already use, so the deploy now verifies the same
 # readiness signal the runtime does.
-if ! curl -fsS "http://127.0.0.1:${PORT:-8000}/api/ready" >/dev/null; then
+# Phase 38: probe from INSIDE the web container, not from the host on a published port.
+#
+# `docker-compose.prod.yml` no longer publishes 8000 — the API is reachable only through
+# the `proxy` service — so a host-side `curl http://127.0.0.1:8000/api/ready` can never
+# connect. Left unchanged, every production deploy would have failed this gate and
+# triggered an automatic rollback of a perfectly healthy release. That is the exact class
+# of breakage a topology change causes in a script that assumed the old topology.
+#
+# `docker compose exec` runs inside the container's network namespace, so this checks the
+# same endpoint the container healthcheck uses, without exposing a port.
+COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+if ! docker compose -f "$COMPOSE_FILE" exec -T web \
+      python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=5)" \
+      >/dev/null 2>&1; then
   echo "Healthcheck FAILED (/api/ready)! Triggering automatic rollback..." >&2
   bash scripts/rollback.sh
   exit 1

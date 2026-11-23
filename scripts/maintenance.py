@@ -103,7 +103,7 @@ def _describe_connection(service) -> None:
     print(f"engine: postgresql   role: {user}   tables owned: {owned}")
 
 
-def _policy_preflight() -> Optional[int]:
+def _policy_preflight(label: Optional[str] = None) -> Optional[int]:
     """Refuse an unsatisfiable backup policy before anything touches the database.
 
     Phase 22 (P21-01). ``create_backup()`` already refuses, but by then the CLI has
@@ -111,6 +111,27 @@ def _policy_preflight() -> Optional[int]:
     of the security claim, so the check has to come first: this returns an exit code
     when the run must not start, and None when it may proceed. ``evaluate()`` is a pure
     function of the environment, so this costs nothing and cannot fail for I/O reasons.
+
+    Phase 38 (F-38-A) — this used to return the exit code and stop, which made a policy
+    refusal **completely silent**:
+
+      * no alert was sent. Alerting lives in ``backup_automation._finish()``, which only
+        the scheduled-run path calls, and the refusal happened *before* that path was
+        entered. So the single most likely production misconfiguration — a missing or
+        unreadable encryption key — disabled alerting at exactly the moment alerting
+        exists for. The runbook told the operator to expect an alert here; there was none.
+      * the status file was not written, so ``maintenance.py status`` and any monitor
+        reading ``.last_backup_status.json`` kept reporting the previous **successful**
+        run while every hourly backup failed.
+
+    Reproduced before changing it: with ``BACKUP_ENCRYPTION_KEY_FILE=/nonexistent`` and a
+    live webhook, ``backup-run`` exited 11 and delivered zero requests, while calling
+    ``run_scheduled_backup()`` directly delivered a correct ``backup.failure`` payload.
+    The divergence was the CLI, not the library.
+
+    When ``label`` is given the refusal is recorded through the same path a scheduled run
+    uses, so alerting and the status file behave identically. When it is not (the manual
+    ``backup`` command), this stays a pure environment check with no side effects.
     """
     from core import backup_policy
 
@@ -118,7 +139,49 @@ def _policy_preflight() -> Optional[int]:
     if policy.allowed:
         return None
     print(f"backup REFUSED [{policy.code}]: {policy.error}", file=sys.stderr)
+    if label is not None:
+        _record_refusal(policy, label)
     return policy.exit_code
+
+
+def _record_refusal(policy, label: str) -> None:
+    """Make a pre-flight refusal visible to alerting and to monitoring.
+
+    Deliberately contains no I/O that can raise: this runs on the failure path, and a
+    refusal that crashed would report the wrong reason. If the status write fails, the
+    alert is still attempted, and vice versa.
+
+    Phase 38 (F-38-C). Whatever ``_finish`` appends to ``warnings`` is printed. The
+    important one is "BACKUP_ALERT_WEBHOOK is not configured: nobody is notified of a
+    failure" — without printing it, an operator who forgot to configure the webhook got a
+    failure line, an exit code, and no statement that no human would ever hear about it.
+    A missing alert configuration must be loud, and it must not be inferred from silence.
+    """
+    from core import backup_automation
+
+    result = {
+        "label": label,
+        "encrypted": False,
+        "offsite": False,
+        "pruned": [],
+        "warnings": [],
+        "exit_code": policy.exit_code,
+        "success": False,
+        "error": policy.error,
+        "encryption_policy": policy.code,
+        "policy_refused": True,
+    }
+    try:
+        backup_automation._finish(result, backup_automation.backup_dir())
+    except Exception as exc:  # noqa: BLE001 - never mask the refusal itself
+        print(
+            f"  warning: could not record the refusal ({type(exc).__name__}); "
+            "the exit code below is still authoritative",
+            file=sys.stderr,
+        )
+        return
+    for warning in result.get("warnings") or []:
+        print(f"  warning: {warning}", file=sys.stderr)
 
 
 def cmd_backup(label: str) -> int:
@@ -157,7 +220,7 @@ def cmd_backup_run(label: str) -> int:
     """
     from core import backup_automation
 
-    refused = _policy_preflight()
+    refused = _policy_preflight(label=label)
     if refused is not None:
         return refused
     _describe_connection(None)  # service arg is unused; identity only

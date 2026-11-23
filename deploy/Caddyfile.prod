@@ -1,0 +1,155 @@
+# Gerege AI Agent — PRODUCTION Caddy reverse proxy
+#
+# Phase 38. This is the TLS terminator production was missing: until now
+# `docker-compose.prod.yml` published the application port 8000 directly to the host, so
+# production would have been served over plaintext HTTP. That is not a cosmetic gap —
+# browsers silently DROP a `Secure` session cookie received over http://, so an operator
+# would appear to log in and then be logged out on every request, and every admin password
+# would cross the network in the clear.
+#
+# This file is deliberately a near-copy of `deploy/Caddyfile` (staging). The two must not
+# drift: a proxy fix applied to one and not the other is how staging and production start
+# disagreeing about security headers. `scripts/check_caddyfile.py` runs over both, and CI
+# runs a real `caddy validate` against both.
+#
+# Differences from staging, and only these:
+#   * the site address is {$PRODUCTION_DOMAIN} instead of {$STAGING_DOMAIN}
+#   * the header comment below states the production fail-closed rule
+#
+# FAIL-CLOSED DOMAIN. `{$PRODUCTION_DOMAIN}` has no default. If it is unset, Caddy is given
+# an empty site address and refuses to start rather than serving an empty site. The compose
+# file additionally requires the variable with `:?`, so the failure happens at
+# `docker compose up`, with a message naming the variable, instead of at the first request.
+# There is deliberately NO fallback to a plaintext address and NO `:80`-only site block: an
+# operator who has not configured a domain must not get a working, insecure deployment by
+# accident.
+#
+# Certificate management is automatic (ACME / Let's Encrypt via TLS-ALPN and HTTP-01 on
+# ports 443 and 80, both published by the `proxy` service). Requirements:
+#   * DNS A/AAAA for PRODUCTION_DOMAIN must resolve to this host BEFORE first start
+#   * ports 80 and 443 must be reachable from the internet (no captive firewall)
+#   * the system clock must be correct, or ACME nonce validation fails
+#   * `caddy_data` MUST persist — deleting it re-issues certificates on next start and
+#     can exhaust Let's Encrypt's duplicate-certificate rate limit
+#   * set ACME_EMAIL so expiry warnings have somewhere to go
+#
+# Validate before first start (a real parse, not the structural checker):
+#   docker run --rm -e PRODUCTION_DOMAIN=app.example.mn -e ACME_EMAIL=ops@example.mn \
+#     -v "$PWD/deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro" \
+#     caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Certificate storage lives in the `caddy_data` volume. Losing that volume means
+# re-issuing certificates, which is rate-limited by Let's Encrypt — back it up, or keep the
+# named volume on persistent storage (the default here).
+
+{
+	# Receives certificate-expiry warnings.
+	email {$ACME_EMAIL}
+
+	# Reject requests whose Host does not match the TLS certificate's name.
+	servers {
+		strict_sni_host on
+	}
+}
+
+{$PRODUCTION_DOMAIN} {
+	encode zstd gzip
+
+	# ---------------------------------------------------------------- security headers
+	# `defer` runs these just before the response is written, so the application's own
+	# values win wherever it set one — which it always does for these five: the middleware
+	# in main.py applies core_security.build_security_headers() to every response, success
+	# or error. The block therefore only fills gaps in responses Caddy generates itself
+	# (ACME challenges, proxy-generated errors), which never reach the application.
+	#
+	# Without `defer` a bare `field value` OVERWRITES the upstream value. The values are
+	# identical today so the outcome was the same, but relying on that coincidence is how
+	# a CSP change in the application would silently stop taking effect.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+		defer
+	}
+
+	# ---------------------------------------------------------------- request limits
+	# Bounded bodies. The largest legitimate upload is an image or a CSV import; 25 MB is
+	# generous for both and stops an unauthenticated client from streaming gigabytes.
+	request_body {
+		max_size 25MB
+	}
+
+	# ---------------------------------------------------------------- API + frontend
+	# One upstream: FastAPI serves both the JSON API and the static SPA, so there is
+	# nothing to split. Rewriting paths here would desynchronise the app's own routing.
+	reverse_proxy web:8000 {
+		# Forward the real client address and scheme. The application only trusts these
+		# when the socket peer is inside TRUSTED_PROXIES. `header_up` REPLACES the value
+		# rather than appending (`header_up X+` would append and let a client inject hops
+		# ahead of ours), so a forged inbound chain cannot survive.
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-Proto {http.request.scheme}
+		header_up X-Forwarded-Host {http.request.host}
+		header_up X-Real-IP {http.request.remote.host}
+
+		# Long enough for a slow AI completion or a QPay token round-trip (the app bounds
+		# its own provider calls at 10-12s); short enough that a hung upstream does not
+		# pin a connection forever.
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 60s
+			read_timeout 90s
+			write_timeout 90s
+		}
+	}
+
+	# ---------------------------------------------------------------- webhooks
+	# Meta, Telegram and QPay all POST here. They are handled by the same application, but
+	# they must not be buffered in ways that break signature checks: Caddy passes bodies
+	# through unmodified, with no rewrite and no body transformation.
+	@webhooks path /api/telegram/webhook* /api/webhook* /api/fintech/qpay/callback*
+	handle @webhooks {
+		reverse_proxy web:8000 {
+			header_up X-Forwarded-For {http.request.remote.host}
+			header_up X-Forwarded-Proto {http.request.scheme}
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+	}
+
+	# ---------------------------------------------------------------- health probes
+	# Answered locally so an external uptime monitor does not consume application
+	# connections or database pool slots just to learn the proxy is up. The application is
+	# still probed for real by the container healthcheck at /api/ready.
+	respond /healthz 200
+
+	# ---------------------------------------------------------------- access log
+	# One `format` subdirective, not two — repeating it is a Caddyfile error (F-37-1).
+	#
+	# The filter removes credential-bearing query keys before the entry is written.
+	# `main.py` accepts a session token as `?token=`, `?auth_token=` or `?client_token=`,
+	# so without this every authenticated page load writes a live session token into the
+	# container log, where it outlives the session and is readable by anything that can
+	# read logs. Query strings are not logged in full for any request: the keys stay
+	# visible (so the log still shows a token was used) but the values are replaced.
+	log {
+		output stdout
+		format json {
+			time_format wall_unix
+			filter {
+				request>uri query {
+					replace token "REDACTED"
+					replace auth_token "REDACTED"
+					replace client_token "REDACTED"
+				}
+			}
+		}
+	}
+}

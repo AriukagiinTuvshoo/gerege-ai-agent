@@ -643,7 +643,33 @@ def run_scheduled_backup(label: str = "scheduled") -> Dict[str, Any]:
         "success": False,
     }
 
-    os.makedirs(directory, exist_ok=True)
+    # Phase 38 (F-38-D): creating the directory was outside the try below, so an
+    # unusable BACKUP_DIR (a path under a full disk, a read-only mount, a typo'd parent)
+    # raised an uncaught traceback from os.makedirs and the process died with a stack
+    # trace instead of the actionable message the except block was written to produce.
+    # The Phase 17 comment in that block claimed this case was handled; it was not, because
+    # the exception escaped one statement earlier. Reproduced with
+    # BACKUP_DIR=/proc/cannot/create -> FileNotFoundError, no alert, no status file.
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        # `_finish` needs the directory to exist to write status. If it does not, the
+        # alert is still attempted and the status write is skipped, rather than losing the
+        # notification because the disk is the thing that broke.
+        result.update(
+            success=False,
+            exit_code=EXIT_BACKUP_FAILED,
+            error=(
+                f"backup directory cannot be created: {type(exc).__name__} "
+                f"({os.path.basename(directory) or directory}); check the path, mount "
+                "and free space"
+            ),
+        )
+        try:
+            _finish(result, directory)
+        except OSError:
+            pass
+        return result
 
     try:
         lock = backup_staging.backup_lock(directory)

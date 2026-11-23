@@ -5,6 +5,56 @@
 
 ---
 
+## 0. Topology (Phase 38)
+
+Production is served **only** through a TLS-terminating proxy. Nothing else publishes a
+host port.
+
+```
+        :80 / :443                    compose network (no published ports)
+internet ────────► proxy (Caddy) ──────────────► web:8000 ──┬──► db:5432   (internal)
+                   └ automatic ACME                          └──► redis:6379 (internal)
+                     certificates
+```
+
+* `proxy` — `caddy:2.8-alpine`, publishes 80/443/443-udp, mounts `deploy/Caddyfile.prod`
+  and a persistent `caddy_data` volume. Obtains and renews certificates automatically.
+* `web` — FastAPI + static SPA. **No `ports:`.** Reachable only from `proxy`.
+* `worker`, `migrate`, `maintenance` — no published ports; `maintenance` is profile-scoped.
+* `db`, `redis` — no published ports, ever.
+
+Before Phase 38, `web` published `${PORT:-8000}:8000` directly and there was no proxy at
+all, so production would have been served over plaintext: browsers drop `Secure` session
+cookies over http://, and every admin password would have crossed the network in the clear.
+
+**Required environment** (see `PRODUCTION_ENV_TEMPLATE.env`). Each is `:?` in the compose
+file, so `docker compose up` refuses to start without it:
+
+| Variable | Why it is required |
+|---|---|
+| `PRODUCTION_DOMAIN` | the hostname Caddy gets a certificate for; no default |
+| `ACME_EMAIL` | where certificate-expiry warnings are sent |
+| `TRUSTED_PROXIES` | the app only honours `X-Forwarded-Proto` from these peers; empty means http:// payment URLs |
+| `ALLOWED_ORIGINS` | CORS allowlist; there is no wildcard fallback in production |
+| `POSTGRES_PASSWORD`, `POSTGRES_OWNER_PASSWORD`, `POSTGRES_APP_PASSWORD` | the bootstrap, owner and runtime credentials |
+| `ADMIN_PASSWORD`, `E02_ACCOUNT_KEY_SECRET` | admin auth; account-level throttle key (min 32 chars) |
+
+**Design decision: the app still binds `0.0.0.0`.** On a Docker bridge network the proxy
+reaches `web` from a different container, so binding `127.0.0.1` would make it unreachable.
+The safety comes from *not publishing the port*, not from the bind address. `uvicorn` runs
+with `--no-proxy-headers` so `TRUSTED_PROXIES` remains the single authority on forwarded
+headers.
+
+**Validate the proxy config before the first start.** A structural checker runs in CI, and
+a real `caddy validate` runs there too, but confirm on the actual host:
+
+```bash
+docker run --rm -e PRODUCTION_DOMAIN="$PRODUCTION_DOMAIN" -e ACME_EMAIL="$ACME_EMAIL" \
+  -v "$PWD/deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro" \
+  caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+
 ## 1. Production Container Topology (`docker-compose.prod.yml`)
 
 Production deployments run 4 isolated services with healthchecks and resource limits:
