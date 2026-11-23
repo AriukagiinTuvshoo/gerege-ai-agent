@@ -106,6 +106,13 @@ services:
       ENV: production
       STRICT_SECURITY: "1"
       WEBHOOK_FAIL_CLOSED: "1"
+      # Phase 35: no code reads this variable. It is kept because removing it would break
+      # an operator's expectation that the setting does something, and because the
+      # behaviour it names is what the code already does unconditionally:
+      # `qpay_webhook_callback` requires provider credentials, obtains a token, and
+      # verifies the payment live (amount + currency) before settling; it fails closed
+      # with 400 otherwise. There is no non-strict mode to switch on. Treat this as
+      # documentation, not a control.
       STRICT_QPAY_VERIFICATION: "1"
       DISABLE_INLINE_SCHEDULER: "1"
       # SEC-01/B-02: CORS allowlist is mandatory in production (no wildcard fallback).
