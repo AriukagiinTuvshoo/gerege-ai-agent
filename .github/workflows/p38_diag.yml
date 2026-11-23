@@ -14,28 +14,32 @@ jobs:
         run: |
           set -uo pipefail
           exec > >(tee /tmp/d.txt) 2>&1
-          test_one() {
-            name="$1"; shift
-            printf '%s\n' "$@" > /tmp/t.caddy
+          probe() {
+            name="$1"
             set +e
             docker run --rm -e DOMAIN=x.example.mn -e STAGING_DOMAIN=x.example.mn \
               -v /tmp/t.caddy:/etc/caddy/Caddyfile:ro caddy:2.8-alpine \
               caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/tmp/o.log 2>&1
             st=$?
-            set -e
+            set +e
             echo "### $name -> exit $st"
-            grep -iE "error|unrecognized|unknown|cannot|invalid" /tmp/o.log | head -3
+            grep -iE "error|unrecognized|unknown|cannot|invalid" /tmp/o.log | head -2
+            true
           }
-          test_one "duplicate format" '{$DOMAIN} {' '	log {' '		format json' '		format json' '	}' '	reverse_proxy web:8000' '}'
-          test_one "unknown directive" '{$DOMAIN} {' '	not_a_real_directive foo' '	reverse_proxy web:8000' '}'
-          test_one "unclosed brace" '{$DOMAIN} {' '	reverse_proxy web:8000'
-          test_one "bad address" '{$DOMAIN} {' '	reverse_proxy' '}'
-          test_one "garbage" 'this is not a caddyfile at all !!!'
-          test_one "empty" ''
+          printf '%s\n' '{$DOMAIN} {' '	not_a_real_directive foo' '	reverse_proxy web:8000' '}' > /tmp/t.caddy
+          probe "unknown directive"
+          printf '%s\n' '{$DOMAIN} {' '	reverse_proxy web:8000' > /tmp/t.caddy
+          probe "unclosed brace"
+          printf '%s\n' 'this is not a caddyfile at all !!!' > /tmp/t.caddy
+          probe "garbage"
+          printf '%s\n' '{$DOMAIN} {' '	reverse_proxy' '}' > /tmp/t.caddy
+          probe "reverse_proxy with no upstream"
+          printf '%s\n' '{$DOMAIN} {' '	header {' '}' '	reverse_proxy web:8000' '}' > /tmp/t.caddy
+          probe "empty header block"
       - name: Commit
         if: always()
         run: |
           cp /tmp/d.txt p38_neg.txt || true
           git config user.name "diag-bot"; git config user.email "d@e.invalid"
-          git add p38_neg.txt; git commit -m "temp: negctl probe" || true
+          git add p38_neg.txt; git commit -m "temp: negctl probe2" || true
           git push origin HEAD:arena/d78ebf88-gerege-ai-agent || true
