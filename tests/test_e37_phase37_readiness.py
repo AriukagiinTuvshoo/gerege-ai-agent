@@ -500,3 +500,68 @@ class TestStagingRunbook:
         text = _read(self.RUNBOOK)
         assert "docker-compose.prod.yml" in text
         assert "no reverse proxy" in text or "no\n  proxy" in text or "no proxy" in text
+
+
+# ------------------------------------------------------- backup alerting (P6)
+
+class TestBackupAlerting:
+    """A backup that fails silently is not a backup.
+
+    The distinct exit codes (10..18) only help if something is watching. Before Phase 37
+    the unit had no `OnFailure=`, so a failed hourly run set a state nobody was told about.
+    """
+
+    SERVICE = "deploy/systemd/gerege-backup.service"
+
+    def test_failure_notification_is_configured(self):
+        text = _read(self.SERVICE)
+        assert "OnFailure=" in text, (
+            "the backup unit has no OnFailure handler, so a failed backup is silent"
+        )
+
+    def test_onfailure_is_a_unit_directive_not_a_service_one(self):
+        """`OnFailure` under [Service] is ignored with 'Unknown key'.
+
+        This is not hypothetical: it was written that way first, and caught only by
+        running `systemd-analyze verify` against the real unit.
+        """
+        # Parse real sections. A naive `partition("[Service]")` splits on the first
+        # occurrence of that string, which appears inside a comment - that is how this
+        # test failed the first time it ran, on a file that was actually correct.
+        sections = {}
+        current = None
+        for raw in _read(self.SERVICE).splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current = line
+                sections.setdefault(current, [])
+                continue
+            if current is not None:
+                sections[current].append(line)
+
+        assert any(
+            entry.startswith("OnFailure=") for entry in sections.get("[Unit]", [])
+        ), f"OnFailure must live in [Unit]; found sections: {sorted(sections)}"
+        assert not any(
+            entry.startswith("OnFailure=") for entry in sections.get("[Service]", [])
+        ), "OnFailure was also left in [Service], where systemd ignores it"
+
+    def test_unit_syntax_is_verified_by_systemd_when_available(self, tmp_path):
+        """Run the real checker. Skipped only where systemd is absent."""
+        import shutil
+
+        if shutil.which("systemd-analyze") is None:
+            pytest.skip("systemd-analyze is not installed")
+        unit = tmp_path / "gerege-backup.service"
+        unit.write_text(_read(self.SERVICE), encoding="utf-8")
+        result = subprocess.run(
+            ["systemd-analyze", "verify", str(unit)],
+            capture_output=True, text=True, timeout=120,
+        )
+        combined = result.stdout + result.stderr
+        assert "Unknown key" not in combined, (
+            f"systemd rejects a directive in the unit:\n{combined}"
+        )
+        assert "Unknown section" not in combined, combined

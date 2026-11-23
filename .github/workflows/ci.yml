@@ -1633,10 +1633,11 @@ jobs:
           # is resolved - so the floor is the measured collected count minus that one xfail,
           # with a small margin, rather than a guessed number.
           #
-          # Phase 37 added tests/test_e37_phase37_readiness.py (20 cases) and
-          # tests/test_e37_lock_integrity.py (8 cases) to the selection above, so the
-          # measured floor rises by 28: 144 -> 172 collected, minus the xfail, minus margin.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 168 --require-summary
+          # Phase 37 added tests/test_e37_phase37_readiness.py (34 cases) and
+          # tests/test_e37_lock_integrity.py (8 cases) to the selection above. Measured
+          # collection is now 187 (186 passing + 1 xfail); the floor keeps the same
+          # 4-case margin: 187 - 1 xfail - 4 = 182.
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 182 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}

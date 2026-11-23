@@ -335,5 +335,19 @@ This section exists so a green staging is not read as a green production.
 * **No point-in-time recovery.** Hourly dumps mean up to an hour of loss.
 * **No offsite destination is configured by default.** `backup_offsite.py` exists and exits
   non-zero when it cannot upload; set `S3_*` or the offsite copy silently does not happen.
+* **Failure alerting is wired but not delivered.** The unit now carries
+  `OnFailure=gerege-backup-alert@%n.service`, but that template **does not exist** until you
+  create it on the host; without it systemd records the failure and warns, and nobody is
+  told. Note the directive is a `[Unit]` key — placing it under `[Service]` makes systemd log
+  `Unknown key` and ignore it, which is exactly what happened before
+  `systemd-analyze verify` caught it. Verify with:
+
+  ```bash
+  systemd-analyze verify /etc/systemd/system/gerege-backup.service   # must not say "Unknown key"
+  systemctl list-timers gerege-backup.timer                          # must show a NEXT value
+  ```
+
+  Monitoring the *absence of success* is stronger than monitoring failure: `OnFailure` cannot
+  fire if the timer was never enabled.
 * **Integration credentials have never been used.** The sandbox matrix in
   `STAGING_INTEGRATION_MATRIX.md` is a plan, not a passed test.
