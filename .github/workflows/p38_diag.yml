@@ -7,16 +7,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Dump caddy validate results verbosely
+      - name: Run caddy validate and capture everything to a file
         run: |
           set -uo pipefail
-          echo "=== staging ==="
-          docker run --rm -e STAGING_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
-            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
-            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 | tail -20
-          echo "staging status: ${PIPESTATUS[0]}"
-          echo "=== prod ==="
-          docker run --rm -e PRODUCTION_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
-            -v "$PWD/deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
-            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 | tail -20
-          echo "prod status: ${PIPESTATUS[0]}"
+          {
+            echo "=== docker version ==="
+            docker version --format '{{.Server.Version}}' || true
+            echo "=== pull caddy ==="
+            docker pull caddy:2.8-alpine 2>&1 | tail -3 || true
+            echo "=== staging validate ==="
+            docker run --rm -e STAGING_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
+              -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
+              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1
+            echo "STAGING_EXIT=$?"
+            echo "=== prod validate ==="
+            docker run --rm -e PRODUCTION_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
+              -v "$PWD/deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
+              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1
+            echo "PROD_EXIT=$?"
+            echo "=== repeated-format control ==="
+            printf '{$DOMAIN} {\n\tlog {\n\t\tformat json\n\t\tformat json\n\t}\n\treverse_proxy web:8000\n}\n' > /tmp/bad
+            docker run --rm -e DOMAIN=ci-validate.example.mn \
+              -v /tmp/bad:/etc/caddy/Caddyfile:ro caddy:2.8-alpine \
+              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1
+            echo "BAD_EXIT=$?"
+          } > /tmp/diag.txt 2>&1
+          cp /tmp/diag.txt "$GITHUB_WORKSPACE/p38_diag_result.txt"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p38-diag
+          path: p38_diag_result.txt
