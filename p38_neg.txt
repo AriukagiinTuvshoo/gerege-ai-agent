@@ -1,0 +1,38 @@
+--- file contents ---
+{$DOMAIN} {$
+^Ilog {$
+^I^Iformat json$
+^I^Iformat json$
+^I}$
+^Ireverse_proxy web:8000$
+}$
+bad_status=0
+--- bad.log ---
+Unable to find image 'caddy:2.8-alpine' locally
+2.8-alpine: Pulling from library/caddy
+63b69af3dc55: Pulling fs layer
+6ccef1045412: Pulling fs layer
+b44c500748de: Pulling fs layer
+60177795cab3: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+4f4fb700ef54: Already exists
+6ccef1045412: Download complete
+60177795cab3: Download complete
+63b69af3dc55: Download complete
+b44c500748de: Download complete
+63b69af3dc55: Pull complete
+91d5cceee199: Download complete
+6ccef1045412: Pull complete
+60177795cab3: Pull complete
+789bb96d2ef6: Download complete
+4f4fb700ef54: Pull complete
+b44c500748de: Pull complete
+Digest: sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
+Status: Downloaded newer image for caddy:2.8-alpine
+Valid configuration
+{"level":"info","ts":1795433848.9160643,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}
+{"level":"info","ts":1795433848.9167092,"msg":"adapted config to JSON","adapter":"caddyfile"}
+{"level":"info","ts":1795433848.9168296,"logger":"http.auto_https","msg":"server is listening only on the HTTPS port but has no TLS connection policies; adding one to enable TLS","server_name":"srv0","https_port":443}
+{"level":"info","ts":1795433848.9168377,"logger":"http.auto_https","msg":"enabling automatic HTTP->HTTPS redirects","server_name":"srv0"}
+{"level":"info","ts":1795433848.9169638,"logger":"tls.cache.maintenance","msg":"started background certificate maintenance","cache":"0xc00018c300"}
+{"level":"info","ts":1795433848.9169776,"logger":"tls.cache.maintenance","msg":"stopped background certificate maintenance","cache":"0xc00018c300"}
