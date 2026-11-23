@@ -50,6 +50,32 @@ FAIL=0
 PASS_COUNT=0
 FAIL_COUNT=0
 
+# Set to 1 immediately before any INTENTIONAL non-zero exit, so the traps below can tell a
+# deliberate refusal (BLOCKED, or checks that failed) from the script itself breaking.
+DELIBERATE_EXIT=0
+
+# Report WHERE an unexpected failure happened.
+#
+# The first version of this script discarded `up` output and, when it died, produced a
+# log that simply stopped after the previous successful check — no error, no line number.
+# Diagnosing it cost a full CI round-trip through a temporary workflow, because Actions
+# logs cannot be downloaded from the audit sandbox. An explicit trap is cheap insurance.
+on_unexpected_failure() {
+    local code=$1 line=$2
+    printf '\n[FATAL] the rehearsal stopped unexpectedly at line %s (status %s)\n' "$line" "$code"
+    printf '[FATAL] this is a bug in the script or a missing prerequisite, not a product failure\n'
+}
+trap 'on_unexpected_failure "$?" "$LINENO"' ERR
+# ERR does not fire on `set -u` in every bash version, so also report on any non-zero exit
+# that reaches here without a recorded check failure.
+on_exit() {
+    local code=$?
+    if [ "$code" -ne 0 ] && [ "$FAIL_COUNT" -eq 0 ] && [ "$DELIBERATE_EXIT" -eq 0 ]; then
+        printf '\n[FATAL] exited %s with no recorded check failure: the script itself broke\n' "$code"
+    fi
+}
+trap on_exit EXIT
+
 note() { printf '  [ok]   %s\n' "$*"; PASS_COUNT=$((PASS_COUNT + 1)); }
 bad()  { printf '  [FAIL] %s\n' "$*"; FAIL=1; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 hdr()  { printf '\n=== %s ===\n' "$*"; }
@@ -61,15 +87,18 @@ hdr "0. preflight"
 if ! command -v docker >/dev/null 2>&1; then
     gafail "docker is not available; the rehearsal cannot run"
     echo "BLOCKED: docker is not installed in this environment."
+    DELIBERATE_EXIT=1
     exit 1
 fi
 if ! docker info >/dev/null 2>&1; then
     gafail "the docker daemon is not reachable"
     echo "BLOCKED: docker daemon unreachable."
+    DELIBERATE_EXIT=1
     exit 1
 fi
 if [ ! -f "$COMPOSE_FILE" ]; then
     gafail "$COMPOSE_FILE is missing"
+    DELIBERATE_EXIT=1
     exit 1
 fi
 note "docker present: $(docker --version)"
@@ -159,7 +188,22 @@ fi
 
 # ----------------------------------------------------------------- 4. datastores + migrate
 hdr "4. postgres, redis and the migration job"
-"${COMPOSE[@]}" up -d db redis >/dev/null 2>&1 || bad "db/redis failed to start"
+# Capture the output instead of discarding it. Discarding it cost a full CI round-trip:
+# the step died here with no diagnostic at all, and the real error (compose refusing to
+# interpolate because the variables were missing) was only visible on stderr.
+if ! "${COMPOSE[@]}" up -d db redis >/tmp/p39_db.log 2>&1; then
+    bad "db/redis failed to start"
+    tail -20 /tmp/p39_db.log
+fi
+# Prove the environment reached this point rather than assuming it: a missing export is
+# otherwise reported by compose as an interpolation error much later and much less clearly.
+for var in STAGING_DOMAIN ADMIN_PASSWORD POSTGRES_PASSWORD POSTGRES_OWNER_PASSWORD \
+           POSTGRES_APP_PASSWORD E02_ACCOUNT_KEY_SECRET ALLOWED_ORIGINS TRUSTED_PROXIES ACME_EMAIL; do
+    if [ -z "${!var:-}" ]; then
+        bad "$var is empty in this shell"
+    fi
+done
+note "all nine required variables are non-empty in the rehearsal shell"
 
 pg_ready=0
 for _ in $(seq 1 60); do
@@ -321,6 +365,7 @@ hdr "result"
 printf '  passed: %s   failed: %s\n' "$PASS_COUNT" "$FAIL_COUNT"
 if [ "$FAIL" -ne 0 ]; then
     gafail "the staging rehearsal FAILED ($FAIL_COUNT check(s)); see above"
+    DELIBERATE_EXIT=1
     exit 1
 fi
 note "staging rehearsal PASSED"
