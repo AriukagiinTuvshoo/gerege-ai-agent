@@ -1,0 +1,22 @@
+name: Phase 38 Caddy diagnostic
+on:
+  push:
+    branches: ["arena/d78ebf88-gerege-ai-agent"]
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dump caddy validate results verbosely
+        run: |
+          set -uo pipefail
+          echo "=== staging ==="
+          docker run --rm -e STAGING_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 | tail -20
+          echo "staging status: ${PIPESTATUS[0]}"
+          echo "=== prod ==="
+          docker run --rm -e PRODUCTION_DOMAIN=ci-validate.example.mn -e ACME_EMAIL=ci@example.mn \
+            -v "$PWD/deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro" caddy:2.8-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 | tail -20
+          echo "prod status: ${PIPESTATUS[0]}"
