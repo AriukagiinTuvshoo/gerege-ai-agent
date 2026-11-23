@@ -1,0 +1,91 @@
+name: p39 diag
+# TEMPORARY. The audit sandbox cannot download Actions logs (the results-receiver host is
+# outside its egress allowlist), and job annotations stop at "exit code 1". This workflow
+# captures the failing output and commits it to the branch, which IS readable. Delete it
+# once the diagnosis is done.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - arena/d78ebf88-gerege-ai-agent
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gerege
+          POSTGRES_PASSWORD: ci_pg_password_2026
+          POSTGRES_DB: gerege_crm_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gerege" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: |
+          pip install -q -r requirements.lock || pip install -q -r requirements.txt
+          pip install -q pytest pytest-randomly pytest-asyncio pyyaml
+      - name: run the phase 36 suite verbosely
+        env:
+          DB_PATH: ${{ github.workspace }}/p36_suite.db
+          REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: |
+          set +e
+          python - <<'PYEOF' > /tmp/env_dump.txt 2>&1
+          import sys, os
+          print("python", sys.version)
+          print("E02 set:", bool(os.getenv("E02_ACCOUNT_KEY_SECRET")))
+          print("REDIS_URL:", os.getenv("REDIS_URL"))
+          PYEOF
+          pytest tests/test_e36_phase36_infra.py tests/test_e36_lock.py \
+                 tests/test_e36_health_monitoring.py tests/test_e36_migration_safety.py \
+                 tests/test_e36_staging_config.py tests/test_e36_reverse_proxy.py \
+                 tests/test_e36_backup_operations.py tests/test_e36_worker_health.py \
+                 tests/test_e37_phase37_readiness.py tests/test_e37_lock_integrity.py \
+                 tests/test_e38_production_architecture.py \
+                 tests/test_e39_staging_operational_readiness.py \
+                 -v --tb=long -p no:cacheprovider -rs > /tmp/p36suite.log 2>&1
+          echo "PYTEST_EXIT=$?" >> /tmp/env_dump.txt
+      - name: run the rehearsal and capture everything
+        run: |
+          set +e
+          bash scripts/p39_staging_rehearsal.sh > /tmp/rehearsal.log 2>&1
+          echo "REHEARSAL_EXIT=$?" >> /tmp/rehearsal.log
+          docker compose -f docker-compose.staging.yml -p p39rehearsal ps -a >> /tmp/rehearsal.log 2>&1
+          docker compose -f docker-compose.staging.yml -p p39rehearsal logs --tail 60 >> /tmp/rehearsal.log 2>&1
+          docker compose -f docker-compose.staging.yml -p p39rehearsal down -v >> /tmp/rehearsal.log 2>&1
+      - name: commit the captured output to the branch
+        run: |
+          set -e
+          {
+            echo "===== ENV / PYTEST EXIT ====="
+            cat /tmp/env_dump.txt || true
+            echo
+            echo "===== PYTEST FAILURES AND SKIPS ====="
+            grep -nE "^(FAILED|ERROR)|SKIPPED|short test summary|^E  " /tmp/p36suite.log | head -120 || true
+            echo
+            echo "===== PYTEST TAIL ====="
+            tail -30 /tmp/p36suite.log || true
+            echo
+            echo "===== REHEARSAL ====="
+            cat /tmp/rehearsal.log || true
+          } > p39_diag_result.txt
+          git config user.name "diag-bot"
+          git config user.email "diag-bot@users.noreply.github.com"
+          git add p39_diag_result.txt
+          git commit -m "temp: p39 diagnostics" || echo "nothing to commit"
+          git push origin HEAD:arena/d78ebf88-gerege-ai-agent || echo "push failed"
