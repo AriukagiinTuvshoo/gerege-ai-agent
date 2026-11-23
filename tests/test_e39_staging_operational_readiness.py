@@ -721,6 +721,138 @@ class TestTheRehearsalScriptIsRealAndWired:
         assert "scheduler_errors" in script, "the F-39-D reproduction is not in the rehearsal"
         assert "id -u" in script, "the non-root assertion is missing"
 
+    def test_it_never_uses_a_compose_subcommand_that_does_not_exist(self, script):
+        """`docker compose wait` killed the script: the command substitution failed and,
+        with no guard, the shell exited silently at that line. Exit codes are read with
+        `docker inspect` instead, which exists on every version.
+
+        Comments are stripped first — an earlier version of this test matched the
+        explanatory comment that documents the fix and failed on correct code.
+        """
+        code = "\n".join(
+            line for line in script.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "compose wait" not in code, "docker compose wait is not a portable subcommand"
+        assert "docker inspect" in code, "the migration job's exit code is never read"
+
+    def test_every_command_substitution_ends_guarded(self, script):
+        """Static companion to the behavioural test above.
+
+        A `X="$(...)"` assignment under `set -o pipefail` aborts the shell with no message
+        when the command fails, so each one must be made non-fatal. This walks the
+        substitution to its MATCHING closing parenthesis rather than pattern-matching a
+        single line, which is what made the first version of this check useless.
+        """
+        offenders = []
+
+        index = 0
+        while True:
+            start = script.find('="$(', index)
+            if start == -1:
+                break
+            index = start + 1
+            # Walk forward from just after the "(" of `$(` to its MATCHING ")".
+            # Starting at start + 4 (not start + 3) matters: `start + 3` points AT that
+            # opening paren, so counting from there left `depth == 0` and the first inner
+            # ")" — the one closing `exec -T redis ...` — looked like the end, truncating
+            # the body before the `|| true` check ever saw the guard. That is why the
+            # negative control below passed when it should have failed.
+            depth = 0
+            position = start + 4
+            end = None
+            while position < len(script):
+                char = script[position]
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    if depth == 0:
+                        end = position + 1
+                        break
+                    depth -= 1
+                position += 1
+            if end is None:
+                continue
+            body = script[start:end]
+            if "|| true" in body or "|| echo" in body:
+                continue
+            line_number = script[:start].count("\n") + 1
+            first = body.splitlines()[0][:70]
+            offenders.append(f"{line_number}: {first}")
+
+        assert not offenders, "unguarded command substitution(s):\n" + "\n".join(offenders)
+
+    def test_it_never_dies_silently_when_compose_fails(self, tmp_path):
+        """BEHAVIOURAL, not a regex.
+
+        The script's first real run died at a command substitution with no message: the
+        log simply stopped. A static check for `|| true` is fragile (multi-line Python
+        heredocs, continuation lines), so instead run the whole script against a `docker`
+        stub whose every container operation fails, and require that it
+
+          * reaches the end and records check failures, and
+          * does NOT report "exited N with no recorded check failure".
+
+        Skipped only if a real docker binary would shadow the stub — the stub is placed
+        first on PATH, so this holds either way; no skip is needed.
+        """
+        import subprocess
+
+        stub_dir = tmp_path / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "docker"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Answer the preflight, then fail every container operation.\n"
+            'case "$1 $2" in\n'
+            '  "--version ") echo "Docker version 0.0.0-stub"; exit 0;;\n'
+            '  "info ") exit 0;;\n'
+            '  "compose version") echo "2.99.0-stub"; exit 0;;\n'
+            '  "compose config") echo "stub: no config" >&2; exit 1;;\n'
+            "esac\n"
+            'echo "stub: docker $* failed" >&2\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{stub_dir}:{env.get('PATH', '/usr/bin:/bin')}"
+        result = subprocess.run(
+            ["bash", self.SCRIPT],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        output = result.stdout + result.stderr
+
+        assert result.returncode != 0, "the rehearsal passed against a docker that fails everything"
+        assert "passed:" in output and "failed:" in output, (
+            f"the rehearsal did not reach its verdict section:\n{output[-1500:]}"
+        )
+        assert "[FAIL]" in output, "no check failure was recorded even though everything failed"
+        assert "with no recorded check failure" not in output, (
+            "the script died from a bare command substitution instead of recording a "
+            f"check failure:\n{output[-1500:]}"
+        )
+        assert "BLOCKED" not in output, (
+            "the script refused to start instead of exercising the checks"
+        )
+
+    def test_it_reports_where_it_stopped(self, script):
+        """A log that just stops is not a diagnosis. The first real run cost a full CI
+        round-trip because nothing said which line died."""
+        assert "on_unexpected_failure" in script
+        assert "LINENO" in script
+        assert "DELIBERATE_EXIT" in script, (
+            "an intentional refusal would be misreported as a script bug"
+        )
+
+    def test_it_verifies_the_environment_reached_it(self, script):
+        """Compose reports a missing export as a confusing interpolation error later."""
+        assert "${!var" in script, "the script never checks its own environment"
+
     def test_ci_actually_invokes_it(self):
         ci = _read(".github/workflows/ci.yml")
         assert self.SCRIPT in ci, "CI never runs the rehearsal, so it proves nothing"

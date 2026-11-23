@@ -115,7 +115,8 @@ export ADMIN_PASSWORD="p39-admin-$$-$RANDOM"
 export POSTGRES_PASSWORD="p39-pg-$$-$RANDOM"
 export POSTGRES_OWNER_PASSWORD="p39-owner-$$-$RANDOM"
 export POSTGRES_APP_PASSWORD="p39-app-$$-$RANDOM"
-export E02_ACCOUNT_KEY_SECRET="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+export E02_ACCOUNT_KEY_SECRET="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))' || true)"
+[ -n "$E02_ACCOUNT_KEY_SECRET" ] || { echo "BLOCKED: could not generate the account key secret"; DELIBERATE_EXIT=1; exit 1; }
 
 teardown() {
     if [ "$KEEP" = "1" ]; then
@@ -132,7 +133,7 @@ trap teardown EXIT
 
 # ------------------------------------------------------- 1. negative control: no secret
 hdr "1. negative control - a missing secret must abort"
-tmp_err="$(mktemp)"
+tmp_err="$(mktemp || true)"
 set +e
 ( unset ADMIN_PASSWORD; "${COMPOSE[@]}" config >/dev/null 2>"$tmp_err" )
 missing_status=$?
@@ -151,7 +152,7 @@ rm -f "$tmp_err"
 
 # ------------------------------------------------------------- 2. config is accepted
 hdr "2. compose config accepts a complete environment"
-config_out="$(mktemp)"
+config_out="$(mktemp || true)"
 if "${COMPOSE[@]}" config >"$config_out" 2>/tmp/p39_config.err; then
     note "compose config OK ($(wc -l <"$config_out") lines)"
 else
@@ -216,7 +217,10 @@ done
 [ "$pg_ready" = "1" ] && note "postgres reported ready" || bad "postgres never became ready"
 
 # Redis must answer PING, not merely be running: a bound port proves nothing.
-redis_pong="$("${COMPOSE[@]}" exec -T redis redis-cli ping 2>/dev/null | tr -d '\r')"
+# `|| true` is required: under `set -o pipefail` a failing redis-cli in this command
+# substitution makes the whole assignment non-zero, and with no `|| bad` guard the shell
+# exits silently. Every direct assignment of a command's output gets the same treatment.
+redis_pong="$("${COMPOSE[@]}" exec -T redis redis-cli ping 2>/dev/null | tr -d '\r' || true)"
 [ "$redis_pong" = "PONG" ] && note "redis answered PING" || bad "redis did not answer PING (got '$redis_pong')"
 
 # `web` and `worker` both depend on `migrate` with condition
@@ -228,17 +232,35 @@ redis_pong="$("${COMPOSE[@]}" exec -T redis redis-cli ping 2>/dev/null | tr -d '
     || { bad "the application plane failed to start"; tail -30 /tmp/p39_up.log; }
 
 # Read the migration job's own exit status rather than trusting that `up` succeeded.
-migrate_exit="$("${COMPOSE[@]}" wait migrate 2>/dev/null | tr -d '\r')"
-if [ "$migrate_exit" != "0" ]; then
-    bad "the migration job exited $migrate_exit"
-    "${COMPOSE[@]}" logs --tail 40 migrate || true
-else
+#
+# `docker compose wait` is NOT a compose subcommand (it was added in Compose v2.28 as
+# `docker compose wait`, but a container's exit code is available more portably with
+# `docker inspect`, and that works on every version). The first version used it anyway and
+# the command substitution failed with no output, killing the script at that line.
+#
+# Wait for the one-shot job to leave the "running" state, then read its exit code.
+migrate_id="$("${COMPOSE[@]}" ps -aq migrate 2>/dev/null | head -1 | tr -d '\r' || true)"
+migrate_exit="unknown"
+if [ -n "$migrate_id" ]; then
+    for _ in $(seq 1 120); do
+        running="$(docker inspect -f '{{.State.Running}}' "$migrate_id" 2>/dev/null | tr -d '\r' || true)"
+        if [ "$running" = "false" ]; then
+            migrate_exit="$(docker inspect -f '{{.State.ExitCode}}' "$migrate_id" 2>/dev/null | tr -d '\r' || true)"
+            break
+        fi
+        sleep 1
+    done
+fi
+if [ "$migrate_exit" = "0" ]; then
     note "migration job exited 0"
+else
+    bad "the migration job did not exit 0 (got '$migrate_exit')"
+    "${COMPOSE[@]}" logs --tail 40 migrate 2>&1 | tail -40 || true
 fi
 
 # Confirm the schema is actually there rather than trusting the exit code.
 tables="$("${COMPOSE[@]}" exec -T db psql -U gerege -d gerege_staging -tAc \
-    "select count(*) from information_schema.tables where table_schema='public'" 2>/dev/null | tr -d ' \r')"
+    "select count(*) from information_schema.tables where table_schema='public'" 2>/dev/null | tr -d ' \r' || true)"
 if [ "${tables:-0}" -gt 0 ] 2>/dev/null; then
     note "public schema has $tables tables"
 else
@@ -268,7 +290,7 @@ except urllib.error.HTTPError as exc:
     print(exc.code)
 except Exception as exc:
     print('ERR', exc)
-" 2>/dev/null | tr -d '\r')"
+" 2>/dev/null | tr -d '\r' || true)"
     if [ "$code" = "200" ]; then
         note "GET $endpoint -> 200"
     else
@@ -282,7 +304,7 @@ hb_status=""
 hb_ok=0
 for _ in $(seq 1 60); do
     hb_status="$("${COMPOSE[@]}" exec -T worker python -c \
-        "from core.worker_heartbeat import read;print(read()['status'])" 2>/dev/null | tr -d '\r')"
+        "from core.worker_heartbeat import read;print(read()['status'])" 2>/dev/null | tr -d '\r' || true)"
     if [ "$hb_status" = "alive" ]; then
         hb_ok=1
         break
@@ -325,7 +347,7 @@ fi
 
 # ------------------------------------------------------------------ 8. non-root container
 hdr "8. the application container does not run as root"
-web_uid="$("${COMPOSE[@]}" exec -T web id -u 2>/dev/null | tr -d '\r')"
+web_uid="$("${COMPOSE[@]}" exec -T web id -u 2>/dev/null | tr -d '\r' || true)"
 if [ "$web_uid" = "0" ]; then
     bad "the application container runs as uid 0"
 elif [ -n "$web_uid" ]; then
@@ -353,7 +375,7 @@ for line in sys.stdin:
         bad.append(f"{row.get(chr(83)+chr(101)+chr(114)+chr(118)+chr(105)+chr(99)+chr(101))}:{health}")
 print(",".join(bad))
 raise SystemExit(1 if bad else 0)
-' 2>/dev/null)" || true
+' 2>/dev/null || true)" || true
 if [ -n "$unhealthy" ]; then
     bad "compose reports unhealthy services: $unhealthy"
 else

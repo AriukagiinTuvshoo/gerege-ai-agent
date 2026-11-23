@@ -1638,13 +1638,13 @@ jobs:
           # Phase 37 added tests/test_e37_phase37_readiness.py (34) and
           # tests/test_e37_lock_integrity.py (8). Phase 38 added
           # tests/test_e38_production_architecture.py (47). Phase 39 added
-          # tests/test_e39_staging_operational_readiness.py (71).
+          # tests/test_e39_staging_operational_readiness.py (76).
           #
-          # Measured collection AFTER Phase 39 is 305. The previously recorded 233 was
+          # Measured collection AFTER Phase 39 is 310. The previously recorded 233 was
           # already stale by one before this phase: a clean checkout of the Phase 38
           # commit collects 234. The explicit file list, not the number, is the authority;
           # the floor exists to catch a suite silently dropping out of the run.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 301 --require-summary
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 306 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
