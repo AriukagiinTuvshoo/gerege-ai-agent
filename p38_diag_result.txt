@@ -3,29 +3,51 @@ docker:
 === staging ===
 Unable to find image 'caddy:2.8-alpine' locally
 2.8-alpine: Pulling from library/caddy
-4f4fb700ef54: Pulling fs layer
-60177795cab3: Pulling fs layer
-6ccef1045412: Pulling fs layer
-b44c500748de: Pulling fs layer
 63b69af3dc55: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+6ccef1045412: Pulling fs layer
+60177795cab3: Pulling fs layer
+b44c500748de: Pulling fs layer
 4f4fb700ef54: Already exists
-63b69af3dc55: Download complete
-60177795cab3: Download complete
 6ccef1045412: Download complete
-91d5cceee199: Download complete
-789bb96d2ef6: Download complete
+60177795cab3: Download complete
+63b69af3dc55: Download complete
 b44c500748de: Download complete
-63b69af3dc55: Pull complete
-60177795cab3: Pull complete
+789bb96d2ef6: Download complete
+91d5cceee199: Download complete
 6ccef1045412: Pull complete
-b44c500748de: Pull complete
+60177795cab3: Pull complete
+63b69af3dc55: Pull complete
 4f4fb700ef54: Pull complete
+b44c500748de: Pull complete
 Digest: sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
 Status: Downloaded newer image for caddy:2.8-alpine
-{"level":"info","ts":1795433194.6641662,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}
-{"level":"warn","ts":1795433194.6647532,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream"}
-{"level":"warn","ts":1795433194.664764,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream"}
-{"level":"warn","ts":1795433194.6647675,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Host: the reverse proxy's default behavior is to pass headers to the upstream"}
-{"level":"warn","ts":1795433194.6650581,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream"}
-{"level":"warn","ts":1795433194.6650617,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream"}
-Error: adapting config using caddyfile: parsing caddyfile tokens for 'log': wrong argument count or unexpected line ending after 'filter', at /etc/caddy/Caddyfile:144
+{"level":"info","ts":1795433291.2495565,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}
+{"level":"warn","ts":1795433291.2505066,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433291.2505205,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433291.2505233,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Host: the reverse proxy's default behavior is to pass headers to the upstream"}
+Valid configuration
+{"level":"warn","ts":1795433291.2510128,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433291.2510238,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"info","ts":1795433291.2519162,"msg":"adapted config to JSON","adapter":"caddyfile"}
+{"level":"warn","ts":1795433291.251921,"msg":"Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies","adapter":"caddyfile","file":"/etc/caddy/Caddyfile","line":45}
+{"level":"info","ts":1795433291.2522597,"logger":"http.auto_https","msg":"server is listening only on the HTTPS port but has no TLS connection policies; adding one to enable TLS","server_name":"srv0","https_port":443}
+{"level":"info","ts":1795433291.2522683,"logger":"http.auto_https","msg":"enabling automatic HTTP->HTTPS redirects","server_name":"srv0"}
+{"level":"info","ts":1795433291.2523315,"logger":"tls.cache.maintenance","msg":"started background certificate maintenance","cache":"0xc0003dd900"}
+{"level":"info","ts":1795433291.2526286,"logger":"tls.cache.maintenance","msg":"stopped background certificate maintenance","cache":"0xc0003dd900"}
+STAGING_EXIT=0
+=== prod ===
+{"level":"info","ts":1795433291.5226555,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}
+{"level":"warn","ts":1795433291.5235016,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433291.5235186,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433291.5235226,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Host: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433291.5239549,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"warn","ts":1795433291.5239687,"logger":"caddyfile","msg":"Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream"}
+{"level":"info","ts":1795433291.525182,"msg":"adapted config to JSON","adapter":"caddyfile"}
+{"level":"warn","ts":1795433291.5252426,"msg":"Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies","adapter":"caddyfile","file":"/etc/caddy/Caddyfile","line":47}
+{"level":"info","ts":1795433291.5257785,"logger":"http.auto_https","msg":"server is listening only on the HTTPS port but has no TLS connection policies; adding one to enable TLS","server_name":"srv0","https_port":443}
+{"level":"info","ts":1795433291.5258932,"logger":"http.auto_https","msg":"enabling automatic HTTP->HTTPS redirects","server_name":"srv0"}
+{"level":"info","ts":1795433291.5258493,"logger":"tls.cache.maintenance","msg":"started background certificate maintenance","cache":"0xc0005f4d80"}
+{"level":"info","ts":1795433291.5264652,"logger":"tls.cache.maintenance","msg":"stopped background certificate maintenance","cache":"0xc0005f4d80"}
+Valid configuration
+PROD_EXIT=0
