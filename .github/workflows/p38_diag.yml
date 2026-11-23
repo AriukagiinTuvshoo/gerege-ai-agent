@@ -1,0 +1,41 @@
+name: Phase 38 negctl diagnostic
+on:
+  push:
+    branches: ["arena/d78ebf88-gerege-ai-agent"]
+permissions:
+  contents: write
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reproduce the real negative control step exactly
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          exec > >(tee /tmp/diag.txt) 2>&1
+          cat > /tmp/Caddyfile.bad <<'BAD'
+          {$DOMAIN} {
+          	log {
+          		format json
+          		format json
+          	}
+          	reverse_proxy web:8000
+          }
+          BAD
+          echo "--- file contents ---"; cat -A /tmp/Caddyfile.bad | head -10
+          set +e
+          docker run --rm -e DOMAIN=ci-validate.example.mn \
+               -v /tmp/Caddyfile.bad:/etc/caddy/Caddyfile:ro caddy:2.8-alpine \
+               caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /tmp/bad.log 2>&1
+          bad_status=$?
+          set -e
+          echo "bad_status=$bad_status"
+          echo "--- bad.log ---"; cat /tmp/bad.log
+      - name: Commit
+        if: always()
+        run: |
+          cp /tmp/diag.txt p38_neg.txt || true
+          git config user.name "diag-bot"; git config user.email "d@e.invalid"
+          git add p38_neg.txt; git commit -m "temp: negctl diag" || true
+          git push origin HEAD:arena/d78ebf88-gerege-ai-agent || true
