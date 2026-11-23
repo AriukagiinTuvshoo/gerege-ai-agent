@@ -1,1 +1,8 @@
-### duplicate format -> exit 0
+### unknown directive -> exit 1
+Error: adapting config using caddyfile: /etc/caddy/Caddyfile:2: unrecognized directive: not_a_real_directive
+### unclosed brace -> exit 1
+Error: adapting config using caddyfile: syntax error: unexpected token 'web:8000', expecting '}', at /etc/caddy/Caddyfile:2 import chain: ['']
+### garbage -> exit 1
+Error: adapting config using caddyfile: subject does not qualify for certificate: '!!!'
+### reverse_proxy with no upstream -> exit 0
+### empty header block -> exit 0
