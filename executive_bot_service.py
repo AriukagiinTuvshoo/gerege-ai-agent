@@ -88,11 +88,24 @@ async def send_executive_report(
                 logger.info(f"Executive report successfully sent to {target_chat_id}")
                 return {"success": True, "message": "Тайлан амжилттай илгээгдлээ", "chat_id": target_chat_id}
             else:
+                # F-34-3: the response body is NOT returned to the caller. Telegram echoes the
+                # request URL in some error payloads, and that URL contains the bot token.
                 logger.error(f"Telegram API Error [{res.status_code}]: {res.text}")
-                return {"success": False, "message": f"Telegram алдаа [{res.status_code}]: {res.text}"}
+                return {
+                    "success": False,
+                    "message": f"Telegram алдаа [{res.status_code}]. Bot токен болон chat ID-г шалгана уу.",
+                }
     except Exception as e:
-        logger.error(f"Error sending executive report: {e}")
-        return {"success": False, "message": str(e)}
+        # F-34-3: previously `str(e)` was returned to the API client. httpx embeds the
+        # request URL in its exception text, and the URL is
+        # `https://api.telegram.org/bot<TOKEN>/sendMessage`, so any transport error
+        # disclosed the tenant's bot token to whoever called this endpoint. The detail
+        # stays in the server log; the client gets a stable message with no secret.
+        logger.error(f"Error sending executive report: {type(e).__name__}: {e}")
+        return {
+            "success": False,
+            "message": "Telegram-т холбогдоход алдаа гарлаа. Сүлжээ болон Bot Token-оо шалгана уу.",
+        }
 
 # -------------------------------------------------------------
 # 3. ЭЗНИЙ ИНТЕРАКТИВ КОМАНД ХҮЛЭЭН АВАХ (/start, /today, /qpay)

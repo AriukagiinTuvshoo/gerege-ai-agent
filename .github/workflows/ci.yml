@@ -1588,6 +1588,22 @@ jobs:
           # closed. A green file that silently skipped them would be worse than no file.
           python scripts/check_pytest_log.py /tmp/p33suite.log --min-collected 22 --require-summary
 
+      - name: Phase 34 — high-risk route and credential security
+        if: ${{ !cancelled() }}
+        env:
+          # The suite isolates itself by rebinding `database.DB_PATH`; this keeps the
+          # per-test files under the workspace and needs no service and no PostgreSQL.
+          DB_PATH: ${{ github.workspace }}/p34_suite.db
+        run: |
+          set -euo pipefail
+          # Providers (Telegram) are mocked at the `httpx.AsyncClient` seam; nothing here
+          # performs network I/O and no message can be delivered.
+          pytest tests/test_e34_phase34_security.py -v --tb=short -p no:cacheprovider | tee /tmp/p34suite.log
+          # Strict. A skip means a cross-tenant, credential-disclosure or authorization
+          # assertion did not run. Six of these tests fail against the pre-fix source, so a
+          # silently reduced collection would hide exactly the regressions they exist for.
+          python scripts/check_pytest_log.py /tmp/p34suite.log --min-collected 36 --require-summary
+
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
         run: |

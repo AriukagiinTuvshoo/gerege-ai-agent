@@ -2372,9 +2372,21 @@ async def send_executive_report_api(payload: Dict[str, Any], request: Request):
         require_auth=True,
         permission="executive:write",
     )
-    chat_id = payload.get("chat_id")
+    # F-34-1: `payload["chat_id"]` used to be forwarded verbatim, so a caller scoped to
+    # tenant A could direct A's report — including A's revenue figures — into tenant B's
+    # Telegram chat by naming B's chat id. The recipient is now always the scoped tenant's
+    # own `telegram_manager_chat_id`. The dashboard never sent `chat_id`, so nothing that
+    # works today stops working; an explicitly supplied value is rejected rather than
+    # silently ignored, so a caller cannot believe it took effect.
+    if str(payload.get("chat_id") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="chat_id тохируулах боломжгүй. Хүлээн авагч нь тухайн салбарын тохиргооноос тодорхойлогдоно.",
+        )
     date_str = payload.get("date_str")
-    res = await executive_bot_service.send_executive_report(chat_id=chat_id, page_id=pid or database.DEFAULT_PAGE_ID, target_date=date_str)
+    res = await executive_bot_service.send_executive_report(
+        chat_id=None, page_id=pid or database.DEFAULT_PAGE_ID, target_date=date_str
+    )
     return res
 
 @app.get("/api/executive/settings")
@@ -2519,11 +2531,23 @@ async def get_retention_summary_api(request: Request, page_id: Optional[str] = Q
 
 @app.post("/api/retention/trigger-checks")
 async def trigger_retention_checks_api(request: Request):
-    """Автомат сэргээлтийн шалгалтыг гараар яг одоо ажиллуулах"""
-    await core_security.require_permission(request, "retention:write")
+    """Автомат сэргээлтийн шалгалтыг гараар яг одоо ажиллуулах (тухайн салбарын хүрээнд)"""
+    # F-34-2: this used to call `require_permission` only and then run the all-tenants
+    # sweep, so a `client` scoped to one tenant could make the server send follow-up
+    # messages into every other tenant. Scope is now resolved to the caller's tenant; only
+    # an admin (whose scope resolves to the default page unless one is named) can widen it.
+    page_id = request.query_params.get("page_id")
+    scoped = await core_security.enforce_tenant_scope(
+        request,
+        requested_page_id=page_id,
+        require_auth=True,
+        permission="retention:write",
+    )
+    if not scoped:
+        raise HTTPException(status_code=403, detail="Салбар тодорхойгүй байна! (Tenant scope required)")
     base_url = str(request.base_url).rstrip("/")
-    stats = await retention_service.run_automated_retention_checks(base_url=base_url)
-    return {"success": True, "stats": stats}
+    stats = await retention_service.run_automated_retention_checks(base_url=base_url, page_id=scoped)
+    return {"success": True, "stats": stats, "page_id": str(scoped)}
 
 # -------------------------------------------------------------
 # 13. ЦАГ ЗАХИАЛГА & ИНТЕРАКТИВ ХУАНЛИ API (APPOINTMENTS)
