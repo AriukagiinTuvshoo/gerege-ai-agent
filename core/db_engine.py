@@ -13,12 +13,53 @@ _SQLALCHEMY_ENGINE = None
 _ENGINE_URL = None
 
 
+def _sqlite_path_from_url(url: str) -> Optional[str]:
+    """Extract the filesystem path from a SQLite SQLAlchemy URL.
+
+    `sqlite:///relative.db` -> ``relative.db``, `sqlite:////abs/x.db` -> ``/abs/x.db``.
+    Returns ``None`` for in-memory databases and for non-SQLite URLs, so callers can
+    fall back to the next source of truth.
+    """
+    if not url.startswith("sqlite"):
+        return None
+    _scheme, _, rest = url.partition("://")
+    # `sqlite://` (in-memory) and `sqlite:///:memory:` have no usable file path.
+    if not rest or rest in (":memory:", "/:memory:"):
+        return None
+    # A three-slash URL is relative (`rest` carries no leading slash); four slashes
+    # leave the absolute path intact. Strip the one separator SQLAlchemy adds.
+    path = rest[1:] if rest.startswith("/") else rest
+    # `sqlite:////:memory:` leaves `/:memory:` after stripping the separator; both spellings
+    # mean "in memory", not "a file literally named :memory:".
+    if not path or path.lstrip("/") in ("", ":memory:"):
+        return None
+    return path
+
+
 def get_sqlite_db_path(default_path: Optional[str] = None) -> str:
+    """Resolve the SQLite file the application reads and writes.
+
+    Precedence, most specific first:
+
+    1. ``default_path`` — an explicit argument (``database.resolved_sqlite_path()``).
+    2. ``DB_PATH``       — the SQLite-specific override.
+    3. ``DATABASE_URL``  — when it is a *SQLite* URL, its path.
+    4. the repository ``leads.db``.
+
+    Step 3 (E-33-2) closes a split-brain: `get_database_url()` honoured a SQLite
+    `DATABASE_URL` while `get_db_connection()` ignored it and opened `leads.db`, so
+    Alembic migrated the URL's file while every repository read and wrote a different
+    one. Any caller that set ``DATABASE_URL=sqlite:///...`` to isolate itself got the
+    opposite of isolation — it kept writing to the repository database.
+    """
     if default_path:
         return default_path
     env_path = os.getenv("DB_PATH", "").strip()
     if env_path:
         return env_path
+    url_path = _sqlite_path_from_url(os.getenv("DATABASE_URL", "").strip())
+    if url_path:
+        return url_path
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "leads.db")
 
 

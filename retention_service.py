@@ -47,6 +47,12 @@ async def dispatch_channel_message(
                 if res.status_code == 200:
                     database.save_chat_message(page_id, sender_id, "telegram", "bot", message_text)
                     return True
+                # E-33-1: a non-200 (e.g. 403 "bot was blocked by the user") used to fall
+                # through this branch into the generic fallback below, which returns True
+                # and persists the message. The caller then counted an undelivered message
+                # as delivered and wrote a "bot" row the customer never received.
+                logger.warning(f"Telegram dispatch non-200 [{res.status_code}] to {sender_id}: {getattr(res, 'text', '')}")
+                return False
         except Exception as e:
             logger.error(f"Telegram dispatch error to {sender_id}: {e}")
             return False

@@ -1572,6 +1572,22 @@ jobs:
           # whole reason the file exists - F-31-1 shipped in Phase 30 with a green suite.
           python scripts/check_pytest_log.py /tmp/p31suite.log --min-collected 15 --require-summary
 
+      - name: Phase 33 — delivery truthfulness and database URL resolution
+        if: ${{ !cancelled() }}
+        env:
+          # The suite isolates itself by rebinding `database.DB_PATH`; this is the same
+          # SQLite path it will use, so the step needs no service and no PostgreSQL.
+          DB_PATH: ${{ github.workspace }}/p33_suite.db
+        run: |
+          set -euo pipefail
+          # External providers are mocked at the `httpx.AsyncClient` seam; no test in this
+          # file performs network I/O or needs a live database server.
+          pytest tests/test_e33_phase33_findings.py -v --tb=short -p no:cacheprovider | tee /tmp/p33suite.log
+          # Strict. A skip here means either the delivery-truthfulness assertions or the
+          # split-brain assertions did not run - and those are the two findings the phase
+          # closed. A green file that silently skipped them would be worse than no file.
+          python scripts/check_pytest_log.py /tmp/p33suite.log --min-collected 22 --require-summary
+
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
         run: |

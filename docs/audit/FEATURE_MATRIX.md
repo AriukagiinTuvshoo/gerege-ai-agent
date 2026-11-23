@@ -6,6 +6,14 @@ PostgreSQL, or missing key sub-cases · **UI-ONLY** = reachable in UI, no workin
 
 Verification column cites the check performed in Phase 0.
 
+> **Status update — Phase 33 (2026-11-16).** The three `BROKEN on PG` defects marked
+> `P0-01`, `P1-01` and `P1-03` below were **re-verified against a live PostgreSQL 16
+> instance** and are **fixed**. Their original wording is kept for the audit trail, and
+> each now carries a `FIXED` annotation naming the check and the regression test that
+> guards it (`tests/test_stage_b_regressions.py`). Do not treat these rows as current
+> defects. Everything else in this file remains as audited in Phase 0 and was not
+> re-verified in Phase 33.
+
 ---
 
 ## 1. Channels / Omnichannel
@@ -16,7 +24,7 @@ Verification column cites the check performed in Phase 0.
 | Meta message receive | Yes | **PARTIAL** | `POST /webhook` → signature verified then processed | cannot reach Meta API from sandbox |
 | Meta send (`send_meta_message`) | Yes | **PARTIAL** | Graph v22.0 call, 10 s timeout, error logged | no live token |
 | IG DM / comments | Yes | **PARTIAL** | shares Meta webhook path | — |
-| Comment-to-DM automation | Yes | **BROKEN on PG** | `create_comment_automation` → `id: None`; `get_comment_automation(None)` → `TypeError` | `P1-01` |
+| Comment-to-DM automation | Yes | **FIXED** (was BROKEN on PG) | Phase 33 re-verified on PostgreSQL 16: `create_comment_automation` returns a real row (`id: 1`); `_SERIAL_ID_TABLES` covers the table. Guard: `test_stage_b_regressions.py` B-03 | `P1-01` — closed |
 | Telegram webhook | Yes | **PARTIAL** | secret-token check, fail-closed | no live bot |
 | ManyChat webhook | Yes | **PARTIAL** | secret check via env or page `verify_token` | — |
 | Website chat widget (`widget.js`) | Yes | **REAL** | 200, 10,290 bytes | `POST /api/chat` |
@@ -41,7 +49,7 @@ Verification column cites the check performed in Phase 0.
 
 | Feature | Claimed | Actual | Evidence | Note |
 |---|---|---|---|---|
-| Leads list | Yes | **BROKEN on PG once data exists** | `get_all_registrations` returns `datetime` → 500 | `P0-01` |
+| Leads list | Yes | **FIXED** (was BROKEN on PG once data exists) | Phase 33 re-verified on PostgreSQL 16 with a real row: `created_at` is `datetime`, `SafeJSONResponse`/`core.serialization` encode it, no 500. Guard: `test_stage_b_regressions.py` B-01 | `P0-01` — closed |
 | Leads filter/search/paginate | Yes | **REAL** (empty DB) | in-Python filtering | O(n) scan, no SQL pagination |
 | Lead status update | Yes | **REAL** | `POST /api/leads/{id}/status` 200 | — |
 | CSV export | Yes | **REAL** | 200, UTF-8 BOM header | — |
@@ -60,7 +68,7 @@ Verification column cites the check performed in Phase 0.
 | Feature | Claimed | Actual | Evidence | Note |
 |---|---|---|---|---|
 | Keyword rules | Yes | **REAL** | `automated_rules`, `sent_followups` | — |
-| Comment trigger | Yes | **BROKEN on PG** | `P1-01` | — |
+| Comment trigger | Yes | **FIXED** (was BROKEN on PG) | same fix as comment-to-DM automation above | `P1-01` — closed |
 | Tag/link/order triggers | Claimed | **MISSING** | only keyword/comment | — |
 | Visual workflow builder | Claimed | **MISSING** | rule list UI only | — |
 | Conditions/branching | Claimed | **MISSING** | — | — |
@@ -73,10 +81,10 @@ Verification column cites the check performed in Phase 0.
 
 | Feature | Claimed | Actual | Evidence | Note |
 |---|---|---|---|---|
-| Fintech summary | Yes | **BROKEN on PG** | `paid_at LIKE '2026-…'` → `timestamp ~~ unknown` | `P1-03` |
-| Executive report preview | Yes | **BROKEN on PG** | `created_at LIKE '…'` | `P1-03` |
+| Fintech summary | Yes | **FIXED** (was BROKEN on PG) | Phase 33 re-verified on PostgreSQL 16 with a PAID + PENDING invoice: `get_fintech_summary` returns correct aggregates. `LIKE` replaced by `day_range_bounds()` half-open bounds. Guard: `test_stage_b_regressions.py` B-04 | `P1-03` — closed |
+| Executive report preview | Yes | **FIXED** (was BROKEN on PG) | same fix as fintech summary above | `P1-03` — closed |
 | ROI analytics (`/api/analytics/roi`) | Yes | **PARTIAL** | tracked links + conversions | no revenue attribution join |
-| Cargo summary | Yes | 200 | verified | date via `arrived_at LIKE` → latent `P1-03` |
+| Cargo summary | Yes | 200 | verified | latent `P1-03` cleared in Phase 33: no `arrived_at LIKE` remains in the codebase |
 | Appointments summary | Yes | 200 | verified | — |
 | Retention summary | Yes | 200 | verified | — |
 | Response-time / handoff rate | Claimed | **MISSING** | not computed | — |

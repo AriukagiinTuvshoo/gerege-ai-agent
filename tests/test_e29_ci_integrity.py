@@ -411,6 +411,7 @@ def test_every_security_phase_suite_is_executed_by_ci():
         "tests/test_e29_ci_integrity.py",
         "tests/test_e30_ssrf_pinning.py",
         "tests/test_e31_proxy_and_pinning_review.py",
+        "tests/test_e33_phase33_findings.py",
     ):
         assert suite in text, f"{suite} is not run by CI"
 

@@ -34,8 +34,19 @@ def resolved_sqlite_path() -> str:
     consults this function so migrations always target the same file the repositories
     read and write — the split-brain that silently sent `init_db()`'s seed to
     `leads.db` while the app read a configured path.
+
+    E-33-2: `DB_PATH` used to be *only* the import-time value, so a process that set
+    `DATABASE_URL`/`DB_PATH` after import (tests, scripts, an operator exporting a
+    variable into a running shell) still reported the repository `leads.db`. Reporting a
+    different file than `get_connection()` opens is exactly the divergence this function
+    exists to prevent. Resolution is therefore re-evaluated against the live environment
+    **unless** a caller has deliberately rebound the module global, which stays
+    authoritative for backup/restore tooling and tests.
     """
-    return DB_PATH
+    if DB_PATH != _DEFAULT_DB_PATH:
+        # Explicitly rebound at runtime (tests, tooling): that assignment wins.
+        return DB_PATH
+    return get_sqlite_db_path(None)
 
 
 def get_connection():

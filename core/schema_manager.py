@@ -44,7 +44,15 @@ def _resolved_sqlite_path() -> Optional[str]:
     could report success against a schema it had created somewhere else.
     """
     if os.getenv("DATABASE_URL", "").strip():
-        return None  # an explicit URL always wins
+        # E-33-2: only a **non-SQLite** URL means "ignore the SQLite file entirely".
+        # A SQLite `DATABASE_URL` names a concrete file and is now honoured by
+        # `get_sqlite_db_path()`, so the application reads and writes *that* file.
+        # Returning `None` here would leave `init_db()`/Alembic with no file to target
+        # while the repositories used one — the split-brain this function exists to stop.
+        from core.db_engine import _sqlite_path_from_url
+
+        if not _sqlite_path_from_url(os.getenv("DATABASE_URL", "").strip()):
+            return None  # an explicit non-SQLite URL always wins
     try:
         import database as _database
 
