@@ -1,0 +1,106 @@
+===== ENV / PYTEST EXIT =====
+python 3.12.16 (main, Oct 26 2026, 02:48:44) [GCC 15.2.0]
+E02 set: False
+REDIS_URL: redis://127.0.0.1:6379/0
+PYTEST_EXIT=0
+
+===== PYTEST FAILURES AND SKIPS =====
+
+===== PYTEST TAIL =====
+  Use a @classmethod decorator below @pytest.fixture and set attributes on cls instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#class-scoped-fixture-as-instance-method
+    fixturefunc = resolve_fixture_function(fixturedef, request)
+
+tests/test_e39_staging_operational_readiness.py::TestStagingResourceLimits::test_every_staging_service_is_bounded[redis]
+  /opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/site-packages/_pytest/fixtures.py:1392: PytestRemovedIn10Warning: Class-scoped fixtures defined as instance methods are deprecated.
+  Instance attributes set in the 'staging' fixture will NOT be visible to test methods,
+  as each test gets a new instance while the fixture runs only once per class.
+  Use a @classmethod decorator below @pytest.fixture and set attributes on cls instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#class-scoped-fixture-as-instance-method
+    fixturefunc = resolve_fixture_function(fixturedef, request)
+
+tests/test_e38_production_architecture.py::TestProductionProxyTopology::test_certificate_storage_is_a_named_volume
+  /opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/site-packages/_pytest/fixtures.py:1392: PytestRemovedIn10Warning: Class-scoped fixtures defined as instance methods are deprecated.
+  Instance attributes set in the 'prod' fixture will NOT be visible to test methods,
+  as each test gets a new instance while the fixture runs only once per class.
+  Use a @classmethod decorator below @pytest.fixture and set attributes on cls instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#class-scoped-fixture-as-instance-method
+    fixturefunc = resolve_fixture_function(fixturedef, request)
+
+tests/test_e36_backup_operations.py::TestSchedulerUnits::test_service_has_a_restart_timeout
+  /opt/hostedtoolcache/Python/3.12.16/x64/lib/python3.12/site-packages/_pytest/fixtures.py:1392: PytestRemovedIn10Warning: Class-scoped fixtures defined as instance methods are deprecated.
+  Instance attributes set in the 'installed' fixture will NOT be visible to test methods,
+  as each test gets a new instance while the fixture runs only once per class.
+  Use a @classmethod decorator below @pytest.fixture and set attributes on cls instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#class-scoped-fixture-as-instance-method
+    fixturefunc = resolve_fixture_function(fixturedef, request)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========== 316 passed, 1 xfailed, 22 warnings in 196.86s (0:03:16) ============
+
+===== REHEARSAL =====
+
+=== 0. preflight ===
+  [ok]   docker present: Docker version 29.4.2, build 055a478
+  [ok]   compose present: 5.1.3
+
+=== 1. negative control - a missing secret must abort ===
+
+[FATAL] the rehearsal stopped unexpectedly at line 138 (status 1)
+[FATAL] this is a bug in the script or a missing prerequisite, not a product failure
+  [ok]   missing ADMIN_PASSWORD rejected with exit 1
+  [ok]   the refusal names the variable: error while interpolating services.worker.environment.ADMIN_PASSWORD: required variable ADMIN_PASSWORD is missing a value: ADMIN_PASSWORD is required
+
+=== 2. compose config accepts a complete environment ===
+  [ok]   compose config OK (277 lines)
+
+=== 3. topology - only the proxy may publish host ports ===
+published ports: proxy:80,443,443
+  [ok]   no service publishes 8000/5432/6379
+
+=== 4. postgres, redis and the migration job ===
+  [ok]   all nine required variables are non-empty in the rehearsal shell
+  [ok]   postgres reported ready
+  [ok]   redis answered PING
+  [ok]   migration job exited 0
+  [ok]   public schema has 19 tables
+
+=== 5. the API answers its own health endpoints ===
+  [ok]   the API answered /api/health
+  [ok]   GET /api/health -> 200
+  [ok]   GET /api/ready -> 200
+
+=== 6. the worker publishes a heartbeat ===
+  [ok]   worker heartbeat status: alive
+
+=== 7. F-39-D - a broken scheduler step must not make a live worker look dead ===
+2026-11-23 18:11:34,019 [ERROR] gerege.worker: appointment reminder step failed: RuntimeError: p39 injected scheduler failure
+  status='alive' scheduler_errors=1
+  [ok]   an injected scheduler failure left the heartbeat alive and counted it
+
+=== 8. the application container does not run as root ===
+  [ok]   web runs as uid 999
+
+=== 9. compose health states ===
+NAME                    IMAGE                 COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+p39rehearsal-db-1       postgres:16-alpine    "docker-entrypoint.s…"   db        44 seconds ago   Up 43 seconds (healthy)   5432/tcp
+p39rehearsal-redis-1    redis:7-alpine        "docker-entrypoint.s…"   redis     44 seconds ago   Up 43 seconds (healthy)   6379/tcp
+p39rehearsal-web-1      p39rehearsal-web      "uvicorn main:app --…"   web       13 seconds ago   Up 9 seconds (healthy)    8000/tcp
+p39rehearsal-worker-1   p39rehearsal-worker   "python worker.py"       worker    13 seconds ago   Up 9 seconds (healthy)    8000/tcp
+  [ok]   no service is reported unhealthy
+
+=== result ===
+  passed: 18   failed: 0
+  [ok]   staging rehearsal PASSED
+
+=== teardown ===
+ Network p39rehearsal_default Removing 
+ Volume p39rehearsal_qrcodes Removed 
+ Network p39rehearsal_default Removed 
+ Volume p39rehearsal_pgdata Removed 
+ Volume p39rehearsal_redisdata Removed 
+  [ok]   stack removed
+REHEARSAL_EXIT=0
+error while interpolating services.worker.environment.DATABASE_URL: required variable POSTGRES_APP_PASSWORD is missing a value: POSTGRES_APP_PASSWORD is required
+error while interpolating services.maintenance.environment.DATABASE_OWNER_URL: required variable POSTGRES_OWNER_PASSWORD is missing a value: POSTGRES_OWNER_PASSWORD is required
+error while interpolating services.web.environment.ADMIN_PASSWORD: required variable ADMIN_PASSWORD is missing a value: ADMIN_PASSWORD is required
