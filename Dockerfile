@@ -33,16 +33,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends postgresql-clie
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r gerege && useradd -r -g gerege -d /app gerege
 
-# Phase 36: install from the hash-locked set, not the ranges.
+# Phase 36: install from the locked set of exact versions, not the ranges.
 #
 # `requirements.txt` allows `fastapi>=0.115.0,<1.0.0`, so two builds of one commit could
-# ship different code. `--require-hashes` makes pip reject any wheel whose SHA-256 does
-# not match and refuse anything not pinned in the lock.
+# ship different code. `requirements.lock` pins all 46 packages in the transitive closure
+# to the versions that pass the suite in CI, so a rebuild installs the same code.
 #
-# The lock was generated from the exact versions that pass the suite in CI
-# (run 45124631443), so this pins what is already tested rather than upgrading anything.
+# `--require-hashes` is deliberately NOT used here. It was, and it broke this build: the
+# lock's hashes were generated on CPython 3.11 (cp311 wheels) while this image is 3.12,
+# and pip refuses any wheel whose hash is not listed — so nothing was installable. See the
+# header of requirements.lock for the full explanation and the command that regenerates
+# hashes on the correct interpreter. Reproducible by *version* today; hash-verified once
+# that is done.
 COPY requirements.lock .
-RUN pip install --no-cache-dir --require-hashes --no-deps -r requirements.lock
+RUN pip install --no-cache-dir --no-deps -r requirements.lock
 
 # requirements.txt is still copied for the dev/test path and for auditability; the
 # production layer above does not read it.

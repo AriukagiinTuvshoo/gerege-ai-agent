@@ -154,31 +154,49 @@ behind a misleading error message.
 
 **Before:** ranges only (`fastapi>=0.115.0,<1.0.0`), no lockfile, mutable base-image tag.
 
-**After:** `requirements.lock` — **46 packages, each with a SHA-256**, generated from the
-exact versions that pass CI, resolved as a full transitive closure and downloaded to capture
-hashes. **No dependency was upgraded.**
+**After:** `requirements.lock` pins all **46** production packages to exact versions —
+the ones that pass the suite in CI, resolved as a full transitive closure. **No dependency
+was upgraded.** `requirements-dev.txt` separates test tooling so the image ships no
+pytest, bandit or moto. `pip-audit` against the lock: **46 packages, 0 vulnerabilities.**
 
-Verified for real, not asserted:
+### The hash attempt, and why it was withdrawn
 
+The first version of the lock carried a SHA-256 per package. **It broke the CI Docker
+build**, and the reason is not obvious:
+
+> The audit environment runs **CPython 3.11**, so every downloaded wheel was `cp311`
+> (`psycopg2_binary-2.9.13-cp311-cp311-manylinux...whl`). The image is `python:3.12-slim`,
+> i.e. `cp312`. `pip install --require-hashes` refuses any wheel whose hash is not listed,
+> and no cp311 wheel installs on 3.12 — so the image build failed outright.
+
+CI caught it (`Build Production Docker Image`, run `45139654537`), and it had passed at
+Phase 35, so this was **a regression I introduced and had to fix**, not a pre-existing
+condition. A lock that only works on the machine that generated it is not a lock.
+
+**Resolution:** the lock keeps exact versions and drops hashes; `--require-hashes` was
+removed from the Dockerfile. Reproducible by *version* today — two builds install the same
+code — but a tampered wheel would not be detected. The header of `requirements.lock`
+records the exact command to regenerate hashes on the image's own interpreter:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src python:3.12-slim bash -c \
+  "pip install pip-tools && pip-compile --generate-hashes -o requirements.lock requirements.txt"
 ```
-python -m venv /tmp/p36_clean
-pip install --require-hashes --no-deps -r requirements.lock   →  Successfully installed 46
-```
 
-The app then ran on that isolated environment: `main` imported, `init_db()` created the
-schema, `/api/ready` returned **200**. Production closure is genuinely sufficient.
+and `tests/test_e36_lock.py` now asserts that the Dockerfile's hash flag and the lock's
+hash coverage **agree**, so the two cannot drift into the broken combination again.
 
-`requirements-dev.txt` splits out pytest/bandit/moto so the production image does not ship
-test tooling. `pip-audit` against the lock: **46 packages, 0 vulnerabilities.**
+### Verified
 
-**Not done, and why:** the base-image digest is a **documented placeholder**. Docker Hub is
-outside the egress allowlist, so the digest could not be resolved, and inventing one
-produces an image that cannot pull at all — worse than the tag. The Dockerfile now installs
-`--require-hashes` from the lock, and `tests/test_e36_lock.py` **xfails** while the
-placeholder is present so it is visible rather than hidden, and turns green by itself once
-resolved.
+`pip install --no-cache-dir --no-deps -r requirements.lock` in a clean venv installed all
+46 packages, and the Dockerfile's build-time `init_db()` then ran successfully on that set
+alone — no dev dependency is needed to build the image.
 
----
+**Base image:** parameterised as `ARG BASE_IMAGE=python:3.12-slim`, so it can be pinned by
+digest at build time with no file edit (`--build-arg BASE_IMAGE=python:3.12-slim@sha256:…`).
+The default remains a tag because Docker Hub is outside the egress allowlist here and a
+fabricated digest makes `FROM` unpullable — the first attempt at that also failed CI. The
+test xfails while the default is a tag, so the gap stays visible and turns green once pinned.
 
 ## 5. Reverse proxy
 
