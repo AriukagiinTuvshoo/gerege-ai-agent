@@ -1,0 +1,108 @@
+# Gerege AI Agent — Caddy reverse proxy
+#
+# Phase 36. This is the TLS terminator the deployment was missing: Phase 35 found
+# `docker-compose.prod.yml` publishing plaintext :8000 with no proxy anywhere in the
+# repository, which meant `Secure` cookies were silently dropped by browsers and every
+# admin password crossed the network in the clear.
+#
+# Usage:
+#   docker compose -f docker-compose.staging.yml --profile proxy up -d
+#
+# Environment (see .env.staging.example):
+#   STAGING_DOMAIN     the real hostname; Caddy obtains a certificate for it
+#   ACME_EMAIL         account address for Let's Encrypt expiry notices
+#   TRUSTED_PROXIES    must contain the proxy's subnet so the app honours
+#                      X-Forwarded-Proto (core/rate_limit.resolve_request_scheme)
+#
+# Certificate storage lives in the `caddy_data` volume. Losing that volume means
+# re-issuing certificates, which is rate-limited by Let's Encrypt — back it up, or use
+# a named volume on persistent storage (the default here).
+
+{
+	# Replace with a real address; it receives certificate-expiry warnings.
+	email {$ACME_EMAIL}
+
+	# Do not advertise the exact version in the Server header.
+	servers {
+		strict_sni_host on
+	}
+}
+
+{$STAGING_DOMAIN} {
+	encode zstd gzip
+
+	# ---------------------------------------------------------------- security headers
+	# The application already sets CSP, X-Frame-Options, nosniff, Referrer-Policy and
+	# HSTS (core/security.py). They are repeated here only for responses Caddy itself
+	# generates (errors, redirects), which never reach the application. `defer` keeps
+	# the application's values authoritative when present.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# ---------------------------------------------------------------- request limits
+	# Bounded bodies. The largest legitimate upload is an image or a CSV import; 25 MB is
+	# generous for both and stops an unauthenticated client from streaming gigabytes.
+	request_body {
+		max_size 25MB
+	}
+
+	# ---------------------------------------------------------------- API + frontend
+	# One upstream: FastAPI serves both the JSON API and the static SPA, so there is
+	# nothing to split. Rewriting paths here would desynchronise the app's own routing.
+	reverse_proxy web:8000 {
+		# Forward the real client address and scheme. The application only trusts these
+		# when the socket peer is inside TRUSTED_PROXIES; Caddy's own headers are
+		# overwritten below so a client cannot smuggle a forged chain through.
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-Proto {http.request.scheme}
+		header_up X-Forwarded-Host {http.request.host}
+		header_up X-Real-IP {http.request.remote.host}
+
+		# Long enough for a slow AI completion or a QPay token round-trip (the app bounds
+		# its own provider calls at 10-12s); short enough that a hung upstream does not
+		# pin a connection forever.
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 60s
+			read_timeout 90s
+			write_timeout 90s
+		}
+	}
+
+	# ---------------------------------------------------------------- webhooks
+	# Meta, Telegram and QPay all POST here. They are handled by the same application,
+	# but they must not be rate-limited or buffered in ways that break signature checks.
+	# Caddy passes bodies through unmodified; no rewrite and no body transformation.
+	@webhooks path /api/telegram/webhook* /api/webhook* /api/fintech/qpay/callback*
+	handle @webhooks {
+		reverse_proxy web:8000 {
+			header_up X-Forwarded-For {http.request.remote.host}
+			header_up X-Forwarded-Proto {http.request.scheme}
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+	}
+
+	# ---------------------------------------------------------------- health probes
+	# Answered locally so an external uptime monitor does not consume application
+	# connections or database pool slots just to learn the proxy is up. The application
+	# is still probed for real at /api/ready (see the healthcheck and monitoring docs).
+	respond /healthz 200
+
+	log {
+		output stdout
+		format json
+		# Do not log query strings: the QPay callback carries an invoice id, and login
+		# flows can carry tokens. The path alone is enough for traffic analysis.
+		format json {
+			time_format wall_unix
+		}
+	}
+}

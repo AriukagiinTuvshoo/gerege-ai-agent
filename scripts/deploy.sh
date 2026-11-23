@@ -95,8 +95,16 @@ fi
 
 echo "=== [Gerege Deploy] 8. Post-deploy healthcheck ==="
 sleep 3
-if ! curl -fsS "http://127.0.0.1:${PORT:-8000}/api/health" >/dev/null; then
-  echo "Healthcheck FAILED! Triggering automatic rollback..." >&2
+# Phase 36: gate on /api/ready, not /api/health.
+#
+# /api/health used to materialise every registration and every page's sessions, so its
+# cost grew with the tenant's data (measured 28 ms empty -> 94.6 ms at 10k rows) and this
+# gate could fail a deploy on a large-but-healthy database. /api/ready performs one
+# `SELECT 1` plus the queue and limiter checks (~6 ms) and is what the container
+# healthcheck and the load balancer already use, so the deploy now verifies the same
+# readiness signal the runtime does.
+if ! curl -fsS "http://127.0.0.1:${PORT:-8000}/api/ready" >/dev/null; then
+  echo "Healthcheck FAILED (/api/ready)! Triggering automatic rollback..." >&2
   bash scripts/rollback.sh
   exit 1
 fi

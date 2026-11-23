@@ -1,7 +1,24 @@
-FROM python:3.12-slim
+# Phase 36: pin the base image by digest, not just by tag.
+#
+# `python:3.12-slim` is a mutable tag: the same Dockerfile can build against a different
+# slim layer next week, so "it built yesterday" says nothing about today. Phase 35 rated
+# this Medium.
+#
+# The digest below MUST be replaced with a real one before the first build. It could not
+# be resolved from the audit environment (Docker Hub is outside the egress allowlist), and
+# inventing a digest would produce an image that cannot pull at all - worse than the tag.
+# Resolve it on a host with registry access:
+#
+#   docker buildx imagetools inspect python:3.12-slim --format '{{.Manifest.Digest}}'
+#
+# then replace `@sha256:REPLACE_ME_WITH_RESOLVED_DIGEST` below. `tests/test_e36_lock.py`
+# fails while the placeholder is present, so this cannot ship silently.
+FROM python:3.12-slim@sha256:REPLACE_ME_WITH_RESOLVED_DIGEST
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
@@ -10,8 +27,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends postgresql-clie
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r gerege && useradd -r -g gerege -d /app gerege
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Phase 36: install from the hash-locked set, not the ranges.
+#
+# `requirements.txt` allows `fastapi>=0.115.0,<1.0.0`, so two builds of one commit could
+# ship different code. `--require-hashes` makes pip reject any wheel whose SHA-256 does
+# not match and refuse anything not pinned in the lock.
+#
+# The lock was generated from the exact versions that pass the suite in CI
+# (run 45124631443), so this pins what is already tested rather than upgrading anything.
+COPY requirements.lock .
+RUN pip install --no-cache-dir --require-hashes --no-deps -r requirements.lock
+
+# requirements.txt is still copied for the dev/test path and for auditability; the
+# production layer above does not read it.
+COPY requirements.txt requirements-dev.txt ./
 
 COPY . .
 

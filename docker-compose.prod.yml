@@ -25,6 +25,16 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-gerege}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-gerege_crm}
+    # Phase 36: make the ceiling explicit instead of inheriting the image default.
+    # With the Phase 36 pool defaults the stack needs 27 connections (2x10 API + 4
+    # worker + 3 maintenance), so the stock 100 is ample; stating it here means the
+    # budget guard, the compose file and the server cannot silently disagree.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${PG_MAX_CONNECTIONS:-100}"
+      - "-c"
+      - "superuser_reserved_connections=${PG_SUPERUSER_RESERVED:-3}"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -115,6 +125,21 @@ services:
       # documentation, not a control.
       STRICT_QPAY_VERIFICATION: "1"
       DISABLE_INLINE_SCHEDULER: "1"
+      # --- Phase 36: connection budget -------------------------------------------
+      # `web` runs uvicorn with --workers 2 (Dockerfile CMD). The startup guard in
+      # main.py reads UVICORN_WORKERS so the budget accounts for both processes; if this
+      # drifts from the Dockerfile the guard under-counts. Change both together.
+      UVICORN_WORKERS: "2"
+      DB_PROCESS_ROLE: "api"
+      # 5+5 per process = 10; 2 processes = 20 connections.
+      # Sized for a threadpool that serves REST + static, not for batch work.
+      DB_POOL_SIZE: "${DB_POOL_SIZE:-5}"
+      DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-5}"
+      DB_POOL_TIMEOUT: "${DB_POOL_TIMEOUT:-30}"
+      DB_POOL_RECYCLE: "${DB_POOL_RECYCLE:-1800}"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      PG_MAX_CONNECTIONS: "${PG_MAX_CONNECTIONS:-100}"
+      PG_SUPERUSER_RESERVED: "${PG_SUPERUSER_RESERVED:-3}"
       # SEC-01/B-02: CORS allowlist is mandatory in production (no wildcard fallback).
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required (e.g. https://app.example.mn)}
       # E-05: the runtime credential. NOT the bootstrap `POSTGRES_USER`.
@@ -186,6 +211,20 @@ services:
       REDIS_URL: redis://redis:6379/0
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      # --- Phase 36: connection budget -------------------------------------------
+      # The worker runs ONE sequential asyncio loop: process_pending_jobs awaits each
+      # handler inside a `for` loop, and every scheduler tick is sequential. It cannot
+      # use 30 connections; 2+2 = 4 is already ample. Counting it at 30 was most of the
+      # Phase 35 over-subscription.
+      UVICORN_WORKERS: "${UVICORN_WORKERS:-2}"
+      DB_PROCESS_ROLE: "worker"
+      DB_POOL_SIZE: "${WORKER_DB_POOL_SIZE:-2}"
+      DB_MAX_OVERFLOW: "${WORKER_DB_MAX_OVERFLOW:-2}"
+      DB_POOL_TIMEOUT: "${DB_POOL_TIMEOUT:-30}"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      # Server ceiling, so the guard compares against reality instead of assuming 100.
+      PG_MAX_CONNECTIONS: "${PG_MAX_CONNECTIONS:-100}"
+      PG_SUPERUSER_RESERVED: "${PG_SUPERUSER_RESERVED:-3}"
     volumes:
       # Phase 20: read-only, same reasoning as `web` above. The worker has no backup code
       # path at all; it never needed write access.
@@ -228,6 +267,13 @@ services:
         python scripts/provision_roles.py --verify
     environment:
       ENV: production
+      # Phase 36: one-shot DDL role. Alembic connects once; 2+1 keeps it inside the same
+      # budget as the running services instead of opening a default 10+20 pool while
+      # `web` and `worker` are already connected.
+      DB_PROCESS_ROLE: "maintenance"
+      DB_POOL_SIZE: "2"
+      DB_MAX_OVERFLOW: "1"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
       # DSNs for the maintenance plane only. These are NOT passed to web/worker.
       # The provisioning steps read ADMIN_DATABASE_URL; `alembic upgrade head` reads
       # DATABASE_URL.

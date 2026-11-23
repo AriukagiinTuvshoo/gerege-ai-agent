@@ -413,6 +413,14 @@ def test_every_security_phase_suite_is_executed_by_ci():
         "tests/test_e31_proxy_and_pinning_review.py",
         "tests/test_e33_phase33_findings.py",
         "tests/test_e34_phase34_security.py",
+        "tests/test_e36_phase36_infra.py",
+        "tests/test_e36_lock.py",
+        "tests/test_e36_health_monitoring.py",
+        "tests/test_e36_migration_safety.py",
+        "tests/test_e36_staging_config.py",
+        "tests/test_e36_reverse_proxy.py",
+        "tests/test_e36_backup_operations.py",
+        "tests/test_e36_worker_health.py",
     ):
         assert suite in text, f"{suite} is not run by CI"
 

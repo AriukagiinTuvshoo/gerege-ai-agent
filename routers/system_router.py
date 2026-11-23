@@ -1,5 +1,6 @@
 from typing import Dict, Any
 from fastapi import APIRouter, Request, Depends
+from fastapi.responses import JSONResponse
 
 import database
 from core.security import require_admin
@@ -61,6 +62,64 @@ async def queue_stats_endpoint(_admin: Dict[str, Any] = Depends(require_admin)):
 async def queue_failed_jobs_endpoint(_admin: Dict[str, Any] = Depends(require_admin)):
     """Dead-Letter болон Failed төлөвт орсон даалгавруудын жагсаалт"""
     return {"jobs": task_queue.list_failed_jobs(limit=50)}
+
+
+@router.get("/worker/health")
+async def worker_health_endpoint(_admin: Dict[str, Any] = Depends(require_admin)):
+    """Worker liveness, queue backlog and scheduler state (Phase 36).
+
+    Phase 35's finding: nothing could answer "is the worker alive?" over HTTP. Queue depth
+    and failed jobs were visible, but a worker that died while the queue was empty was
+    completely invisible -- the symptom would have been silently missing daily reports.
+
+    The heartbeat is a short-TTL Redis key (no schema change, and expiry means a dead
+    worker cannot leave a stale "healthy" flag behind). ``status`` is one of:
+
+      alive    a heartbeat completed within the freshness window
+      stale    a heartbeat exists but is older than expected -- wedged, not merely absent
+      missing  no heartbeat at all: never started, or its TTL lapsed
+      unknown  Redis could not be read, so no claim is made either way
+
+    Admin-only, because queue and scheduler state are deployment-internal.
+    """
+    from core import worker_heartbeat
+
+    worker_state = worker_heartbeat.read()
+    try:
+        stats = task_queue.get_queue_stats()
+    except Exception as exc:
+        stats = {"error": type(exc).__name__}
+
+    # Scheduler health is reported from the same queue stats the worker writes to: the
+    # worker owns the scheduler in production (DISABLE_INLINE_SCHEDULER=1 in `web`), so a
+    # dead worker is *also* a dead scheduler. Saying so explicitly prevents an operator
+    # from reading "worker missing" as a delivery problem only.
+    dead_letter = int(stats.get("dead_letter") or 0)
+    pending = int(stats.get("pending") or 0)
+    backlogged = pending > 100
+
+    healthy = worker_state["status"] == "alive"
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "worker": worker_state,
+            "scheduler": {
+                # In this topology the scheduler runs inside the worker.
+                "location": "worker",
+                "healthy": healthy,
+                "note": (
+                    "the API runs with DISABLE_INLINE_SCHEDULER=1, so a stopped worker "
+                    "also stops scheduled reports and retention"
+                ),
+            },
+            "queue": stats,
+            "alerts": {
+                "worker_not_alive": not healthy,
+                "backlog_over_100": backlogged,
+                "dead_letter_jobs": dead_letter,
+            },
+        },
+    )
 
 
 @router.post("/queue/process")

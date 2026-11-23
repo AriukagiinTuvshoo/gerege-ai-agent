@@ -1470,3 +1470,87 @@ def reset_account_failures(identifier: str) -> None:
     if key is None:
         return
     get_limiter().reset_key(key)
+
+
+# ---------------------------------------------------------------------------
+# Forwarded scheme (Phase 36, F-36-3)
+# ---------------------------------------------------------------------------
+#
+# When TLS is terminated by a reverse proxy, the app receives plain HTTP on the socket
+# and sees `scheme="http"`. Nothing in this codebase read `X-Forwarded-Proto`, and the
+# container runs uvicorn with `--no-proxy-headers`, so Starlette never promoted the
+# header either. Measured: with `X-Forwarded-Proto: https` present,
+# `str(request.base_url)` still returned `http://staging.example.mn/`.
+#
+# That is not cosmetic. `request.base_url` is used to build the QPay callback URL and
+# the payment page URL (`fintech_service.py:354,402`), so behind a TLS proxy every
+# generated payment link and callback would be plaintext `http://` - and QPay would
+# call back over an unencrypted connection, or refuse.
+#
+# The trust rule is deliberately identical to `resolve_client_ip`: the header is
+# honoured only when the socket peer is a configured trusted proxy. Otherwise it is
+# ignored and the socket scheme wins, so a client that talks to the app directly
+# cannot claim to be on HTTPS and have us mint an https:// payment URL it does not own.
+
+#: The only allowed forwarded-scheme values. Anything else is ignored rather than
+#: normalised, because `X-Forwarded-Proto: javascript` (or any novel string) reaching
+#: a URL we hand to a payment provider is not a value worth being clever about.
+_ALLOWED_FORWARDED_SCHEMES = frozenset({"http", "https"})
+
+
+def resolve_request_scheme(request) -> str:
+    """The scheme this request really used, honouring a trusted proxy.
+
+    Returns ``"https"`` only when either the ASGI scope already says so (a proxy that
+    speaks TLS to us, or uvicorn with proxy headers enabled) or a trusted proxy asserts
+    it. Every other case returns the socket scheme.
+    """
+    scope_scheme = getattr(getattr(request, "scope", {}), "get", lambda *_: None)("scheme")
+    if scope_scheme not in ("http", "https"):
+        url = getattr(request, "url", None)
+        scope_scheme = getattr(url, "scheme", None) or "http"
+
+    if scope_scheme == "https":
+        return "https"
+
+    peer = _peer_address(request)
+    trusted_list = get_trusted_proxies()
+    if not trusted_list or peer is None or not _is_trusted_proxy(peer, trusted_list):
+        # Untrusted peer: its forwarding headers carry no authority.
+        return scope_scheme
+
+    try:
+        raw = request.headers.get("x-forwarded-proto")
+    except Exception:
+        return scope_scheme
+    if not raw:
+        return scope_scheme
+
+    if len(raw) > 16:
+        return scope_scheme
+    # A chain ("https, http") is normal when two proxies are in front. The left-most
+    # entry is the original client's scheme; take it and validate strictly.
+    candidate = raw.split(",")[0].strip().lower()
+    if candidate not in _ALLOWED_FORWARDED_SCHEMES:
+        logger.warning(
+            "ignoring X-Forwarded-Proto=%r from trusted proxy; not in %s",
+            raw[:32], sorted(_ALLOWED_FORWARDED_SCHEMES),
+        )
+        return scope_scheme
+    return candidate
+
+
+def build_external_base_url(request) -> str:
+    """Absolute base URL for links we hand to third parties.
+
+    Mirrors ``str(request.base_url)`` but replaces the scheme with
+    :func:`resolve_request_scheme`, so a payment callback generated behind a TLS proxy
+    is ``https://`` rather than ``http://``. The host is passed through unchanged
+    because ``base_url`` already derives it from the ``Host`` header, and trusting that
+    header is no worse here than it already is elsewhere in the request path.
+    """
+    base = str(request.base_url)
+    scheme = resolve_request_scheme(request)
+    if "://" in base and base.split("://", 1)[0] != scheme:
+        base = scheme + "://" + base.split("://", 1)[1]
+    return base

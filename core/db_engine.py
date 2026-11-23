@@ -84,11 +84,83 @@ def is_postgres() -> bool:
     return get_database_url().startswith("postgresql")
 
 
+#: Per-process-role pool defaults for PostgreSQL (Phase 36).
+#:
+#: Phase 35 measured the pool configuration against the server ceiling and found the two
+#: were unrelated: every process used the same 10+20 defaults regardless of what it
+#: actually does. A budget of 2 x 30 (API) + 30 (worker) = 90 against
+#: ``max_connections=100`` leaves no room for migrations, backups or an operator's psql.
+#:
+#: These defaults are sized from observed concurrency, not guessed:
+#:
+#: ``api``     uvicorn serves on a threadpool, so it genuinely needs several concurrent
+#:             connections. 5+5 = 10 per process; 2 workers = 20.
+#: ``worker``  ``task_queue.process_pending_jobs`` awaits handlers in a sequential
+#:             ``for`` loop and the worker's scheduler ticks are sequential too, so one
+#:             connection is in flight at a time. 2+2 = 4 is generous.
+#: ``maintenance`` one-shot CLIs (backup/restore/prune/provision) that run one statement
+#:             at a time. 2+1 = 3.
+#:
+#: ``DB_POOL_SIZE`` / ``DB_MAX_OVERFLOW`` still override everything, so existing
+#: deployments and the SQLite test suite are unaffected.
+POOL_DEFAULTS_BY_ROLE = {
+    "api": (5, 5),
+    "worker": (2, 2),
+    "maintenance": (2, 1),
+}
+#: Role used when ``DB_PROCESS_ROLE`` is unset or unrecognised. The historical 10+20 is
+#: deliberately *not* the fallback: an unlabelled process that inherits the old values is
+#: exactly how the budget drifted in the first place.
+DEFAULT_PROCESS_ROLE = "api"
+
+
+def resolve_process_role() -> str:
+    """Which pool profile this process should use.
+
+    ``DB_PROCESS_ROLE`` is explicit so the budget is a deployment decision rather than an
+    inference. Compose sets it per service; a developer running ``uvicorn`` locally gets
+    ``api`` by default.
+    """
+    role = (os.getenv("DB_PROCESS_ROLE") or DEFAULT_PROCESS_ROLE).strip().lower()
+    if role not in POOL_DEFAULTS_BY_ROLE:
+        logger.warning(
+            "unknown DB_PROCESS_ROLE=%r; falling back to %r (valid: %s)",
+            role, DEFAULT_PROCESS_ROLE, ", ".join(sorted(POOL_DEFAULTS_BY_ROLE)),
+        )
+        return DEFAULT_PROCESS_ROLE
+    return role
+
+
+def resolve_pool_settings() -> Dict[str, Any]:
+    """Resolve pool size, overflow, timeout and role for this process.
+
+    Explicit ``DB_POOL_SIZE`` / ``DB_MAX_OVERFLOW`` always win, which keeps every existing
+    deployment and test that sets them working unchanged.
+    """
+    role = resolve_process_role()
+    default_size, default_overflow = POOL_DEFAULTS_BY_ROLE[role]
+    return {
+        "role": role,
+        "pool_size": int(os.getenv("DB_POOL_SIZE", str(default_size))),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", str(default_overflow))),
+        "pool_timeout": float(os.getenv("DB_POOL_TIMEOUT", "30")),
+        # Phase 36 (F-36-1). The application pool had NO client-side connect bound:
+        # `pool_timeout` only bounds waiting for a free slot, not the TCP connect itself.
+        # Measured against an unroutable address, `engine.connect()` hung until the OS
+        # gave up (~63s here at tcp_syn_retries=6; macOS/Linux defaults can exceed 75s),
+        # while the backup path with `connect_timeout=10` failed at exactly 10.0s.
+        # A slot stuck in connect is never returned, so an unreachable database turns
+        # into a stalled pool rather than a clean error.
+        "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+    }
+
+
 def create_sqlalchemy_engine(db_url: Optional[str] = None):
     """SQLAlchemy Engine үүсгэх (PostgreSQL QueuePool эсвэл SQLite WAL)"""
     from sqlalchemy import create_engine, event
 
     url = db_url or get_database_url()
+    pool = resolve_pool_settings()
     if url.startswith("sqlite"):
         engine = create_engine(
             url,
@@ -108,9 +180,12 @@ def create_sqlalchemy_engine(db_url: Optional[str] = None):
     else:
         engine = create_engine(
             url,
-            pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
-            max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
-            pool_timeout=float(os.getenv("DB_POOL_TIMEOUT", "30")),
+            pool_size=pool["pool_size"],
+            max_overflow=pool["max_overflow"],
+            pool_timeout=pool["pool_timeout"],
+            # F-36-1: bound the TCP connect. Without this a blackholed/unreachable
+            # server leaves the slot checked out until the OS TCP stack gives up.
+            connect_args={"connect_timeout": pool["connect_timeout"]},
             pool_pre_ping=True,
             pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
             future=True,
@@ -188,6 +263,153 @@ def dispose_shared_engine() -> None:
         finally:
             _SQLALCHEMY_ENGINE = None
             _ENGINE_URL = None
+
+
+def compute_connection_budget(
+    api_processes: int = 1,
+    worker_processes: int = 1,
+    maintenance_processes: int = 1,
+    server_max_connections: int = 100,
+    reserved_superuser: int = 3,
+) -> Dict[str, Any]:
+    """Account for every PostgreSQL connection the stack will open.
+
+    Phase 35 found no guard anywhere in the codebase compared the pool configuration to
+    the server limit, so an over-subscribed deployment failed at runtime as ordinary
+    application errors instead of at deploy time with a clear message.
+
+    The budget is computed from what each role actually does (see
+    ``POOL_DEFAULTS_BY_ROLE``), not from a single global assumption:
+
+    * API processes are multiplied by uvicorn's worker count, because the engine is a
+      per-process singleton (``_SQLALCHEMY_ENGINE``) - each fork gets its own pool.
+    * The worker is a single sequential asyncio loop, so it is counted once.
+    * ``maintenance``/``migrate`` are one-shot and usually run while ``web`` and
+      ``worker`` are still up during a deploy, so they must fit in the same ceiling.
+
+    Returns a dict with the per-role breakdown and ``fits`` (bool).
+    """
+    def _per(role: str, explicit: Optional[Dict[str, int]] = None):
+        size, overflow = POOL_DEFAULTS_BY_ROLE[role]
+        if explicit:
+            size = explicit.get("pool_size", size)
+            overflow = explicit.get("max_overflow", overflow)
+        return size + overflow
+
+    api_each = _per("api")
+    worker_each = _per("worker")
+    maint_each = _per("maintenance")
+
+    lines = {
+        "api": {"processes": api_processes, "per_process": api_each,
+                "total": api_processes * api_each},
+        "worker": {"processes": worker_processes, "per_process": worker_each,
+                   "total": worker_processes * worker_each},
+        "maintenance": {"processes": maintenance_processes, "per_process": maint_each,
+                        "total": maintenance_processes * maint_each},
+    }
+    total = sum(v["total"] for v in lines.values())
+    usable = server_max_connections - reserved_superuser
+    return {
+        "breakdown": lines,
+        "total_required": total,
+        "server_max_connections": server_max_connections,
+        "reserved_superuser": reserved_superuser,
+        "usable": usable,
+        "headroom": usable - total,
+        "fits": total <= usable,
+    }
+
+
+def connection_budget_from_env(api_processes: int = 1) -> Dict[str, Any]:
+    """Build the budget from the *current* process's resolved settings.
+
+    ``api_processes`` should be the real uvicorn ``--workers`` value at the call site.
+    """
+    settings = resolve_pool_settings()
+    budget = compute_connection_budget(
+        api_processes=api_processes,
+        server_max_connections=int(os.getenv("PG_MAX_CONNECTIONS", "100")),
+        reserved_superuser=int(os.getenv("PG_SUPERUSER_RESERVED", "3")),
+    )
+    # An explicit override changes this process's own footprint.
+    role = settings["role"]
+    own = settings["pool_size"] + settings["max_overflow"]
+    base = POOL_DEFAULTS_BY_ROLE[role]
+    if own != sum(base):
+        delta = own - sum(base)
+        budget["breakdown"][role]["per_process"] = own
+        budget["breakdown"][role]["total"] = (
+            budget["breakdown"][role]["processes"] * own
+        )
+        budget["total_required"] += delta * budget["breakdown"][role]["processes"]
+        budget["headroom"] = budget["usable"] - budget["total_required"]
+        budget["fits"] = budget["total_required"] <= budget["usable"]
+    return budget
+
+
+def enforce_connection_budget(api_processes: int = 1, strict: Optional[bool] = None) -> Dict[str, Any]:
+    """Warn (or raise) when the configured pool cannot fit the server.
+
+    Fail-safe policy, mirroring how the rest of this codebase treats production:
+
+    * Never raises for SQLite - the test suite and local dev must not care.
+    * In production (``is_production_mode()``) an over-budget configuration raises
+      ``RuntimeError`` at startup, because the alternative is discovering it as random
+      errors during peak traffic.
+    * Outside production it logs a loud warning and continues, so a developer with a
+      small laptop PostgreSQL can still run the app.
+    * ``strict`` overrides the production default; ``DB_STRICT_CONNECTION_BUDGET=0``
+      is the explicit escape hatch and is logged so it can never be silent.
+    """
+    if not is_postgres():
+        return {"enforced": False, "reason": "sqlite"}
+
+    budget = connection_budget_from_env(api_processes=api_processes)
+    if strict is None:
+        strict = _is_production_mode()
+        if os.getenv("DB_STRICT_CONNECTION_BUDGET", "").strip().lower() in ("0", "false", "no"):
+            strict = False
+            logger.warning(
+                "DB_STRICT_CONNECTION_BUDGET=0 set; connection budget will not fail the "
+                "process (total required=%s, usable=%s)",
+                budget["total_required"], budget["usable"],
+            )
+
+    if budget["fits"]:
+        logger.info(
+            "connection budget OK: %s required, %s usable (headroom %s) - role=%s",
+            budget["total_required"], budget["usable"], budget["headroom"],
+            budget.get("role", resolve_process_role()),
+        )
+        return {"enforced": strict, "ok": True, **budget}
+
+    detail = ", ".join(
+        f"{name}={v['total']} ({v['processes']}x{v['per_process']})"
+        for name, v in budget["breakdown"].items()
+    )
+    message = (
+        "PostgreSQL connection budget exceeded: "
+        f"{budget['total_required']} connections required > {budget['usable']} usable "
+        f"(max_connections={budget['server_max_connections']} - "
+        f"{budget['reserved_superuser']} reserved). Breakdown: {detail}. "
+        "Lower DB_POOL_SIZE/DB_MAX_OVERFLOW, set DB_PROCESS_ROLE per service, or raise "
+        "PostgreSQL max_connections."
+    )
+    if strict:
+        raise RuntimeError(message)
+    logger.warning(message)
+    return {"enforced": False, "ok": False, **budget}
+
+
+def _is_production_mode() -> bool:
+    """Local copy to avoid importing core.security at module import time.
+
+    ``core.security`` imports request-handling dependencies; ``db_engine`` is imported by
+    the worker and by CLI scripts that must not drag the web stack in.
+    """
+    from core.security import is_production_mode as _prod
+    return _prod()
 
 
 def get_pool_status() -> Dict[str, Any]:

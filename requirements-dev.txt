@@ -1,0 +1,16 @@
+# Test / CI-only dependencies. NOT installed by the production image.
+#
+# Phase 36 split these out of requirements.txt so the production install is small and the
+# lockfile (requirements.lock) covers only what ships. Versions are the ones the verified
+# CI environment actually used; ranges are kept here because these run in CI, not on a
+# customer-facing host, and pinning them hard would make test-tooling upgrades painful for
+# no production benefit.
+-r requirements.txt
+
+pytest>=9.0.3,<10.0.0
+PyYAML>=6.0,<7.0
+bandit
+pip-audit
+moto[s3]
+fakeredis
+pgserver

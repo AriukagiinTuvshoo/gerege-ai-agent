@@ -1604,6 +1604,30 @@ jobs:
           # silently reduced collection would hide exactly the regressions they exist for.
           python scripts/check_pytest_log.py /tmp/p34suite.log --min-collected 36 --require-summary
 
+      - name: Phase 36 — connection budget, lockfile, health separation, worker heartbeat
+        if: ${{ !cancelled() }}
+        env:
+          # The suite isolates itself by rebinding `database.DB_PATH`; no service and no
+          # PostgreSQL is required. The F-36-1 connect-timeout case talks to an unroutable
+          # address (10.255.255.1) and never reaches a server, so this performs no real
+          # network I/O and needs no Redis beyond the optional heartbeat cases.
+          DB_PATH: ${{ github.workspace }}/p36_suite.db
+        run: |
+          set -euo pipefail
+          pytest tests/test_e36_phase36_infra.py tests/test_e36_lock.py \
+                 tests/test_e36_health_monitoring.py tests/test_e36_migration_safety.py \
+                 tests/test_e36_staging_config.py tests/test_e36_reverse_proxy.py \
+                 tests/test_e36_backup_operations.py tests/test_e36_worker_health.py \
+                 -v --tb=short -p no:cacheprovider | tee /tmp/p36suite.log
+          # Strict, and deliberately so. These files are the only thing standing between a
+          # future change and the four defects Phase 36 closed: an unbounded pool connect,
+          # an over-subscribed connection budget, http:// payment URLs behind TLS, and a
+          # worker nobody could observe. A skip means one of those regressed silently.
+          # The one expected exception is the base-image digest, which is an xfail until it
+          # is resolved - so the floor below is the measured 144 collected minus that one
+          # xfail, with a small margin, rather than a guessed number.
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 140 --require-summary
+
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
         run: |

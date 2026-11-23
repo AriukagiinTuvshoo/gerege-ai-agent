@@ -109,6 +109,22 @@ async def run_worker_tick(loop_count: int) -> dict:
     # Leaving the call here and letting it raise nightly would train operators to ignore
     # worker errors, so it is gone rather than wrapped in a try/except.
 
+    # Phase 36: record a completed tick so worker liveness is observable over HTTP.
+    # Deliberately at the END of the tick: a heartbeat written at the start would keep
+    # reporting "alive" while the loop was wedged inside a handler, which is the failure
+    # mode worth detecting. Best-effort -- a monitoring write must never stop the worker.
+    try:
+        from core import worker_heartbeat
+        worker_heartbeat.beat(loop_count, extra={
+            "queue_processed": stats.get("queue_processed", 0),
+            "stale_recovered": stats.get("stale_recovered", 0),
+            "reports_sent": stats.get("reports_sent", 0),
+            "reminders_sent": stats.get("reminders_sent", 0),
+        })
+    except Exception as beat_exc:
+        # Redis down is survivable: the queue falls back to DB polling.
+        logger.warning(f"worker heartbeat skipped: {beat_exc}")
+
     return stats
 
 
@@ -139,6 +155,16 @@ async def worker_main_loop(max_iterations: Optional[int] = None):
 
     database.init_db()
     register_default_task_handlers()
+    # Phase 36: the worker is a sequential asyncio loop, so it is counted once in the
+    # connection budget regardless of TASK_QUEUE_BATCH_SIZE. Runs after init_db so a
+    # misconfiguration is reported with the schema already known-good.
+    try:
+        from core.db_engine import enforce_connection_budget
+        enforce_connection_budget(api_processes=int(os.getenv("UVICORN_WORKERS", "1")))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning(f"connection budget check skipped: {exc}")
     logger.info(f"Gerege Dedicated Background Worker started (worker_id={task_queue.worker_id}).")
     loop_count = 0
     while not _SHUTDOWN_EVENT.is_set():

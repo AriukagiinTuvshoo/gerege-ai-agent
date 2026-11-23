@@ -388,9 +388,16 @@ def test_22_dockerfile_and_compose_pass_no_proxy_headers():
     compose = open(os.path.join(REPO_ROOT, "docker-compose.prod.yml"), encoding="utf-8").read()
     # The compose `web` service uses the image default command, but a `worker` or any
     # explicit uvicorn command must also disable it.
+    #
+    # Phase 36: skip comments. A YAML comment that explains the flag necessarily contains
+    # the word "uvicorn", and matching it made this assertion fail on its own
+    # documentation rather than on a real command line.
     for line in compose.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
         if "uvicorn" in line and "--no-proxy-headers" not in line:
-            raise AssertionError(f"compose starts uvicorn without --no-proxy-headers: {line.strip()}")
+            raise AssertionError(f"compose starts uvicorn without --no-proxy-headers: {stripped}")
 
 
 def test_23_relaxed_security_is_visible_and_off_by_default(monkeypatch):

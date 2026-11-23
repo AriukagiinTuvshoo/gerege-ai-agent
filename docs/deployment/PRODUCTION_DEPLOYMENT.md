@@ -264,6 +264,65 @@ half-restored database. After a restore it re-runs a full `provision_roles --app
 > guard and **refuse** to run under the runtime credential, so those snippets no longer
 > work. Use the CLI, which sets the owner credential explicitly.
 
+### 5.1 Schema rollback: what is and is not possible
+
+`scripts/rollback.sh` restores **data**; it does not run `alembic downgrade`. Do not assume
+a failed deploy can be undone with one. Phase 36 measured the actual behaviour of every
+migration rather than assuming:
+
+| Migration | Downgrade | Notes |
+|---|---|---|
+| 0001 initial schema | yes | |
+| 0002 schema authority | yes | |
+| 0003 foreign keys | yes | |
+| **0004 tenant session identity** | **conditional** | refuses when tenants collide — see below |
+| 0005 username uniqueness | yes | |
+| 0006 login identity | yes | |
+| 0007 audit append-only | yes | |
+
+**0004 is data-dependent, not unconditionally irreversible.** It collapses
+`session_states` from a `(sender_id)` key to `(page_id, sender_id)`. If two tenants hold a
+session for the *same* `sender_id`, going back would have to delete one of them, so the
+downgrade raises instead of destroying data:
+
+```
+RuntimeError: Cannot downgrade to a sender-only primary key: several tenants hold a row
+for the same sender, and collapsing them would destroy data.
+```
+
+Both branches were exercised against PostgreSQL 16 in Phase 36:
+
+* **No collisions** (fresh or single-tenant database): `alembic downgrade 0003` **succeeds**.
+* **Collisions present** (the normal state once two tenants have talked to the same person
+  on different pages): the downgrade **refuses**, the revision stays at `0004`, and **both
+  rows are still there afterwards**. Verified: 2 rows before, 2 rows after.
+
+Practical consequence: on any database that has served more than one tenant, treat a
+schema rollback past 0004 as **unavailable** and recover with a restore instead:
+
+```bash
+bash scripts/rollback.sh          # code + data, verified
+```
+
+If you genuinely need to go back, resolve the collisions deliberately first — decide which
+tenant keeps the session — then downgrade. Never script that.
+
+### 5.2 Do not run two migrators against a fresh volume
+
+Measured on an empty database: two `alembic upgrade head` processes started together both
+attempt to create `alembic_version`. One succeeds; the other exits 1 with
+`already exists`. The schema still ends at `0007` with 19 tables, so the failure is clean
+rather than a partial migration — but it is a non-zero exit, and a deploy script that
+treats that as fatal would roll back a perfectly good deployment.
+
+Against an **already-migrated** database (the normal redeploy) both processes exit 0.
+
+Rules:
+* Exactly one `migrate` container per deployment. `docker compose up` guarantees this;
+  a Kubernetes Job with `parallelism > 1`, or two hosts deploying simultaneously, does not.
+* `core/schema_manager.py` takes a `pg_advisory_lock` for the app-side schema path, but
+  Alembic's own `env.py` takes no lock — which is why the first-boot case behaves as above.
+
 ## 6. Credential rotation
 
 ```bash

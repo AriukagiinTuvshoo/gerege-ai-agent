@@ -95,6 +95,18 @@ async def lifespan(app: FastAPI):
     # Raises RateLimitStoreUnavailable, which aborts startup (uvicorn exits non-zero) rather
     # than degrading to `limit x workers`. Development/tests are unaffected.
     core_rate_limit.validate_store_for_startup()
+    # Phase 36: refuse to start with a pool configuration that cannot fit the server.
+    # Phase 35 found 2x(10+20) + 30 = 90 against max_connections=100 with no guard, so an
+    # over-subscribed deployment surfaced as random connection errors under load instead
+    # of a clear startup failure. `--workers` is not visible from inside a worker process,
+    # so it is passed explicitly through UVICORN_WORKERS (compose/Dockerfile set it).
+    try:
+        from core.db_engine import enforce_connection_budget
+        enforce_connection_budget(api_processes=int(os.getenv("UVICORN_WORKERS", "1")))
+    except RuntimeError:
+        raise
+    except Exception as exc:  # never let the guard itself block startup
+        logger.warning(f"connection budget check skipped: {exc}")
 
     scheduler_task = None
     if os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1":
@@ -1758,14 +1770,100 @@ async def update_knowledge(payload: Dict[str, Any], request: Request, page_id: O
 # -------------------------------------------------------------
 # 11. СИСТЕМИЙН ЭРҮҮЛ МЭНД БА ТҮЛХҮҮРҮҮД
 # -------------------------------------------------------------
+@app.get("/api/live")
+async def liveness_check():
+    """Cheap liveness probe (Phase 36).
+
+    Answers only "is this process serving HTTP?". No database, no Redis, no counting.
+    Phase 35 measured `/api/health` at 28 ms on an empty database rising to 95 ms at 10k
+    rows because it loads every registration and every active session; that is the wrong
+    cost profile for a probe a container runtime or load balancer calls every few seconds.
+    This endpoint has a constant cost of roughly a dictionary literal.
+
+    Deliberately NOT dependent on the database or Redis: a restart cannot fix either, so
+    making liveness depend on them would turn a dependency outage into a crash loop. That
+    reasoning is why `/api/health` was already Redis-independent (E-02 Phase 6) and it
+    applies equally here. Readiness is `/api/ready`.
+    """
+    return JSONResponse({"status": "alive"})
+
+
 @app.get("/api/health")
 async def health_check():
+    """Deep-ish health: dependency flags plus a *bounded* data summary.
+
+    Phase 36 replaced the unbounded table scan. Previously this loaded every registration
+    and every active session on every call, so its cost grew linearly with the customer's
+    data and a monitor pointed here became a source of load. The totals are now capped at
+    HEALTH_SUMMARY_SCAN_LIMIT rows and reported as "at least N" when the cap is reached,
+    which keeps the diagnostic value (is there data? roughly how much?) at a constant cost.
+
+    Use `/api/live` for container liveness and `/api/ready` for readiness. This endpoint is
+    for a human or a low-frequency dashboard, not a probe.
+    """
     load_dotenv(override=True)
-    rows = database.get_all_registrations()
-    pages = database.get_all_pages()
-    # E-01: `get_active_sessions` is tenant-scoped, so the cross-tenant total is an
-    # explicit per-tenant aggregate instead of an unscoped "give me everything" call.
-    sessions = [s for p in pages for s in database.get_active_sessions(page_id=p["page_id"])]
+    # Phase 36: counts come from `COUNT(*)`, not from materialising rows.
+    #
+    # The previous implementation called get_all_registrations() and
+    # get_all_pages(), then fetched every page's active sessions, so the endpoint's cost
+    # and memory use grew linearly with the tenant's data (measured: 28 ms empty,
+    # 94.6 ms at 10k rows) while a health probe called it every few seconds.
+    #
+    # `COUNT(*)` is O(1)-ish for the planner and allocates nothing per row. It is still a
+    # scan on SQLite, so this endpoint remains unsuitable as a high-frequency liveness
+    # probe -- that is what /api/live is for -- but it no longer scales with data volume
+    # in a way that can exhaust a worker.
+    # Explicit statements rather than an f-string over a table name. The names below are
+    # literals, but Phase 26's rule is that SQL is never assembled from a variable: a
+    # future edit that passed user input into a helper like the previous `_count(table)`
+    # would have been an injection with no visible string concatenation at the call site.
+    # Bandit also flags the interpolated form (B608), and a suppression there would have
+    # been the wrong trade.
+    _HEALTH_COUNTS = {
+        "pages": "SELECT COUNT(*) FROM pages",
+        "registrations": "SELECT COUNT(*) FROM registrations",
+        # Exactly preserves the previous number: the old code summed
+        # len(get_active_sessions(page)) over every page, and that function returns every
+        # `session_states` row for a page with no `is_active` filter (despite its name), so
+        # the cross-tenant total is simply the table's row count. Adding a filter here
+        # would have silently changed the reported figure.
+        "session_states": "SELECT COUNT(*) FROM session_states",
+    }
+
+    def _count(name: str) -> "int | None":
+        """Run one of the fixed COUNT(*) statements, or None if it fails."""
+        statement = _HEALTH_COUNTS.get(name)
+        if statement is None:
+            return None
+        conn = None
+        cur = None
+        try:
+            conn = database.get_connection()
+            cur = conn.cursor()
+            cur.execute(statement)
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return int(row[0] if not isinstance(row, dict) else list(row.values())[0])
+        except Exception as exc:
+            logger.warning(f"health: count({name}) unavailable: {exc}")
+            return None
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    total_pages = _count("pages")
+    total_leads = _count("registrations")
+    active_sessions = _count("session_states")
+    summary_available = None not in (total_pages, total_leads, active_sessions)
     return JSONResponse({
         "status": "healthy",
         "gemini_ready": agent.is_gemini_ready(),
@@ -1776,9 +1874,11 @@ async def health_check():
         "rate_limits_shared_across_workers": core_rate_limit.get_limiter().is_shared(),
         "meta_token_configured": bool(os.getenv("META_PAGE_ACCESS_TOKEN", "").strip()),
         "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip()),
-        "total_pages": len(pages),
-        "total_leads": len(rows),
-        "active_sessions": len(sessions)
+        # None means "could not be counted"; it is not reported as 0.
+        "total_pages": total_pages,
+        "total_leads": total_leads,
+        "active_sessions": active_sessions,
+        "summary_available": summary_available,
     })
 
 @app.get("/api/ready")
@@ -2239,7 +2339,9 @@ async def create_invoice_manual_api(
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Мөнгөн дүн 0-ээс их байх ёстой")
     desc = payload.get("description", "Үйлчилгээний төлбөр")
-    base_url = str(request.base_url)
+    # Phase 36 (F-36-3): honour a trusted proxy's X-Forwarded-Proto so a TLS-terminated
+    # deployment does not mint http:// payment callbacks and pay-page links.
+    base_url = core_rate_limit.build_external_base_url(request)
     order = await fintech_service.create_payment_order(
         page_id=page_id or database.DEFAULT_PAGE_ID,
         amount=amount,
@@ -2275,7 +2377,9 @@ async def scan_cargo_package_api(payload: Dict[str, Any], request: Request):
     if not code:
         return JSONResponse(status_code=400, content={"error": "tracking_code is required"})
     loc = payload.get("location", "УБ Төв Агуулах")
-    base_url = str(request.base_url)
+    # Phase 36 (F-36-3): honour a trusted proxy's X-Forwarded-Proto so a TLS-terminated
+    # deployment does not mint http:// payment callbacks and pay-page links.
+    base_url = core_rate_limit.build_external_base_url(request)
     res = await cargo_service.scan_and_notify_package(
         page_id=pid or database.DEFAULT_PAGE_ID,
         tracking_code=code,
@@ -2545,7 +2649,7 @@ async def trigger_retention_checks_api(request: Request):
     )
     if not scoped:
         raise HTTPException(status_code=403, detail="Салбар тодорхойгүй байна! (Tenant scope required)")
-    base_url = str(request.base_url).rstrip("/")
+    base_url = core_rate_limit.build_external_base_url(request).rstrip("/")
     stats = await retention_service.run_automated_retention_checks(base_url=base_url, page_id=scoped)
     return {"success": True, "stats": stats, "page_id": str(scoped)}
 

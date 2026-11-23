@@ -1,0 +1,250 @@
+# Gerege AI Agent — STAGING stack
+#
+# Phase 36. Derived from docker-compose.prod.yml, with the three Phase 35 blockers
+# closed and staging isolation enforced:
+#
+#   1. HTTPS        a Caddy `proxy` service terminates TLS; `web` publishes NO host port
+#   2. Connections  per-role pools plus a startup budget guard (27 required of 97)
+#   3. Backups      a host systemd timer drives the `maintenance` profile (deploy/README)
+#
+# Differences from production, deliberately:
+#   * Every credential comes from .env.staging and must differ from production. The
+#     file refuses to start without them (`:?`), so staging cannot inherit prod values
+#     by accident.
+#   * `POSTGRES_DB` defaults to a staging-named database so a shared host cannot collide.
+#   * The proxy is the only published port. 8000 and 5432 are unreachable from outside.
+#
+# NOT a production file. Do not point this at production data.
+#
+# Start:  docker compose -f docker-compose.staging.yml up -d
+# Proxy:  enabled by default below; if TLS cannot be issued (no DNS yet), run
+#         `--profile no-proxy` and use deploy/Caddyfile.local instead. Never expose
+#         port 8000 to the internet to work around a certificate problem.
+
+name: gerege-staging
+
+services:
+  # ------------------------------------------------------------------ TLS terminator
+  proxy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"        # HTTP/3
+    environment:
+      STAGING_DOMAIN: ${STAGING_DOMAIN:?STAGING_DOMAIN is required (the real hostname)}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required for certificate expiry notices}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data          # certificates — losing this re-issues and hits LE rate limits
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ------------------------------------------------------------------ application
+  web:
+    build: .
+    restart: unless-stopped
+    # NO `ports:`. Caddy reaches this over the compose network only.
+    environment:
+      ENV: production
+      STRICT_SECURITY: "1"
+      WEBHOOK_FAIL_CLOSED: "1"
+      REQUIRE_LEAST_PRIVILEGE: "1"
+      DISABLE_INLINE_SCHEDULER: "1"
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required (e.g. https://<STAGING_DOMAIN>)}
+      # Phase 36 (F-36-3): the app only honours X-Forwarded-Proto from these peers, so
+      # this MUST contain the proxy's address range or generated payment callbacks are
+      # plaintext http://. The compose network is 172.x by default; the Caddy container
+      # gets an address inside it. Do not set this to 0.0.0.0/0.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:?TRUSTED_PROXIES must be set to the proxy subnet}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_APP_USER:-gerege_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_staging}
+      DATABASE_OWNER_URL: postgresql://${POSTGRES_OWNER_USER:-gerege_owner}:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_staging}
+      REDIS_URL: redis://redis:6379/0
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      E02_ACCOUNT_KEY_SECRET: ${E02_ACCOUNT_KEY_SECRET:?E02_ACCOUNT_KEY_SECRET is required}
+      # --- connection budget (Phase 36) ---
+      UVICORN_WORKERS: "2"
+      DB_PROCESS_ROLE: "api"
+      DB_POOL_SIZE: "${DB_POOL_SIZE:-5}"
+      DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-5}"
+      DB_POOL_TIMEOUT: "${DB_POOL_TIMEOUT:-30}"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      PG_MAX_CONNECTIONS: "${PG_MAX_CONNECTIONS:-100}"
+      PG_SUPERUSER_RESERVED: "${PG_SUPERUSER_RESERVED:-3}"
+      # --- integrations: staging credentials ONLY ---
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+      META_APP_SECRET: ${META_APP_SECRET:-}
+      META_VERIFY_TOKEN: ${META_VERIFY_TOKEN:-}
+      QPAY_USERNAME: ${QPAY_USERNAME:-}
+      QPAY_PASSWORD: ${QPAY_PASSWORD:-}
+      QPAY_INVOICE_CODE: ${QPAY_INVOICE_CODE:-}
+      QPAY_BASE_URL: ${QPAY_BASE_URL:-https://merchant-sandbox.qpay.mn}
+    volumes:
+      - qrcodes:/app/static/qrcodes
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # /api/ready, never /api/health: the latter does full table scans per call.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 40s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    environment:
+      ENV: production
+      STRICT_SECURITY: "1"
+      REQUIRE_LEAST_PRIVILEGE: "1"
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_APP_USER:-gerege_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_staging}
+      REDIS_URL: redis://redis:6379/0
+      E02_ACCOUNT_KEY_SECRET: ${E02_ACCOUNT_KEY_SECRET:?E02_ACCOUNT_KEY_SECRET is required}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      # --- connection budget (Phase 36) ---
+      # Sequential asyncio loop: 2+2 = 4 connections, not 30.
+      UVICORN_WORKERS: "2"
+      DB_PROCESS_ROLE: "worker"
+      DB_POOL_SIZE: "${WORKER_DB_POOL_SIZE:-2}"
+      DB_MAX_OVERFLOW: "${WORKER_DB_MAX_OVERFLOW:-2}"
+      DB_POOL_TIMEOUT: "${DB_POOL_TIMEOUT:-30}"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      PG_MAX_CONNECTIONS: "${PG_MAX_CONNECTIONS:-100}"
+      PG_SUPERUSER_RESERVED: "${PG_SUPERUSER_RESERVED:-3}"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # No HTTP surface; the worker writes a heartbeat that /api/admin/worker/health reads.
+      test: ["CMD", "python", "-c", "import sys,datetime,pathlib; p=pathlib.Path('/tmp/worker_heartbeat'); sys.exit(0 if p.exists() and (datetime.datetime.now().timestamp()-p.stat().st_mtime)<180 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ------------------------------------------------------------------ one-shot migrate
+  migrate:
+    build: .
+    restart: "no"
+    command:
+      - "sh"
+      - "-c"
+      - >-
+        python scripts/provision_roles.py --apply &&
+        python -m alembic upgrade head &&
+        python scripts/provision_roles.py --apply &&
+        python scripts/provision_roles.py --verify
+    environment:
+      ENV: production
+      DB_PROCESS_ROLE: "maintenance"
+      DB_POOL_SIZE: "2"
+      DB_MAX_OVERFLOW: "1"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_staging}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_staging}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------ maintenance plane
+  # Profile-scoped: never runs on a plain `up`. Driven by a host systemd timer.
+  maintenance:
+    build: .
+    profiles: ["maintenance"]
+    restart: "no"
+    environment:
+      ENV: production
+      DB_PROCESS_ROLE: "maintenance"
+      DB_POOL_SIZE: "2"
+      DB_MAX_OVERFLOW: "1"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      DATABASE_OWNER_URL: postgresql://${POSTGRES_OWNER_USER:-gerege_owner}:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_staging}
+      BACKUP_ENCRYPTION: ${BACKUP_ENCRYPTION:-on}
+      BACKUP_ENCRYPTION_KEY_FILE: /run/secrets/backup.key
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_MIN_KEEP: ${BACKUP_MIN_KEEP:-7}
+      BACKUP_MAX_AGE_HOURS: ${BACKUP_MAX_AGE_HOURS:-36}
+      BACKUP_OFFSITE_URL: ${BACKUP_OFFSITE_URL:-}
+      BACKUP_OFFSITE_ACCESS_KEY: ${BACKUP_OFFSITE_ACCESS_KEY:-}
+      BACKUP_OFFSITE_SECRET_KEY: ${BACKUP_OFFSITE_SECRET_KEY:-}
+      BACKUP_OFFSITE_REGION: ${BACKUP_OFFSITE_REGION:-}
+    volumes:
+      - backups:/app/backups
+      - ${BACKUP_KEY_FILE:-./secrets/backup.key}:/run/secrets/backup.key:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------ data plane
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    # No published ports. Reachable only from this compose network.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gerege}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-gerege_staging}
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${PG_MAX_CONNECTIONS:-100}"
+      - "-c"
+      - "superuser_reserved_connections=${PG_SUPERUSER_RESERVED:-3}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gerege} -d ${POSTGRES_DB:-gerege_staging}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "200mb"
+      - "--maxmemory-policy"
+      - "noeviction"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:
+  qrcodes:
+  backups:
+  caddy_data:
+  caddy_config:
