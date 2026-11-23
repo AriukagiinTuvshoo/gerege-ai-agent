@@ -114,8 +114,11 @@ silent divergence in place. Option A is the only one that removes the split-brai
 |---|---|
 | `core/db_engine.py` | New `_sqlite_path_from_url()`; `get_sqlite_db_path()` precedence is now `default_path` → `DB_PATH` → SQLite `DATABASE_URL` → repository `leads.db` |
 | `core/schema_manager.py` | Only a **non-SQLite** URL suppresses SQLite resolution, matching the connection layer |
-| `database.py` | `resolved_sqlite_path()` re-reads the live environment; an explicit runtime rebind of `database.DB_PATH` still wins (the Vercel bootstrap in `api/index.py` depends on that) |
 | `.env.example` | Documents `DB_PATH` (previously absent entirely) and the new precedence |
+
+`database.py` is **unchanged**. An earlier draft also rewrote `resolved_sqlite_path()`
+to re-read the environment, which caused a regression described in §5a below; the
+split-brain is closed by the two changes above alone, so the third was reverted.
 
 PostgreSQL behaviour is unchanged: a `postgresql://` URL still selects PostgreSQL and
 yields no SQLite path.
@@ -170,6 +173,32 @@ variable, which a pre-fix `database.py` ignores — was fixed by rebinding the m
 global, so a negative-control run cannot write to the developer's database.
 
 Both flaws were caught by the negative control, not by the green run.
+
+### 5a. A regression this phase introduced and then removed
+
+The first version of the E-33-2 fix also changed `database.resolved_sqlite_path()` to
+re-derive the path from the environment whenever `database.DB_PATH` still equalled its
+import-time default. That heuristic cannot tell "nobody rebound it" from "it was rebound
+to exactly the default value", and a pre-existing subprocess test does the latter:
+
+```python
+os.environ.pop("DB_PATH")
+database.DB_PATH = str(tmp_path / 'shared.db')   # no longer distinguishable
+```
+
+With `DB_PATH` absent, the re-derivation fell back to the repository `leads.db`, so
+`tests/test_e02_login_rate_limit.py` and `tests/test_e02_phase4_account_protection.py`
+began writing a `Shared` page into the developer's database. The full suite stayed green
+throughout; the only symptom was a page count moving 25 → 26.
+
+Caught by checking `leads.db` row counts after the run, not by any assertion. Reverted the
+`database.py` change, verified the split-brain is still closed without it (connection,
+Alembic and the actual `PRAGMA database_list` path all agree on the URL's file), and
+confirmed the subprocess tests no longer touch the repository database.
+
+**Lesson:** a change to path resolution must be checked against writers that *rebind the
+module global*, not only against environment variables. The green suite would not have
+caught it.
 
 ---
 

@@ -321,9 +321,13 @@ def test_e33_2_connection_and_migration_layers_agree(tmp_path, monkeypatch):
     target = str(tmp_path / "agreed.db")
     monkeypatch.delenv("DB_PATH", raising=False)
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{target}")
-    # Neutralise any rebinding another module performed earlier in the session so this
-    # test observes environment resolution, which is what the finding is about.
-    monkeypatch.setattr(database, "DB_PATH", database._DEFAULT_DB_PATH, raising=False)
+
+    # A fresh process binds `database.DB_PATH` from the environment at import, so reload
+    # to reproduce that. Without it this compares against the global left by an earlier
+    # reload in this session, which would be testing the reload order, not the finding.
+    import importlib
+
+    importlib.reload(database)
 
     repository_path = database.resolved_sqlite_path()
     migration_path = schema_manager._resolved_sqlite_path()
@@ -341,6 +345,11 @@ def test_e33_2_an_explicit_rebinding_still_wins_over_the_url(tmp_path, monkeypat
     The Vercel bootstrap copies the database into a private runtime directory and assigns
     `database.DB_PATH` directly. A SQLite `DATABASE_URL` must not override that, or the
     serverless entry point would write to the wrong file.
+
+    This is also why `database.resolved_sqlite_path()` was left unchanged: a subprocess
+    test (`test_e02_phase4_account_protection`) deletes `DB_PATH` from the environment and
+    then rebinds the module global to its own file. Any attempt to re-derive the path from
+    the environment would ignore that rebind and write to the repository database instead.
     """
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'url.db'}")
     rebound = str(tmp_path / "runtime" / "leads.db")
