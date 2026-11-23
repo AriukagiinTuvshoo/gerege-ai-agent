@@ -208,6 +208,21 @@ services:
       DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
       ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_staging}
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_staging}
+      # Phase 39 (F-39-I). `provision_roles.py` reads GEREGE_OWNER_PASSWORD and
+      # GEREGE_APP_PASSWORD, NOT the POSTGRES_* names. Production's migrate service
+      # already mapped them; staging did not.
+      #
+      # Measured consequence, from the container rehearsal: provision_roles ran without
+      # passwords, so it created gerege_owner and gerege_app with NO password. PostgreSQL
+      # then refuses every login for them, and the application crash-looped with
+      #   FATAL: password authentication failed for user "gerege_app"
+      # while the migration itself had succeeded (19 tables present). The stack looked
+      # half-up and the worker never wrote a heartbeat.
+      #
+      # This is exactly the class of defect a config review cannot catch and a rehearsal
+      # always does.
+      GEREGE_OWNER_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}
+      GEREGE_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
     depends_on:
       db:
         condition: service_healthy

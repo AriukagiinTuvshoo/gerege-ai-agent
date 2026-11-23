@@ -868,6 +868,79 @@ class TestTheRehearsalScriptIsRealAndWired:
 
 
 # --------------------------------------------------------------------------------------
+# F-39-I — staging created its database roles with no password
+# --------------------------------------------------------------------------------------
+
+
+class TestTheMigrationJobProvisionsRealRolePasswords:
+    """Found by the container rehearsal, not by any config review.
+
+    `provision_roles.py` reads GEREGE_OWNER_PASSWORD / GEREGE_APP_PASSWORD. The staging
+    migrate service set only POSTGRES_* and ADMIN_DATABASE_URL, so both roles were created
+    with no password at all (`pw = ""` in role_ddl). Measured on CI: migrations applied
+    (19 tables) and then every application connection died with
+    `FATAL: password authentication failed for user "gerege_app"`, the worker never wrote
+    a heartbeat, and the whole application plane crash-looped.
+    """
+
+    @staticmethod
+    def _provision_env_name() -> tuple[str, str]:
+        """The variable names the provisioning script actually reads."""
+        source = _read("scripts/provision_roles.py")
+        return (
+            re.search(r'getenv\("(GEREGE_OWNER_PASSWORD)"', source).group(1),
+            re.search(r'getenv\("(GEREGE_APP_PASSWORD)"', source).group(1),
+        )
+
+    def test_the_provisioning_script_reads_the_names_this_test_assumes(self):
+        owner, app = self._provision_env_name()
+        assert owner == "GEREGE_OWNER_PASSWORD"
+        assert app == "GEREGE_APP_PASSWORD"
+
+    def test_the_provisioning_script_creates_a_passwordless_role_when_unset(self):
+        """The failure mode, asserted directly so the severity is not overstated: with no
+        password supplied the role is created WITHOUT one, and PostgreSQL then rejects
+        every login for it. The DDL must keep that shape or this test is wrong."""
+        source = _read("scripts/provision_roles.py")
+        assert 'pw = f" PASSWORD {_quote_literal(conn, password)}" if password else ""' in source
+        assert 'ALTER ROLE {name} PASSWORD' in source, (
+            "an existing role must also get its password set, or a re-run cannot repair it"
+        )
+
+    @pytest.mark.parametrize("rel", [STAGING, PROD], ids=["staging", "production"])
+    def test_the_migration_job_supplies_the_role_passwords(self, rel):
+        owner, app = self._provision_env_name()
+        environment = _yaml(rel)["services"]["migrate"]["environment"] or {}
+
+        assert owner in environment, f"{rel}'s migrate service never sets {owner}"
+        assert app in environment, f"{rel}'s migrate service never sets {app}"
+        # and they must come from the same secrets the application uses
+        assert "POSTGRES_OWNER_PASSWORD" in str(environment[owner])
+        assert "POSTGRES_APP_PASSWORD" in str(environment[app])
+
+    def test_the_two_environments_agree_on_the_role_passwords(self):
+        """Staging was the file that lacked them; do not let the pair drift again."""
+        staging = _yaml(STAGING)["services"]["migrate"]["environment"]
+        prod = _yaml(PROD)["services"]["migrate"]["environment"]
+        for name in ("GEREGE_OWNER_PASSWORD", "GEREGE_APP_PASSWORD"):
+            assert name in staging, f"staging migrate is missing {name}"
+            assert name in prod, f"production migrate is missing {name}"
+            assert staging[name] == prod[name], f"{name} differs between staging and production"
+
+    def test_the_role_passwords_are_required_not_defaulted(self):
+        """A default password here would be a committed credential."""
+        environment = _yaml(STAGING)["services"]["migrate"]["environment"]
+        for name in ("GEREGE_OWNER_PASSWORD", "GEREGE_APP_PASSWORD"):
+            assert ":?" in str(environment[name]), f"{name} has a fallback instead of failing fast"
+
+    def test_the_application_connects_as_the_app_role(self):
+        """The role whose password was missing is the one the application authenticates as."""
+        web_env = _yaml(STAGING)["services"]["web"]["environment"]
+        assert "gerege_app" in str(web_env["DATABASE_URL"])
+        assert "POSTGRES_APP_PASSWORD" in str(web_env["DATABASE_URL"])
+
+
+# --------------------------------------------------------------------------------------
 # F-39-F — the staging env template named a variable no code reads
 # --------------------------------------------------------------------------------------
 
