@@ -2,7 +2,7 @@ name: P40 diag
 on:
   push:
     branches: [arena/d78ebf88-gerege-ai-agent]
-  workflow_dispatch
+  workflow_dispatch:
 jobs:
   diag:
     runs-on: ubuntu-latest
