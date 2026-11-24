@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -35,6 +36,34 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _read(rel: str) -> str:
     with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as handle:
         return handle.read()
+
+
+def _tmp_log(content: str) -> str:
+    """Write a synthetic pytest log and return its path."""
+    handle = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8")
+    with handle:
+        handle.write(content)
+    return handle.name
+
+
+def _run_gate(log_path: str, *args: str) -> "subprocess.CompletedProcess[str]":
+    """Run the real log guard, so these tests exercise the script and not a copy of it."""
+    return subprocess.run(
+        [sys.executable, "scripts/check_pytest_log.py", log_path, *args],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _active_step_env(step: str) -> "set[str]":
+    """The env keys a `run:` step really sets, ignoring commented-out ones.
+
+    A naive `"PGHOST:" in step` also matches `# PGHOST: "..."`, which is how a guard can
+    pass while the step provides nothing at all.
+    """
+    return set(re.findall(r"^\s{10}([A-Z][A-Z0-9_]*):", step, flags=re.MULTILINE))
 
 
 # --------------------------------------------------------------------------------------
@@ -344,7 +373,7 @@ class TestF40DSkippedBackupSuite:
     def test_the_step_provides_the_dr_database_its_suite_requires(self):
         """The DR file skips on one variable; the step must set it."""
         step = _phase29_backup_step()
-        assert "P24_DR_DATABASE_URL" in step, (
+        assert "P24_DR_DATABASE_URL" in _active_step_env(step), (
             "the backup step does not set P24_DR_DATABASE_URL, so every case in "
             "test_e07_phase24_disaster_recovery.py skips and the step still passes"
         )
@@ -355,7 +384,7 @@ class TestF40DSkippedBackupSuite:
     def test_the_step_provides_the_postgresql_url_the_other_suites_require(self):
         """db_bounds / connection_bounds / restore_verification gate on DATABASE_URL."""
         step = _phase29_backup_step()
-        assert "DATABASE_URL:" in step, (
+        assert "DATABASE_URL" in _active_step_env(step), (
             "the backup step does not set DATABASE_URL, so the PostgreSQL-only cases in "
             "db_bounds, connection_bounds, restore_verification and backup_policy skip"
         )
@@ -388,19 +417,15 @@ class TestF40DSkippedBackupSuite:
         log_guard = _read("scripts/check_pytest_log.py")
         assert "collected_total = (int(matches[-1]) if matches else 0) + skipped" in log_guard
 
-    def test_every_permitted_skip_is_named_and_exists(self):
-        """`--allow-skip` matches a NAME, so each entry must be a real test name.
-
-        A typo in this list would silently allow nothing - the gate would then fail on
-        the next run rather than on this one - so the names are checked against the
-        modules that own them.
-        """
+    def test_every_permitted_skip_exception_is_real(self):
+        """`--allow-skip` matches a NAME and `--allow-skip-file` a PATH; both must exist."""
         step = _phase29_backup_step()
         gate = step[step.index("check_pytest_log.py"):]
-        allowed = re.findall(r'--allow-skip\s+"([^"]+)"', gate)
-        assert allowed, "no --allow-skip entries: every S3 case would now fail the gate"
-        assert len(set(allowed)) == len(allowed), f"duplicate --allow-skip entries: {allowed}"
-
+        names = re.findall(r'--allow-skip\s+"([^"]+)"', gate)
+        paths = re.findall(r'--allow-skip-file\s+"([^"]+)"', gate)
+        assert names or paths, "no skip exceptions: every S3 case would now fail the gate"
+        assert len(set(names)) == len(names), f"duplicate --allow-skip entries: {names}"
+        assert len(set(paths)) == len(paths), f"duplicate --allow-skip-file entries: {paths}"
         corpus = "".join(
             _read(rel)
             for rel in (
@@ -409,24 +434,79 @@ class TestF40DSkippedBackupSuite:
                 "tests/test_e07_phase22_wal_copy_safety.py",
             )
         )
-        missing = [name for name in allowed if f"def {name}(" not in corpus]
-        assert not missing, f"--allow-skip names that are not test functions: {missing}"
+        for name in names:
+            assert f"def {name}(" in corpus, f"--allow-skip names a non-existent test: {name}"
+        for path in paths:
+            assert os.path.exists(os.path.join(REPO_ROOT, path)), (
+                f"--allow-skip-file names a file that does not exist: {path}"
+            )
 
-    def test_the_only_non_s3_exception_is_the_sqlite_wal_case(self):
-        """Every permitted skip is an S3 case except the one documented exception."""
+    def test_every_allowed_skip_file_is_an_s3_gated_suite(self):
+        """A path exception must be justified by the module's own S3 gate."""
         step = _phase29_backup_step()
         gate = step[step.index("check_pytest_log.py"):]
-        allowed = set(re.findall(r'--allow-skip\s+"([^"]+)"', gate))
-        s3 = set(
-            re.findall(r"def (test_\w+)\(", _read("tests/test_e07_phase22_offsite_pagination.py"))
-            + re.findall(r"def (test_\w+)\(", _read("tests/test_e07_phase22_offsite_integrity.py"))
+        paths = re.findall(r'--allow-skip-file\s+"([^"]+)"', gate)
+        assert paths, "no --allow-skip-file entries"
+        for path in paths:
+            body = _read(path)
+            assert "BACKUP_OFFSITE_TEST_ENDPOINT" in body or "_available()" in body, (
+                f"{path} is exempted from the skip check but does not gate on an S3 "
+                "endpoint; an environmental skip in a PostgreSQL suite would be hidden"
+            )
+
+    def test_the_postgresql_suites_are_not_exempt_from_the_skip_check(self):
+        """The 23 cases F-40-D recovered are exactly the ones that must not be excused."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        paths = set(re.findall(r'--allow-skip-file\s+"([^"]+)"', gate))
+        for pg_suite in (
+            "tests/test_e07_phase22_db_bounds.py",
+            "tests/test_e07_phase22_connection_bounds.py",
+            "tests/test_e07_phase23_restore_verification.py",
+            "tests/test_e07_phase22_backup_policy.py",
+            "tests/test_e07_phase22_recovery_safety.py",
+            "tests/test_e07_phase24_disaster_recovery.py",
+        ):
+            assert pg_suite not in paths, (
+                f"{pg_suite} is exempted from the skip check - the PostgreSQL/DR cases "
+                "must run in CI, which is the whole point of F-40-D"
+            )
+
+    def test_the_step_provides_the_libpq_variables_recovery_safety_needs(self):
+        """Seven cases provision their own database and read plain PG* variables."""
+        step = _phase29_backup_step()
+        active = _active_step_env(step)
+        for var in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"):
+            assert var in active, (
+                f"the step does not set {var}; recovery_safety provisioning reads libpq "
+                "PG* variables, and a shell export in another step does not reach here"
+            )
+        module = _read("tests/test_e07_phase22_recovery_safety.py")
+        for var in ("PGHOST", "PGUSER", "PGPASSWORD"):
+            assert f'os.getenv("{var}"' in module, var
+
+    def test_the_collection_floor_does_not_depend_on_the_verbosity_flag(self):
+        """`-q` hides the per-case "SKIPPED [" markers, `-v` shows them.
+
+        The first version of --min-collected counted those markers, so the very same suite
+        reported 195 collected under -q and 228 under -v. The CI step uses -v, which is why
+        it was not caught there; the next step that switched to -q would have failed with a
+        message about a file that was not missing.
+        """
+        # Real -q output: a dot per pass, an "s" per skip, no per-case marker lines at all.
+        quiet = _tmp_log("s..\n=== 2 passed, 1 skipped in 1.0s ===\n")
+        verbose = _tmp_log(
+            "tests/test_e07_phase22_db_bounds.py::test_a SKIPPED [ 30%]\n"
+            "tests/test_e07_phase22_db_bounds.py::test_b PASSED [ 60%]\n"
+            "tests/test_e07_phase22_db_bounds.py::test_c PASSED [100%]\n"
+            "=== 2 passed, 1 skipped in 1.0s ===\n"
         )
-        # The S3 files also hold PostgreSQL-only cases; those must NOT be allowed to skip
-        # now that CI provides a database.
-        non_s3 = allowed - s3
-        assert non_s3 == {"test_live_database_is_actually_in_wal_mode"}, (
-            f"unexpected non-S3 skip exception(s): {sorted(non_s3 - {'test_live_database_is_actually_in_wal_mode'})}"
-        )
+        for log in (quiet, verbose):
+            result = _run_gate(
+                log, "--min-collected", "3", "--require-summary", "--allow-skip", "test_a"
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert "3 collected" in result.stdout
 
 
 class TestF40CDeploymentRunbookStatesTheBudget:

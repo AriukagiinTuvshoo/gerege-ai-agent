@@ -1564,6 +1564,16 @@ jobs:
           # drops its own objects and the DR cases assert the row count they seed.
           DATABASE_URL: "postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p24_dr"
           DATABASE_OWNER_URL: "postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p24_dr"
+          # Phase 40 (F-40-D, third gap). Seven cases in recovery_safety provision their
+          # OWN database and need a SUPERUSER connection to do it; they read plain libpq
+          # PG* variables, which the `export PGPASSWORD=...` earlier in this step does
+          # NOT provide (a shell export dies with the step). Measured in the CI-shaped
+          # run: with these unset, 7 skip ("no administrative PostgreSQL connection").
+          PGHOST: "127.0.0.1"
+          PGPORT: "5432"
+          PGUSER: "gerege"
+          PGPASSWORD: "ci_pg_password_2026"
+          PGDATABASE: "postgres"
         run: |
           set -euo pipefail
           pytest tests/test_e07_phase22_alerting.py tests/test_e07_phase22_backup_policy.py \
@@ -1594,51 +1604,30 @@ jobs:
           # by the skips themselves. Measured with a migrated disposable database owned by
           # gerege_owner and no offsite endpoint configured: 227 passed, 1 skipped.
           #
-          # The permitted skips are exactly these 33, each named by test name because
-          # `--allow-skip` matches a NAME, not a reason (check_pytest_log.py:47). Two
-          # kinds:
+          # The permitted skips are two kinds, and the gate names them by FILE where a
+          # whole module is gated on an external service:
           #
-          #   * 32 S3 cases in test_e07_phase22_offsite_pagination.py (19) and
-          #     test_e07_phase22_offsite_integrity.py (13), which need a live endpoint.
-          #     CI has none; they pass against moto locally (measured: 34 passed there).
-          #     A known, reported gap rather than a hidden one.
-          #   * 1 SQLite-only WAL case, which cannot apply when PostgreSQL is the engine
+          #   * the four offsite suites, whose 46 cases need a live S3 endpoint
+          #     (BACKUP_OFFSITE_TEST_ENDPOINT). CI has none; they pass against moto
+          #     locally. A known, reported gap rather than a hidden one. Named by path
+          #     on purpose: listing 46 individual test names would rot the first time one
+          #     is renamed, while a whole module being environment-gated is a stable fact.
+          #   * the SQLite-only WAL case, which cannot apply when PostgreSQL is the engine
           #     under test.
           #
-          # Measured in the CI environment (no S3 endpoint, disposable database present):
-          # 195 passed, 33 skipped. Before F-40-D the same step reported 172 passed and
-          # 56 skipped - the 23 PostgreSQL/DR cases are what this recovers.
+          # Any skip in any OTHER file still fails this step, which is what makes the
+          # check meaningful: before F-40-D the step passed --no-skip-check, so the 23
+          # PostgreSQL/DR cases that skipped on every run were invisible.
+          #
+          # Measured in the CI environment (no S3 endpoint, disposable database present,
+          # libpq PG* variables set): 202 passed, 47 skipped.
           python scripts/check_pytest_log.py /tmp/p29backup.log \
-            --min-passed 190 --require-summary \
+            --min-passed 195 --require-summary \
             --allow-skip "test_live_database_is_actually_in_wal_mode" \
-            --allow-skip "test_listing_returns_every_object" \
-            --allow-skip "test_listing_matches_an_independent_count_at_a_page_boundary" \
-            --allow-skip "test_prefix_restricts_the_listing_across_pages" \
-            --allow-skip "test_empty_bucket_is_complete_and_empty" \
-            --allow-skip "test_ordering_is_deterministic" \
-            --allow-skip "test_remote_retention_sees_objects_on_later_pages" \
-            --allow-skip "test_retention_dry_run_deletes_nothing_across_pages" \
-            --allow-skip "test_retention_keeps_the_newest_objects_on_later_pages" \
-            --allow-skip "test_truncated_page_is_followed" \
-            --allow-skip "test_repeated_continuation_token_is_detected" \
-            --allow-skip "test_truncated_without_token_is_detected" \
-            --allow-skip "test_malformed_xml_is_reported" \
-            --allow-skip "test_page_two_failure_raises_rather_than_returning_a_partial_view" \
-            --allow-skip "test_soft_failure_reports_incompleteness_instead_of_an_empty_bucket" \
-            --allow-skip "test_page_cap_prevents_an_unbounded_walk" \
-            --allow-skip "test_s3_download_returns_the_bytes" \
-            --allow-skip "test_s3_does_not_redeclare_an_abstract_download" \
-            --allow-skip "test_download_writes_privately_and_leaves_no_partial" \
-            --allow-skip "test_download_of_a_missing_object_fails_cleanly" \
-            --allow-skip "test_metadata_only_verify_accepts_same_size_corruption" \
-            --allow-skip "test_verify_against_record_rejects_same_size_corruption" \
-            --allow-skip "test_verify_against_record_accepts_a_good_object" \
-            --allow-skip "test_verify_against_record_rejects_truncation" \
-            --allow-skip "test_verify_against_record_rejects_a_different_size_object" \
-            --allow-skip "test_verify_against_record_rejects_a_missing_object" \
-            --allow-skip "test_verify_against_record_refuses_without_a_digest" \
-            --allow-skip "test_verify_against_record_leaves_no_temporary_files" \
-            --allow-skip "test_multipart_upload_is_verified_by_size_and_digest"
+            --allow-skip-file "tests/test_e07_phase22_offsite_pagination.py" \
+            --allow-skip-file "tests/test_e07_phase22_offsite_integrity.py" \
+            --allow-skip-file "tests/test_e07_phase22_offsite_status.py" \
+            --allow-skip-file "tests/test_e07_phase24_offsite_integration.py"
 
       - name: Phase 29 — CI test integrity (exit codes, log guard, workflow validator)
         if: ${{ !cancelled() }}

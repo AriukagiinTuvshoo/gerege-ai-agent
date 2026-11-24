@@ -24,7 +24,7 @@ import sys
 
 USAGE = (
     "usage: check_pytest_log.py <logfile> [--min-passed N] [--require-summary] "
-    "[--allow-skip TESTNAME] [--no-skip-check] [--min-collected N]"
+    "[--allow-skip TESTNAME] [--allow-skip-file PATH] [--no-skip-check] [--min-collected N]"
 )
 
 #: Lines pytest writes for a failed or errored test. `-v` prints "FAILED path::test" and
@@ -46,6 +46,14 @@ def main(argv: list[str]) -> int:
     # blanket disable: every *other* skip still fails.
     allowed_skips = [
         argv[i + 1] for i, a in enumerate(argv) if a == "--allow-skip" and i + 1 < len(argv)
+    ]
+    # `--allow-skip-file PATH` permits any skip whose line names that file. Needed where a
+    # whole MODULE is gated on an external service rather than individual tests: the four
+    # offsite suites gate 46 cases on a live S3 endpoint, and listing 46 test names would
+    # rot the moment one is renamed while a path stays stable. Like --allow-skip it is a
+    # narrowing, not a blanket disable: a skip in any other file still fails.
+    allowed_skip_files = [
+        argv[i + 1] for i, a in enumerate(argv) if a == "--allow-skip-file" and i + 1 < len(argv)
     ]
     min_passed = None
     require_summary = "--require-summary" in argv
@@ -91,18 +99,27 @@ def main(argv: list[str]) -> int:
     unexpected_skips = [
         line for line in skip_lines
         if not any(name in line for name in allowed_skips)
+        and not any(path in line for path in allowed_skip_files)
     ]
     if want_skip_check and unexpected_skips:
         print(f"::error::{log_path}: a case was SKIPPED; skipping is not passing")
         for line in unexpected_skips:
             print(f"  {line}")
         return 1
-    if skip_lines and allowed_skips:
+    if skip_lines and (allowed_skips or allowed_skip_files):
         print(f"  {log_path}: {len(skip_lines)} documented skip(s) allowed")
 
 
     matches = _PASSED_RE.findall(text)
-    skipped = len(re.findall(r"SKIPPED\s*\[", text))
+    # The summary line states the skip count outright ("195 passed, 33 skipped"), while the
+    # per-case "SKIPPED [" markers exist only under -v. Counting listeners here rather than
+    # reading the summary made --min-collected depend on the verbosity flag: the same suite
+    # reported 195 collected under -q and 228 under -v. Prefer the summary, fall back to the
+    # markers for a log that was truncated before the summary.
+    summary_skips = re.findall(r"(\d+) skipped", text)
+    skipped = (
+        int(summary_skips[-1]) if summary_skips else len(re.findall(r"SKIPPED\s*\[", text))
+    )
 
     if min_collected is not None:
         collected_total = (int(matches[-1]) if matches else 0) + skipped
