@@ -853,6 +853,49 @@ class TestTheRehearsalScriptIsRealAndWired:
         """Compose reports a missing export as a confusing interpolation error later."""
         assert "${!var" in script, "the script never checks its own environment"
 
+    def test_it_never_re_enables_errexit(self, script):
+        """The script runs without `set -e` on purpose: every check records a failure and
+        continues to the verdict. A single `set -e` introduced mid-script made all later
+        failures fatal AND fired the ERR trap, so a PASSING rehearsal printed
+        `[FATAL] the rehearsal stopped unexpectedly` after its own negative control.
+        """
+        offenders = [
+            f"{number}: {line.strip()}"
+            for number, line in enumerate(script.splitlines(), 1)
+            if not line.lstrip().startswith("#")
+            and re.search(r"^\s*set\s+-[a-z]*e", line)
+        ]
+        assert not offenders, "errexit is re-enabled in:\n" + "\n".join(offenders)
+
+    def test_the_fatal_path_is_not_triggered_by_a_passing_run(self, tmp_path):
+        """A `[FATAL]` line in a green run trains an operator to ignore it."""
+        import subprocess
+
+        stub_dir = tmp_path / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "docker"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$1 $2" in\n'
+            '  "--version ") echo "Docker version 0.0.0-stub"; exit 0;;\n'
+            '  "info ") exit 0;;\n'
+            '  "compose version") echo "2.99.0-stub"; exit 0;;\n'
+            "esac\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{stub_dir}:{env.get('PATH', '/usr/bin:/bin')}"
+        result = subprocess.run(
+            ["bash", self.SCRIPT], cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300
+        )
+        output = result.stdout + result.stderr
+        # The negative control legitimately fails here (every compose call fails), but the
+        # ERR trap must not fire merely because a check was recorded.
+        assert "[FATAL] the rehearsal stopped unexpectedly" not in output, output[-2000:]
+
     def test_ci_actually_invokes_it(self):
         ci = _read(".github/workflows/ci.yml")
         assert self.SCRIPT in ci, "CI never runs the rehearsal, so it proves nothing"

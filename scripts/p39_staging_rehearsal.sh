@@ -134,10 +134,17 @@ trap teardown EXIT
 # ------------------------------------------------------- 1. negative control: no secret
 hdr "1. negative control - a missing secret must abort"
 tmp_err="$(mktemp || true)"
-set +e
-( unset ADMIN_PASSWORD; "${COMPOSE[@]}" config >/dev/null 2>"$tmp_err" )
-missing_status=$?
-set -e
+# `set +e` / `$?` / `set -e` looked reasonable but re-enabled errexit in the middle of a
+# script that otherwise runs without it, so every later failure became fatal AND fired the
+# ERR trap: the passing rehearsal printed
+#   [FATAL] the rehearsal stopped unexpectedly at line 138
+# after its own negative control. Capture the status with `if !`, which never trips
+# errexit and never trips the trap.
+if ( unset ADMIN_PASSWORD; "${COMPOSE[@]}" config >/dev/null 2>"$tmp_err" ); then
+    missing_status=0
+else
+    missing_status=$?
+fi
 if [ "$missing_status" -eq 0 ]; then
     bad "compose accepted the file with ADMIN_PASSWORD unset, so a misconfigured host starts half-built"
 else
