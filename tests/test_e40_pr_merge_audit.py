@@ -306,3 +306,95 @@ class TestF40CWorkerStopGrace:
             f"{per_handler_ceiling_s}s each ({batch * per_handler_ceiling_s}s); the "
             "container would still be SIGKILLed mid-batch"
         )
+
+
+# --------------------------------------------------------------------------------------
+# F-40-D  MEDIUM  two thirds of a "227 tests" CI step skipped on every run
+# --------------------------------------------------------------------------------------
+#
+# The Phase 22/23/24 step claimed 227 cases. Measured in the job's own environment
+# (no P24_DR_DATABASE_URL, no DATABASE_URL, no offsite endpoint), 23 of those cases
+# skip:
+#
+#   tests/test_e07_phase24_disaster_recovery.py          11  (P24_DR_DATABASE_URL unset)
+#   tests/test_e07_phase22_db_bounds.py                   5  ("needs PostgreSQL")
+#   tests/test_e07_phase22_connection_bounds.py           3  ("needs a PostgreSQL DATABASE_URL")
+#   tests/test_e07_phase23_restore_verification.py        3  ("needs a PostgreSQL DATABASE_URL")
+#   tests/test_e07_phase22_backup_policy.py               1  ("needs PostgreSQL")
+#
+# and the guard could not see any of it, for two reasons that compound:
+#
+#   * the step passed --no-skip-check, so a SKIPPED line was not a failure;
+#   * --min-collected counts passed + skipped, so the skips satisfied the floor.
+#
+# A step that ran 204 cases while claiming 227, and silently dropped the whole disaster
+# -recovery suite, reported success. With a migrated disposable database owned by
+# gerege_owner and no offsite endpoint, the same selection is 227 passed, 1 skipped.
+
+
+def _phase29_backup_step() -> str:
+    """The workflow text of the Phase 22/23/24 backup step, plus its gate command."""
+    text = _read(".github/workflows/ci.yml")
+    start = text.index("Phase 22/23/24 — backup security")
+    end = text.index("Phase 29 — CI test integrity")
+    return text[start:end]
+
+
+class TestF40DSkippedBackupSuite:
+    def test_the_step_provides_the_dr_database_its_suite_requires(self):
+        """The DR file skips on one variable; the step must set it."""
+        step = _phase29_backup_step()
+        assert "P24_DR_DATABASE_URL" in step, (
+            "the backup step does not set P24_DR_DATABASE_URL, so every case in "
+            "test_e07_phase24_disaster_recovery.py skips and the step still passes"
+        )
+        # Positive control: the test module really does gate on exactly this name.
+        module = _read("tests/test_e07_phase24_disaster_recovery.py")
+        assert 'os.getenv("P24_DR_DATABASE_URL"' in module
+
+    def test_the_step_provides_the_postgresql_url_the_other_suites_require(self):
+        """db_bounds / connection_bounds / restore_verification gate on DATABASE_URL."""
+        step = _phase29_backup_step()
+        assert "DATABASE_URL:" in step, (
+            "the backup step does not set DATABASE_URL, so the PostgreSQL-only cases in "
+            "db_bounds, connection_bounds, restore_verification and backup_policy skip"
+        )
+        for rel in (
+            "tests/test_e07_phase22_db_bounds.py",
+            "tests/test_e07_phase22_connection_bounds.py",
+            "tests/test_e07_phase23_restore_verification.py",
+        ):
+            body = _read(rel)
+            assert "DATABASE_URL" in body, rel
+
+    def test_the_gate_no_longer_disables_the_skip_check(self):
+        """A skip must be a failure unless it is named as the documented exception."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        assert "--no-skip-check" not in gate, (
+            "the backup gate still passes --no-skip-check, which is what allowed 23 "
+            "skipped cases to report as a passing step"
+        )
+
+    def test_the_gate_counts_passes_not_collected_cases(self):
+        """`collected = passed + skipped`, so a collected floor is satisfied by skips."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        assert "--min-passed" in gate, (
+            "the backup gate asserts collected cases (passed + skipped) rather than passes, "
+            "so skipped cases count toward the floor"
+        )
+        # And the mechanism this guards against is real, not hypothetical.
+        log_guard = _read("scripts/check_pytest_log.py")
+        assert "collected_total = (int(matches[-1]) if matches else 0) + skipped" in log_guard
+
+    def test_the_one_remaining_permitted_skip_is_the_sqlite_only_wal_case(self):
+        """The narrowing must name a case that genuinely cannot run on PostgreSQL."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        allowed = re.findall(r'--allow-skip\s+"([^"]+)"', gate)
+        assert allowed == ["test_live_database_is_actually_in_wal_mode"], allowed
+        module = _read("tests/test_e07_phase22_wal_copy_safety.py")
+        assert "WAL mode does not apply" in module, (
+            "the named exception no longer carries the reason it was allowed"
+        )

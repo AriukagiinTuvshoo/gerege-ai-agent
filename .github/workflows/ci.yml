@@ -1510,8 +1510,51 @@ jobs:
       # in this environment (measured: 184 passing), and the skips are permitted because
       # they carry their own reason in the test. Running the offsite integration against a
       # real S3 service is reported as a known gap rather than papered over with a number.
+      - name: Phase 40 — provision the DR database the backup suite needs
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          # Phase 40 (F-40-D). Dedicated, disposable, and OWNED BY gerege_owner: the DR
+          # suite's row-count helper reads as gerege_owner over TCP with no -p flag, so the
+          # tables must belong to that role and a password must exist. Verified locally:
+          # without this the whole file skips (11 skipped, step still green); with it,
+          # 11 passed.
+          export PGPASSWORD="ci_pg_password_2026"
+          psql -h 127.0.0.1 -p 5432 -U gerege -d postgres -q \
+            -c "ALTER ROLE gerege_owner LOGIN PASSWORD 'ci_pg_password_2026'" \
+            -c "DROP DATABASE IF EXISTS gerege_p24_dr" \
+            -c "CREATE DATABASE gerege_p24_dr OWNER gerege_owner"
+          DATABASE_URL="postgresql+psycopg2://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr" \
+          DATABASE_OWNER_URL="postgresql+psycopg2://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr" \
+            alembic upgrade head
+          # The rollback case protects an existing row, and the suite asserts one is there.
+          psql -h 127.0.0.1 -p 5432 -U gerege -d gerege_p24_dr -q \
+            -c "INSERT INTO pages (page_id, name) VALUES ('p24_dr_seed','Phase 24 DR seed') ON CONFLICT DO NOTHING"
+          OWNER=$(psql -h 127.0.0.1 -p 5432 -U gerege -d gerege_p24_dr -tAc \
+            "SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname='public'")
+          echo "DR database ready; table owner(s): $OWNER"
+          test "$OWNER" = "gerege_owner" || { echo "::error::DR tables must be owned by gerege_owner, got $OWNER"; exit 1; }
+
       - name: Phase 22/23/24 — backup security, alerting, offsite integrity, restore
         if: ${{ !cancelled() }}
+        env:
+          # Phase 40 (F-40-D): this file needs its OWN disposable PostgreSQL database, and
+          # CI set no P24_DR_DATABASE_URL, so all 11 cases skipped on every run while the
+          # step reported success. The gate could not see it: --no-skip-check was passed
+          # (the S3 cases legitimately skip) and the collected floor counts passed+skipped,
+          # so 11 skips still satisfied ">= 227". Measured locally with this DSN shape:
+          # 11 passed. The database is created and migrated in the setup step below,
+          # owned by gerege_owner because the suite's row-count helper reads as that role.
+          P24_DR_DATABASE_URL: "postgresql://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr"
+          # Phase 40 (F-40-D, second half): twelve more cases in this selection skip unless
+          # DATABASE_URL names a PostgreSQL database (`"postgres" in url`). The job's global
+          # env never set one, so they skipped on every run too: db_bounds, connection_bounds,
+          # restore_verification and backup_policy. Measured with this DSN set on the same
+          # selection: 224 passed, 0 skipped, and the remaining S3 cases pass against moto
+          # locally. Pointed at the same disposable DR database - the suite creates and
+          # drops its own objects and the DR cases assert the row count they seed.
+          DATABASE_URL: "postgresql+psycopg2://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr"
+          DATABASE_OWNER_URL: "postgresql+psycopg2://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr"
         run: |
           set -euo pipefail
           pytest tests/test_e07_phase22_alerting.py tests/test_e07_phase22_backup_policy.py \
@@ -1530,12 +1573,24 @@ jobs:
                  tests/test_e07_phase24_disaster_recovery.py \
                  tests/test_e07_phase24_offsite_integration.py \
                  -v --tb=short -p no:cacheprovider | tee /tmp/p29backup.log
-          # The floor is on cases COLLECTED, not on passes. 79 of these cases skip without a
-          # live S3 endpoint, so the pass count varies by environment - 184 here, 148 in CI -
-          # while 227 are collected either way. Asserting a pass count would have failed on
-          # a difference that says nothing about the code; asserting the collection catches
-          # the case that actually matters, a file quietly dropping out of the run.
-          python scripts/check_pytest_log.py /tmp/p29backup.log --min-collected 227 --no-skip-check
+          # The floor is on cases COLLECTED, not on passes. 34 of these cases skip without a
+          # live S3 endpoint, so the pass count varies by environment while 227 are collected
+          # either way. Asserting a pass count would fail on a difference that says nothing
+          # about the code; asserting the collection catches a file quietly dropping out.
+          #
+          # Phase 40 (F-40-D): the skip check is now ON, and the permissive floor of 227
+          # collected (= passed + skipped) is replaced by a PASS floor. Before this, the
+          # step reported success while 11 DR cases and 12 PostgreSQL cases skipped on
+          # every run: --no-skip-check hid the skips, and "collected >= 227" was satisfied
+          # by the skips themselves. Measured with a migrated disposable database owned by
+          # gerege_owner and no offsite endpoint configured: 227 passed, 1 skipped.
+          #
+          # The one permitted skip is the SQLite-only WAL case, which cannot apply when
+          # PostgreSQL is the engine under test; it is named here so a NEW environmental
+          # skip cannot join it silently.
+          python scripts/check_pytest_log.py /tmp/p29backup.log \
+            --min-passed 224 --require-summary \
+            --allow-skip "test_live_database_is_actually_in_wal_mode"
 
       - name: Phase 29 — CI test integrity (exit codes, log guard, workflow validator)
         if: ${{ !cancelled() }}
@@ -1640,14 +1695,14 @@ jobs:
           # tests/test_e37_lock_integrity.py (8). Phase 38 added
           # tests/test_e38_production_architecture.py (47). Phase 39 added
           # tests/test_e39_staging_operational_readiness.py (85).
-          # Phase 40 added tests/test_e40_pr_merge_audit.py (18: 12 for F-40-A and 6
-          # for F-40-B/F-40-C).
+          # Phase 40 added tests/test_e40_pr_merge_audit.py (23: 12 for F-40-A, 6 for
+          # F-40-B/F-40-C and 5 for F-40-D).
           #
-          # Measured collection AFTER Phase 40 is 337. The previously recorded 233 was
+          # Measured collection AFTER Phase 40 is 342. The previously recorded 233 was
           # already stale by one before this phase: a clean checkout of the Phase 38
           # commit collects 234. The explicit file list, not the number, is the authority;
           # the floor exists to catch a suite silently dropping out of the run.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 333 --require-summary
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 338 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
