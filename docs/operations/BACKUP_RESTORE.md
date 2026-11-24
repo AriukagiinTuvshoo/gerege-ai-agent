@@ -41,14 +41,29 @@ privileges would otherwise re-widen `gerege_app` to full CRUD on `audit_logs`).
 
 ### Scheduled Backups
 The worker's 03:00 job was removed: it ran as `gerege_app`, which cannot `pg_dump`.
-Schedule it on the host instead:
+Schedule it on the host instead, and use **`backup-run`**, not `backup`:
 
 ```cron
 0 3 * * * cd /srv/gerege && docker compose -f docker-compose.prod.yml run --rm \
-  maintenance python scripts/maintenance.py backup --label daily_auto \
-  && docker compose -f docker-compose.prod.yml run --rm \
-  maintenance python scripts/maintenance.py prune --days 14
+  --no-deps maintenance python scripts/maintenance.py backup-run --label daily_auto \
+  >> /var/log/gerege-backup.log 2>&1
 ```
+
+`backup-run` is the only entry point that performs the whole scheduled sequence
+(backup → encrypt → verify → retain → **alert**) and returns the documented exit
+codes. `maintenance.py backup` is the manual, interactive one: it creates a backup
+and reports a code, but it does **not** post to `BACKUP_ALERT_WEBHOOK` at all. A cron
+entry built on `backup` therefore fails silently — the archive is missing, the exit
+code is in a log nobody reads, and no alert leaves the host.
+
+> Phase 40 (F-40-A) corrected this section. It previously recommended
+> `maintenance.py backup` in a cron block, which contradicts both the shipped
+> `deploy/cron/gerege-backup.cron` and `deploy/systemd/gerege-backup.service` (both
+> use `backup-run`) and `docs/ALERTING-SETUP.md` (which describes `backup-run` as the
+> command that alerts). Measured: on an identical `pg_dump` failure with no webhook
+> configured, `backup` printed only `backup FAILED: ...` while `backup-run` also
+> printed `warning: BACKUP_ALERT_WEBHOOK is not configured: nobody is notified of a
+> failure`.
 
 ### API surface after E-05
 
