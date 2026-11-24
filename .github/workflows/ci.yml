@@ -1574,6 +1574,13 @@ jobs:
           PGUSER: "gerege"
           PGPASSWORD: "ci_pg_password_2026"
           PGDATABASE: "postgres"
+          # ...and the password of the OWNER role those tests then connect as. The job's
+          # server authenticates with scram-sha-256, so the suite cannot invent a password
+          # for gerege_owner the way it does on a trust-configured local cluster: the
+          # module-scope fixture would fail to connect, and seven cases that provision and
+          # then assert on their own database would skip. It must match what
+          # provision_roles.py was run with, or the suite rotates the credential it needs.
+          GEREGE_OWNER_PASSWORD: "ci_owner_password_2026"
         run: |
           set -euo pipefail
           pytest tests/test_e07_phase22_alerting.py tests/test_e07_phase22_backup_policy.py \
@@ -1740,11 +1747,11 @@ jobs:
           # Phase 40 added tests/test_e40_pr_merge_audit.py (29: 12 for F-40-A, 6 for
           # F-40-B/F-40-C, 9 for F-40-D and 2 for the runbook's stop-time numbers).
           #
-          # Measured collection AFTER Phase 40 is 348. The previously recorded 233 was
+          # Measured collection AFTER Phase 40 is 347 (CI measured; 348 predicted and wrong). The previously recorded 233 was
           # already stale by one before this phase: a clean checkout of the Phase 38
           # commit collects 234. The explicit file list, not the number, is the authority;
           # the floor exists to catch a suite silently dropping out of the run.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 348 --require-summary
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 347 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}

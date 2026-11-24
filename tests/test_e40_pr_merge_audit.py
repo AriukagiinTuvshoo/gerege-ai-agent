@@ -484,6 +484,32 @@ class TestF40DSkippedBackupSuite:
         module = _read("tests/test_e07_phase22_recovery_safety.py")
         for var in ("PGHOST", "PGUSER", "PGPASSWORD"):
             assert f'os.getenv("{var}"' in module, var
+        # Those seven cases then connect as gerege_owner, and the job's server uses
+        # scram-sha-256, so the role's real password has to be in this step. Without it the
+        # fixture cannot connect and the seven cases skip - which is exactly what the one CI
+        # run that got this far reported.
+        assert "GEREGE_OWNER_PASSWORD" in active, (
+            "the step does not set GEREGE_OWNER_PASSWORD; the recovery_safety fixture "
+            "connects as gerege_owner, and a scram-authenticated server will not accept a "
+            "password the suite invented"
+        )
+        assert "GEREGE_OWNER_PASSWORD" in module, (
+            "recovery_safety no longer reads GEREGE_OWNER_PASSWORD for its owner DSN, so "
+            "the step's value is not the one this suite connects with"
+        )
+
+    def test_the_owner_password_the_step_sets_is_the_one_it_provisioned_with(self):
+        """Two steps, one role: if they disagree the suite rotates its own credential."""
+        text = _read(".github/workflows/ci.yml")
+        step = _phase29_backup_step()
+        provisioned = re.findall(r'GEREGE_OWNER_PASSWORD: "([^"]+)"', text)
+        assert provisioned, "no step sets GEREGE_OWNER_PASSWORD"
+        assert len(set(provisioned)) == 1, (
+            f"the workflow provisions gerege_owner with more than one password: {provisioned}"
+        )
+        assert f'GEREGE_OWNER_PASSWORD: "{provisioned[0]}"' in step, (
+            "the backup step's GEREGE_OWNER_PASSWORD differs from the provisioning step's"
+        )
 
     def test_a_log_that_names_no_skips_is_not_treated_as_clean(self):
         """`-q` prints "33 skipped" but names none of them, and that is not a pass.

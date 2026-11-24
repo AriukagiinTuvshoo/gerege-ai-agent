@@ -79,7 +79,16 @@ def _require_disposable_database(name: str) -> None:
 # Credentials for the throwaway PostgreSQL these tests create and drop. The defaults match
 # the disposable local cluster; P22_PG_PASSWORD overrides them so the value never has to be
 # correct for a real environment, and no credential is committed for one.
-_P22_OWNER_PASSWORD = os.getenv("P22_PG_PASSWORD", "p22_owner")
+#
+# The fallback is not enough on its own. In CI `gerege_owner` already exists, is a real
+# role with a real password (ci_owner_password_2026), and the server authenticates with
+# scram-sha-256, so a locally-invented `p22_owner` fails to connect - and the module-scope
+# fixture turns that connection failure into seven skips. Reading the role's password from
+# the environment it was provisioned in is the difference between "this suite owns its
+# database" and "this suite stops checking anything the moment CI has a password".
+_P22_OWNER_PASSWORD = (
+    os.getenv("P22_PG_PASSWORD") or os.getenv("GEREGE_OWNER_PASSWORD") or "p22_owner"
+)
 
 
 def _dsn(name: str, role: str = "gerege_owner", password: str = "") -> str:
@@ -141,8 +150,10 @@ def disposable():
     env = {
         "DATABASE_URL": _dsn(RECOVERY_DB),
         "DATABASE_OWNER_URL": _libpq(RECOVERY_DB),
-        "GEREGE_OWNER_PASSWORD": "p22_owner",
-        "GEREGE_APP_PASSWORD": "p22_app",
+        # The same password _admin_conn's server expects for gerege_owner: provisioning the
+        # roles below must not rotate the credential this suite then connects with.
+        "GEREGE_OWNER_PASSWORD": _P22_OWNER_PASSWORD,
+        "GEREGE_APP_PASSWORD": os.getenv("GEREGE_APP_PASSWORD", "p22_app"),
     }
     saved = {k: os.environ.get(k) for k in env}
     os.environ.update(env)

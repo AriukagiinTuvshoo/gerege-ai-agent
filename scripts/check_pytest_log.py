@@ -186,13 +186,17 @@ def main(argv: list[str]) -> int:
                     reasons[reason] = reasons.get(reason, 0) + 1
         total = sum(per_file.values())
         digest = ", ".join(f"{name} {count}" for name, count in sorted(per_file.items()))
+        # The reason goes in the SAME annotation line as the file, not on a following line:
+        # only the message of a ::error:: command reaches the annotations API, ordinary
+        # stdout does not. A file name without the reason still costs a full CI cycle to
+        # interpret - the step provisions three things, and "migrate failed" and "no
+        # connection" are different bugs.
+        top = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:2]
+        why = ("; ".join(f"{reason} (x{count})" for reason, count in top)) or "no reason recorded"
         print(
             f"::error::{log_path}: {total} case(s) SKIPPED in file(s) with no documented "
-            f"exception: {digest or '(no attributable lines)'}"
+            f"exception: {digest or '(no attributable lines)'} - reason: {why}"
         )
-        if reasons:
-            top = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
-            print("  reason(s): " + "; ".join(f"{reason} (x{count})" for reason, count in top))
         print(
             "  a case that skips is not a case that passed; each file above needs a "
             "database, an endpoint, or a named exception - and the first two are the fix"
