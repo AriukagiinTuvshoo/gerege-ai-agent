@@ -1516,21 +1516,30 @@ jobs:
           set -euo pipefail
           # Phase 40 (F-40-D). Dedicated, disposable, and OWNED BY gerege_owner: the DR
           # suite's row-count helper reads as gerege_owner over TCP with no -p flag, so the
-          # tables must belong to that role and a password must exist. Verified locally:
-          # without this the whole file skips (11 skipped, step still green); with it,
-          # 11 passed.
+          # tables must belong to that role.
+          #
+          # The role does not exist until provision_roles.py creates it - the service
+          # container only provides the `gerege` superuser - which is how the Phase 18 step
+          # does it. An `ALTER ROLE gerege_owner` here failed on the first CI attempt with
+          # "role does not exist", so the role is created the same way it is created there,
+          # with the owner password the rest of this workflow already uses.
           export PGPASSWORD="ci_pg_password_2026"
-          psql -h 127.0.0.1 -p 5432 -U gerege -d postgres -q \
-            -c "ALTER ROLE gerege_owner LOGIN PASSWORD 'ci_pg_password_2026'" \
+          psql -h 127.0.0.1 -U gerege -d postgres -q \
             -c "DROP DATABASE IF EXISTS gerege_p24_dr" \
-            -c "CREATE DATABASE gerege_p24_dr OWNER gerege_owner"
-          DATABASE_URL="postgresql+psycopg2://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr" \
-          DATABASE_OWNER_URL="postgresql+psycopg2://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr" \
+            -c "CREATE DATABASE gerege_p24_dr"
+          export GEREGE_OWNER_PASSWORD="ci_owner_password_2026"
+          export GEREGE_APP_PASSWORD="ci_app_password_2026"
+          export ADMIN_DATABASE_URL="postgresql://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr"
+          python scripts/provision_roles.py --apply
+          DATABASE_URL="postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p24_dr" \
+          DATABASE_OWNER_URL="postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p24_dr" \
             alembic upgrade head
+          python scripts/provision_roles.py --apply          # converge grants over the new tables
+          python scripts/provision_roles.py --verify
           # The rollback case protects an existing row, and the suite asserts one is there.
-          psql -h 127.0.0.1 -p 5432 -U gerege -d gerege_p24_dr -q \
+          psql -h 127.0.0.1 -U gerege -d gerege_p24_dr -q \
             -c "INSERT INTO pages (page_id, name) VALUES ('p24_dr_seed','Phase 24 DR seed') ON CONFLICT DO NOTHING"
-          OWNER=$(psql -h 127.0.0.1 -p 5432 -U gerege -d gerege_p24_dr -tAc \
+          OWNER=$(psql -h 127.0.0.1 -U gerege -d gerege_p24_dr -tAc \
             "SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname='public'")
           echo "DR database ready; table owner(s): $OWNER"
           test "$OWNER" = "gerege_owner" || { echo "::error::DR tables must be owned by gerege_owner, got $OWNER"; exit 1; }
@@ -1545,7 +1554,7 @@ jobs:
           # so 11 skips still satisfied ">= 227". Measured locally with this DSN shape:
           # 11 passed. The database is created and migrated in the setup step below,
           # owned by gerege_owner because the suite's row-count helper reads as that role.
-          P24_DR_DATABASE_URL: "postgresql://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr"
+          P24_DR_DATABASE_URL: "postgresql://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p24_dr"
           # Phase 40 (F-40-D, second half): twelve more cases in this selection skip unless
           # DATABASE_URL names a PostgreSQL database (`"postgres" in url`). The job's global
           # env never set one, so they skipped on every run too: db_bounds, connection_bounds,
@@ -1553,8 +1562,8 @@ jobs:
           # selection: 224 passed, 0 skipped, and the remaining S3 cases pass against moto
           # locally. Pointed at the same disposable DR database - the suite creates and
           # drops its own objects and the DR cases assert the row count they seed.
-          DATABASE_URL: "postgresql+psycopg2://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr"
-          DATABASE_OWNER_URL: "postgresql+psycopg2://gerege_owner:ci_pg_password_2026@127.0.0.1:5432/gerege_p24_dr"
+          DATABASE_URL: "postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p24_dr"
+          DATABASE_OWNER_URL: "postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p24_dr"
         run: |
           set -euo pipefail
           pytest tests/test_e07_phase22_alerting.py tests/test_e07_phase22_backup_policy.py \
