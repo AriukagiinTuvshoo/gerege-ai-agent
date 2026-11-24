@@ -96,18 +96,116 @@ def main(argv: list[str]) -> int:
         return 1
 
     skip_lines = [line for line in text.splitlines() if _SKIP_RE.search(line)]
-    unexpected_skips = [
-        line for line in skip_lines
-        if not any(name in line for name in allowed_skips)
-        and not any(path in line for path in allowed_skip_files)
-    ]
-    if want_skip_check and unexpected_skips:
-        print(f"::error::{log_path}: a case was SKIPPED; skipping is not passing")
-        for line in unexpected_skips:
+
+    # `-rs` writes every skip twice, in two shapes carrying different information:
+    #   per case:   tests/x.py::test_a SKIPPED (short reason...) [ 12%]
+    #   summary:    SKIPPED [19] tests/x.py:40: the full reason
+    # Only the per-case form names the TEST, which is what --allow-skip matches on; only
+    # the summary form states a grouped count, a file and line, and the whole reason. So
+    # the decision is made per case and the explanation is read from the summary.
+    #
+    # A `-q` run prints neither, only "=== 1 passed, 33 skipped ===", which means a log can
+    # claim 33 skips and name none of them. That is unverifiable rather than clean, and this
+    # gate refuses to call it clean: an exception list that cannot be applied is not an
+    # exception. CI passes -v -rs, so a log without per-case lines is a misconfigured step,
+    # not a suite with nothing to report.
+    summary_skip_re = re.compile(
+        r"^\s*SKIPPED \[(\d+)\]\s+([\w./-]+\.py):\d+:\s*(.*)$"
+    )
+    case_skip_lines = [line for line in skip_lines if "::" in line]
+    summary_skips = [match for match in (summary_skip_re.match(line) for line in skip_lines) if match]
+    total_skipped_match = re.findall(r"(\d+) skipped", text)
+    total_skipped = int(total_skipped_match[-1]) if total_skipped_match else 0
+
+    unexpected: list[str] = []
+    unexpected_files: set[str] = set()
+    if not case_skip_lines and summary_skips:
+        # A log whose only skip evidence is the summary section (a truncated capture, or a
+        # pytest that writes SKIPPED [n] without the per-case lines). The decision can only
+        # be made per summary line, so a NAME exception is matched against the line itself -
+        # pytest puts the test name in the reason position for these.
+        unexpected = [
+            match.group(0)
+            for match in summary_skips
+            if not any(name in match.group(0) for name in allowed_skips)
+            and not any(path in match.group(2) for path in allowed_skip_files)
+        ]
+        unexpected_files = {
+            match.group(2) for match in summary_skips if match.group(0) in unexpected
+        }
+    elif want_skip_check and total_skipped and not case_skip_lines:
+        # Under `-q` pytest prints neither the per-case SKIPPED lines nor the summary
+        # section: only "=== 1 passed, 33 skipped ===". A log can therefore claim 33 skips
+        # and name none of them. That is unverifiable, not clean, and this gate will not
+        # call it clean - an exception list that cannot be applied is not an exception.
+        # CI passes -v -rs, so this means a misconfigured step, not a suite with no skips.
+        print(
+            f"::error::{log_path}: the summary reports {total_skipped} skipped case(s) but the "
+            "log names none of them, so no exception can be checked; run pytest with -v so "
+            "the per-case SKIPPED lines are written (CI passes -v -rs)"
+        )
+        return 1
+
+    if case_skip_lines:
+        # The normal path: -v names every skipped case, so the decision is per case.
+        for line in case_skip_lines:
+            if any(name in line for name in allowed_skips):
+                continue
+            if any(path in line for path in allowed_skip_files):
+                continue
+            unexpected.append(line)
+            match = re.search(r"^\s*([\w./-]+\.py)::", line)
+            unexpected_files.add(match.group(1) if match else "(unattributed line)")
+
+    if want_skip_check and unexpected:
+        # Report the FILES and the REASONS, not just the fact. The annotation channel is
+        # capped and the job log needs a maintainer to sign in, so a message that says only
+        # "a case was SKIPPED" costs a full CI cycle to interpret. The reason is the whole
+        # difference between "no S3 endpoint in CI" and "the database this step provisions
+        # is not reachable" - and the second is a bug in the step itself.
+        per_file: dict[str, int] = {}
+        reasons: dict[str, int] = {}
+        for match in summary_skips:
+            if match.group(2) not in unexpected_files:
+                continue
+            count = int(match.group(1))
+            per_file[match.group(2)] = per_file.get(match.group(2), 0) + count
+            reason = match.group(3).strip()
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + count
+        if not per_file:
+            # No summary section (-v without -rs): count the per-case lines instead, and
+            # take the truncated reason pytest put in parentheses.
+            for line in unexpected:
+                match = re.search(r"^\s*([\w./-]+\.py)", line)
+                key = match.group(1) if match else "(unattributed line)"
+                per_file[key] = per_file.get(key, 0) + 1
+                reason_match = re.search(r"SKIPPED \(([^)]*)\)", line)
+                if reason_match and reason_match.group(1).strip():
+                    reason = reason_match.group(1).strip().rstrip(".").strip()
+                    reasons[reason] = reasons.get(reason, 0) + 1
+        total = sum(per_file.values())
+        digest = ", ".join(f"{name} {count}" for name, count in sorted(per_file.items()))
+        print(
+            f"::error::{log_path}: {total} case(s) SKIPPED in file(s) with no documented "
+            f"exception: {digest or '(no attributable lines)'}"
+        )
+        if reasons:
+            top = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+            print("  reason(s): " + "; ".join(f"{reason} (x{count})" for reason, count in top))
+        print(
+            "  a case that skips is not a case that passed; each file above needs a "
+            "database, an endpoint, or a named exception - and the first two are the fix"
+        )
+        for line in unexpected:
             print(f"  {line}")
         return 1
     if skip_lines and (allowed_skips or allowed_skip_files):
-        print(f"  {log_path}: {len(skip_lines)} documented skip(s) allowed")
+        # Report CASES, not log lines: -rs writes each skip twice, so the line count says 62
+        # where the suite skipped 33, and a number that cannot be reconciled with the
+        # summary line is worse than no number.
+        counted = sum(int(match.group(1)) for match in summary_skips) or len(case_skip_lines)
+        print(f"  {log_path}: {counted} documented skip(s) allowed")
 
 
     matches = _PASSED_RE.findall(text)

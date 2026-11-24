@@ -1591,7 +1591,7 @@ jobs:
                  tests/test_e07_phase23_restore_verification.py \
                  tests/test_e07_phase24_disaster_recovery.py \
                  tests/test_e07_phase24_offsite_integration.py \
-                 -v --tb=short -p no:cacheprovider | tee /tmp/p29backup.log
+                 -v --tb=short -rs -p no:cacheprovider | tee /tmp/p29backup.log
           # The floor is on cases COLLECTED, not on passes. 34 of these cases skip without a
           # live S3 endpoint, so the pass count varies by environment while 227 are collected
           # either way. Asserting a pass count would fail on a difference that says nothing
@@ -1614,6 +1614,11 @@ jobs:
           #     is renamed, while a whole module being environment-gated is a stable fact.
           #   * the SQLite-only WAL case, which cannot apply when PostgreSQL is the engine
           #     under test.
+          #
+          # -rs prints each skip with its reason. Without it the log says a case skipped but
+          # never why, and the reason is the whole difference between "no S3 endpoint here"
+          # and "the database the step provisions is not reachable" - the second is a bug in
+          # this step, and the first run of F-40-D failed on exactly that ambiguity.
           #
           # Any skip in any OTHER file still fails this step, which is what makes the
           # check meaningful: before F-40-D the step passed --no-skip-check, so the 23
@@ -1732,14 +1737,14 @@ jobs:
           # tests/test_e37_lock_integrity.py (8). Phase 38 added
           # tests/test_e38_production_architecture.py (47). Phase 39 added
           # tests/test_e39_staging_operational_readiness.py (85).
-          # Phase 40 added tests/test_e40_pr_merge_audit.py (26: 12 for F-40-A, 6 for
-          # F-40-B/F-40-C, 6 for F-40-D and 2 for the runbook's stop-time numbers).
+          # Phase 40 added tests/test_e40_pr_merge_audit.py (29: 12 for F-40-A, 6 for
+          # F-40-B/F-40-C, 9 for F-40-D and 2 for the runbook's stop-time numbers).
           #
-          # Measured collection AFTER Phase 40 is 345. The previously recorded 233 was
+          # Measured collection AFTER Phase 40 is 348. The previously recorded 233 was
           # already stale by one before this phase: a clean checkout of the Phase 38
           # commit collects 234. The explicit file list, not the number, is the authority;
           # the floor exists to catch a suite silently dropping out of the run.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 341 --require-summary
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 348 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}

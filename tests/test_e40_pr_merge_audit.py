@@ -485,28 +485,30 @@ class TestF40DSkippedBackupSuite:
         for var in ("PGHOST", "PGUSER", "PGPASSWORD"):
             assert f'os.getenv("{var}"' in module, var
 
-    def test_the_collection_floor_does_not_depend_on_the_verbosity_flag(self):
-        """`-q` hides the per-case "SKIPPED [" markers, `-v` shows them.
+    def test_a_log_that_names_no_skips_is_not_treated_as_clean(self):
+        """`-q` prints "33 skipped" but names none of them, and that is not a pass.
 
-        The first version of --min-collected counted those markers, so the very same suite
-        reported 195 collected under -q and 228 under -v. The CI step uses -v, which is why
-        it was not caught there; the next step that switched to -q would have failed with a
-        message about a file that was not missing.
+        Two separate defects lived here. --min-collected counted per-case "SKIPPED ["
+        markers, which exist only under -v, so one suite reported 195 collected under -q
+        and 228 under -v. And once the count came from the summary instead, a -q log passed
+        the skip check by having nothing for it to inspect: the gate read "33 skipped" and
+        agreed, because there was no line to disagree with. Both are the same mistake -
+        treating silence as evidence.
         """
-        # Real -q output: a dot per pass, an "s" per skip, no per-case marker lines at all.
+        # Real -q output: a dot per pass, an "s" per skip, no per-case lines, no reasons.
         quiet = _tmp_log("s..\n=== 2 passed, 1 skipped in 1.0s ===\n")
-        verbose = _tmp_log(
-            "tests/test_e07_phase22_db_bounds.py::test_a SKIPPED [ 30%]\n"
-            "tests/test_e07_phase22_db_bounds.py::test_b PASSED [ 60%]\n"
-            "tests/test_e07_phase22_db_bounds.py::test_c PASSED [100%]\n"
-            "=== 2 passed, 1 skipped in 1.0s ===\n"
+        result = _run_gate(quiet, "--allow-skip", "test_a")
+        assert result.returncode == 1, result.stdout
+        assert "names none of them" in result.stdout, result.stdout
+
+        # --min-collected reads the summary's "N skipped", not the markers, so the same log
+        # resolves to 3 collected. Checked without the skip check, which would stop first:
+        # the two questions are independent and a gate that conflates them cannot be read.
+        counted = _run_gate(
+            quiet, "--min-collected", "3", "--require-summary", "--no-skip-check"
         )
-        for log in (quiet, verbose):
-            result = _run_gate(
-                log, "--min-collected", "3", "--require-summary", "--allow-skip", "test_a"
-            )
-            assert result.returncode == 0, result.stdout + result.stderr
-            assert "3 collected" in result.stdout
+        assert counted.returncode == 0, counted.stdout
+        assert "3 collected" in counted.stdout, counted.stdout
 
 
 class TestF40CDeploymentRunbookStatesTheBudget:
