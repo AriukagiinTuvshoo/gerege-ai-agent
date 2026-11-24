@@ -263,6 +263,16 @@ services:
     build: .
     restart: unless-stopped
     command: ["python", "worker.py"]
+    # Phase 40 (F-40-C): the shutdown budget. `run_worker_tick` awaits one full
+    # `process_pending_jobs(batch_size=25)`, and each handler is awaited inside it, so
+    # the SIGTERM handler's event is only observed BETWEEN ticks. Measured on a live
+    # disposable PostgreSQL + Redis with the shipped loop: 25 x 1 s handlers = 23.34 s to
+    # exit. Docker's default stop grace is 10 s, after which the container is SIGKILLed,
+    # so a redeploy during a busy batch never completed the graceful shutdown the
+    # readiness documents describe. No job is lost (at-least-once with a 300 s visibility
+    # timeout) but the shutdown is not graceful and the batch is abandoned half-done.
+    # 25 x 2 s = 50 s covers a batch of network-bound handlers with margin.
+    stop_grace_period: 60s
     environment:
       ENV: production
       STRICT_SECURITY: "1"

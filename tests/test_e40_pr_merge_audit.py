@@ -159,3 +159,150 @@ class TestTheTwoBackupCommandsDifferAsDocumented:
         manual_help = re.search(r'"backup",\s*help="([^"]+)"', text)
         assert manual_help, "the manual command has no help text"
         assert "alert" not in manual_help.group(1).lower(), manual_help.group(1)
+
+
+# --------------------------------------------------------------------------------------
+# F-40-B  MEDIUM  .env.example shipped a backup setting that no code path reads
+# --------------------------------------------------------------------------------------
+#
+# The template is the only configuration reference a new deployment has. It listed
+#
+#     BACKUP_OFFSITE_PATH=
+#     BACKUP_OFFSITE_MOUNT=./backups
+#
+# and only the first exists: `grep -rn BACKUP_OFFSITE_MOUNT` matches nothing under
+# core/, scripts/ or deploy/. The provider is chosen from BACKUP_OFFSITE_URL /
+# BACKUP_OFFSITE_PATH alone (core/backup_offsite.py:860, core/backup_automation.py:122),
+# so an operator who filled in the MOUNT form configured nothing, got
+# `OFFSITE_NOT_CONFIGURED` plus a warning, and left every backup on the host it is
+# supposed to survive. Measured on the shipped code before the fix:
+# `evaluate_offsite(dict(BACKUP_OFFSITE_MOUNT="./backups"))` returns provider None.
+
+#: Every variable name a comment may mention for historical context. Anything else that
+#: looks like a setting but is not assigned must be a real, read variable.
+def _assigned_env_names(text: str) -> set:
+    return set(re.findall(r"^([A-Z][A-Z0-9_]*)\s*=", text, flags=re.MULTILINE))
+
+
+def _documented_env_names(text: str) -> set:
+    """Names the file presents as settings: assignments plus `NAME` in pointy/backticked form."""
+    return _assigned_env_names(text) | set(re.findall(r"`([A-Z][A-Z0-9_]{3,})`", text))
+
+
+class TestF40BDeadBackupSetting:
+    def test_the_template_does_not_name_an_offsite_mount_setting(self):
+        """The MOUNT spelling must not be offered as a setting — nothing reads it."""
+        text = _read(".env.example")
+        assigned = _assigned_env_names(text)
+        assert "BACKUP_OFFSITE_MOUNT" not in assigned, (
+            ".env.example still ASSIGNS BACKUP_OFFSITE_MOUNT, which no code path reads; "
+            "the only recognised setting is BACKUP_OFFSITE_PATH"
+        )
+
+    def test_the_offsite_setting_the_template_offers_is_the_one_the_code_reads(self):
+        """Positive control: the surviving name must be a name the backup plane reads."""
+        text = _read(".env.example")
+        assert "BACKUP_OFFSITE_PATH" in _assigned_env_names(text), (
+            ".env.example must still offer BACKUP_OFFSITE_PATH: it is the variable that "
+            "actually selects the offsite destination"
+        )
+        readers = (
+            _read("core/backup_automation.py")
+            + _read("core/backup_offsite.py")
+        )
+        assert "BACKUP_OFFSITE_PATH" in readers, (
+            "BACKUP_OFFSITE_PATH is no longer read by the backup plane either — the "
+            "template and the code have drifted apart again"
+        )
+
+    def test_no_backup_setting_in_the_template_is_unread_by_the_code(self):
+        """Generalisation: every BACKUP_* the template assigns must appear in the code."""
+        template = _read(".env.example")
+        offered = {n for n in _assigned_env_names(template) if n.startswith("BACKUP_")}
+        assert offered, "the template assigns no BACKUP_* settings at all"
+        code = _read("core/backup_automation.py") + _read("core/backup_offsite.py") + _read(
+            "core/backup_policy.py"
+        ) + _read("core/backup_service.py") + _read("core/backup_crypto.py")
+        unread = sorted(n for n in offered if n not in code)
+        assert not unread, (
+            f".env.example assigns backup setting(s) that no backup module reads: {unread}. "
+            "An operator who sets these configures nothing."
+        )
+
+
+# --------------------------------------------------------------------------------------
+# F-40-C  MEDIUM  the worker needs more than Docker's 10 s stop grace to finish a batch
+# --------------------------------------------------------------------------------------
+#
+# Measured against a disposable PostgreSQL 16.2 and a live Redis, a single worker process
+# running the shipped `worker_main_loop`:
+#
+#   * idle (loop waiting on the shutdown event)          -> stopped in 0.00 s
+#   * after SIGTERM mid-tick, 25 x 1 s jobs in one batch  -> 23.34 s
+#   * the same shape measured earlier, 25 x 3 s jobs      -> 13.88 s (partial batch)
+#
+# `run_worker_tick` awaits `process_pending_jobs(batch_size=25)`, and that loop awaits
+# each handler, so the shutdown event is only observed between ticks. Docker's default
+# stop grace is 10 s and no compose file sets `stop_grace_period`; after 10 s the
+# container is SIGKILLed. The architecture is at-least-once with a 300 s visibility
+# timeout, so no job is lost — but the "graceful shutdown" the readiness documents
+# describe does not complete for the worker, and every redeploy can SIGKILL it mid-batch.
+#
+# The fix is configuration, not code: give the worker room to finish a batch.
+
+WORKER_DEFAULT_BATCH = 25
+DOCKER_DEFAULT_STOP_GRACE = 10
+
+
+def _worker_batch_size() -> int:
+    text = _read("worker.py")
+    match = re.search(r"process_pending_jobs\(batch_size=(\d+)\)", text)
+    assert match, "worker.py no longer calls process_pending_jobs(batch_size=N)"
+    return int(match.group(1))
+
+
+def _stop_grace_seconds(compose_text: str, service: str) -> int:
+    """Parse `stop_grace_period` for one compose service; 0 when absent."""
+    # `re.split` with a lookahead consumes nothing, so the two-space indent stays on the
+    # block; match the service name at the start of the captured text.
+    blocks = re.split(r"^  (?=[a-z_]+:)", compose_text, flags=re.MULTILINE)
+    for block in blocks:
+        if not block.startswith(f"{service}:"):
+            continue
+        match = re.search(r"stop_grace_period:\s*(\d+)\s*s", block)
+        return int(match.group(1)) if match else 0
+    raise AssertionError(f"service {service!r} not found in the compose file")
+
+
+class TestF40CWorkerStopGrace:
+    def test_the_worker_gets_more_stop_grace_than_docker_defaults_to(self):
+        """A worker that finishes a whole batch needs longer than 10 s."""
+        grace = _stop_grace_seconds(_read("docker-compose.prod.yml"), "worker")
+        assert grace > DOCKER_DEFAULT_STOP_GRACE, (
+            "docker-compose.prod.yml sets no stop_grace_period for `worker` (or one <= "
+            f"Docker's {DOCKER_DEFAULT_STOP_GRACE}s default), but a tick can run "
+            f"{_worker_batch_size()} handlers before the shutdown event is observed"
+        )
+
+    def test_staging_matches_production_so_the_rehearsal_measures_the_real_behaviour(self):
+        prod = _stop_grace_seconds(_read("docker-compose.prod.yml"), "worker")
+        staging = _stop_grace_seconds(_read("docker-compose.staging.yml"), "worker")
+        assert staging == prod, (
+            f"staging worker stop_grace_period={staging}s but production has {prod}s; the "
+            "staging rehearsal would then not exercise the production shutdown budget"
+        )
+
+    def test_the_grace_covers_a_full_batch_of_realistic_handlers(self):
+        """The configured grace must exceed a batch of handlers, not merely 10 s."""
+        grace = _stop_grace_seconds(_read("docker-compose.prod.yml"), "worker")
+        batch = _worker_batch_size()
+        # A handler slow enough to matter: the task_queue default timeout is 60 s, but a
+        # batch of those is not survivable by any sane grace, so the budget is stated for
+        # a handler of up to 2 s — the network-bound shape of this codebase's handlers
+        # (a Telegram send, a Sheets append, a Meta reply).
+        per_handler_ceiling_s = 2
+        assert grace >= batch * per_handler_ceiling_s, (
+            f"stop_grace_period={grace}s cannot cover one batch of {batch} handlers at "
+            f"{per_handler_ceiling_s}s each ({batch * per_handler_ceiling_s}s); the "
+            "container would still be SIGKILLed mid-batch"
+        )
