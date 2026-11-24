@@ -1,7 +1,7 @@
 # PHASE 8 — PRODUCTION DEPLOYMENT AND OBSERVABILITY
 
 **Repository:** `https://github.com/AriukagiinTuvshoo/gerege-ai-agent`  
-**Modules:** [`Dockerfile`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/Dockerfile), [`docker-compose.prod.yml`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/docker-compose.prod.yml), [`main.py`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/main.py), [`worker.py`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/worker.py), [`core/monitoring.py`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/core/monitoring.py), [`vercel.json`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/vercel.json)
+**Modules:** [`Dockerfile`](../../Dockerfile), [`docker-compose.prod.yml`](../../docker-compose.prod.yml), [`main.py`](../../main.py), [`worker.py`](../../worker.py), [`core/monitoring.py`](../../core/monitoring.py), [`vercel.json`](../../vercel.json)
 
 ---
 

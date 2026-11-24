@@ -10,7 +10,7 @@
          ├─ Auth & 7-Role RBAC (`core/security.py`)
          ├─ Telemetry & Security Headers (`core/monitoring.py`)
          ├─ Multi-Provider AI Router (`agent.py`, `core/ai_router.py`)
-         └─ Domain Repositories (`core/repositories.py`)
+         └─ Domain Services (`*_service.py`, data access via `database.py`)
                           │
         ┌─────────────────┴─────────────────┐
         ▼                                   ▼
@@ -33,7 +33,7 @@
 |---|---|---|
 | **HTTP API & Webhooks** | `main.py`, `routers/system_router.py` | FastAPI endpoints, request correlation (`X-Request-ID`), security headers, webhook signature verification, rate limiting, and 10MB upload bounds. |
 | **Security & RBAC** | `core/security.py` | 7-role RBAC permission matrix, tenant scope enforcement (`enforce_tenant_scope`), fail-closed webhook HMAC verification, SSRF guard, and QPay amount/currency validation. |
-| **Database Engine** | `core/db_engine.py`, `core/models.py`, `database.py` | Dual-mode SQLAlchemy engine (`postgresql+psycopg2` connection pool with `SAVEPOINT` statement isolation and `sqlite3` WAL compatibility). Zero drift across all 15 tables. |
+| **Database Engine** | `core/db_engine.py`, `core/models.py`, `database.py` | Dual-mode SQLAlchemy engine (`postgresql+psycopg2` connection pool with `SAVEPOINT` statement isolation and `sqlite3` WAL compatibility). Zero drift across all 18 tables. |
 | **AI Pipeline** | `agent.py`, `core/ai_router.py` | Gemini primary model + optional OpenAI/Anthropic fallback, prompt injection filter, `ToolExecutionGuard` (max 3 tool calls/turn, invoice amount bounds), `<thought>` tag stripping, secret redaction, and deterministic CI fallback. |
 | **Task Queue & Worker** | `core/task_queue.py`, `worker.py` | Durable `task_jobs` table + Redis `LPUSH`/`RPOP` notification channel, auto-reconnect, atomic `locked_by` claiming, visibility timeout recovery (`recover_stale_jobs`), exponential backoff, and Dead-Letter Queue (`DEAD_LETTER`). |
 | **Backup & Restore** | `core/backup_service.py` | Gzip-compressed SQLite online backup or PostgreSQL `pg_dump`, `.sha256` checksum, `.meta.json` manifest (`schema_version`, `table_counts`), pre-restore snapshot, and atomic restore (`psql --single-transaction -v ON_ERROR_STOP=1` or staging `PRAGMA integrity_check`). |

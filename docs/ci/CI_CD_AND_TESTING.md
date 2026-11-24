@@ -1,13 +1,13 @@
 # PHASE 7 — CI/CD AND AUTOMATED TESTING
 
 **Repository:** `https://github.com/AriukagiinTuvshoo/gerege-ai-agent`  
-**Modules:** [`.github/workflows/ci.yml`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/.github/workflows/ci.yml), [`tests/test_enterprise_phases.py`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/tests/test_enterprise_phases.py), [`tests/test_ai_eval_suite.py`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/tests/test_ai_eval_suite.py), [`requirements.txt`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/requirements.txt)
+**Modules:** [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml), [`tests/test_enterprise_phases.py`](../../tests/test_enterprise_phases.py), [`tests/test_ai_eval_suite.py`](../../tests/test_ai_eval_suite.py), [`requirements.txt`](../../requirements.txt)
 
 ---
 
 ## 1. GitHub Actions CI Pipeline Architecture
 
-The CI workflow in [`.github/workflows/ci.yml`](file:///c:/Users/enhtv/Documents/ai-agent-person-fixed/ai-agent-person/.github/workflows/ci.yml) provisions real **`postgres:16-alpine`** and **`redis:7-alpine`** service containers and executes 6 mandatory verification gates on every push and pull request to `main`:
+The CI workflow in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) provisions real **`postgres:16-alpine`** and **`redis:7-alpine`** service containers and executes 6 mandatory verification gates on every push and pull request to `main`:
 
 1. **Syntax & Bytecode Compilation Gate:**
    - Runs `python -m py_compile` across all core application, router, service, worker, and migration modules.

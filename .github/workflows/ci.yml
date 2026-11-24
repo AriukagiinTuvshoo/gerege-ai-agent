@@ -1737,6 +1737,7 @@ jobs:
                  tests/test_e39_staging_operational_readiness.py \
                  tests/test_e40_pr_merge_audit.py \
                  tests/test_e09_worker_scale_measurements.py \
+                 tests/test_e11_documentation_verification.py \
                  -v --tb=short -p no:cacheprovider | tee /tmp/p36suite.log
           # Strict, and deliberately so. These files are the only thing standing between a
           # future change and the four defects Phase 36 closed: an unbounded pool connect,
@@ -1755,15 +1756,17 @@ jobs:
           # Phase 9's closing measurements added tests/test_e09_worker_scale_measurements.py
           # (11: two workers on one heartbeat key, a SIGKILLed worker's reported state,
           # cross-process scheduler exclusion, and the report recording all three).
+          # Phase 11/12 verification added tests/test_e11_documentation_verification.py
+          # (68: fifteen documents checked for resolving links, no local paths, real module
+          # names in the diagram, table counts that match the code, plus the Phase 10 gate).
           #
-          # Measured collection in CI is 347 without that file; this phase adds 11, so the
-          # floor below is 358. The 347 is CI's number; the 11 is a local count of a file
-          # that cannot skip (a missing Redis skips 9 of them, and the gate refuses skips),
-          # so the sum is the only arithmetic here. The previously recorded 233 was
+          # Measured collection in CI is 347 without either file; this branch adds 11 + 68,
+          # so the floor below is 426. The 347 is CI's number; 79 is a local count of files
+          # that cannot skip, so the sum is the only arithmetic here. The previously recorded 233 was
           # already stale by one before this phase: a clean checkout of the Phase 38
           # commit collects 234. The explicit file list, not the number, is the authority;
           # the floor exists to catch a suite silently dropping out of the run.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 358 --require-summary
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 426 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
@@ -2009,7 +2012,14 @@ jobs:
           DATABASE_URL: "postgresql+psycopg2://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_crm_test"
           REDIS_URL: "redis://127.0.0.1:6379/0"
         run: |
-          pytest tests/test_failure_scenarios.py -v --tb=short
+          set -euo pipefail
+          # Phase 10 claims twenty chaos scenarios, all passing. The step ran pytest with no
+          # log written and no guard, so the only output was the job log - and a scenario
+          # that SKIPPED (a missing Redis, a database that would not connect) reported
+          # exactly what a scenario that passed reported. Twenty cases, twenty passes, or
+          # the step says so by name.
+          pytest tests/test_failure_scenarios.py -v --tb=short -p no:cacheprovider | tee /tmp/p10scenarios.log
+          python scripts/check_pytest_log.py /tmp/p10scenarios.log --min-passed 20 --require-summary
 
       - name: Build Production Docker Image
         if: ${{ !cancelled() }}
