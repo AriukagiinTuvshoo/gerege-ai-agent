@@ -339,11 +339,21 @@ async def boom(*args, **kwargs):
 
 appointment_service.check_and_dispatch_appointment_reminders = boom
 asyncio.run(worker.run_worker_tick(0))
-state = worker_heartbeat.read()
+
+# Read THIS worker's record, named explicitly.
+#
+# Phase 41 made liveness per-worker, and `read()` names a worker under `heartbeat` only
+# when exactly one exists - with several, picking one arbitrarily is the bug that phase
+# fixed. This check runs `docker compose exec` inside a container whose worker is already
+# beating, so two records exist and the bare `read()["heartbeat"]` is legitimately None.
+# The question this check asks is "did MY tick leave MY record alive and counted", so it
+# asks it of the identity the tick itself used.
+worker_id = worker_heartbeat.current_worker_id()
+state = worker_heartbeat.read(worker_id)
 heartbeat = state.get("heartbeat") or {}
 status = state.get("status")
 errors = heartbeat.get("scheduler_errors")
-print(f"  status={status!r} scheduler_errors={errors!r}")
+print(f"  worker={worker_id!r} status={status!r} scheduler_errors={errors!r}")
 raise SystemExit(0 if status == "alive" and errors == 1 else 1)
 PYEOF
 then

@@ -475,7 +475,12 @@ class TestWorkerTickSurvivesASchedulerFailure:
 
         asyncio.run(worker.run_worker_tick(0))
 
-        state = worker_heartbeat.read()
+        # Read the record THIS tick wrote, named by the identity the tick used. Reading the
+        # pool and taking `["heartbeat"]` happens to work when one worker exists, but it
+        # asserts "some worker is alive and counted" rather than "this tick wrote this".
+        # The staging rehearsal asked the weaker question and broke the moment a second
+        # worker shared the container, so both now ask the stronger one.
+        state = worker_heartbeat.read(worker_heartbeat.current_worker_id())
         assert state.get("status") == "alive", (
             "a partially failing worker reported dead; before the fix the heartbeat was "
             f"never written and status became 'missing' (got {state.get('status')!r})"
@@ -493,13 +498,20 @@ class TestWorkerTickSurvivesASchedulerFailure:
 
         monkeypatch.setenv("DB_PATH", str(tmp_path / "clean.db"))
         database.init_db()
-        worker_heartbeat._redis().delete(worker_heartbeat._key())
+        # Clear every heartbeat under the namespace, not just the prefix itself: the keys
+        # are per-worker now, so deleting `_key()` (the bare prefix) removes nothing.
+        client = worker_heartbeat._redis()
+        for key in client.keys(worker_heartbeat._prefix() + "*"):
+            client.delete(key)
+        worker_heartbeat.clear()
 
         import worker
 
         asyncio.run(worker.run_worker_tick(0))
 
-        heartbeat = worker_heartbeat.read().get("heartbeat") or {}
+        heartbeat = (
+            worker_heartbeat.read(worker_heartbeat.current_worker_id()).get("heartbeat") or {}
+        )
         assert heartbeat.get("scheduler_errors") == 0, heartbeat
 
 

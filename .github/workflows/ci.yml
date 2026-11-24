@@ -59,9 +59,11 @@ jobs:
           pip install -r requirements.txt
           # Phase 41: the offsite (S3) suites need a server, not a mock - the contract they
           # test is the HTTP page transaction, and `_truthful_count` verifies with boto3's
-          # own paginator. requirements-dev.txt already pins `moto[s3]`; this installs the
-          # standalone server entry point the suites start against.
-          pip install "moto[s3]==5.2.5" boto3
+          # own paginator. requirements-dev.txt pins `moto[s3]`; the standalone server
+          # entry point is in the separate `server` extra (flask, flask-cors, ...). The
+          # first CI run proved the difference: `moto[s3]` alone raised ModuleNotFoundError
+          # for moto.server, and the step's guard correctly failed instead of skipping.
+          pip install "moto[s3,server]==5.2.5" boto3
 
       - name: Compile & Syntax Verification
         run: |
