@@ -537,6 +537,35 @@ class TestF40DSkippedBackupSuite:
         assert "3 collected" in counted.stdout, counted.stdout
 
 
+    def test_the_pass_floor_is_below_the_measured_count_and_the_comment_says_which(self):
+        """A floor above the real count fails every run; the comment is how that is caught.
+
+        This bit twice: the gate was written with --min-passed 195 while CI measures 181,
+        and the comment beside it claimed 202. Both numbers were guesses about an
+        environment that had already been measured, and neither was reconciled with the
+        other. The comment is the record of the measurement, so the code is checked against
+        it here rather than in a CI cycle.
+        """
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        floor = int(re.search(r"--min-passed (\d+)", gate).group(1))
+        collected = int(re.search(r"--min-collected (\d+)", gate).group(1))
+        measured = re.search(r"(\d+) passed, (\d+) skipped, (\d+) collected", step)
+        assert measured, "the step does not record what CI measured; a floor with no record is a guess"
+        passed, skipped, collected_measured = (int(group) for group in measured.groups())
+        assert passed + skipped == collected_measured, (
+            f"the recorded measurement is internally inconsistent: {passed} + {skipped} != "
+            f"{collected_measured}"
+        )
+        assert floor <= passed, (
+            f"--min-passed {floor} exceeds the measured {passed} passed, so this step fails "
+            "on every run regardless of the code"
+        )
+        assert collected == collected_measured, (
+            f"--min-collected {collected} does not match the recorded {collected_measured}"
+        )
+
+
 class TestF40CDeploymentRunbookStatesTheBudget:
     """An operator deciding whether a stop is safe needs the number, not the word."""
 

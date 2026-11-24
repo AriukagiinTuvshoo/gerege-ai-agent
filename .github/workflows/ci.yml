@@ -1632,9 +1632,14 @@ jobs:
           # PostgreSQL/DR cases that skipped on every run were invisible.
           #
           # Measured in the CI environment (no S3 endpoint, disposable database present,
-          # libpq PG* variables set): 202 passed, 47 skipped.
+          # libpq PG* variables set): 181 passed, 47 skipped, 228 collected - 46 S3 cases
+          # and the one WAL case. The pass floor is 180, one below the measurement: a case
+          # added later that legitimately skips should show up as the skip this step
+          # reports, not as a pass count that suddenly fails here. The collection floor is
+          # exact, because a file quietly dropping out of the selection is the failure this
+          # replaced.
           python scripts/check_pytest_log.py /tmp/p29backup.log \
-            --min-passed 195 --require-summary \
+            --min-passed 180 --min-collected 228 --require-summary \
             --allow-skip "test_live_database_is_actually_in_wal_mode" \
             --allow-skip-file "tests/test_e07_phase22_offsite_pagination.py" \
             --allow-skip-file "tests/test_e07_phase22_offsite_integrity.py" \
