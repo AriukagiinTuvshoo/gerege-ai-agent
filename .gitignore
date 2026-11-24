@@ -9,6 +9,13 @@ __pycache__/
 *.pyd
 
 # Local Databases & Logs
+# Test-suite artefacts. The suites that rebind DB_PATH leave a database file behind;
+# committing one carries a developer's rows into the repository, and the size of the
+# diff is whoever ran the suite last.
+gerege_crm_next.db
+gerege_crm_next.db-journal
+gerege_crm_next.db-wal
+gerege_crm_next.db-shm
 leads.db
 leads.db-journal
 leads.db-wal

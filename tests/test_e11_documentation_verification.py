@@ -190,6 +190,39 @@ class TestTheArchitectureDiagramNamesRealModules:
         assert not missing, f"the architecture diagram names modules that do not exist: {missing}"
 
 
+# ------------------------------------------------------------ no database in the repository
+
+
+class TestNoRuntimeDatabaseIsCommitted:
+    """A test suite that rebinds DB_PATH leaves a database file behind.
+
+    `gerege_crm_next.db` was tracked by the two commits before this one, because running
+    the suite in this checkout created it and the next `git add -A` swept it up. What that
+    commits is a developer's rows and a diff whose size is whoever ran the tests last.
+    """
+
+    def test_no_dot_db_file_is_tracked(self):
+        import subprocess
+
+        tracked = subprocess.run(
+            ["git", "ls-files", "*.db", "*.sqlite", "*.sqlite3"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if tracked.returncode != 0:
+            pytest.skip("not a git checkout")
+        files = [line for line in tracked.stdout.splitlines() if line.strip()]
+        assert not files, f"database file(s) are tracked in the repository: {files}"
+
+    def test_the_ignore_rules_cover_the_suite_database(self):
+        body = _read(".gitignore")
+        assert "gerege_crm_next.db" in body, (
+            "the suite's database file is not ignored, so the next `git add -A` tracks it"
+        )
+
+
 # -------------------------------------------------------------- Phase 10's scenario count
 
 

@@ -1757,16 +1757,17 @@ jobs:
           # (11: two workers on one heartbeat key, a SIGKILLed worker's reported state,
           # cross-process scheduler exclusion, and the report recording all three).
           # Phase 11/12 verification added tests/test_e11_documentation_verification.py
-          # (68: fifteen documents checked for resolving links, no local paths, real module
-          # names in the diagram, table counts that match the code, plus the Phase 10 gate).
+          # (70: fifteen documents checked for resolving links, no local paths, real module
+          # names in the diagram, table counts that match the code, the Phase 10 gate, and
+          # that no database file is tracked).
           #
-          # Measured collection in CI is 347 without either file; this branch adds 11 + 68,
-          # so the floor below is 426. The 347 is CI's number; 79 is a local count of files
+          # Measured collection in CI is 347 without either file; this branch adds 11 + 70,
+          # so the floor below is 428. The 347 is CI's number; 79 is a local count of files
           # that cannot skip, so the sum is the only arithmetic here. The previously recorded 233 was
           # already stale by one before this phase: a clean checkout of the Phase 38
           # commit collects 234. The explicit file list, not the number, is the authority;
           # the floor exists to catch a suite silently dropping out of the run.
-          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 426 --require-summary
+          python scripts/check_pytest_log.py /tmp/p36suite.log --min-collected 428 --require-summary
 
       - name: Phase 26 — SQL identifier validation, injection regression, suppression guard
         if: ${{ !cancelled() }}
