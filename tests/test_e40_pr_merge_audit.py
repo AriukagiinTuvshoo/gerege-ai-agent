@@ -441,18 +441,37 @@ class TestF40DSkippedBackupSuite:
                 f"--allow-skip-file names a file that does not exist: {path}"
             )
 
-    def test_every_allowed_skip_file_is_an_s3_gated_suite(self):
-        """A path exception must be justified by the module's own S3 gate."""
+    def test_no_offsite_suite_is_excused_from_the_skip_check(self):
+        """Phase 41 CLOSED this gap, so the assertion is inverted rather than deleted.
+
+        Phase 40 recorded four `--allow-skip-file` exceptions for the S3 suites and this
+        test checked they were justified. They were: those modules gate on an endpoint CI
+        did not provide. Phase 41 provides one, which makes the exceptions wrong - they
+        would now hide a skip in a suite that is supposed to run.
+
+        Deleting the test would delete the memory of why the exceptions existed. Keeping it
+        as an inversion means a future `--allow-skip-file` on an offsite suite fails here
+        with an explanation, instead of quietly reappearing.
+        """
         step = _phase29_backup_step()
         gate = step[step.index("check_pytest_log.py"):]
         paths = re.findall(r'--allow-skip-file\s+"([^"]+)"', gate)
-        assert paths, "no --allow-skip-file entries"
-        for path in paths:
-            body = _read(path)
-            assert "BACKUP_OFFSITE_TEST_ENDPOINT" in body or "_available()" in body, (
-                f"{path} is exempted from the skip check but does not gate on an S3 "
-                "endpoint; an environmental skip in a PostgreSQL suite would be hidden"
-            )
+        offsite = [p for p in paths if "offsite" in os.path.basename(p)]
+        assert not offsite, (
+            f"the gate still excuses offsite suites: {offsite}. CI now runs an S3 endpoint "
+            "(moto on 127.0.0.1:5062), so a skip in these suites means the endpoint failed "
+            "and must fail the gate."
+        )
+        # Positive control: those suites really do gate on the endpoint, which is why they
+        # were excused - and why the endpoint's presence is what makes the exception wrong.
+        for rel in (
+            "tests/test_e07_phase22_offsite_pagination.py",
+            "tests/test_e07_phase22_offsite_integrity.py",
+            "tests/test_e07_phase22_offsite_status.py",
+            "tests/test_e07_phase24_offsite_integration.py",
+        ):
+            body = _read(rel)
+            assert "BACKUP_OFFSITE_TEST_ENDPOINT" in body or "_available()" in body, rel
 
     def test_the_postgresql_suites_are_not_exempt_from_the_skip_check(self):
         """The 23 cases F-40-D recovered are exactly the ones that must not be excused."""

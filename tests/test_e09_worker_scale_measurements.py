@@ -14,11 +14,16 @@ questions had no answer backed by a number:
 Each was measured before it was asserted, against the real code paths: `worker.py`'s own
 loop for (1) and (2), `database.claim_notification_lock` in two OS processes for (3).
 
-The answers are not all comfortable. (1) shows the second worker REPLACES the first's
-heartbeat, so the endpoint reports one worker when two are running; (2) shows a killed
-worker reads `alive` for up to FRESH_WINDOW_SECONDS. Both are recorded as they are - the
-tests pin the current behaviour so a change is visible, and the ones that describe a
-limitation say so in their own name.
+The answers were not all comfortable. At the time (1) showed the second worker REPLACING
+the first's heartbeat, so the endpoint reported one worker when two were running, and (2)
+showed a killed worker reading `alive` for 150 s. Both were recorded as they were, and
+both **were fixed in Phase 41** - which is why these tests now assert the fixed behaviour.
+
+Keeping the history matters here: a reader who finds `test_two_workers_each_keep_a_
+heartbeat` should be able to see that this was measured as broken first. The pre-fix
+behaviour is reproduced by `git show 4e9acf8:core/worker_heartbeat.py`, and the numbers
+are in `docs/audit/PHASE_9_MEASUREMENTS.md` (§1, §2) and
+`docs/audit/PHASE_41_WORKER_RELIABILITY.md` §3.
 """
 
 from __future__ import annotations
@@ -60,74 +65,72 @@ class TestTwoWorkersShareOneHeartbeatKey:
         monkeypatch.setenv("WORKER_ID", "worker-B")
         assert worker_heartbeat._key() == first
 
-    def test_the_second_worker_replaces_the_first_and_the_report_names_only_one(
-        self, monkeypatch
-    ):
-        """Measurement, not intention: two beats, one surviving payload.
+    def test_two_workers_each_keep_their_own_heartbeat(self, monkeypatch):
+        """Phase 9 measured this as broken; Phase 41 fixed it, and this asserts the fix.
 
-        A deployment running two worker processes is therefore reported as running one,
-        and the id it reports is whichever beat last. The queue counters have the same
-        problem: `loop_count` and the tick totals are per process, so the endpoint shows
-        one process's numbers as though they were the deployment's.
-
-        This is pinned rather than fixed because the production topology is a single
-        worker process (see the comment on `_key`). The test exists so that turning the
-        worker into a pool is a decision someone makes with this number in front of them,
-        not a discovery made from a graph that silently halved.
+        Before: two beats, one key, and the endpoint named only whichever beat last. The
+        first worker was not stale, not missing, not reported at all. After: two keys, two
+        entries, and neither can overwrite the other.
         """
         from core import worker_heartbeat
 
         client = _redis_or_skip(worker_heartbeat)
-        client.delete(worker_heartbeat._key())
+        for key in client.keys(worker_heartbeat._prefix() + "*"):
+            client.delete(key)
         try:
             monkeypatch.setenv("WORKER_ID", "worker-A")
             assert worker_heartbeat.beat(loop_count=7) is True
-            first = json.loads(client.get(worker_heartbeat._key()))
-            assert first["worker_id"] == "worker-A"
-
             monkeypatch.setenv("WORKER_ID", "worker-B")
             assert worker_heartbeat.beat(loop_count=3) is True
-            stored = json.loads(client.get(worker_heartbeat._key()))
 
-            # One key. One payload. The first worker is no longer represented at all.
-            assert stored["worker_id"] == "worker-B", "the last beat wins the single key"
-            assert stored["loop_count"] == 3
-            assert client.exists(worker_heartbeat._key())
+            first = json.loads(client.get(worker_heartbeat._key("worker-A")))
+            second = json.loads(client.get(worker_heartbeat._key("worker-B")))
+            assert first["loop_count"] == 7, "worker B overwrote worker A's heartbeat"
+            assert second["loop_count"] == 3
+
             report = worker_heartbeat.read()
-            assert report["status"] == "alive"
-            assert report["heartbeat"]["worker_id"] == "worker-B"
+            assert report["worker_count"] == 2
+            assert report["alive_count"] == 2
+            assert {w["worker_id"] for w in report["workers"]} == {"worker-A", "worker-B"}
+            # With two workers there is no single "the worker" to name, so the compat
+            # field is None rather than an arbitrary pick.
+            assert report["heartbeat"] is None
+            assert report["heartbeat_summary"] is None
         finally:
-            client.delete(worker_heartbeat._key())
+            for key in client.keys(worker_heartbeat._prefix() + "*"):
+                client.delete(key)
 
 
 # ------------------------------------------------------------- a worker that is SIGKILLed
 
 
-class TestAKilledWorkerStillReadsAlive:
-    """Measured: `kill -9`, then `alive` for 150 s and `missing` after the 180 s TTL."""
+class TestAKilledWorkerStopsLookingAliveWithinTheWindow:
+    """Phase 9 measured 150 s; Phase 41 lowered the window to 30 s and measured 27–30 s.
+
+    A SIGKILLed process cannot clear its key or stop beating, so its state is a function of
+    the age of its last beat. That is the same mechanism as before - the change is the
+    constant, and the measurement that the constant holds in a real process
+    (`docs/audit/PHASE_41_WORKER_RELIABILITY.md` §3: stale at +30.0 s from a live SIGKILL).
+    """
 
     @pytest.mark.parametrize(
         ("age_seconds", "expected"),
         [
             (0.0, "alive"),  # the moment of the kill
-            (30.0, "alive"),  # still called alive half a minute later
-            (149.0, "alive"),  # one second inside the fresh window
-            (151.0, "stale"),  # past it: reported stale, not dead
+            (29.0, "alive"),  # one second inside the fresh window
+            (31.0, "stale"),  # past it: reported stale, not alive
+            (89.0, "stale"),  # still present, still stale
         ],
     )
     def test_the_reported_state_for_a_heartbeat_of_a_given_age(
-        self, monkeypatch, age_seconds, expected
+        self, age_seconds, expected
     ):
-        """The state the endpoint returns is a function of age alone.
-
-        A SIGKILLed process cannot clear its key, so this is exactly the sequence an
-        operator sees: nothing distinguishes "working" from "killed" until the heartbeat
-        ages out of the fresh window.
-        """
+        """The state the endpoint returns is a function of age alone."""
         from core import worker_heartbeat
 
         client = _redis_or_skip(worker_heartbeat)
-        client.delete(worker_heartbeat._key())
+        for key in client.keys(worker_heartbeat._prefix() + "*"):
+            client.delete(key)
         try:
             payload = {
                 "worker_id": "worker-kill9",
@@ -135,30 +138,42 @@ class TestAKilledWorkerStillReadsAlive:
                 "at": time.time() - age_seconds,
                 "pid": 12345,
             }
-            client.set(worker_heartbeat._key(), json.dumps(payload), ex=180)
-            assert worker_heartbeat.read()["status"] == expected
+            client.set(
+                worker_heartbeat._key("worker-kill9"),
+                json.dumps(payload),
+                ex=worker_heartbeat.DEFAULT_TTL_SECONDS,
+            )
+            state = worker_heartbeat.read("worker-kill9")
+            assert state["status"] == expected
         finally:
-            client.delete(worker_heartbeat._key())
+            for key in client.keys(worker_heartbeat._prefix() + "*"):
+                client.delete(key)
 
-    def test_the_measured_window_is_the_configured_fresh_window(self):
+    def test_the_detection_window_is_bounded_by_the_fresh_window(self):
         """The number in the report is the number in the code, not a value copied twice."""
         from core import worker_heartbeat
 
-        assert worker_heartbeat.FRESH_WINDOW_SECONDS == 150
-        assert worker_heartbeat.DEFAULT_TTL_SECONDS == 180
-        assert worker_heartbeat.FRESH_WINDOW_SECONDS < worker_heartbeat.DEFAULT_TTL_SECONDS
+        assert worker_heartbeat.FRESH_WINDOW_SECONDS == 30, (
+            "the window moved; re-measure detection before changing this assertion"
+        )
+        assert worker_heartbeat.DEFAULT_TTL_SECONDS == 90
+        assert worker_heartbeat.BEAT_INTERVAL_SECONDS < worker_heartbeat.FRESH_WINDOW_SECONDS
+        # Two consecutive missed beats must not stale a healthy worker.
+        assert worker_heartbeat.BEAT_INTERVAL_SECONDS * 2 <= worker_heartbeat.FRESH_WINDOW_SECONDS
 
     def test_a_real_sigkill_leaves_the_key_intact(self, tmp_path):
-        """The claim above, verified by killing a process rather than by reasoning about it.
+        """Verified by killing a process rather than by reasoning about it.
 
         A short-lived child writes one heartbeat and blocks; SIGKILL gives it no chance to
-        clean up, which is the point. If the key is gone afterwards the window above is
-        fiction, and a worker crash would be reported correctly for the wrong reason.
+        clean up, which is the point. If the key vanished on kill, detecting the crash
+        would be "working" for the wrong reason - the worker would look like it never
+        started rather than like it died.
         """
         from core import worker_heartbeat
 
         client = _redis_or_skip(worker_heartbeat)
-        client.delete(worker_heartbeat._key())
+        for key in client.keys(worker_heartbeat._prefix() + "*"):
+            client.delete(key)
         code = (
             "import os,sys,time;"
             "sys.path.insert(0, %r);"
@@ -170,22 +185,23 @@ class TestAKilledWorkerStillReadsAlive:
         proc = subprocess.Popen([sys.executable, "-c", code], cwd=str(tmp_path))
         try:
             for _ in range(100):
-                if client.exists(worker_heartbeat._key()):
+                if client.exists(worker_heartbeat._key("worker-sigkill")):
                     break
                 time.sleep(0.1)
-            assert client.exists(worker_heartbeat._key()), "the child never wrote a heartbeat"
-            assert worker_heartbeat.read()["status"] == "alive"
+            assert client.exists(worker_heartbeat._key("worker-sigkill")), (
+                "the child never wrote a heartbeat"
+            )
+            assert worker_heartbeat.read("worker-sigkill")["status"] == "alive"
 
             proc.kill()
             proc.wait(timeout=30)
             assert proc.returncode not in (0, None)
 
-            # The key survives the kill, and still reads alive.
-            assert client.exists(worker_heartbeat._key()), (
+            assert client.exists(worker_heartbeat._key("worker-sigkill")), (
                 "the heartbeat key vanished when the process was SIGKILLed; a killed "
                 "worker would then be reported as never having started"
             )
-            assert worker_heartbeat.read()["status"] == "alive", (
+            assert worker_heartbeat.read("worker-sigkill")["status"] == "alive", (
                 "SIGKILL should leave a fresh heartbeat behind - the process had no chance "
                 "to clear it or to stop beating"
             )
@@ -193,38 +209,8 @@ class TestAKilledWorkerStillReadsAlive:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=30)
-            client.delete(worker_heartbeat._key())
-
-
-# ------------------------------------------------------- the report records the numbers
-
-class TestTheMeasurementsAreWrittenDown:
-    """A measurement that lives only in a commit message is lost by the next release."""
-
-    REPORT = "docs/audit/PHASE_9_MEASUREMENTS.md"
-
-    def test_the_report_exists_and_states_each_answer(self):
-        with open(os.path.join(REPO_ROOT, self.REPORT), encoding="utf-8") as handle:
-            text = handle.read()
-        # §1: the second worker replaces the first.
-        assert "last beat wins" in text or "second worker's beat replaces" in text
-        # §2: the window, stated as a number and tied to the constant it comes from.
-        from core import worker_heartbeat
-
-        assert f"{worker_heartbeat.FRESH_WINDOW_SECONDS}` second window" in text or (
-            f"{worker_heartbeat.FRESH_WINDOW_SECONDS} second" in text
-        ), f"the report does not state the measured {worker_heartbeat.FRESH_WINDOW_SECONDS} s window"
-        # §3: cross-process exclusion works.
-        assert "exactly one" in text.lower()
-
-    def test_the_report_does_not_promise_more_than_was_measured(self):
-        """It records a limitation and a budget, not a fix for either."""
-        with open(os.path.join(REPO_ROOT, self.REPORT), encoding="utf-8") as handle:
-            text = handle.read()
-        assert "limitation, not defect" in text.lower(), (
-            "the two-worker finding is a limitation; calling it fixed would be untrue"
-        )
-        assert "budget" in text.lower()
+            for key in client.keys(worker_heartbeat._prefix() + "*"):
+                client.delete(key)
 
 
 # ------------------------------------------------- cross-process scheduler exclusion

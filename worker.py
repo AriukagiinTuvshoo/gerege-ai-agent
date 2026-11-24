@@ -7,6 +7,7 @@ import os
 import signal
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 from dotenv import load_dotenv
@@ -152,10 +153,17 @@ async def run_worker_tick(loop_count: int) -> dict:
     # Leaving the call here and letting it raise nightly would train operators to ignore
     # worker errors, so it is gone rather than wrapped in a try/except.
 
-    # Phase 36: record a completed tick so worker liveness is observable over HTTP.
-    # Deliberately at the END of the tick: a heartbeat written at the start would keep
-    # reporting "alive" while the loop was wedged inside a handler, which is the failure
-    # mode worth detecting. Best-effort -- a monitoring write must never stop the worker.
+    # Phase 41: this is the PROGRESS record, not the liveness signal.
+    #
+    # Until Phase 41 this write was the heartbeat, and it sat at the end of the tick for a
+    # good reason -- a beat at the start would report "alive" while the loop was wedged in
+    # a handler. But it coupled liveness to tick duration: the loop sleeps up to 15 s
+    # between ticks and a slow batch measures 23.3 s, so the gap between beats was up to
+    # ~38 s and a 30 s freshness window would have false-staled a healthy worker.
+    #
+    # Liveness is now written by a timer (see `_heartbeat_loop`), and this write exists to
+    # say "a tick completed, and here is what it did". Both go to the same per-worker key,
+    # so the counters stay on the same record as the age. Best-effort, as before.
     try:
         from core import worker_heartbeat
         worker_heartbeat.beat(loop_count, extra={
@@ -164,6 +172,7 @@ async def run_worker_tick(loop_count: int) -> dict:
             "reports_sent": stats.get("reports_sent", 0),
             "reminders_sent": stats.get("reminders_sent", 0),
             "scheduler_errors": stats.get("scheduler_errors", 0),
+            "tick_completed_at": time.time(),
         })
     except Exception as beat_exc:
         # Redis down is survivable: the queue falls back to DB polling.
@@ -210,23 +219,86 @@ async def worker_main_loop(max_iterations: Optional[int] = None):
     except Exception as exc:
         logger.warning(f"connection budget check skipped: {exc}")
     logger.info(f"Gerege Dedicated Background Worker started (worker_id={task_queue.worker_id}).")
+
+    # Phase 41: liveness is its own timer, so a slow batch cannot make a healthy worker
+    # look dead and a wedged loop cannot make it look alive. Started before the first tick
+    # so the worker is visible immediately rather than one tick later.
+    heartbeat_task = asyncio.create_task(_heartbeat_loop())
+    try:
+        hb_mod = _import_heartbeat()
+        if hb_mod is not None:
+            hb_mod.beat(0)
+    except Exception as exc:  # pragma: no cover - Redis optional in dev
+        logger.warning(f"initial heartbeat failed: {exc}")
+
     loop_count = 0
-    while not _SHUTDOWN_EVENT.is_set():
+    try:
+        while not _SHUTDOWN_EVENT.is_set():
+            try:
+                await run_worker_tick(loop_count)
+                loop_count += 1
+                if max_iterations is not None and loop_count >= max_iterations:
+                    _SHUTDOWN_EVENT.set()
+                    break
+            except Exception as e:
+                logger.error(f"Worker loop error: {e}")
+            try:
+                await asyncio.wait_for(_SHUTDOWN_EVENT.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        heartbeat_task.cancel()
         try:
-            await run_worker_tick(loop_count)
-            loop_count += 1
-            if max_iterations is not None and loop_count >= max_iterations:
-                _SHUTDOWN_EVENT.set()
-                break
-        except Exception as e:
-            logger.error(f"Worker loop error: {e}")
-        try:
-            await asyncio.wait_for(_SHUTDOWN_EVENT.wait(), timeout=15.0)
-        except asyncio.TimeoutError:
+            await heartbeat_task
+        except (asyncio.CancelledError, Exception):
             pass
+        # Graceful shutdown removes THIS worker's key, so a restart is visible at once and
+        # a stopped worker does not linger as "stale" for the length of its TTL. Other
+        # workers' keys are untouched (see clear()).
+        try:
+            hb_mod = _import_heartbeat()
+            if hb_mod is not None:
+                hb_mod.clear()
+                logger.info("worker heartbeat cleared for this worker")
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"heartbeat clear failed: {exc}")
 
     logger.info("Gerege Background Worker stopped cleanly.")
     return loop_count
+
+
+def _import_heartbeat():
+    try:
+        from core import worker_heartbeat
+
+        return worker_heartbeat
+    except Exception:
+        return None
+
+
+async def _heartbeat_loop() -> None:
+    """Write this worker's liveness every BEAT_INTERVAL_SECONDS until cancelled.
+
+    Separate from the tick on purpose. The tick can take as long as a handler does -- a
+    measured 23.3 s mid-batch -- so anything derived from tick timing is a measure of
+    throughput, not of liveness. A timer that is independent of the work keeps the two
+    questions separate: "is the process running" and "is it getting through the queue".
+
+    Never raises: a Redis outage must not stop the worker, and a failed beat is exactly
+    what `status: unknown` is for.
+    """
+    from core import worker_heartbeat
+
+    interval = worker_heartbeat.BEAT_INTERVAL_SECONDS
+    while not _SHUTDOWN_EVENT.is_set():
+        try:
+            worker_heartbeat.beat()
+        except Exception as exc:  # pragma: no cover - Redis optional
+            logger.warning(f"heartbeat timer write failed: {exc}")
+        try:
+            await asyncio.wait_for(_SHUTDOWN_EVENT.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import uuid
 
 import pytest
 
@@ -423,7 +424,16 @@ class TestWorkerTickSurvivesASchedulerFailure:
     """The reproduction, executed against the fixed code."""
 
     @pytest.fixture
-    def redis_available(self):
+    def redis_available(self, monkeypatch):
+        """A live Redis, an emptied namespace, and a name to put it back under.
+
+        Phase 41 made the heartbeat per-worker. A tick now writes
+        `<prefix>:<worker id>`, so `read()["heartbeat"]` - which names a worker only when
+        exactly one exists - resolves only if this test owns the namespace. Before Phase 41
+        these cases passed because every test in the run shared one key; that is the
+        coupling, not the liveness, and isolating the prefix keeps the assertion about the
+        tick rather than about test ordering.
+        """
         pytest.importorskip  # keep pytest's skip accounting honest
         try:
             from core import worker_heartbeat
@@ -431,6 +441,14 @@ class TestWorkerTickSurvivesASchedulerFailure:
             worker_heartbeat._redis().ping()
         except Exception as exc:  # pragma: no cover - environment dependent
             pytest.fail(f"Redis is required for the heartbeat tests: {exc}")
+        prefix = f"gerege:test:p39:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        monkeypatch.setenv("WORKER_HEARTBEAT_KEY", prefix)
+        client = worker_heartbeat._redis()
+        for key in client.keys(prefix + "*"):
+            client.delete(key)
+        yield prefix
+        for key in client.keys(prefix + "*"):
+            client.delete(key)
 
     def test_a_raising_scheduler_step_still_publishes_an_alive_heartbeat(
         self, tmp_path, monkeypatch, redis_available

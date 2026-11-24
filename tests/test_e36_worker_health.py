@@ -37,13 +37,24 @@ class TestHeartbeatStates:
 
     @pytest.fixture()
     def redis_client(self, hb):
+        """A live Redis with NO worker heartbeats in it.
+
+        Phase 41 made the key per worker, so clearing `hb._key()` (the prefix) deletes
+        nothing - the fixture has to clear the prefix's children, or every test in this
+        class sees the previous test's worker as a live pool member.
+        """
         client = hb._redis()
         if client is None:
             pytest.skip("needs a live Redis")
-        client.delete(hb._key())
+
+        def wipe():
+            for key in client.keys(hb._prefix() + "*"):
+                client.delete(key)
+
+        wipe()
         yield client
         try:
-            client.delete(hb._key())
+            wipe()
         except Exception:
             pass
 
@@ -62,7 +73,7 @@ class TestHeartbeatStates:
     def test_stale_heartbeat_is_not_alive(self, hb, redis_client):
         """The critical property: a dead worker's last beat must not look healthy."""
         redis_client.set(
-            hb._key(),
+            hb._key("w-1"),
             json.dumps({"worker_id": "w-1", "loop_count": 3, "at": time.time() - 1000, "pid": 1}),
             ex=hb.DEFAULT_TTL_SECONDS,
         )
@@ -74,7 +85,7 @@ class TestHeartbeatStates:
     def test_expired_key_reports_missing_not_stale(self, hb, redis_client):
         """TTL expiry is what stops a dead worker leaving a permanent healthy flag."""
         redis_client.set(
-            hb._key(),
+            hb._key("w"),
             json.dumps({"worker_id": "w", "loop_count": 1, "at": time.time(), "pid": 1}),
             ex=1,
         )
@@ -82,7 +93,7 @@ class TestHeartbeatStates:
         assert hb.read()["status"] == "missing"
 
     def test_unknown_when_payload_is_corrupt(self, hb, redis_client):
-        redis_client.set(hb._key(), "not-json", ex=60)
+        redis_client.set(hb._key("w-1"), "not-json", ex=60)
         state = hb.read()
         assert state["status"] == "unknown"
         assert "reason" in state
@@ -108,9 +119,14 @@ class TestHeartbeatPayloadSafety:
         client = hb._redis()
         if client is None:
             pytest.skip("needs a live Redis")
-        client.delete(hb._key())
+
+        def wipe():
+            for key in client.keys(hb._prefix() + "*"):
+                client.delete(key)
+
+        wipe()
         yield client
-        client.delete(hb._key())
+        wipe()
 
     def test_secret_keys_are_rejected(self, redis_client):
         """Regression: an open `extra` dict put a token verbatim into the response."""

@@ -98,11 +98,31 @@ async def worker_health_endpoint(_admin: Dict[str, Any] = Depends(require_admin)
     pending = int(stats.get("pending") or 0)
     backlogged = pending > 100
 
+    # Phase 41: `worker` is now the POOL, and the old single-worker shape is preserved
+    # under `worker.heartbeat` for the case of exactly one worker so existing consumers do
+    # not break. Two shapes used to be one: "this deployment has a worker" and "every
+    # worker in the pool is healthy". They are reported separately now, because with one
+    # key the second question could not be asked at all.
     healthy = worker_state["status"] == "alive"
+    single = worker_state.get("workers") or []
+    compat = {
+        # Pre-Phase-41 consumers read worker.heartbeat.worker_id / .loop_count. Keep that
+        # available when there is exactly one worker, and never invent one when there are
+        # several - a fabricated "the worker" is how the pool became invisible.
+        "heartbeat": (
+            {k: v for k, v in single[0].items() if k not in ("status", "age_seconds")}
+            if len(single) == 1
+            else None
+        ),
+        "fresh_window_seconds": worker_state.get("fresh_window_seconds"),
+        "ttl_seconds": worker_state.get("ttl_seconds"),
+    }
+    if worker_state.get("reason"):
+        compat["reason"] = worker_state["reason"]
     return JSONResponse(
         status_code=200 if healthy else 503,
         content={
-            "worker": worker_state,
+            "worker": {**worker_state, **{k: v for k, v in compat.items() if k not in worker_state}},
             "scheduler": {
                 # In this topology the scheduler runs inside the worker.
                 "location": "worker",
@@ -115,6 +135,12 @@ async def worker_health_endpoint(_admin: Dict[str, Any] = Depends(require_admin)
             "queue": stats,
             "alerts": {
                 "worker_not_alive": not healthy,
+                # Phase 41: a pool with some workers dead is a partial outage, and it is
+                # invisible in a single boolean. Reported separately so an alert rule can
+                # fire on "degraded" rather than waiting for total loss.
+                "worker_pool_degraded": worker_state.get("stale_count", 0) > 0,
+                "worker_count": worker_state.get("worker_count", 0),
+                "alive_worker_count": worker_state.get("alive_count", 0),
                 "backlog_over_100": backlogged,
                 "dead_letter_jobs": dead_letter,
             },

@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -505,34 +506,68 @@ class TestProductionConfigFailsClosed:
 
 # ------------------------------------------------------ operational monitoring (P7)
 
+@pytest.fixture
+def isolated_heartbeat(monkeypatch):
+    """Give this test its own heartbeat namespace, emptied before and after.
+
+    Phase 41: liveness is per-worker, so a read sees every worker that shares the Redis
+    database. Two consequences for a test that asserts "the deployment is alive":
+
+      * other suites' keys make the pool ambiguous, and `read()` correctly refuses to name
+        a single worker when there is more than one;
+      * a leftover key from an earlier test can make a dead-worker case look alive.
+
+    Pointing the prefix at a per-test value removes both. The name is not a bypass of the
+    production path: `WORKER_HEARTBEAT_KEY` is the documented override, and everything
+    below still goes through `beat()` and `read()` unchanged.
+    """
+    from core import worker_heartbeat
+
+    if not os.getenv("REDIS_URL"):
+        pytest.fail(
+            "REDIS_URL is not set. The CI step supplies it; skipping here would make a "
+            "missing liveness check indistinguishable from a passing one, which is the "
+            "exact gap Phase 36 closed for the worker probe."
+        )
+    prefix = f"gerege:test:p38:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    monkeypatch.setenv("WORKER_HEARTBEAT_KEY", prefix)
+    client = worker_heartbeat._redis()
+    for key in client.keys(prefix + "*"):
+        client.delete(key)
+    yield prefix
+    for key in client.keys(prefix + "*"):
+        client.delete(key)
+
+
 class TestOperationalSignals:
     """Each signal is executed against a real store; none is inferred from source."""
 
-    def test_worker_heartbeat_reports_alive_after_a_beat(self):
+    def test_worker_heartbeat_reports_alive_after_a_beat(self, isolated_heartbeat):
+        """One worker, alone in the namespace, reports itself.
+
+        Phase 41 made liveness per-worker. `read()` names a worker under `heartbeat` only
+        when exactly one exists - with several, an arbitrary pick is the bug that phase
+        fixed. This test therefore has to present exactly one worker, which is what
+        `isolated_heartbeat` does; before Phase 41 it passed only because every test in
+        the run shared one key and the last writer won.
+        """
         from core import worker_heartbeat
 
-        if not os.getenv("REDIS_URL"):
-            pytest.fail(
-                "REDIS_URL is not set. The CI step supplies it; skipping here would make "
-                "a missing liveness check indistinguishable from a passing one, which is "
-                "the exact gap Phase 36 closed for the worker probe."
-            )
         assert worker_heartbeat.beat(loop_count=42, worker_id="p38-probe") is True
         report = worker_heartbeat.read()
         assert report["status"] == "alive"
+        assert report["worker_count"] == 1, report
         heartbeat = report["heartbeat"]
         assert heartbeat["worker_id"] == "p38-probe"
         assert heartbeat["loop_count"] == 42
 
-    def test_a_stale_heartbeat_is_not_reported_alive(self):
+    def test_a_stale_heartbeat_is_not_reported_alive(self, isolated_heartbeat):
         """A dead worker's last heartbeat must not keep the deployment looking healthy."""
         import json
         import time
 
         from core import worker_heartbeat
 
-        if not os.getenv("REDIS_URL"):
-            pytest.fail("REDIS_URL is not set; the stale-heartbeat guard cannot be verified")
         import redis
 
         client = redis.from_url(os.environ["REDIS_URL"])
@@ -550,6 +585,9 @@ class TestOperationalSignals:
             ex=5000,
         )
         try:
+            # The pool view is what production reads. With one record present and old, the
+            # aggregate must be "stale": a dead worker's key must not keep the deployment
+            # looking healthy, which is the property this asserts.
             assert worker_heartbeat.read()["status"] == "stale"
         finally:
             client.delete(key)
