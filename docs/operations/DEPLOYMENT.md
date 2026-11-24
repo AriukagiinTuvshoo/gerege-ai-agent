@@ -38,3 +38,25 @@ curl -fsS http://localhost:8000/api/ready
    python -c "from core import backup_service; print(backup_service.restore_backup('<backup_filename>'))"
    ```
 3. Redeploy the previous container image and verify `/api/ready` returns HTTP `200`.
+
+### 3.1 How long a stop takes (measured)
+
+`docker compose stop` / `docker compose up -d` sends `SIGTERM` and then waits
+`stop_grace_period` before `SIGKILL`. Measured in Phase 40 against a disposable
+PostgreSQL 16.2 and a live Redis:
+
+| Process | `SIGTERM` behaviour | Measured |
+|---|---|---|
+| `web` (uvicorn) | in-flight request is completed, then exit | **0.17 s** with a request in flight |
+| `worker`, idle | exits on the next event-loop check | **0.00 s** |
+| `worker`, mid-batch | finishes the current `process_pending_jobs` batch first | **23.3 s** (25 handlers x 1 s) |
+
+The worker only observes the shutdown event *between* ticks, and one tick awaits a
+whole batch of 25 handlers. Docker's default grace is 10 s, so before Phase 40 every
+redeploy during a busy batch ended in `SIGKILL`. `docker-compose.prod.yml` and
+`docker-compose.staging.yml` now set `stop_grace_period: 60s` on `worker` (Phase 40,
+F-40-C). Nothing is lost either way — the queue is at-least-once with a 300 s
+visibility timeout — but a batch abandoned half-done is retried work.
+
+If you raise `batch_size` in `worker.py` or add a handler slower than ~2 s, raise
+`stop_grace_period` with it: the budget is `batch_size x per-handler time`.

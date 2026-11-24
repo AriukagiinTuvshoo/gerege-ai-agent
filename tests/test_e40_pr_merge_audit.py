@@ -398,3 +398,25 @@ class TestF40DSkippedBackupSuite:
         assert "WAL mode does not apply" in module, (
             "the named exception no longer carries the reason it was allowed"
         )
+
+
+class TestF40CDeploymentRunbookStatesTheBudget:
+    """An operator deciding whether a stop is safe needs the number, not the word."""
+
+    def test_the_runbook_documents_the_measured_stop_times(self):
+        text = _read("docs/operations/DEPLOYMENT.md")
+        assert "stop_grace_period" in text, (
+            "DEPLOYMENT.md does not mention stop_grace_period, so an operator has no way to "
+            "know a worker stop can exceed Docker's 10 s default"
+        )
+        assert "23.3 s" in text or "23.34 s" in text, (
+            "the measured worker stop time is not in the runbook"
+        )
+
+    def test_the_runbook_numbers_match_the_configuration(self):
+        """The documented budget must be the one the compose file actually sets."""
+        text = _read("docs/operations/DEPLOYMENT.md")
+        grace = _stop_grace_seconds(_read("docker-compose.prod.yml"), "worker")
+        assert f"{grace}s" in text.replace("`", ""), (
+            f"DEPLOYMENT.md does not state the configured {grace}s worker stop grace"
+        )
