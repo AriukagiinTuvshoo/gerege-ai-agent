@@ -388,15 +388,44 @@ class TestF40DSkippedBackupSuite:
         log_guard = _read("scripts/check_pytest_log.py")
         assert "collected_total = (int(matches[-1]) if matches else 0) + skipped" in log_guard
 
-    def test_the_one_remaining_permitted_skip_is_the_sqlite_only_wal_case(self):
-        """The narrowing must name a case that genuinely cannot run on PostgreSQL."""
+    def test_every_permitted_skip_is_named_and_exists(self):
+        """`--allow-skip` matches a NAME, so each entry must be a real test name.
+
+        A typo in this list would silently allow nothing - the gate would then fail on
+        the next run rather than on this one - so the names are checked against the
+        modules that own them.
+        """
         step = _phase29_backup_step()
         gate = step[step.index("check_pytest_log.py"):]
         allowed = re.findall(r'--allow-skip\s+"([^"]+)"', gate)
-        assert allowed == ["test_live_database_is_actually_in_wal_mode"], allowed
-        module = _read("tests/test_e07_phase22_wal_copy_safety.py")
-        assert "WAL mode does not apply" in module, (
-            "the named exception no longer carries the reason it was allowed"
+        assert allowed, "no --allow-skip entries: every S3 case would now fail the gate"
+        assert len(set(allowed)) == len(allowed), f"duplicate --allow-skip entries: {allowed}"
+
+        corpus = "".join(
+            _read(rel)
+            for rel in (
+                "tests/test_e07_phase22_offsite_pagination.py",
+                "tests/test_e07_phase22_offsite_integrity.py",
+                "tests/test_e07_phase22_wal_copy_safety.py",
+            )
+        )
+        missing = [name for name in allowed if f"def {name}(" not in corpus]
+        assert not missing, f"--allow-skip names that are not test functions: {missing}"
+
+    def test_the_only_non_s3_exception_is_the_sqlite_wal_case(self):
+        """Every permitted skip is an S3 case except the one documented exception."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        allowed = set(re.findall(r'--allow-skip\s+"([^"]+)"', gate))
+        s3 = set(
+            re.findall(r"def (test_\w+)\(", _read("tests/test_e07_phase22_offsite_pagination.py"))
+            + re.findall(r"def (test_\w+)\(", _read("tests/test_e07_phase22_offsite_integrity.py"))
+        )
+        # The S3 files also hold PostgreSQL-only cases; those must NOT be allowed to skip
+        # now that CI provides a database.
+        non_s3 = allowed - s3
+        assert non_s3 == {"test_live_database_is_actually_in_wal_mode"}, (
+            f"unexpected non-S3 skip exception(s): {sorted(non_s3 - {'test_live_database_is_actually_in_wal_mode'})}"
         )
 
 
