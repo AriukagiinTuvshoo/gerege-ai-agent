@@ -451,3 +451,60 @@ class TestTheSourceGuardsUsePytestSkip:
             "a skipped case satisfied --require-run; the check must match PASSED, not the name"
         )
         assert "it SKIPPED" in result.stdout
+
+
+class TestTheStepProvidesARealDatabase:
+    """A skip gate is only meaningful if the suite CAN run.
+
+    CI run 45575674150 measured the other half of F-42-B: once the skip check was on, the
+    step failed with "8 case(s) SKIPPED". Six were `@pytestmark_pg` cases and two were the
+    destructive ones - because the step set no DATABASE_URL, so `db_engine.is_postgres()`
+    was False and the whole module fell back to SQLite on every run since it was written.
+
+    The module was therefore never exercised against PostgreSQL in CI. `--no-skip-check`
+    is what kept that invisible, which is why removing it had to be paired with giving the
+    step a database rather than with an exception for the skips.
+    """
+
+    def _step(self) -> str:
+        text = open(os.path.join(REPO_ROOT, ".github/workflows/ci.yml"), encoding="utf-8").read()
+        start = text.index("Phase 20 — backup confidentiality")
+        return text[start : text.index("Phase 20: the critical property", start)]
+
+    def test_the_step_names_a_postgresql_database(self):
+        step = self._step()
+        assert "DATABASE_URL:" in step, (
+            "the step sets no DATABASE_URL, so is_postgres() is False and every "
+            "PostgreSQL case in the module skips - which is what CI measured as 8 skips"
+        )
+        assert "postgresql+psycopg2://" in step, "the DATABASE_URL is not a PostgreSQL URL"
+
+    def test_the_step_creates_and_migrates_its_own_disposable_database(self):
+        """It must own one: two cases empty `public` and cannot share with another step."""
+        step = self._step()
+        assert "CREATE DATABASE gerege_p20_test" in step
+        assert "alembic upgrade head" in step
+        assert "provision_roles.py --apply" in step, (
+            "without the grants the owner role connects to a database it cannot read"
+        )
+
+    def test_the_step_seeds_the_row_the_round_trip_case_protects(self):
+        step = self._step()
+        assert "p20_seed" in step
+
+    def test_the_count_floor_still_matches_the_measured_run(self):
+        """32 pass with a real database; the floor stays 24 as before."""
+        step = self._step()
+        assert "--min-passed 24" in step
+        # Comments in this step legitimately mention the flag while explaining why it was
+        # removed. What must not be present is the flag as an ARGUMENT, so only lines that
+        # invoke the guard are examined.
+        commands = [
+            line for line in step.splitlines()
+            if "check_pytest_log.py" in line
+        ]
+        assert commands, "the guard is not invoked in this step"
+        for line in commands:
+            assert "--no-skip-check" not in line, (
+                f"the p20 gate still passes --no-skip-check: {line.strip()}"
+            )

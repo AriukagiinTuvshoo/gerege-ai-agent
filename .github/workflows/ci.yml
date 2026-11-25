@@ -1414,8 +1414,32 @@ jobs:
           # rest of the suite. This step owns a disposable database, which is why the
           # opt-in belongs here and nowhere else.
           GEREGE_DESTRUCTIVE_TESTS: "1"
+          # Phase 43. This step set no DATABASE_URL, so `db_engine.is_postgres()` was
+          # False and the module fell back to SQLite for every run. Eight cases skipped
+          # because of it - the six `@pytestmark_pg` ones and the two destructive ones -
+          # and the step still reported success, because `--no-skip-check` hid them.
+          # Measured on CI run 45575674150: "8 case(s) SKIPPED". The suite never tested
+          # PostgreSQL in CI at all; it tested a SQLite stand-in and the gate called that
+          # green. Naming a real database is what makes the step do what it says.
+          DATABASE_URL: "postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p20_test"
         run: |
           set -euo pipefail
+          # The module owns a disposable database: two cases empty `public`, so it must not
+          # share one with any other step. Created here rather than relying on one existing.
+          export PGPASSWORD="ci_pg_password_2026"
+          psql -h 127.0.0.1 -U gerege -d postgres -q \
+            -c "DROP DATABASE IF EXISTS gerege_p20_test" \
+            -c "CREATE DATABASE gerege_p20_test"
+          # `gerege_owner` needs the schema and the grants, exactly as the DR step does, or
+          # the suite connects and finds nothing it can read.
+          export GEREGE_OWNER_PASSWORD="ci_owner_password_2026"
+          export ADMIN_DATABASE_URL="postgresql://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_p20_test"
+          DATABASE_URL="postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p20_test" \
+            alembic upgrade head
+          python scripts/provision_roles.py --apply
+          # The round-trip case protects an existing row, and asserts one is there.
+          psql -h 127.0.0.1 -U gerege -d gerege_p20_test -q \
+            -c "INSERT INTO pages (page_id, name) VALUES ('p20_seed','Phase 20 seed') ON CONFLICT DO NOTHING"
           pytest tests/test_e06_phase20_backup_remediation.py -v --tb=short -p no:cacheprovider | tee /tmp/p20suite.log
           # Phase 29: a threshold alone cannot fail on a failure - 62 passing plus one
           # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
