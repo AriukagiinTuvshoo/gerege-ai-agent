@@ -488,6 +488,52 @@ class TestTheStepProvidesARealDatabase:
             "without the grants the owner role connects to a database it cannot read"
         )
 
+    def test_provisioning_comes_before_the_migration(self):
+        """The order is load-bearing, and getting it wrong failed CI in one second.
+
+        The first fix migrated and then provisioned. `CREATE DATABASE` makes the
+        superuser the database owner, and since PostgreSQL 15 the `public` schema grants
+        CREATE only to `pg_database_owner` - so `alembic upgrade head` as `gerege_owner`
+        cannot create `alembic_version` at all:
+
+            psycopg2.errors.InsufficientPrivilege: permission denied for schema public
+
+        `provision_roles.py` is what issues `GRANT USAGE, CREATE ON SCHEMA public TO
+        gerege_owner`, so it has to run first. Exact command positions, not membership:
+        the step is long enough that "both appear somewhere" is a weak assertion.
+        """
+        step = self._step()
+        commands = [
+            line.strip()
+            for line in step.splitlines()
+            if not line.strip().startswith("#") and line.strip()
+        ]
+        provision = next(
+            (
+                index for index, line in enumerate(commands)
+                if line.startswith("python scripts/provision_roles.py --apply")
+            ),
+            None,
+        )
+        migrate = next(
+            (index for index, line in enumerate(commands) if "alembic upgrade head" in line),
+            None,
+        )
+        assert provision is not None, "the step never provisions the roles"
+        assert migrate is not None, "the step never migrates the database"
+        assert provision < migrate, (
+            "alembic runs before provision_roles.py --apply, so gerege_owner has no CREATE "
+            "on schema public and the migration dies with 'permission denied for schema "
+            "public' before a single test runs"
+        )
+
+    def test_the_step_asserts_the_resulting_ownership(self):
+        """The suite's row-count helper reads as gerege_owner; assert it, do not assume it."""
+        step = self._step()
+        assert "tableowner" in step and "gerege_owner" in step, (
+            "the step never checks that the tables belong to gerege_owner"
+        )
+
     def test_the_step_seeds_the_row_the_round_trip_case_protects(self):
         step = self._step()
         assert "p20_seed" in step

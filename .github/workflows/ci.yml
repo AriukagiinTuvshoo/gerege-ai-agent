@@ -1432,11 +1432,37 @@ jobs:
             -c "CREATE DATABASE gerege_p20_test"
           # `gerege_owner` needs the schema and the grants, exactly as the DR step does, or
           # the suite connects and finds nothing it can read.
+          #
+          # ORDER MATTERS, and getting it wrong is a hard failure, not a slow one. The
+          # first version of this fix migrated BEFORE provisioning and CI rejected it in
+          # one second:
+          #
+          #   psycopg2.errors.InsufficientPrivilege: permission denied for schema public
+          #
+          # `CREATE DATABASE` makes the superuser the database owner, and from PostgreSQL 15
+          # the `public` schema no longer grants CREATE to PUBLIC - the only CREATE grant is
+          # to `pg_database_owner`, i.e. the superuser here. So `alembic upgrade head` as
+          # `gerege_owner` cannot even create `alembic_version`, and the step dies before
+          # pytest starts. Reproduced locally on a fresh database.
+          #
+          # `provision_roles.py` is what issues `GRANT USAGE, CREATE ON SCHEMA public TO
+          # gerege_owner`, so it has to run first. That is the sequence the Phase 24 DR step
+          # uses, and it is repeated here with the same shape: provision -> migrate ->
+          # provision (converge the grants over the new tables) -> verify. The middle
+          # `--apply` is not redundant: the first one runs before the tables exist.
           export GEREGE_OWNER_PASSWORD="ci_owner_password_2026"
           export ADMIN_DATABASE_URL="postgresql://gerege:ci_pg_password_2026@127.0.0.1:5432/gerege_p20_test"
+          python scripts/provision_roles.py --apply
           DATABASE_URL="postgresql+psycopg2://gerege_owner:ci_owner_password_2026@127.0.0.1:5432/gerege_p20_test" \
             alembic upgrade head
-          python scripts/provision_roles.py --apply
+          python scripts/provision_roles.py --apply          # converge grants over the new tables
+          python scripts/provision_roles.py --verify
+          # Ownership is the property the suite's row-count helper depends on; assert it
+          # rather than trusting the sequence above to have produced it.
+          OWNER=$(psql -h 127.0.0.1 -U gerege -d gerege_p20_test -tAc \
+            "SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname='public'")
+          echo "Phase 20 database ready; table owner(s): $OWNER"
+          test "$OWNER" = "gerege_owner" || { echo "::error::Phase 20 tables must be owned by gerege_owner, got $OWNER"; exit 1; }
           # The round-trip case protects an existing row, and asserts one is there.
           psql -h 127.0.0.1 -U gerege -d gerege_p20_test -q \
             -c "INSERT INTO pages (page_id, name) VALUES ('p20_seed','Phase 20 seed') ON CONFLICT DO NOTHING"
