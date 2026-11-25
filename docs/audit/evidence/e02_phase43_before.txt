@@ -1,0 +1,73 @@
+===============================================================================
+E-02 Phase 4.3 — RED evidence: memory expiry parity & durable single-use refunds
+Recorded against the UNMODIFIED tree at:
+e3d5a1b94764ec4e7d8828d36c04f0fe5ce5fcc3
+  e3d5a1b docs(E-02): record Phase 4.2 CI run 44015598884 (success, 38/38 steps, zero skipped)
+===============================================================================
+
+## 1. Issue 1 — memory refunds an admission whose window has expired
+   W1 expires and NO later window is created. Redis refuses (its key is gone);
+   memory must refuse for the same reason.
+
+  A admitted in W1        count=1
+  clock advanced +901s (W1 expired, no W2 created)
+  peek(count) after expiry = 0
+  refund of EXPIRED admission -> True
+  EXPECTED False (mem) / Redis also False      ACTUAL True
+  RESULT: DEFECT REPRODUCED — expired admission refundable
+
+## 2. Issue 2 — a live claim is evicted by UNRELATED tenants' refunds
+   _refunded was one process-wide set bounded to _MAX_TRACKED_IDENTITIES (10000),
+   evicted with set.pop(). Other tenants' refunds consume that budget.
+
+  victim: 3 admissions, 1 refunded, count=2 (window LIVE)
+  claim present = True   bound = 10000
+  other-tenant refunds performed = 23417
+  claim still present = False
+  REPLAY of the live token -> True   count 2 -> 1
+  RESULT: DEFECT REPRODUCED — unexpired claim evicted by other accounts
+
+## 3. Store representation at this commit
+   _counters: key -> (window_started_at, count, generation)   # no window recorded
+   _refunded: ONE global set, bounded, set.pop() eviction
+   refund_admission(): checks generation + count; NO expiry check
+
+## 4. New suite status at this commit (RED)
+
+The Phase 4.3 suite was run against this unmodified tree (implementation changes stashed, so the
+store was the Phase 4.2 one) with REDIS_URL live:
+
+    tests/test_e02_phase43_memory_claim_durability.py
+    5 failed, 18 passed, 0 skipped, 23 collected
+
+    FAILED test_301_memory_refund_of_an_expired_admission_is_refused
+    FAILED test_304_memory_and_redis_agree_when_no_later_window_exists
+    FAILED test_310_claims_do_not_outlive_their_window
+    FAILED test_311_claim_growth_is_bounded_by_admissions_in_the_window
+    FAILED test_316_token_carries_the_window_it_was_admitted_with
+
+No skip: RED is measured with REDIS_URL live, so the Redis half executed too.
+
+## 5. Discrimination evidence for the claim-eviction tests
+
+test_307/test_308 were themselves defective at first: they passed against the buggy design, so
+they proved nothing. Two harness defects were found and corrected, recorded here rather than
+quietly fixed:
+
+  a) The victim's counter was driven to zero before the replay. An emptied counter is deleted
+     (identically on Redis), so the replay was refused by "no counter", not by the claim. Fixed
+     by keeping the victim's counter non-empty.
+  b) The earlier pressure loop counted *refused* admissions (token is None past the threshold)
+     as claims, so it applied almost no pressure while the bound was still 10,000. Fixed by only
+     counting real admissions and by asserting eviction was actually observed.
+
+With the assertions corrected, the same tests were run against the original store to prove they
+discriminate. Against the buggy design:
+
+    test_307 -> FAILED  "a live claim was forgotten under pressure from other accounts,
+                         so the same token was refunded twice (count 2 -> 1)"
+    test_308 -> FAILED  "harness: the old global set still holds the claim, so eviction was
+                         not exercised"
+
+Against the fixed design both pass. That comparison is the evidence; a test that passes both
+ways would prove nothing.

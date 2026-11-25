@@ -2,7 +2,7 @@ fastapi>=0.115.0,<1.0.0
 uvicorn>=0.30.0,<1.0.0
 httpx>=0.27.0,<1.0.0
 google-genai>=0.1.0,<2.0.0
-pillow>=10.4.0,<12.0.0
+pillow>=13.0.0,<14.0.0
 python-dotenv>=1.0.0,<2.0.0
 python-multipart>=0.0.9,<1.0.0
 openpyxl>=3.1.5,<4.0.0
@@ -12,4 +12,11 @@ sqlalchemy>=2.0.30,<3.0.0
 alembic>=1.13.0,<2.0.0
 psycopg2-binary>=2.9.9,<3.0.0
 redis>=5.0.0,<6.0.0
-pytest>=8.0.0,<9.0.0
+pytest>=9.0.3,<10.0.0
+cryptography>=42.0.0,<56.0.0
+# Phase 29: scripts/validate_workflows.py (run by CI) and tests/test_e29_ci_integrity.py
+# parse the workflow to enforce the pytest exit-code guard. Both were written against a
+# developer environment that happened to have PyYAML installed; CI did not, so the
+# validator exited 2 with "PyYAML is required" and the step failed. Declared here rather
+# than installed inline in the step, so a local run and CI agree.
+PyYAML>=6.0,<7.0

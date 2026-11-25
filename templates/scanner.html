@@ -174,7 +174,9 @@
     let currentCameraId = null;
     let currentPackage = null;
     let scannedHistory = [];
-    const pageId = "{{ page_id }}";
+    // Phase 25: page_id comes straight from ?page_id= on an unauthenticated route.
+    // tojson is the correct escaper for a JS context and closes `</script>` breakout.
+    const pageId = {{ page_id|tojson }};
 
     // Audio chime on scan (Web Audio API synthetic double-beep)
     function playBeep(success = true) {

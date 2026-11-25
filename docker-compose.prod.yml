@@ -1,5 +1,32 @@
 version: "3.9"
 
+# Phase 39 (F-39-C): explicit project name.
+#
+# Without this, Compose derives the project name from the directory the file lives in.
+# `docker-compose.staging.yml` sets `name: gerege-staging`, so staging is pinned — but
+# production was not. On a host where both stacks are checked out under a similar path
+# (or where the directory is renamed), production's volumes (`pgdata`, `redisdata`,
+# `caddy_data`) and staging's would resolve to the same project and the two stacks would
+# share a database volume. Pinning it makes that impossible rather than unlikely.
+name: gerege-production
+
+# ---------------------------------------------------------------------------
+# E-05: two credentials, two planes.
+#
+# `gerege_app`   runtime   -> web, worker. Owns nothing, no DDL, audit_logs is
+#                             SELECT+INSERT only. This is the only DSN the
+#                             application containers receive.
+# `gerege_owner` maintenance -> migrate, maintenance. Runs Alembic, pg_dump and
+#                             restore. Never mounted into web or worker.
+#
+# The bootstrap superuser (`POSTGRES_USER`) is used by the `db` container to create
+# its own cluster and by `provision-roles` to create the two roles. It is not a
+# runtime credential any more.
+#
+# Provisioning runs from `migrate` (which depends on nothing else) so a fresh stack
+# comes up in one `docker compose up`: create roles -> migrate as owner -> start web.
+# ---------------------------------------------------------------------------
+
 services:
   db:
     image: postgres:16-alpine
@@ -8,6 +35,16 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-gerege}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-gerege_crm}
+    # Phase 36: make the ceiling explicit instead of inheriting the image default.
+    # With the Phase 36 pool defaults the stack needs 27 connections (2x10 API + 4
+    # worker + 3 maintenance), so the stock 100 is ample; stating it here means the
+    # budget guard, the compose file and the server cannot silently disagree.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${PG_MAX_CONNECTIONS:-100}"
+      - "-c"
+      - "superuser_reserved_connections=${PG_SUPERUSER_RESERVED:-3}"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -24,7 +61,49 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    # E-02 Phase 6, R11 + R14. The eviction policy and the memory cap are security settings
+    # here, not tuning:
+    #
+    #   --maxmemory-policy noeviction  (Redis's default, now explicit)
+    #     A rate-limit counter must never be evicted to make room for another one. Evicting a
+    #     live counter silently hands that account a fresh budget — the same bug as the memory
+    #     store's capacity handling, which refuses rather than displaces a live counter. Under
+    #     pressure Redis refuses writes instead, the account limiter fails closed (R14), and
+    #     readiness turns 503. That is the intended failure: loud and closed, not quiet and open.
+    #     Do NOT switch to allkeys-lru "to avoid errors"; it converts this into a bypass.
+    #
+    #   --maxmemory 400mb
+    #     Derived from measurement, not guessed. Two keys are written per admitted account
+    #     (`ratelimit:auth_account:<digest>` and its lockout sibling), both with a TTL equal to
+    #     the 900 s window. A measured 20,000-account fill (40,000 keys) used
+    #     292.5 bytes/account = 5.6 MiB, so on logical `used_memory` 400mb holds roughly
+    #     1.4 million concurrently-throttled accounts — far beyond any realistic login working
+    #     set. (Phase 7 reported ~339 B/account; the difference is measurement conditions, not
+    #     a regression. Both are recorded rather than silently reconciled.)
+    #
+    #     MEASURED: used_memory only. NOT measured: peak RSS under a real workload in this
+    #     container, allocator behaviour across a fork/AOF-rewrite, and the actual cgroup limit
+    #     at deploy time. `maxmemory` bounds logical memory, not RSS, and Redis can exceed
+    #     maxmemory transiently while freeing. So "400mb fits in a 512M container" is an
+    #     assumption with a thin margin, not a verified fact — see docs/audit §13.7.
+    #
+    #     ACTION REQUIRED before relying on this in production: confirm the deployment's
+    #     container memory limit (status: UNVERIFIED in the audited environment — no container
+    #     runtime was available to inspect), and keep at least ~25% headroom between
+    #     maxmemory and that limit. With --appendonly yes, the AOF rewrite buffer and COW
+    #     during a background rewrite add to RSS on top of used_memory.
+    #
+    # Review point: if the account-key namespace or per-account key count changes, re-measure
+    # and re-derive this number. If the deployment approaches ~1M live counters in one window,
+    # raise maxmemory and the container limit together.
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "400mb"
+      - "--maxmemory-policy"
+      - "noeviction"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -38,32 +117,137 @@ services:
           cpus: "0.50"
           memory: 512M
 
+  # ------------------------------------------------------------------ TLS terminator
+  # Phase 38. Until this existed, `web` published `${PORT:-8000}:8000` directly, so
+  # production would have been served over plaintext HTTP: browsers drop a `Secure`
+  # session cookie sent over http://, and every admin password crossed the network in
+  # the clear. This service is the same architecture as staging's `proxy`, on purpose.
+  #
+  # Only this service publishes host ports. `web`, `worker`, `db` and `redis` publish
+  # nothing, so the application and the datastores are unreachable except through Caddy
+  # on the compose network.
+  proxy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"        # HTTP/3
+    environment:
+      # `:?` so a deployment without a real domain stops at `docker compose up` with a
+      # message naming the variable, instead of coming up on plaintext or on an empty
+      # site address. There is no default: a default would be a URL that resolves to
+      # nothing, which is worse than a refusal.
+      PRODUCTION_DOMAIN: ${PRODUCTION_DOMAIN:?PRODUCTION_DOMAIN is required (the real hostname; Caddy obtains the certificate for it)}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required for certificate expiry notices}
+    volumes:
+      - ./deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data          # certificates — losing this re-issues and hits LE rate limits
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      # `caddy version` only proves the binary runs. It does not prove a certificate was
+      # issued; that is a DNS/network concern verified in the runbook, not something the
+      # container can assert about the outside world.
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
   web:
     build: .
     restart: unless-stopped
-    ports:
-      - "${PORT:-8000}:8000"
+    # Phase 38: NO `ports:`. The application is reachable only through `proxy` over the
+    # compose network. Publishing 8000 exposed the API over plaintext and bypassed TLS,
+    # HSTS and the proxy's header handling entirely.
+    expose:
+      - "8000"               # documentation only; the compose network can always reach it
     environment:
       ENV: production
       STRICT_SECURITY: "1"
       WEBHOOK_FAIL_CLOSED: "1"
+      # Phase 35: no code reads this variable. It is kept because removing it would break
+      # an operator's expectation that the setting does something, and because the
+      # behaviour it names is what the code already does unconditionally:
+      # `qpay_webhook_callback` requires provider credentials, obtains a token, and
+      # verifies the payment live (amount + currency) before settling; it fails closed
+      # with 400 otherwise. There is no non-strict mode to switch on. Treat this as
+      # documentation, not a control.
       STRICT_QPAY_VERIFICATION: "1"
       DISABLE_INLINE_SCHEDULER: "1"
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
+      # --- Phase 36: connection budget -------------------------------------------
+      # `web` runs uvicorn with --workers 2 (Dockerfile CMD). The startup guard in
+      # main.py reads UVICORN_WORKERS so the budget accounts for both processes; if this
+      # drifts from the Dockerfile the guard under-counts. Change both together.
+      UVICORN_WORKERS: "2"
+      DB_PROCESS_ROLE: "api"
+      # 5+5 per process = 10; 2 processes = 20 connections.
+      # Sized for a threadpool that serves REST + static, not for batch work.
+      DB_POOL_SIZE: "${DB_POOL_SIZE:-5}"
+      DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-5}"
+      DB_POOL_TIMEOUT: "${DB_POOL_TIMEOUT:-30}"
+      DB_POOL_RECYCLE: "${DB_POOL_RECYCLE:-1800}"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      PG_MAX_CONNECTIONS: "${PG_MAX_CONNECTIONS:-100}"
+      PG_SUPERUSER_RESERVED: "${PG_SUPERUSER_RESERVED:-3}"
+      # SEC-01/B-02: CORS allowlist is mandatory in production (no wildcard fallback).
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required (e.g. https://app.example.mn)}
+      # E-05: the runtime credential. NOT the bootstrap `POSTGRES_USER`.
+      # `POSTGRES_APP_PASSWORD` is required (`:?`) so a deployment cannot silently come up
+      # with a blank password, and so the failure is at `compose up` rather than at login.
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_APP_USER:-gerege_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_crm}
+      # The startup assertion is enforced by ENV=production alone; this makes the intent
+      # explicit and keeps the check on even if ENV were ever relaxed.
+      REQUIRE_LEAST_PRIVILEGE: "1"
       REDIS_URL: redis://redis:6379/0
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      # E-02 Phase 3, changed by Phase 38. There IS a reverse proxy in this topology now
+      # (`proxy`), so this can no longer default to empty: the app only honours
+      # X-Forwarded-Proto from a trusted peer, and without it every generated payment
+      # callback URL would be minted as http:// even though clients arrive over https.
+      # Required (`:?`) so the stack refuses to start rather than silently producing
+      # plaintext QPay callback URLs.
+      #
+      # Set this to the compose network's subnet (or the proxy's static address) — never
+      # to 0.0.0.0/0, which would let any client on the network forge its own scheme.
+      # uvicorn runs with --no-proxy-headers (see Dockerfile), so this is the single
+      # authority on forwarding.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:?TRUSTED_PROXIES is required now that a proxy fronts the app (the proxy subnet, e.g. 172.16.0.0/12)}
+      # E-02 Phase 4.1: keyed-HMAC secret for account-level failed-login counters.
+      # `compose` sets ENV=production (see the environment block above), so the app REFUSES
+      # TO START if this is unset, blank or shorter than 32 characters. Required, not optional:
+      # use ":?" so a missing value fails at `docker compose up` rather than at request time.
+      # Quoted: the `:?` message contains punctuation YAML would otherwise misparse.
+      E02_ACCOUNT_KEY_SECRET: ${E02_ACCOUNT_KEY_SECRET:?required, min 32 chars - see docs/deployment/PRODUCTION_DEPLOYMENT.md 1.2}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       META_APP_SECRET: ${META_APP_SECRET:-}
       META_VERIFY_TOKEN: ${META_VERIFY_TOKEN:-}
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
     volumes:
-      - ./backups:/app/backups
+      # Phase 20: read-only. Phase 19 showed the web container could DELETE or replace
+      # any archive, checksum or manifest in this directory — a compromised app could
+      # destroy the entire local backup set, and a plaintext leftover was readable
+      # outright. The admin API only lists and verifies (GET /backups, POST
+      # /backups/verify), both of which need read access and nothing more; create and
+      # restore were removed in E-05 and run from the maintenance container.
+      - ./backups:/app/backups:ro
       - ./static/qrcodes:/app/static/qrcodes
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # E-05: roles must exist and be verified before the app connects. A failed
+      # provisioning or a failed `--verify` now stops `web` from starting at all.
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=4)"]
       interval: 20s
@@ -79,26 +263,203 @@ services:
     build: .
     restart: unless-stopped
     command: ["python", "worker.py"]
+    # Phase 40 (F-40-C): the shutdown budget. `run_worker_tick` awaits one full
+    # `process_pending_jobs(batch_size=25)`, and each handler is awaited inside it, so
+    # the SIGTERM handler's event is only observed BETWEEN ticks. Measured on a live
+    # disposable PostgreSQL + Redis with the shipped loop: 25 x 1 s handlers = 23.34 s to
+    # exit. Docker's default stop grace is 10 s, after which the container is SIGKILLed,
+    # so a redeploy during a busy batch never completed the graceful shutdown the
+    # readiness documents describe. No job is lost (at-least-once with a 300 s visibility
+    # timeout) but the shutdown is not graceful and the batch is abandoned half-done.
+    # 25 x 2 s = 50 s covers a batch of network-bound handlers with margin.
+    stop_grace_period: 60s
     environment:
       ENV: production
       STRICT_SECURITY: "1"
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
+      # E-05: same runtime credential as `web`. The worker never needs DDL —
+      # `ensure_schema()` is a no-op at head and the tail of `init_db()` is data only.
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_APP_USER:-gerege_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_crm}
+      REQUIRE_LEAST_PRIVILEGE: "1"
       REDIS_URL: redis://redis:6379/0
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      # --- Phase 36: connection budget -------------------------------------------
+      # The worker runs ONE sequential asyncio loop: process_pending_jobs awaits each
+      # handler inside a `for` loop, and every scheduler tick is sequential. It cannot
+      # use 30 connections; 2+2 = 4 is already ample. Counting it at 30 was most of the
+      # Phase 35 over-subscription.
+      UVICORN_WORKERS: "${UVICORN_WORKERS:-2}"
+      DB_PROCESS_ROLE: "worker"
+      DB_POOL_SIZE: "${WORKER_DB_POOL_SIZE:-2}"
+      DB_MAX_OVERFLOW: "${WORKER_DB_MAX_OVERFLOW:-2}"
+      DB_POOL_TIMEOUT: "${DB_POOL_TIMEOUT:-30}"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      # Server ceiling, so the guard compares against reality instead of assuming 100.
+      PG_MAX_CONNECTIONS: "${PG_MAX_CONNECTIONS:-100}"
+      PG_SUPERUSER_RESERVED: "${PG_SUPERUSER_RESERVED:-3}"
     volumes:
-      - ./backups:/app/backups
+      # Phase 20: read-only, same reasoning as `web` above. The worker has no backup code
+      # path at all; it never needed write access.
+      - ./backups:/app/backups:ro
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Phase 39 (F-39-B): production's worker had NO healthcheck. Phase 37 fixed this
+      # for staging and the fix was never mirrored, so in production a wedged worker
+      # (a hung handler, a dead loop, an exhausted Redis connection) kept
+      # `restart: unless-stopped` from ever restarting it and looked healthy to
+      # `docker compose ps`. The container would sit there consuming nothing and
+      # processing nothing, with no signal anywhere.
+      #
+      # This reads the same Redis key worker.py writes via core.worker_heartbeat, which
+      # /api/admin/worker/health also reports, so the probe and the API cannot disagree.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - >-
+          import sys;
+          from core.worker_heartbeat import read;
+          sys.exit(0 if read()["status"] == "alive" else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 1024M
 
+  # -------------------------------------------------------------------------
+  # E-05: the owner plane. One-shot, no restart, no published port.
+  #
+  # `migrate` is the only service that holds `POSTGRES_OWNER_PASSWORD`, and it
+  # does the whole bring-up in order: create/refresh the two roles, then migrate
+  # as the owner. `web` and `worker` depend on it completing successfully, so an
+  # over-privileged or missing role stops the stack at start-up rather than at the
+  # first request.
+  #
+  # `depends_on` uses `service_completed_successfully`, so `docker compose up` on a
+  # fresh volume provisions roles and migrates before anything serves traffic.
+  # -------------------------------------------------------------------------
+  migrate:
+    build: .
+    restart: "no"
+    command:
+      - "sh"
+      - "-c"
+      - >-
+        python scripts/provision_roles.py --apply &&
+        python -m alembic upgrade head &&
+        python scripts/provision_roles.py --apply &&
+        python scripts/provision_roles.py --verify
+    environment:
+      ENV: production
+      # Phase 36: one-shot DDL role. Alembic connects once; 2+1 keeps it inside the same
+      # budget as the running services instead of opening a default 10+20 pool while
+      # `web` and `worker` are already connected.
+      DB_PROCESS_ROLE: "maintenance"
+      DB_POOL_SIZE: "2"
+      DB_MAX_OVERFLOW: "1"
+      DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-10}"
+      # DSNs for the maintenance plane only. These are NOT passed to web/worker.
+      # The provisioning steps read ADMIN_DATABASE_URL; `alembic upgrade head` reads
+      # DATABASE_URL.
+      #
+      # Why `--apply` runs TWICE, and why both run as the bootstrap account:
+      #
+      #   pass 1 (before migration) creates the two roles. On a fresh volume there is
+      #     nothing else to do — no tables exist yet.
+      #   migration runs as the bootstrap account, which owns what it creates: 19 tables,
+      #     13 sequences and the two audit trigger functions.
+      #   pass 2 (after migration) is the one that matters on both fresh and existing
+      #     volumes: it transfers ownership of everything to `gerege_owner` and applies
+      #     the grants.
+      #
+      # `ALTER TABLE ... OWNER TO gerege_owner` requires the *current* user to be a member
+      # of the new owner, so it cannot be done by `gerege_owner` over objects it does not
+      # yet own. That is why this container holds the bootstrap credential, and why web
+      # and worker never do.
+      #
+      # Both passes are idempotent; `--verify` runs last and fails the container if the
+      # end state is wrong, which stops `web`/`worker` from starting.
+      ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-gerege}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gerege_crm}
+      GEREGE_OWNER_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}
+      GEREGE_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
+    volumes:
+      - ./backups:/app/backups
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Operator-invoked or timer-invoked, never started by `up` (profile-scoped,
+  # restart: "no"). This is the only service that holds the owner credential.
+  #
+  #   # manual
+  #   docker compose -f docker-compose.prod.yml run --rm maintenance \
+  #       python scripts/maintenance.py backup --label manual
+  #   # what the scheduler runs (backup + encrypt + verify + retain + alert)
+  #   docker compose -f docker-compose.prod.yml run --rm --no-deps maintenance \
+  #       python scripts/maintenance.py backup-run --label scheduled
+  #
+  # Phase 16 (MEDIUM-02): `backup-run` needs the encryption key and, optionally, an
+  # offsite target and an alert webhook. Encryption is ON by default and the run FAILS
+  # CLOSED in production if no key is configured, rather than quietly writing plaintext
+  # tenant data to the host. Set BACKUP_ENCRYPTION=off only in development.
+  maintenance:
+    build: .
+    restart: "no"
+    profiles: ["maintenance"]
+    entrypoint: ["python", "scripts/maintenance.py"]
+    environment:
+      ENV: production
+      DATABASE_OWNER_URL: postgresql://${POSTGRES_OWNER_USER:-gerege_owner}:${POSTGRES_OWNER_PASSWORD:?POSTGRES_OWNER_PASSWORD is required}@db:5432/${POSTGRES_DB:-gerege_crm}
+      BACKUP_ENCRYPTION: ${BACKUP_ENCRYPTION:-on}
+      # The key is a FILE, never an env value. It must be mounted from the host at the
+      # path below; the documentation (docs/operations/BACKUP_ENCRYPTION.md) names this
+      # same path. Phase 17 found the docs telling operators to create
+      # /etc/gerege/backup.key while Compose mounted ./secrets/backup.key, so following
+      # the instructions produced a key the container never saw.
+      BACKUP_ENCRYPTION_KEY_FILE: ${BACKUP_ENCRYPTION_KEY_FILE:-/run/secrets/backup.key}
+      BACKUP_OFFSITE_PATH: ${BACKUP_OFFSITE_PATH:-}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_MIN_KEEP: ${BACKUP_MIN_KEEP:-7}
+      BACKUP_ALERT_WEBHOOK: ${BACKUP_ALERT_WEBHOOK:-}
+      BACKUP_MAX_AGE_HOURS: ${BACKUP_MAX_AGE_HOURS:-36}
+    volumes:
+      - ./backups:/app/backups
+      # The key is mounted read-only from the host. It is a FILE, never an env value,
+      # so it cannot leak through `docker inspect` or a process listing.
+      - ./secrets/backup.key:/run/secrets/backup.key:ro
+      # Offsite target. Phase 18: this used to default to `./backups`, i.e. the SAME
+      # host directory already mounted at /app/backups, so a self-copy was reported as an
+      # offsite backup. There is deliberately NO default mount now, because a default
+      # that is silently the same disk is worse than none. To use a second device,
+      # uncomment and point it somewhere real:
+      #
+      #   - /mnt/backup-disk:/mnt/offsite
+      #
+      # and set BACKUP_OFFSITE_PATH=/mnt/offsite. Preferred in production is object
+      # storage: set BACKUP_OFFSITE_URL (https), BACKUP_OFFSITE_ACCESS_KEY,
+      # BACKUP_OFFSITE_SECRET_KEY and BACKUP_OFFSITE_REGION, which needs no mount at
+      # all. With nothing configured the run reports OFFSITE: NOT CONFIGURED.
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:
   redisdata:
+  # Phase 38: certificate storage. Losing this re-issues every certificate on the next
+  # start, which is rate-limited by Let's Encrypt. Keep it on persistent storage and back
+  # it up with the same care as the database — a restore that forgets it can lock the
+  # host out of new certificates for a week.
+  caddy_data:
+  caddy_config:

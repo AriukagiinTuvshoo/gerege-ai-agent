@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import database
 from core import backup_service
 from scripts import migrate_sqlite_to_postgres
+from tests.conftest import copy_sqlite_database
 
 
 def test_migration_detects_target_only_extra_rows():
@@ -24,8 +25,8 @@ def test_migration_detects_target_only_extra_rows():
     try:
         src_db = os.path.join(tmp_dir, "src.db")
         tgt_db = os.path.join(tmp_dir, "tgt.db")
-        shutil.copy2(database.DB_PATH, src_db)
-        shutil.copy2(database.DB_PATH, tgt_db)
+        copy_sqlite_database(database.DB_PATH, src_db)
+        copy_sqlite_database(database.DB_PATH, tgt_db)
 
         # Insert an extra row ONLY in target DB
         tconn = sqlite3.connect(tgt_db)
@@ -56,7 +57,7 @@ def test_migration_clean_batch_streaming_succeeds():
     try:
         src_db = os.path.join(tmp_dir, "src.db")
         tgt_db = os.path.join(tmp_dir, "tgt.db")
-        shutil.copy2(database.DB_PATH, src_db)
+        copy_sqlite_database(database.DB_PATH, src_db)
 
         rep = migrate_sqlite_to_postgres.run_migration(
             sqlite_path=src_db,
@@ -77,7 +78,10 @@ def test_sqlite_restore_verification_rejects_missing_or_empty_tables():
     try:
         database.init_db()
         live_db = os.path.join(tmp_dir, "live.db")
-        shutil.copy2(orig_db_path, live_db)
+        # `orig_db_path` is the live database: WAL-aware copy, or the restored copy could
+        # be missing tables. `bad_raw` below copies `live_db` (a plain file this test owns,
+        # already checkpointed by the backup that just read it), so it stays a plain copy.
+        copy_sqlite_database(orig_db_path, live_db)
         database.DB_PATH = live_db
 
         # 1. Valid backup + restore succeeds with real verification
@@ -138,7 +142,13 @@ def test_postgres_restore_good_when_configured():
 
     good_bk = backup_service.create_backup(label="pg_restore_ver_ok")
     assert good_bk["success"] is True, f"PG create_backup failed: {good_bk}"
-    assert good_bk["filename"].endswith(".sql.gz")
+    # Phase 20: create_backup() enforces the encryption policy internally, so the archive
+    # it publishes is authenticated ciphertext. The assertion is tightened rather than
+    # loosened: the file must be an encrypted archive *and* it must authenticate. The
+    # restore assertions below are unchanged and still verify the data round-trips.
+    assert good_bk["filename"].endswith(".sql.gz.enc"), good_bk["filename"]
+    assert good_bk.get("encrypted") is True
+    assert good_bk.get("encryption_format") == "authenticated"
 
     res_good = {}
     try:

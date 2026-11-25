@@ -2,7 +2,7 @@ import os
 import hmac
 import hashlib
 import logging
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, List, Optional, Set
 from fastapi import Request, HTTPException
 
 import database
@@ -225,6 +225,58 @@ def is_query_token_allowed() -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# CORS origin allowlist (finding SEC-01 / B-02)
+# ---------------------------------------------------------------------------
+_DEV_DEFAULT_ORIGINS = (
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
+
+
+def resolve_allowed_origins() -> List[str]:
+    """
+    CORS-д зөвшөөрөгдөх origin-уудын жагсаалтыг буцаана.
+
+    Яагаад: `allow_origins=["*"]` ба `allow_credentials=True` хослолд Starlette нь
+    дуудагчийн `Origin`-ыг шууд буцаадаг ("reflect") тул дурын вэбсайт нэвтэрсэн
+    хэрэглэгчийн cookie-той хүсэлт илгээж хариуг уншиж чаддаг байсан (SEC-01).
+
+    Дүрэм:
+      * `ALLOWED_ORIGINS` (таслалаар тусгаарласан) байвал түүнийг л ашиглана.
+      * Wildcard (`*`) зөвхөн production БИШ үед зөвшөөрөгдөнө.
+      * Production/strict горимд жагсаалт хоосон бол аюулгүй default (өөрөө) —
+        хэзээ ч `*` руу буцахгүй (fail-closed).
+      * `null` origin-ыг хэзээ ч зөвшөөрөхгүй.
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    prod = is_production_mode()
+
+    if raw:
+        origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+        cleaned: List[str] = []
+        for origin in origins:
+            if origin == "*":
+                # Never permit credentialed wildcard, in any mode.
+                continue
+            if origin.lower() == "null":
+                continue
+            if origin not in cleaned:
+                cleaned.append(origin)
+        if cleaned:
+            return cleaned
+    elif not prod:
+        return list(_DEV_DEFAULT_ORIGINS)
+
+    # Production (or an unusable config): bind to the app's own origins only.
+    self_origin = os.getenv("APP_ORIGIN", "").strip().rstrip("/")
+    if self_origin and self_origin.lower() != "null":
+        return [self_origin]
+    return []
+
+
 def extract_token_from_request(
     request: Optional[Request] = None,
     authorization: Optional[str] = None,
@@ -366,6 +418,28 @@ def verify_resource_tenant_ownership(
     """
     Тухайн обьект (Lead, Session, Invoice, Cargo, Appointment) нь
     нэвтэрсэн хэрэглэгчийн салбарт харьяалагдаж буй эсэхийг шалгах (IDOR хамгаалалт)
+
+    Phase 45 (F-44-A): this guard **fails closed on a missing tenant**. The previous
+    condition was
+
+        ``if not user_pid or (resource_page_id and str(resource_page_id) != str(user_pid))``
+
+    whose second clause is falsy when ``resource_page_id`` is ``None`` or ``""`` - so a
+    resource with no tenant of its own was **allowed to every tenant-scoped user**:
+
+        resource_page_id='pageA' -> ALLOWED      (correct)
+        resource_page_id='pageB' -> DENIED 403   (correct)
+        resource_page_id=None    -> ALLOWED      (WRONG - the bug)
+        resource_page_id=''      -> ALLOWED      (WRONG - the bug)
+
+    That was reachable in principle because ``registrations.page_id`` is nullable. It is
+    no longer reachable after Phase 45 made the column ``NOT NULL`` (migration 0008), but
+    a guard that depends on a schema invariant somewhere else is one migration away from
+    being wrong again. The rule now lives here, where the decision is made: a resource
+    that cannot name its tenant cannot be proven to belong to the caller, so it is denied.
+
+    Admins are unaffected - they are allowed across tenants by design, and the tenant
+    check below never applied to them either.
     """
     if not user:
         if require_auth or is_production_mode():
@@ -373,12 +447,68 @@ def verify_resource_tenant_ownership(
         return
     role = str(user.get("role") or "").strip().lower()
     if not is_admin_role(role):
-        user_pid = user.get("page_id")
-        if not user_pid or (resource_page_id and str(resource_page_id) != str(user_pid)):
+        user_pid = str(user.get("page_id") or "").strip()
+        resource_pid = "" if resource_page_id is None else str(resource_page_id).strip()
+        # Missing owner on either side is a denial, not an exemption. `not resource_pid`
+        # comes first so the reason is explicit rather than implied by string inequality.
+        if not user_pid or not resource_pid or resource_pid != user_pid:
             raise HTTPException(
                 status_code=403,
                 detail="Энэхүү бүртгэл танай салбарт хамаарахгүй байна! (IDOR Forbidden)",
             )
+
+
+#: Phase 45 (F-44-B). The string that shipped as the fallback for `META_VERIFY_TOKEN`,
+#: the `pages.verify_token` column default and the request-body default. It is in this
+#: repository, in every published install and in the migrations, so it is a *published*
+#: value: treating it as a secret is the defect, not an oversight to be documented.
+PUBLIC_VERIFY_TOKEN_PLACEHOLDER = "agent_verify_secret_token_123"
+
+
+def meta_verify_token_is_placeholder(token: Optional[str]) -> bool:
+    """True when ``token`` carries no secrecy at all.
+
+    Two shapes count: the published default itself, and anything a template would leave
+    behind (`changeme`, `<generate: …>`, `your-…`). Comparison is case-insensitive and
+    whitespace-trimmed, because those are the variations an operator actually types.
+    """
+    value = str(token or "").strip()
+    if not value:
+        return True
+    lowered = value.lower()
+    if lowered == PUBLIC_VERIFY_TOKEN_PLACEHOLDER:
+        return True
+    placeholders = ("changeme", "change_me", "placeholder", "your-", "<generate", "todo", "xxx")
+    return any(marker in lowered for marker in placeholders)
+
+
+def meta_verify_token_is_usable(token: Optional[str]) -> bool:
+    """Whether the Meta handshake may proceed with ``token`` as the expected value.
+
+    Phase 45 (F-44-B). The GET `/webhook` handler used
+
+        ``expected_token = os.getenv("META_VERIFY_TOKEN", "agent_verify_secret_token_123")``
+
+    so a deployment that never set the variable completed Meta's subscription handshake
+    with a value that is printed in this repository. Phase 44 measured it: under
+    ``ENV=production`` with the variable unset, the endpoint still accepted the public
+    string.
+
+    The rule is now the same one `_verify_admin_password` already applies to the admin
+    password: in production (or `STRICT_SECURITY`), an unset, empty or placeholder value
+    is **not usable**, and the caller must fail closed. Outside production the published
+    default stays usable, because local development and the test suite rely on it and
+    nothing is exposed there.
+
+    This function decides only *whether a value may be used*. It never returns the value
+    and never logs it, so it cannot leak the configured secret.
+    """
+    value = str(token or "").strip()
+    if not value:
+        return False
+    if is_production_mode() and meta_verify_token_is_placeholder(value):
+        return False
+    return True
 
 
 def verify_meta_webhook_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
@@ -451,3 +581,89 @@ def verify_manychat_webhook_secret(request: Request, page_id: Optional[str] = No
         return False
 
     return hmac.compare_digest(header_secret, expected)
+
+
+# ---------------------------------------------------------------------------
+# Security response headers (finding SEC-03 / P2-04)
+# ---------------------------------------------------------------------------
+#: Third-party origins the dashboard actually loads. Kept explicit rather than a
+#: wildcard: a CDN compromise is the exact scenario CSP is meant to bound, so the policy
+#: only names the hosts the product really uses. If an asset is added to the templates,
+#: add its origin here or the browser will block it.
+CSP_SCRIPT_SRC = (
+    "'self'",
+    "https://cdn.tailwindcss.com",
+    "https://cdnjs.cloudflare.com",
+    "https://cdn.jsdelivr.net",
+    "https://unpkg.com",
+)
+CSP_STYLE_SRC = (
+    "'self'",
+    "https://cdn.tailwindcss.com",
+    "https://cdnjs.cloudflare.com",
+    "https://fonts.googleapis.com",
+)
+CSP_FONT_SRC = ("'self'", "https://fonts.gstatic.com", "data:")
+CSP_IMG_SRC = ("'self'", "data:", "blob:", "https:")
+CSP_CONNECT_SRC = ("'self'",)
+#: Nothing is embedded in an iframe today — `docs.google.com` and `sheets.new` in
+#: `dashboard.html` are plain navigation links, which CSP does not govern. If a widget is
+#: ever embedded, add its origin here.
+CSP_FRAME_SRC = ("'none'",)
+
+
+def build_content_security_policy() -> str:
+    """
+    Build the Content-Security-Policy header value.
+
+    Honest note on `'unsafe-inline'` and `'unsafe-eval'`: `dashboard.html` (a single
+    310 kB file) uses 118 inline `onclick=` handlers and four inline `<script>` blocks, and
+    `cdn.tailwindcss.com` compiles CSS in the browser at runtime, which requires
+    `eval`. A policy without these directives would break the entire dashboard, so they
+    are present for now.
+
+    That makes this policy a **partial** mitigation, not a full one: it still removes the
+    ability to load script from an arbitrary attacker-controlled origin, and it bounds
+    `object-src`, `base-uri`, `frame-ancestors` and form targets, which is where most
+    injected-markup attacks start. It does *not* stop an injected inline handler from
+    running. Removing the inline handlers is tracked separately as frontend work
+    (`docs/audit/ROADMAP.md`); only then can `'unsafe-inline'` be dropped for a nonce.
+
+    `'unsafe-eval'` is granted only for the Tailwind CDN; it is the price of runtime
+    compilation, and self-hosting a compiled stylesheet would let it be removed.
+    """
+    script_src = tuple(CSP_SCRIPT_SRC) + ("'unsafe-inline'", "'unsafe-eval'")
+    directives = {
+        "default-src": ("'self'",),
+        "script-src": script_src,
+        "style-src": tuple(CSP_STYLE_SRC) + ("'unsafe-inline'",),
+        "img-src": CSP_IMG_SRC,
+        "font-src": CSP_FONT_SRC,
+        "connect-src": CSP_CONNECT_SRC,
+        "frame-src": CSP_FRAME_SRC,
+        "object-src": ("'none'",),
+        "base-uri": ("'self'",),
+        "form-action": ("'self'",),
+        "frame-ancestors": ("'none'",),
+    }
+    return "; ".join(f"{name} {' '.join(sources)}" for name, sources in directives.items())
+
+
+def build_security_headers() -> Dict[str, str]:
+    """
+    Response headers applied to every response, success or error.
+
+    HSTS is emitted **only** in production: sending it from a local HTTP dev server would
+    pin `localhost` to HTTPS in the developer's browser for a year and is a well-known way
+    to break a workstation. `X-Frame-Options` remains alongside the CSP
+    `frame-ancestors` directive because older browsers do not implement the latter.
+    """
+    headers: Dict[str, str] = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "Content-Security-Policy": build_content_security_policy(),
+    }
+    if is_production_mode():
+        headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return headers

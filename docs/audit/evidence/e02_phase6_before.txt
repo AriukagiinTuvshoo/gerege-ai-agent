@@ -1,0 +1,57 @@
+E-02 Phase 6 — RED baseline: the pre-remediation implementation against the new tests
+Captured 2026-11-17T06:30:52Z
+Method: git stash of the fixed core/rate_limit.py, database.py, main.py; new test file kept.
+Command: pytest tests/test_e02_phase6_remediation.py -q --tb=no (SQLite, no Redis)
+
+RESULT: 35 failed, 18 passed, 7 skipped
+
+Every finding is discriminated. The 35 failures are the tests that pin the fixed behaviour:
+
+FAILED test_601_account_store_generic_exception_fails_closed
+FAILED test_602_redis_connection_failure_fails_closed
+FAILED test_603_redis_timeout_fails_closed
+FAILED test_604_redis_script_error_fails_closed
+FAILED test_606_store_failure_refuses_the_http_login
+FAILED test_607_store_failure_does_not_authenticate
+FAILED test_608_store_failure_leaks_no_internal_detail
+FAILED test_620_production_without_redis_url_refuses_to_start
+FAILED test_621_production_with_blank_redis_url_refuses_to_start
+FAILED test_622_production_with_unreachable_redis_refuses_to_start
+FAILED test_623_startup_error_names_no_credentials
+FAILED test_624_development_without_redis_keeps_the_documented_fallback
+FAILED test_626_production_never_silently_selects_memory
+FAILED test_628_two_workers_cannot_exceed_the_threshold_without_redis
+FAILED test_640_readiness_healthy_when_db_and_store_are_ok
+FAILED test_642_readiness_503_when_store_is_down_in_production
+FAILED test_650_tenant_b_cannot_take_tenant_a_username
+FAILED test_651_case_variant_is_also_a_conflict
+FAILED test_652_whitespace_variants_are_conflicts[ alice ]
+FAILED test_652_whitespace_variants_are_conflicts[\talice]
+FAILED test_652_whitespace_variants_are_conflicts[alice\n]
+FAILED test_652_whitespace_variants_are_conflicts[  ALICE  ]
+FAILED test_652_whitespace_variants_are_conflicts[\t Alice \t]
+FAILED test_654_attacker_password_never_authenticates_as_tenant_a
+FAILED test_655_rejected_write_leaves_tenant_b_unchanged
+FAILED test_659_a_page_id_of_another_tenant_is_not_hijackable
+FAILED test_661_no_duplicate_username_can_be_created_by_the_write_path
+FAILED test_662_get_page_is_addressed_by_page_id_only
+FAILED test_664_conflict_message_is_generic
+FAILED test_670_custom_window_stops_reporting_once_expired
+FAILED test_673_exact_boundary_reads_as_expired
+FAILED test_674_five_then_nine_hundred_does_not_extend_the_window
+FAILED test_676_expired_generation_read_does_not_resurrect
+FAILED test_677_by_identity_read_matches_by_username_read
+FAILED test_680_ttl_is_not_extended_by_a_read
+
+Grouped by finding:
+  R14 — account limiter fail-closed : test_601, 602, 603, 604, 606, 607, 608  (7 failed)
+  R11 — production shared store     : test_620, 621, 622, 623, 624, 626, 628 (7 failed)
+  R11 — readiness includes the store: test_640, 642                         (2 failed)
+  R10 — cross-tenant credential write: test_650, 651, 652(x5), 654, 655, 659, 661, 662, 664 (12 failed)
+  R15 — generation-window read path : test_670, 673, 674, 676, 677, 680     (6 failed)
+
+Not expected to discriminate (correctly passed on BOTH implementations):
+  test_605 capacity fail-closed      — already fixed in Phase 4.4; pinned to prevent regression
+  test_609/610/611 legit login paths — behaviour that had to remain unchanged
+  test_612 IP fail-open posture      — unchanged by design; pinned so it cannot drift
+  test_671/672 default-window reads  — the 900s default was never affected by R15

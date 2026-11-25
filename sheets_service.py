@@ -3,13 +3,91 @@ import io
 import json
 import re
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
+
+from core import outbound_http
 import uuid
 from typing import Dict, List, Any, Optional
 
 # In-memory cache to avoid hammering Google Sheets on every message (TTL = 60 seconds)
 _SHEET_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 60
+
+
+#: Hosts the CSV fetch may contact. Checked before the request AND after any redirect.
+_ALLOWED_SHEET_HOST = "docs.google.com"
+
+
+class _SameHostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when it stays on the allowlisted host.
+
+    Phase 27 (B310). `normalize_sheet_csv_url()` validates the URL the operator supplies,
+    but `urlopen` then followed whatever the server sent back. The final URL was never
+    re-checked, so validation covered only the first hop.
+
+    What that is and is not worth, stated precisely because both directions matter:
+
+    * `urllib` already refuses a redirect to `file:`/`ftp:` - it raises "Redirection to url
+      is not allowed" for any non-http(s) scheme. So the classic scheme downgrade was not
+      reachable here, and this is not described as a fix for it.
+    * What `urllib` *does* follow is an http(s) redirect to any host, including
+      `169.254.169.254` (cloud metadata) and RFC1918 addresses. Verified against a local
+      server: the client reached the target and returned its 401. That is the actual
+      SSRF surface, and pinning the host is the control that closes it.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(newurl)
+        # https only: a downgrade to plain http would discard the certificate check that
+        # makes the rest of this defence meaningful.
+        if parsed.scheme != "https" or parsed.hostname != _ALLOWED_SHEET_HOST:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                f"refusing redirect to {parsed.scheme}://{parsed.netloc}: the sheet fetch may "
+                f"only contact {_ALLOWED_SHEET_HOST}",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _sheet_opener() -> urllib.request.OpenerDirector:
+    """An opener that applies the host allowlist to every hop, and pins the connection.
+
+    Phase 30. The host allowlist and the per-hop redirect guard already constrained *where*
+    the fetch could go, and TLS hostname verification already meant a rebound address could
+    not impersonate docs.google.com without a valid certificate for it. What was still true
+    is that the hostname was resolved twice - once to validate, once to connect - so this
+    pins the connection to the address the validation actually saw. Cheap, and it removes
+    the second lookup rather than reasoning about whether it is reachable.
+
+    The pin is best-effort by design: if resolution fails here the call raises, and the
+    caller already treats a failed sheet fetch as an ordinary failure. It must never turn a
+    working sheet fetch into a refusal, so a host that resolves to an address the pin will
+    not accept (which for docs.google.com should be impossible) is a hard error rather than
+    a silent fallback to an unpinned connection.
+    """
+    from core import pinned_http
+
+    try:
+        addresses = pinned_http.outbound_http.resolve_host(
+            _ALLOWED_SHEET_HOST, 443
+        )
+    except Exception:
+        addresses = []
+    if not addresses:
+        # Same shape as before the change: let the default machinery run and fail loudly on
+        # its own terms rather than converting a resolver blip into a different error.
+        return urllib.request.build_opener(_SameHostRedirectHandler)
+    return pinned_http.build_pinned_opener_from(
+        addresses,
+        extra_handlers=(_SameHostRedirectHandler,),
+    )
 
 
 def normalize_sheet_csv_url(sheet_url: str) -> str:
@@ -22,7 +100,13 @@ def normalize_sheet_csv_url(sheet_url: str) -> str:
     url = sheet_url.strip()
     from urllib.parse import urlparse
     parsed = urlparse(url)
-    if parsed.scheme not in ("https", "http") or parsed.hostname != "docs.google.com":
+    # Phase 28: https only. `http` was accepted, and the pass-through branch below returned
+    # an http URL unchanged - so the fetch ran in plaintext, where nothing binds the
+    # connection to the hostname. That matters because TLS is the control that actually
+    # defeats DNS rebinding: to serve docs.google.com from a rebound internal address an
+    # attacker must present a certificate for docs.google.com. Over plain http they need
+    # only answer the request.
+    if parsed.scheme != "https" or parsed.hostname != _ALLOWED_SHEET_HOST:
         raise ValueError("Зөвхөн docs.google.com дээрх Google Sheets холбоос зөвшөөрөгдөнө (SSRF хамгаалалт).")
 
     if "output=csv" in url or "/export?format=csv" in url:
@@ -60,7 +144,31 @@ def fetch_sheet_rows(sheet_url: str, force_refresh: bool = False) -> List[Dict[s
             "User-Agent": "Mozilla/5.0 (compatible; GeregeBot/2.0)"
         }
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    # Phase 28: resolve the allowlisted host and refuse if it is not globally routable.
+    #
+    # Honest scope, because overstating this would be worse than not doing it: this is a
+    # second layer, not the primary control. It rejects an environment where docs.google.com
+    # is hijacked by /etc/hosts or a poisoned resolver, and it rejects a host whose
+    # resolution includes any private address. It does NOT close the race between this
+    # lookup and the socket connect inside `urlopen` - only pinning the address would, and
+    # that requires a custom HTTP client. What closes the race in practice is TLS: the
+    # connection is https-only (enforced above), so a rebound address must still present a
+    # valid certificate for docs.google.com.
+    _refusal = outbound_http.reject_reason(_ALLOWED_SHEET_HOST, 443)
+    if _refusal:
+        raise ValueError(
+            f"refusing to fetch a sheet: {_ALLOWED_SHEET_HOST} {_refusal}. This host must "
+            "resolve only to public addresses."
+        )
+
+    # Phase 27: an opener that re-checks the host on every redirect, rather than trusting
+    # the first-hop validation above.
+    with _sheet_opener().open(req, timeout=10) as resp:
+        final_host = urllib.parse.urlsplit(resp.geturl()).hostname
+        if final_host != _ALLOWED_SHEET_HOST:
+            raise ValueError(
+                f"sheet fetch ended at {final_host!r}, which is not {_ALLOWED_SHEET_HOST}"
+            )
         raw_bytes = resp.read()
 
     text = raw_bytes.decode("utf-8-sig", errors="replace")

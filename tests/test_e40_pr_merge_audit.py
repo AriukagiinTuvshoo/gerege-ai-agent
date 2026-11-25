@@ -1,0 +1,607 @@
+"""Phase 40 — PR #1 final audit: merge readiness.
+
+This phase is an audit, so most of what it established is recorded in
+`docs/audit/PHASE_40_PR_MERGE_AUDIT.md` rather than here. The tests below are the
+findings that produced a code or documentation change, kept so the same drift cannot
+return silently.
+
+  F-40-A  HIGH  docs/operations/BACKUP_RESTORE.md documented a cron entry built on
+                `maintenance.py backup`, which never posts to BACKUP_ALERT_WEBHOOK at
+                all. The shipped `deploy/cron/gerege-backup.cron` and
+                `deploy/systemd/gerege-backup.service` both use `backup-run`, and
+                docs/ALERTING-SETUP.md describes `backup-run` as the alerting command.
+                An operator following the runbook would have had a nightly backup that
+                failed silently: no archive, an exit code in a log nobody reads, and no
+                alert leaving the host. Measured on an identical `pg_dump` failure with
+                no webhook configured — `backup` printed only `backup FAILED: ...`,
+                while `backup-run` also printed
+                `warning: BACKUP_ALERT_WEBHOOK is not configured: nobody is notified`.
+
+The distinction is real and is asserted behaviourally below, not just by reading docs.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+import pytest
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _read(rel: str) -> str:
+    with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _tmp_log(content: str) -> str:
+    """Write a synthetic pytest log and return its path."""
+    handle = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8")
+    with handle:
+        handle.write(content)
+    return handle.name
+
+
+def _run_gate(log_path: str, *args: str) -> "subprocess.CompletedProcess[str]":
+    """Run the real log guard, so these tests exercise the script and not a copy of it."""
+    return subprocess.run(
+        [sys.executable, "scripts/check_pytest_log.py", log_path, *args],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _active_step_env(step: str) -> "set[str]":
+    """The env keys a `run:` step really sets, ignoring commented-out ones.
+
+    A naive `"PGHOST:" in step` also matches `# PGHOST: "..."`, which is how a guard can
+    pass while the step provides nothing at all.
+    """
+    return set(re.findall(r"^\s{10}([A-Z][A-Z0-9_]*):", step, flags=re.MULTILINE))
+
+
+# --------------------------------------------------------------------------------------
+# F-40-A — only `backup-run` alerts, and every scheduling document must say so
+# --------------------------------------------------------------------------------------
+
+
+class TestOnlyTheAlertingCommandIsDocumentedForScheduling:
+    SCHEDULING_DOCS = (
+        "docs/operations/BACKUP_RESTORE.md",
+        "docs/deployment/PRODUCTION_DEPLOYMENT.md",
+        "docs/deployment/STAGING_DEPLOYMENT.md",
+    )
+    SHIPPED_SCHEDULERS = (
+        "deploy/cron/gerege-backup.cron",
+        "deploy/systemd/gerege-backup.service",
+    )
+
+    def test_the_shipped_schedulers_use_the_alerting_command(self):
+        """These are the artefacts that actually run on a host."""
+        for path in self.SHIPPED_SCHEDULERS:
+            text = _read(path)
+            assert "maintenance.py backup-run" in text, f"{path} does not use backup-run"
+            assert not re.search(r"maintenance\.py\s+backup\s+--label", text), (
+                f"{path} schedules the non-alerting `backup` command"
+            )
+
+    @pytest.mark.parametrize("path", SCHEDULING_DOCS)
+    def test_no_scheduling_document_recommends_the_non_alerting_command(self, path):
+        """The defect: BACKUP_RESTORE.md's cron block used `backup`, contradicting the
+        shipped units and the alerting guide."""
+        text = _read(path)
+        offenders = re.findall(r"maintenance\.py\s+backup\s+--label\s+daily_auto", text)
+        assert not offenders, (
+            f"{path} schedules `maintenance.py backup --label daily_auto`, which never "
+            "posts to BACKUP_ALERT_WEBHOOK"
+        )
+
+    @pytest.mark.parametrize("path", SCHEDULING_DOCS)
+    def test_every_scheduling_document_names_backup_run(self, path):
+        assert "maintenance.py backup-run" in _read(path), (
+            f"{path} describes scheduled backups without naming the only command that alerts"
+        )
+
+    def test_the_alerting_guide_and_the_runbook_agree(self):
+        alerting = _read("docs/ALERTING-SETUP.md")
+        assert "backup-run" in alerting
+        # The guide's claim is the authority the runbook must not contradict.
+        assert "BACKUP_ALERT_WEBHOOK" in alerting
+
+    def test_the_corrected_section_explains_why(self):
+        """A doc fix without the reason is reverted by the next person who tidies up."""
+        text = _read("docs/operations/BACKUP_RESTORE.md")
+        assert "F-40-A" in text, "the correction does not record the finding that caused it"
+        assert "does **not** post to" in text or "does not post to" in text
+
+
+class TestTheTwoBackupCommandsDifferAsDocumented:
+    """Behavioural, on the real CLI. No database is needed: the policy preflight refuses
+    first, which is exactly the path Phase 38 fixed for F-38-C and is where the two
+    command names diverge in what they tell an operator."""
+
+    @staticmethod
+    def _run(args, env_extra):
+        env = dict(os.environ)
+        env.pop("BACKUP_ALERT_WEBHOOK", None)  # the no-alert-configured case
+        env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, "scripts/maintenance.py", *args],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    def test_both_commands_exist_and_differ(self):
+        listing = subprocess.run(
+            [sys.executable, "scripts/maintenance.py", "--help"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        ).stdout
+        assert "backup-run" in listing, "the alerting command is gone"
+        assert re.search(r"\bbackup\b", listing), "the manual command is gone"
+
+    def test_only_backup_run_documents_the_alert_behaviour(self):
+        """`backup-run`'s docstring is where an operator learns that it alerts.
+
+        Three wrong versions of this test before it was right, each caught the same way:
+        its own negative control. `def cmd_backup(` is a PREFIX of `def cmd_backup_run(`,
+        so any `split("def cmd_backup(")` finds the wrong function; and cmd_backup has NO
+        docstring at all, so a naive "next triple-quoted string" read returns
+        cmd_backup_run's. The assertion is therefore made with an AST, which cannot
+        confuse two functions with a common prefix.
+        """
+        import ast
+
+        tree = ast.parse(_read("scripts/maintenance.py"))
+        docs = {
+            node.name: ast.get_docstring(node) or ""
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        assert "cmd_backup_run" in docs, "cmd_backup_run not found"
+        assert "alert" in docs["cmd_backup_run"].lower(), (
+            "backup-run's docstring no longer tells an operator that it alerts"
+        )
+
+        # cmd_backup must not claim to alert. It has no docstring today, which satisfies
+        # this; if one is added that promises alerting, this fails.
+        assert "alert" not in docs.get("cmd_backup", "").lower(), (
+            "cmd_backup's docstring claims alerting, but it never posts to the webhook"
+        )
+
+    def test_the_two_commands_have_distinct_documented_contracts(self):
+        """An operator must be able to tell them apart from `--help` alone."""
+        text = _read("scripts/maintenance.py")
+        assert '"backup-run", help="scheduled run: backup + encrypt + verify + retain + alert"' in text
+        manual_help = re.search(r'"backup",\s*help="([^"]+)"', text)
+        assert manual_help, "the manual command has no help text"
+        assert "alert" not in manual_help.group(1).lower(), manual_help.group(1)
+
+
+# --------------------------------------------------------------------------------------
+# F-40-B  MEDIUM  .env.example shipped a backup setting that no code path reads
+# --------------------------------------------------------------------------------------
+#
+# The template is the only configuration reference a new deployment has. It listed
+#
+#     BACKUP_OFFSITE_PATH=
+#     BACKUP_OFFSITE_MOUNT=./backups
+#
+# and only the first exists: `grep -rn BACKUP_OFFSITE_MOUNT` matches nothing under
+# core/, scripts/ or deploy/. The provider is chosen from BACKUP_OFFSITE_URL /
+# BACKUP_OFFSITE_PATH alone (core/backup_offsite.py:860, core/backup_automation.py:122),
+# so an operator who filled in the MOUNT form configured nothing, got
+# `OFFSITE_NOT_CONFIGURED` plus a warning, and left every backup on the host it is
+# supposed to survive. Measured on the shipped code before the fix:
+# `evaluate_offsite(dict(BACKUP_OFFSITE_MOUNT="./backups"))` returns provider None.
+
+#: Every variable name a comment may mention for historical context. Anything else that
+#: looks like a setting but is not assigned must be a real, read variable.
+def _assigned_env_names(text: str) -> set:
+    return set(re.findall(r"^([A-Z][A-Z0-9_]*)\s*=", text, flags=re.MULTILINE))
+
+
+def _documented_env_names(text: str) -> set:
+    """Names the file presents as settings: assignments plus `NAME` in pointy/backticked form."""
+    return _assigned_env_names(text) | set(re.findall(r"`([A-Z][A-Z0-9_]{3,})`", text))
+
+
+class TestF40BDeadBackupSetting:
+    def test_the_template_does_not_name_an_offsite_mount_setting(self):
+        """The MOUNT spelling must not be offered as a setting — nothing reads it."""
+        text = _read(".env.example")
+        assigned = _assigned_env_names(text)
+        assert "BACKUP_OFFSITE_MOUNT" not in assigned, (
+            ".env.example still ASSIGNS BACKUP_OFFSITE_MOUNT, which no code path reads; "
+            "the only recognised setting is BACKUP_OFFSITE_PATH"
+        )
+
+    def test_the_offsite_setting_the_template_offers_is_the_one_the_code_reads(self):
+        """Positive control: the surviving name must be a name the backup plane reads."""
+        text = _read(".env.example")
+        assert "BACKUP_OFFSITE_PATH" in _assigned_env_names(text), (
+            ".env.example must still offer BACKUP_OFFSITE_PATH: it is the variable that "
+            "actually selects the offsite destination"
+        )
+        readers = (
+            _read("core/backup_automation.py")
+            + _read("core/backup_offsite.py")
+        )
+        assert "BACKUP_OFFSITE_PATH" in readers, (
+            "BACKUP_OFFSITE_PATH is no longer read by the backup plane either — the "
+            "template and the code have drifted apart again"
+        )
+
+    def test_no_backup_setting_in_the_template_is_unread_by_the_code(self):
+        """Generalisation: every BACKUP_* the template assigns must appear in the code."""
+        template = _read(".env.example")
+        offered = {n for n in _assigned_env_names(template) if n.startswith("BACKUP_")}
+        assert offered, "the template assigns no BACKUP_* settings at all"
+        code = _read("core/backup_automation.py") + _read("core/backup_offsite.py") + _read(
+            "core/backup_policy.py"
+        ) + _read("core/backup_service.py") + _read("core/backup_crypto.py")
+        unread = sorted(n for n in offered if n not in code)
+        assert not unread, (
+            f".env.example assigns backup setting(s) that no backup module reads: {unread}. "
+            "An operator who sets these configures nothing."
+        )
+
+
+# --------------------------------------------------------------------------------------
+# F-40-C  MEDIUM  the worker needs more than Docker's 10 s stop grace to finish a batch
+# --------------------------------------------------------------------------------------
+#
+# Measured against a disposable PostgreSQL 16.2 and a live Redis, a single worker process
+# running the shipped `worker_main_loop`:
+#
+#   * idle (loop waiting on the shutdown event)          -> stopped in 0.00 s
+#   * after SIGTERM mid-tick, 25 x 1 s jobs in one batch  -> 23.34 s
+#   * the same shape measured earlier, 25 x 3 s jobs      -> 13.88 s (partial batch)
+#
+# `run_worker_tick` awaits `process_pending_jobs(batch_size=25)`, and that loop awaits
+# each handler, so the shutdown event is only observed between ticks. Docker's default
+# stop grace is 10 s and no compose file sets `stop_grace_period`; after 10 s the
+# container is SIGKILLed. The architecture is at-least-once with a 300 s visibility
+# timeout, so no job is lost — but the "graceful shutdown" the readiness documents
+# describe does not complete for the worker, and every redeploy can SIGKILL it mid-batch.
+#
+# The fix is configuration, not code: give the worker room to finish a batch.
+
+WORKER_DEFAULT_BATCH = 25
+DOCKER_DEFAULT_STOP_GRACE = 10
+
+
+def _worker_batch_size() -> int:
+    text = _read("worker.py")
+    match = re.search(r"process_pending_jobs\(batch_size=(\d+)\)", text)
+    assert match, "worker.py no longer calls process_pending_jobs(batch_size=N)"
+    return int(match.group(1))
+
+
+def _stop_grace_seconds(compose_text: str, service: str) -> int:
+    """Parse `stop_grace_period` for one compose service; 0 when absent."""
+    # `re.split` with a lookahead consumes nothing, so the two-space indent stays on the
+    # block; match the service name at the start of the captured text.
+    blocks = re.split(r"^  (?=[a-z_]+:)", compose_text, flags=re.MULTILINE)
+    for block in blocks:
+        if not block.startswith(f"{service}:"):
+            continue
+        match = re.search(r"stop_grace_period:\s*(\d+)\s*s", block)
+        return int(match.group(1)) if match else 0
+    raise AssertionError(f"service {service!r} not found in the compose file")
+
+
+class TestF40CWorkerStopGrace:
+    def test_the_worker_gets_more_stop_grace_than_docker_defaults_to(self):
+        """A worker that finishes a whole batch needs longer than 10 s."""
+        grace = _stop_grace_seconds(_read("docker-compose.prod.yml"), "worker")
+        assert grace > DOCKER_DEFAULT_STOP_GRACE, (
+            "docker-compose.prod.yml sets no stop_grace_period for `worker` (or one <= "
+            f"Docker's {DOCKER_DEFAULT_STOP_GRACE}s default), but a tick can run "
+            f"{_worker_batch_size()} handlers before the shutdown event is observed"
+        )
+
+    def test_staging_matches_production_so_the_rehearsal_measures_the_real_behaviour(self):
+        prod = _stop_grace_seconds(_read("docker-compose.prod.yml"), "worker")
+        staging = _stop_grace_seconds(_read("docker-compose.staging.yml"), "worker")
+        assert staging == prod, (
+            f"staging worker stop_grace_period={staging}s but production has {prod}s; the "
+            "staging rehearsal would then not exercise the production shutdown budget"
+        )
+
+    def test_the_grace_covers_a_full_batch_of_realistic_handlers(self):
+        """The configured grace must exceed a batch of handlers, not merely 10 s."""
+        grace = _stop_grace_seconds(_read("docker-compose.prod.yml"), "worker")
+        batch = _worker_batch_size()
+        # A handler slow enough to matter: the task_queue default timeout is 60 s, but a
+        # batch of those is not survivable by any sane grace, so the budget is stated for
+        # a handler of up to 2 s — the network-bound shape of this codebase's handlers
+        # (a Telegram send, a Sheets append, a Meta reply).
+        per_handler_ceiling_s = 2
+        assert grace >= batch * per_handler_ceiling_s, (
+            f"stop_grace_period={grace}s cannot cover one batch of {batch} handlers at "
+            f"{per_handler_ceiling_s}s each ({batch * per_handler_ceiling_s}s); the "
+            "container would still be SIGKILLed mid-batch"
+        )
+
+
+# --------------------------------------------------------------------------------------
+# F-40-D  MEDIUM  two thirds of a "227 tests" CI step skipped on every run
+# --------------------------------------------------------------------------------------
+#
+# The Phase 22/23/24 step claimed 227 cases. Measured in the job's own environment
+# (no P24_DR_DATABASE_URL, no DATABASE_URL, no offsite endpoint), 23 of those cases
+# skip:
+#
+#   tests/test_e07_phase24_disaster_recovery.py          11  (P24_DR_DATABASE_URL unset)
+#   tests/test_e07_phase22_db_bounds.py                   5  ("needs PostgreSQL")
+#   tests/test_e07_phase22_connection_bounds.py           3  ("needs a PostgreSQL DATABASE_URL")
+#   tests/test_e07_phase23_restore_verification.py        3  ("needs a PostgreSQL DATABASE_URL")
+#   tests/test_e07_phase22_backup_policy.py               1  ("needs PostgreSQL")
+#
+# and the guard could not see any of it, for two reasons that compound:
+#
+#   * the step passed --no-skip-check, so a SKIPPED line was not a failure;
+#   * --min-collected counts passed + skipped, so the skips satisfied the floor.
+#
+# A step that ran 204 cases while claiming 227, and silently dropped the whole disaster
+# -recovery suite, reported success. With a migrated disposable database owned by
+# gerege_owner and no offsite endpoint, the same selection is 227 passed, 1 skipped.
+
+
+def _phase29_backup_step() -> str:
+    """The workflow text of the Phase 22/23/24 backup step, plus its gate command."""
+    text = _read(".github/workflows/ci.yml")
+    start = text.index("Phase 22/23/24 — backup security")
+    end = text.index("Phase 29 — CI test integrity")
+    return text[start:end]
+
+
+class TestF40DSkippedBackupSuite:
+    def test_the_step_provides_the_dr_database_its_suite_requires(self):
+        """The DR file skips on one variable; the step must set it."""
+        step = _phase29_backup_step()
+        assert "P24_DR_DATABASE_URL" in _active_step_env(step), (
+            "the backup step does not set P24_DR_DATABASE_URL, so every case in "
+            "test_e07_phase24_disaster_recovery.py skips and the step still passes"
+        )
+        # Positive control: the test module really does gate on exactly this name.
+        module = _read("tests/test_e07_phase24_disaster_recovery.py")
+        assert 'os.getenv("P24_DR_DATABASE_URL"' in module
+
+    def test_the_step_provides_the_postgresql_url_the_other_suites_require(self):
+        """db_bounds / connection_bounds / restore_verification gate on DATABASE_URL."""
+        step = _phase29_backup_step()
+        assert "DATABASE_URL" in _active_step_env(step), (
+            "the backup step does not set DATABASE_URL, so the PostgreSQL-only cases in "
+            "db_bounds, connection_bounds, restore_verification and backup_policy skip"
+        )
+        for rel in (
+            "tests/test_e07_phase22_db_bounds.py",
+            "tests/test_e07_phase22_connection_bounds.py",
+            "tests/test_e07_phase23_restore_verification.py",
+        ):
+            body = _read(rel)
+            assert "DATABASE_URL" in body, rel
+
+    def test_the_gate_no_longer_disables_the_skip_check(self):
+        """A skip must be a failure unless it is named as the documented exception."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        assert "--no-skip-check" not in gate, (
+            "the backup gate still passes --no-skip-check, which is what allowed 23 "
+            "skipped cases to report as a passing step"
+        )
+
+    def test_the_gate_counts_passes_not_collected_cases(self):
+        """`collected = passed + skipped`, so a collected floor is satisfied by skips."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        assert "--min-passed" in gate, (
+            "the backup gate asserts collected cases (passed + skipped) rather than passes, "
+            "so skipped cases count toward the floor"
+        )
+        # And the mechanism this guards against is real, not hypothetical.
+        log_guard = _read("scripts/check_pytest_log.py")
+        assert "collected_total = (int(matches[-1]) if matches else 0) + skipped" in log_guard
+
+    def test_every_permitted_skip_exception_is_real(self):
+        """`--allow-skip` matches a NAME and `--allow-skip-file` a PATH; both must exist."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        names = re.findall(r'--allow-skip\s+"([^"]+)"', gate)
+        paths = re.findall(r'--allow-skip-file\s+"([^"]+)"', gate)
+        assert names or paths, "no skip exceptions: every S3 case would now fail the gate"
+        assert len(set(names)) == len(names), f"duplicate --allow-skip entries: {names}"
+        assert len(set(paths)) == len(paths), f"duplicate --allow-skip-file entries: {paths}"
+        corpus = "".join(
+            _read(rel)
+            for rel in (
+                "tests/test_e07_phase22_offsite_pagination.py",
+                "tests/test_e07_phase22_offsite_integrity.py",
+                "tests/test_e07_phase22_wal_copy_safety.py",
+            )
+        )
+        for name in names:
+            assert f"def {name}(" in corpus, f"--allow-skip names a non-existent test: {name}"
+        for path in paths:
+            assert os.path.exists(os.path.join(REPO_ROOT, path)), (
+                f"--allow-skip-file names a file that does not exist: {path}"
+            )
+
+    def test_no_offsite_suite_is_excused_from_the_skip_check(self):
+        """Phase 41 CLOSED this gap, so the assertion is inverted rather than deleted.
+
+        Phase 40 recorded four `--allow-skip-file` exceptions for the S3 suites and this
+        test checked they were justified. They were: those modules gate on an endpoint CI
+        did not provide. Phase 41 provides one, which makes the exceptions wrong - they
+        would now hide a skip in a suite that is supposed to run.
+
+        Deleting the test would delete the memory of why the exceptions existed. Keeping it
+        as an inversion means a future `--allow-skip-file` on an offsite suite fails here
+        with an explanation, instead of quietly reappearing.
+        """
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        paths = re.findall(r'--allow-skip-file\s+"([^"]+)"', gate)
+        offsite = [p for p in paths if "offsite" in os.path.basename(p)]
+        assert not offsite, (
+            f"the gate still excuses offsite suites: {offsite}. CI now runs an S3 endpoint "
+            "(moto on 127.0.0.1:5062), so a skip in these suites means the endpoint failed "
+            "and must fail the gate."
+        )
+        # Positive control: those suites really do gate on the endpoint, which is why they
+        # were excused - and why the endpoint's presence is what makes the exception wrong.
+        for rel in (
+            "tests/test_e07_phase22_offsite_pagination.py",
+            "tests/test_e07_phase22_offsite_integrity.py",
+            "tests/test_e07_phase22_offsite_status.py",
+            "tests/test_e07_phase24_offsite_integration.py",
+        ):
+            body = _read(rel)
+            assert "BACKUP_OFFSITE_TEST_ENDPOINT" in body or "_available()" in body, rel
+
+    def test_the_postgresql_suites_are_not_exempt_from_the_skip_check(self):
+        """The 23 cases F-40-D recovered are exactly the ones that must not be excused."""
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        paths = set(re.findall(r'--allow-skip-file\s+"([^"]+)"', gate))
+        for pg_suite in (
+            "tests/test_e07_phase22_db_bounds.py",
+            "tests/test_e07_phase22_connection_bounds.py",
+            "tests/test_e07_phase23_restore_verification.py",
+            "tests/test_e07_phase22_backup_policy.py",
+            "tests/test_e07_phase22_recovery_safety.py",
+            "tests/test_e07_phase24_disaster_recovery.py",
+        ):
+            assert pg_suite not in paths, (
+                f"{pg_suite} is exempted from the skip check - the PostgreSQL/DR cases "
+                "must run in CI, which is the whole point of F-40-D"
+            )
+
+    def test_the_step_provides_the_libpq_variables_recovery_safety_needs(self):
+        """Seven cases provision their own database and read plain PG* variables."""
+        step = _phase29_backup_step()
+        active = _active_step_env(step)
+        for var in ("PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"):
+            assert var in active, (
+                f"the step does not set {var}; recovery_safety provisioning reads libpq "
+                "PG* variables, and a shell export in another step does not reach here"
+            )
+        module = _read("tests/test_e07_phase22_recovery_safety.py")
+        for var in ("PGHOST", "PGUSER", "PGPASSWORD"):
+            assert f'os.getenv("{var}"' in module, var
+        # Those seven cases then connect as gerege_owner, and the job's server uses
+        # scram-sha-256, so the role's real password has to be in this step. Without it the
+        # fixture cannot connect and the seven cases skip - which is exactly what the one CI
+        # run that got this far reported.
+        assert "GEREGE_OWNER_PASSWORD" in active, (
+            "the step does not set GEREGE_OWNER_PASSWORD; the recovery_safety fixture "
+            "connects as gerege_owner, and a scram-authenticated server will not accept a "
+            "password the suite invented"
+        )
+        assert "GEREGE_OWNER_PASSWORD" in module, (
+            "recovery_safety no longer reads GEREGE_OWNER_PASSWORD for its owner DSN, so "
+            "the step's value is not the one this suite connects with"
+        )
+
+    def test_the_owner_password_the_step_sets_is_the_one_it_provisioned_with(self):
+        """Two steps, one role: if they disagree the suite rotates its own credential."""
+        text = _read(".github/workflows/ci.yml")
+        step = _phase29_backup_step()
+        provisioned = re.findall(r'GEREGE_OWNER_PASSWORD: "([^"]+)"', text)
+        assert provisioned, "no step sets GEREGE_OWNER_PASSWORD"
+        assert len(set(provisioned)) == 1, (
+            f"the workflow provisions gerege_owner with more than one password: {provisioned}"
+        )
+        assert f'GEREGE_OWNER_PASSWORD: "{provisioned[0]}"' in step, (
+            "the backup step's GEREGE_OWNER_PASSWORD differs from the provisioning step's"
+        )
+
+    def test_a_log_that_names_no_skips_is_not_treated_as_clean(self):
+        """`-q` prints "33 skipped" but names none of them, and that is not a pass.
+
+        Two separate defects lived here. --min-collected counted per-case "SKIPPED ["
+        markers, which exist only under -v, so one suite reported 195 collected under -q
+        and 228 under -v. And once the count came from the summary instead, a -q log passed
+        the skip check by having nothing for it to inspect: the gate read "33 skipped" and
+        agreed, because there was no line to disagree with. Both are the same mistake -
+        treating silence as evidence.
+        """
+        # Real -q output: a dot per pass, an "s" per skip, no per-case lines, no reasons.
+        quiet = _tmp_log("s..\n=== 2 passed, 1 skipped in 1.0s ===\n")
+        result = _run_gate(quiet, "--allow-skip", "test_a")
+        assert result.returncode == 1, result.stdout
+        assert "names none of them" in result.stdout, result.stdout
+
+        # --min-collected reads the summary's "N skipped", not the markers, so the same log
+        # resolves to 3 collected. Checked without the skip check, which would stop first:
+        # the two questions are independent and a gate that conflates them cannot be read.
+        counted = _run_gate(
+            quiet, "--min-collected", "3", "--require-summary", "--no-skip-check"
+        )
+        assert counted.returncode == 0, counted.stdout
+        assert "3 collected" in counted.stdout, counted.stdout
+
+
+    def test_the_pass_floor_is_below_the_measured_count_and_the_comment_says_which(self):
+        """A floor above the real count fails every run; the comment is how that is caught.
+
+        This bit twice: the gate was written with --min-passed 195 while CI measures 181,
+        and the comment beside it claimed 202. Both numbers were guesses about an
+        environment that had already been measured, and neither was reconciled with the
+        other. The comment is the record of the measurement, so the code is checked against
+        it here rather than in a CI cycle.
+        """
+        step = _phase29_backup_step()
+        gate = step[step.index("check_pytest_log.py"):]
+        floor = int(re.search(r"--min-passed (\d+)", gate).group(1))
+        collected = int(re.search(r"--min-collected (\d+)", gate).group(1))
+        measured = re.search(r"(\d+) passed, (\d+) skipped, (\d+) collected", step)
+        assert measured, "the step does not record what CI measured; a floor with no record is a guess"
+        passed, skipped, collected_measured = (int(group) for group in measured.groups())
+        assert passed + skipped == collected_measured, (
+            f"the recorded measurement is internally inconsistent: {passed} + {skipped} != "
+            f"{collected_measured}"
+        )
+        assert floor <= passed, (
+            f"--min-passed {floor} exceeds the measured {passed} passed, so this step fails "
+            "on every run regardless of the code"
+        )
+        assert collected == collected_measured, (
+            f"--min-collected {collected} does not match the recorded {collected_measured}"
+        )
+
+
+class TestF40CDeploymentRunbookStatesTheBudget:
+    """An operator deciding whether a stop is safe needs the number, not the word."""
+
+    def test_the_runbook_documents_the_measured_stop_times(self):
+        text = _read("docs/operations/DEPLOYMENT.md")
+        assert "stop_grace_period" in text, (
+            "DEPLOYMENT.md does not mention stop_grace_period, so an operator has no way to "
+            "know a worker stop can exceed Docker's 10 s default"
+        )
+        assert "23.3 s" in text or "23.34 s" in text, (
+            "the measured worker stop time is not in the runbook"
+        )
+
+    def test_the_runbook_numbers_match_the_configuration(self):
+        """The documented budget must be the one the compose file actually sets."""
+        text = _read("docs/operations/DEPLOYMENT.md")
+        grace = _stop_grace_seconds(_read("docker-compose.prod.yml"), "worker")
+        assert f"{grace}s" in text.replace("`", ""), (
+            f"DEPLOYMENT.md does not state the configured {grace}s worker stop grace"
+        )

@@ -21,7 +21,7 @@ Previously, `core/db_engine.py` defined a SQLAlchemy engine while `database.py` 
 
 ## 2. Unified Authoritative Schema (`core/models.py` & `database.py`)
 
-All 15 tables in `core/models.py`, `database.py`, and Alembic migration `0001_initial_enterprise_schema.py` have identical table and column names:
+All 17 tables the migration tool copies (`MIGRATION_TABLES` in `scripts/migrate_sqlite_to_postgres.py`) have identical table and column names in `core/models.py`, `database.py`, and the Alembic migrations. `core/models.py` defines 18; the extra one, `page_login_namespace`, is created by migration 0006 and holds no source rows to transfer:
 
 | # | Table Name | Primary Key | Tenant Key | Key Indexes / Unique Constraints |
 |---|---|---|---|---|
@@ -69,13 +69,15 @@ python scripts/migrate_sqlite_to_postgres.py --sqlite-path registrations.db --dr
 
 ### 4.2 Live Migration to PostgreSQL
 ```bash
+# Export the target URL instead of passing it on the command line. A password in argv is
+# visible to every local user through `ps` and is written to your shell history.
+export DATABASE_URL="postgresql://gerege:$(cat /run/secrets/gerege_db_password)@localhost:5432/gerege_db"
 python scripts/migrate_sqlite_to_postgres.py \
   --sqlite-path registrations.db \
-  --postgres-url "postgresql://gerege:STRONG_PASS@localhost:5432/gerege_db" \
   --report backups/migration_report.json
 ```
 
 ### 4.3 Safety Guarantees
 1. **Consistent Snapshot:** Uses `sqlite3.backup()` to copy `registrations.db` to an isolated temporary snapshot before reading, avoiding any locks on live traffic.
 2. **Idempotent Upserts:** Uses `ON CONFLICT (...) DO NOTHING` and advances PostgreSQL `SERIAL` sequences (`setval(pg_get_serial_sequence(...))`) so re-running never duplicates records.
-3. **Automated Verification:** Compares source vs. target row counts across all 15 tables and verifies financial sums (`SUM(amount)` on `invoices`, `SUM(amount) WHERE status='PAID'`, and `SUM(price_amount)` on `cargo_packages`).
+3. **Automated Verification:** Compares source vs. target row counts across all 17 tables and verifies financial sums (`SUM(amount)` on `invoices`, `SUM(amount) WHERE status='PAID'`, and `SUM(price_amount)` on `cargo_packages`).

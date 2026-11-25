@@ -1,0 +1,116 @@
+===============================================================================
+E-02 Phase 4.4 — LIVE evidence: two real Uvicorn workers + shared Redis
+Implementation commit: 505184e (working tree, pre-commit)
+Date: 2026-11-17T05:21:49Z
+===============================================================================
+seeded 2 accounts into /home/user/gerege-ai-agent/.scratch/sim44.db
+
+==============================================================================
+Setup
+==============================================================================
+2 workers, port 8176, Redis redis://127.0.0.1:6379/0
+health: 200
+distinct worker pids that SERVED requests: ['87433', '87434']
+  [PASS] two distinct workers served requests  — pids=['87433', '87434']
+
+==============================================================================
+A. Mixed windows — the generation's window is fixed at creation (Redis)
+==============================================================================
+  same generation across both admissions : True
+  token windows (5s call, 900s call)     : 5s, 5s
+  count after the 5s window passed       : 0
+  refund of the 900s token               : False
+  [PASS] one generation, one effective window
+  [PASS] the long token does not extend the generation
+  [PASS] the generation expired on its own window
+  [PASS] refund after that expiry is refused
+
+==============================================================================
+B. Mixed windows — reverse order (900s then 5s)
+==============================================================================
+  TTL after 900s call / after 5s call: 900 / 900
+  token B's reported window          : 900s
+  count after 5.6s                   : 2
+  refund B (5s caller token)         : True
+  refund A (900s caller token)       : True
+  [PASS] a later short call does not shorten the TTL
+  [PASS] the 5s token reports the generation's real window
+  [PASS] generation still live after 5.6s
+  [PASS] both tokens refundable once
+
+==============================================================================
+C. Capacity pressure cannot erase a live account budget
+==============================================================================
+  cap raised to 50 for this arm
+  victim at 19 of 20 failures before pressure
+  fillers admitted/refused: 49/351
+  victim count after pressure: 19
+  victim's next attempt: allowed=True count=20
+  [PASS] live budget survived capacity pressure
+  [PASS] the victim was not handed a fresh budget
+  [PASS] new identities are refused at capacity
+  [PASS] refused admissions get no token
+
+==============================================================================
+D. Expired refund, duplicate refund, cross-worker replay (Redis)
+==============================================================================
+  expired refund: False
+  first refund: True / replay: False / count: 3
+  [PASS] expired refund refused
+  [PASS] duplicate refund refused
+  [PASS] count reflects exactly one refund
+
+==============================================================================
+E. Cross-worker token replay through the real request path
+==============================================================================
+  first process: refund=True count=2
+  second process replay -> False count=2
+  [PASS] cross-process replay of a used token is refused
+  [PASS] count unchanged by the replay
+
+==============================================================================
+F. Redis key/TTL shape
+==============================================================================
+  counters=2 gen=2 claims=4
+    ratelimit:auth_account:36b6507752954d3fccdaa7dd4c9690cd value=2 ttl=60
+    ratelimit:auth_account:4acf04acd6d349c8bffaff1c615c0bdc value=3 ttl=59
+    ratelimit:auth_account:36b6507752954d3fccdaa7dd4c9690cd:gen:refunded:fc0529d058a0a280:be83ebed6c6f6064 ttl=60
+    ratelimit:auth_account:4acf04acd6d349c8bffaff1c615c0bdc:gen:refunded:114f6d09a5af6eb3:4d49174c621b23a5 ttl=891
+  [PASS] no plaintext identifier in any key  — leaked=[]
+  [PASS] every counter has a TTL
+  [PASS] every claim key has a TTL
+
+==============================================================================
+G. Worker arm: threshold and login still correct across both processes
+==============================================================================
+  first 429 at attempt 21 (threshold 20)
+  [PASS] threshold still 20 across workers and aliases
+  successful login status: 200 | Globex count: 2
+  [PASS] login still works
+  [PASS] second account unaffected by this section's traffic  — expected 2, got 2
+
+==============================================================================
+H. Serving process refuses to start without E02_ACCOUNT_KEY_SECRET
+==============================================================================
+  exit code: 3
+    
+    ERROR:    Application startup failed. Exiting.
+  [PASS] production refuses to start without the secret
+
+==============================================================================
+RESULT: ALL CHECKS PASSED
+==============================================================================
+
+--- worker output (tail) ---
+INFO:     Terminated child process [87434]
+INFO:     Waiting for child process [87433]
+INFO:     Shutting down
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [87434]
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [87433]
+INFO:     Waiting for child process [87434]
+INFO:     Stopping parent process [87431]

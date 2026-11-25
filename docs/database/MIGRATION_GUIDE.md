@@ -2,7 +2,7 @@
 
 ## 1. Overview (`scripts/migrate_sqlite_to_postgres.py`)
 
-The migration pipeline transfers all 15 tables from SQLite (`leads.db`) to PostgreSQL 16 (or a target SQLite database) with deterministic row-level and table-level verification:
+The migration pipeline transfers the 17 tables in `MIGRATION_TABLES` from SQLite (`leads.db`) to PostgreSQL 16 (or a target SQLite database) with deterministic row-level and table-level verification:
 - **Safe Online Snapshot**: Creates a temporary consistent snapshot via `sqlite3.Connection.backup()` before reading.
 - **Batch Processing**: Streams rows ordered by primary key in configurable batches (`--batch-size 500`).
 - **Deterministic Row & Table Checksums**: Computes canonical JSON SHA-256 hashes (`compute_canonical_row_hash`, `compute_table_checksum`) across all columns for every table.
@@ -36,6 +36,6 @@ python scripts/migrate_sqlite_to_postgres.py \
 
 The script only returns exit code `0` when all of the following hold:
 1. `conflicts == []` (zero conflicting rows).
-2. `source_count == target_count` for all 15 tables.
-3. `source_checksum == target_checksum` (SHA-256 canonical table hash) for all 15 tables.
+2. `source_count == target_count` for all 17 tables.
+3. `source_checksum == target_checksum` (SHA-256 canonical table hash) for all 17 tables.
 4. `paid_revenue_match == True` and `pending_revenue_match == True` (exact financial MNT equality).

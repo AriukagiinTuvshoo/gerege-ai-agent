@@ -47,6 +47,12 @@ async def dispatch_channel_message(
                 if res.status_code == 200:
                     database.save_chat_message(page_id, sender_id, "telegram", "bot", message_text)
                     return True
+                # E-33-1: a non-200 (e.g. 403 "bot was blocked by the user") used to fall
+                # through this branch into the generic fallback below, which returns True
+                # and persists the message. The caller then counted an undelivered message
+                # as delivered and wrote a "bot" row the customer never received.
+                logger.warning(f"Telegram dispatch non-200 [{res.status_code}] to {sender_id}: {getattr(res, 'text', '')}")
+                return False
         except Exception as e:
             logger.error(f"Telegram dispatch error to {sender_id}: {e}")
             return False
@@ -84,9 +90,22 @@ async def dispatch_channel_message(
 # -------------------------------------------------------------
 # 2. АВТОМАТ СЭРГЭЭХ ДҮРМҮҮДИЙГ АЖИЛЛУУЛАХ (CRON / LOOP)
 # -------------------------------------------------------------
-async def run_automated_retention_checks(base_url: str = "http://localhost:8000") -> Dict[str, Any]:
-    """Бүх хуудсын хувьд идэвхтэй дүрмүүдийг шалгаж, харилцагчид руу авто-сануулга илгээх"""
-    pages = database.get_all_pages()
+async def run_automated_retention_checks(
+    base_url: str = "http://localhost:8000",
+    page_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Идэвхтэй дүрмүүдийг шалгаж, харилцагчид руу авто-сануулга илгээх.
+
+    `page_id` given restricts the run to that one tenant. F-34-2: the manual trigger
+    endpoint used to call this with no argument, so the scheduler's all-tenants sweep ran
+    with whatever identity the HTTP caller had — a `client` scoped to tenant A could make
+    the server send follow-ups into tenants B and C. The scheduler still sweeps every
+    tenant; the HTTP path now passes the caller's scope.
+    """
+    if page_id:
+        pages = [p for p in database.get_all_pages() if str(p.get("page_id")) == str(page_id)]
+    else:
+        pages = database.get_all_pages()
     stats = {
         "abandoned_sent": 0,
         "cargo_pickup_sent": 0,

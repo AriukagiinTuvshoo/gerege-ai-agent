@@ -1,8 +1,8 @@
 import os
 import re
-import ast
 import sqlite3
 import logging
+import threading
 from typing import Optional, Any, List, Sequence, Dict, Set
 from dotenv import load_dotenv
 
@@ -13,12 +13,53 @@ _SQLALCHEMY_ENGINE = None
 _ENGINE_URL = None
 
 
+def _sqlite_path_from_url(url: str) -> Optional[str]:
+    """Extract the filesystem path from a SQLite SQLAlchemy URL.
+
+    `sqlite:///relative.db` -> ``relative.db``, `sqlite:////abs/x.db` -> ``/abs/x.db``.
+    Returns ``None`` for in-memory databases and for non-SQLite URLs, so callers can
+    fall back to the next source of truth.
+    """
+    if not url.startswith("sqlite"):
+        return None
+    _scheme, _, rest = url.partition("://")
+    # `sqlite://` (in-memory) and `sqlite:///:memory:` have no usable file path.
+    if not rest or rest in (":memory:", "/:memory:"):
+        return None
+    # A three-slash URL is relative (`rest` carries no leading slash); four slashes
+    # leave the absolute path intact. Strip the one separator SQLAlchemy adds.
+    path = rest[1:] if rest.startswith("/") else rest
+    # `sqlite:////:memory:` leaves `/:memory:` after stripping the separator; both spellings
+    # mean "in memory", not "a file literally named :memory:".
+    if not path or path.lstrip("/") in ("", ":memory:"):
+        return None
+    return path
+
+
 def get_sqlite_db_path(default_path: Optional[str] = None) -> str:
+    """Resolve the SQLite file the application reads and writes.
+
+    Precedence, most specific first:
+
+    1. ``default_path`` — an explicit argument (``database.resolved_sqlite_path()``).
+    2. ``DB_PATH``       — the SQLite-specific override.
+    3. ``DATABASE_URL``  — when it is a *SQLite* URL, its path.
+    4. the repository ``leads.db``.
+
+    Step 3 (E-33-2) closes a split-brain: `get_database_url()` honoured a SQLite
+    `DATABASE_URL` while `get_db_connection()` ignored it and opened `leads.db`, so
+    Alembic migrated the URL's file while every repository read and wrote a different
+    one. Any caller that set ``DATABASE_URL=sqlite:///...`` to isolate itself got the
+    opposite of isolation — it kept writing to the repository database.
+    """
     if default_path:
         return default_path
     env_path = os.getenv("DB_PATH", "").strip()
     if env_path:
         return env_path
+    url_path = _sqlite_path_from_url(os.getenv("DATABASE_URL", "").strip())
+    if url_path:
+        return url_path
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "leads.db")
 
 
@@ -43,11 +84,83 @@ def is_postgres() -> bool:
     return get_database_url().startswith("postgresql")
 
 
+#: Per-process-role pool defaults for PostgreSQL (Phase 36).
+#:
+#: Phase 35 measured the pool configuration against the server ceiling and found the two
+#: were unrelated: every process used the same 10+20 defaults regardless of what it
+#: actually does. A budget of 2 x 30 (API) + 30 (worker) = 90 against
+#: ``max_connections=100`` leaves no room for migrations, backups or an operator's psql.
+#:
+#: These defaults are sized from observed concurrency, not guessed:
+#:
+#: ``api``     uvicorn serves on a threadpool, so it genuinely needs several concurrent
+#:             connections. 5+5 = 10 per process; 2 workers = 20.
+#: ``worker``  ``task_queue.process_pending_jobs`` awaits handlers in a sequential
+#:             ``for`` loop and the worker's scheduler ticks are sequential too, so one
+#:             connection is in flight at a time. 2+2 = 4 is generous.
+#: ``maintenance`` one-shot CLIs (backup/restore/prune/provision) that run one statement
+#:             at a time. 2+1 = 3.
+#:
+#: ``DB_POOL_SIZE`` / ``DB_MAX_OVERFLOW`` still override everything, so existing
+#: deployments and the SQLite test suite are unaffected.
+POOL_DEFAULTS_BY_ROLE = {
+    "api": (5, 5),
+    "worker": (2, 2),
+    "maintenance": (2, 1),
+}
+#: Role used when ``DB_PROCESS_ROLE`` is unset or unrecognised. The historical 10+20 is
+#: deliberately *not* the fallback: an unlabelled process that inherits the old values is
+#: exactly how the budget drifted in the first place.
+DEFAULT_PROCESS_ROLE = "api"
+
+
+def resolve_process_role() -> str:
+    """Which pool profile this process should use.
+
+    ``DB_PROCESS_ROLE`` is explicit so the budget is a deployment decision rather than an
+    inference. Compose sets it per service; a developer running ``uvicorn`` locally gets
+    ``api`` by default.
+    """
+    role = (os.getenv("DB_PROCESS_ROLE") or DEFAULT_PROCESS_ROLE).strip().lower()
+    if role not in POOL_DEFAULTS_BY_ROLE:
+        logger.warning(
+            "unknown DB_PROCESS_ROLE=%r; falling back to %r (valid: %s)",
+            role, DEFAULT_PROCESS_ROLE, ", ".join(sorted(POOL_DEFAULTS_BY_ROLE)),
+        )
+        return DEFAULT_PROCESS_ROLE
+    return role
+
+
+def resolve_pool_settings() -> Dict[str, Any]:
+    """Resolve pool size, overflow, timeout and role for this process.
+
+    Explicit ``DB_POOL_SIZE`` / ``DB_MAX_OVERFLOW`` always win, which keeps every existing
+    deployment and test that sets them working unchanged.
+    """
+    role = resolve_process_role()
+    default_size, default_overflow = POOL_DEFAULTS_BY_ROLE[role]
+    return {
+        "role": role,
+        "pool_size": int(os.getenv("DB_POOL_SIZE", str(default_size))),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", str(default_overflow))),
+        "pool_timeout": float(os.getenv("DB_POOL_TIMEOUT", "30")),
+        # Phase 36 (F-36-1). The application pool had NO client-side connect bound:
+        # `pool_timeout` only bounds waiting for a free slot, not the TCP connect itself.
+        # Measured against an unroutable address, `engine.connect()` hung until the OS
+        # gave up (~63s here at tcp_syn_retries=6; macOS/Linux defaults can exceed 75s),
+        # while the backup path with `connect_timeout=10` failed at exactly 10.0s.
+        # A slot stuck in connect is never returned, so an unreachable database turns
+        # into a stalled pool rather than a clean error.
+        "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+    }
+
+
 def create_sqlalchemy_engine(db_url: Optional[str] = None):
     """SQLAlchemy Engine үүсгэх (PostgreSQL QueuePool эсвэл SQLite WAL)"""
     from sqlalchemy import create_engine, event
 
     url = db_url or get_database_url()
+    pool = resolve_pool_settings()
     if url.startswith("sqlite"):
         engine = create_engine(
             url,
@@ -65,15 +178,64 @@ def create_sqlalchemy_engine(db_url: Optional[str] = None):
 
         return engine
     else:
-        return create_engine(
+        engine = create_engine(
             url,
-            pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
-            max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
-            pool_timeout=float(os.getenv("DB_POOL_TIMEOUT", "30")),
+            pool_size=pool["pool_size"],
+            max_overflow=pool["max_overflow"],
+            pool_timeout=pool["pool_timeout"],
+            # F-36-1: bound the TCP connect. Without this a blackholed/unreachable
+            # server leaves the slot checked out until the OS TCP stack gives up.
+            connect_args={"connect_timeout": pool["connect_timeout"]},
             pool_pre_ping=True,
             pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
             future=True,
         )
+
+        @event.listens_for(engine, "connect")
+        def _set_pg_session_bounds(dbapi_connection, connection_record):
+            """Bound every pooled session, not just the maintenance ones.
+
+            Phase 22 (P21-09). `core.db_bounds` bounds the backup/restore path, but the
+            application pool had all three timeouts at `0`. That matters because ~53
+            helpers acquire a connection and close it without `try/finally`; when an
+            exception unwinds and something retains the traceback (logging with
+            `exc_info`, an exception group, a stored test failure), the frame keeps the
+            connection alive. Reproduced: 5 such failures held 5 connections in
+            `idle in transaction`, retaining their row locks for as long as the traceback
+            lived - and with `idle_in_transaction_session_timeout = 0` nothing on the
+            server reclaims them. That is the exact mechanism that blocked the
+            `_reset_public_schema` ACCESS EXCLUSIVE lock and turned a recoverable restore
+            rollback into a hang.
+
+            The server-side bounds are the backstop for the client-side leak: a connection
+            that is abandoned mid-transaction is now rolled back by PostgreSQL after
+            `idle_in_transaction_session_timeout`, releasing its locks. `statement_timeout`
+            additionally stops a single pathological query from pinning a pool slot.
+
+            Values are generous enough not to alter behaviour under normal load, and each
+            is overridable. Set any of them to 0 to disable that bound (not recommended).
+            """
+            statements = (
+                ("idle_in_transaction_session_timeout",
+                 os.getenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "60000")),
+                ("statement_timeout", os.getenv("DB_STATEMENT_TIMEOUT_MS", "300000")),
+                ("lock_timeout", os.getenv("DB_LOCK_TIMEOUT_MS", "30000")),
+            )
+            cursor = dbapi_connection.cursor()
+            try:
+                for name, value in statements:
+                    cursor.execute(f"SET {name} = {int(value)}")
+                cursor.execute("SELECT 1")
+            except Exception:
+                # A session that refuses these SETs must not break every connection; the
+                # pool would become unusable. Report and continue unbounded rather than
+                # fail closed here, because this is a defence-in-depth backstop and the
+                # product must still serve traffic.
+                logger.warning("could not apply PostgreSQL session bounds")
+            finally:
+                cursor.close()
+
+        return engine
 
 
 def get_shared_engine():
@@ -101,6 +263,153 @@ def dispose_shared_engine() -> None:
         finally:
             _SQLALCHEMY_ENGINE = None
             _ENGINE_URL = None
+
+
+def compute_connection_budget(
+    api_processes: int = 1,
+    worker_processes: int = 1,
+    maintenance_processes: int = 1,
+    server_max_connections: int = 100,
+    reserved_superuser: int = 3,
+) -> Dict[str, Any]:
+    """Account for every PostgreSQL connection the stack will open.
+
+    Phase 35 found no guard anywhere in the codebase compared the pool configuration to
+    the server limit, so an over-subscribed deployment failed at runtime as ordinary
+    application errors instead of at deploy time with a clear message.
+
+    The budget is computed from what each role actually does (see
+    ``POOL_DEFAULTS_BY_ROLE``), not from a single global assumption:
+
+    * API processes are multiplied by uvicorn's worker count, because the engine is a
+      per-process singleton (``_SQLALCHEMY_ENGINE``) - each fork gets its own pool.
+    * The worker is a single sequential asyncio loop, so it is counted once.
+    * ``maintenance``/``migrate`` are one-shot and usually run while ``web`` and
+      ``worker`` are still up during a deploy, so they must fit in the same ceiling.
+
+    Returns a dict with the per-role breakdown and ``fits`` (bool).
+    """
+    def _per(role: str, explicit: Optional[Dict[str, int]] = None):
+        size, overflow = POOL_DEFAULTS_BY_ROLE[role]
+        if explicit:
+            size = explicit.get("pool_size", size)
+            overflow = explicit.get("max_overflow", overflow)
+        return size + overflow
+
+    api_each = _per("api")
+    worker_each = _per("worker")
+    maint_each = _per("maintenance")
+
+    lines = {
+        "api": {"processes": api_processes, "per_process": api_each,
+                "total": api_processes * api_each},
+        "worker": {"processes": worker_processes, "per_process": worker_each,
+                   "total": worker_processes * worker_each},
+        "maintenance": {"processes": maintenance_processes, "per_process": maint_each,
+                        "total": maintenance_processes * maint_each},
+    }
+    total = sum(v["total"] for v in lines.values())
+    usable = server_max_connections - reserved_superuser
+    return {
+        "breakdown": lines,
+        "total_required": total,
+        "server_max_connections": server_max_connections,
+        "reserved_superuser": reserved_superuser,
+        "usable": usable,
+        "headroom": usable - total,
+        "fits": total <= usable,
+    }
+
+
+def connection_budget_from_env(api_processes: int = 1) -> Dict[str, Any]:
+    """Build the budget from the *current* process's resolved settings.
+
+    ``api_processes`` should be the real uvicorn ``--workers`` value at the call site.
+    """
+    settings = resolve_pool_settings()
+    budget = compute_connection_budget(
+        api_processes=api_processes,
+        server_max_connections=int(os.getenv("PG_MAX_CONNECTIONS", "100")),
+        reserved_superuser=int(os.getenv("PG_SUPERUSER_RESERVED", "3")),
+    )
+    # An explicit override changes this process's own footprint.
+    role = settings["role"]
+    own = settings["pool_size"] + settings["max_overflow"]
+    base = POOL_DEFAULTS_BY_ROLE[role]
+    if own != sum(base):
+        delta = own - sum(base)
+        budget["breakdown"][role]["per_process"] = own
+        budget["breakdown"][role]["total"] = (
+            budget["breakdown"][role]["processes"] * own
+        )
+        budget["total_required"] += delta * budget["breakdown"][role]["processes"]
+        budget["headroom"] = budget["usable"] - budget["total_required"]
+        budget["fits"] = budget["total_required"] <= budget["usable"]
+    return budget
+
+
+def enforce_connection_budget(api_processes: int = 1, strict: Optional[bool] = None) -> Dict[str, Any]:
+    """Warn (or raise) when the configured pool cannot fit the server.
+
+    Fail-safe policy, mirroring how the rest of this codebase treats production:
+
+    * Never raises for SQLite - the test suite and local dev must not care.
+    * In production (``is_production_mode()``) an over-budget configuration raises
+      ``RuntimeError`` at startup, because the alternative is discovering it as random
+      errors during peak traffic.
+    * Outside production it logs a loud warning and continues, so a developer with a
+      small laptop PostgreSQL can still run the app.
+    * ``strict`` overrides the production default; ``DB_STRICT_CONNECTION_BUDGET=0``
+      is the explicit escape hatch and is logged so it can never be silent.
+    """
+    if not is_postgres():
+        return {"enforced": False, "reason": "sqlite"}
+
+    budget = connection_budget_from_env(api_processes=api_processes)
+    if strict is None:
+        strict = _is_production_mode()
+        if os.getenv("DB_STRICT_CONNECTION_BUDGET", "").strip().lower() in ("0", "false", "no"):
+            strict = False
+            logger.warning(
+                "DB_STRICT_CONNECTION_BUDGET=0 set; connection budget will not fail the "
+                "process (total required=%s, usable=%s)",
+                budget["total_required"], budget["usable"],
+            )
+
+    if budget["fits"]:
+        logger.info(
+            "connection budget OK: %s required, %s usable (headroom %s) - role=%s",
+            budget["total_required"], budget["usable"], budget["headroom"],
+            budget.get("role", resolve_process_role()),
+        )
+        return {"enforced": strict, "ok": True, **budget}
+
+    detail = ", ".join(
+        f"{name}={v['total']} ({v['processes']}x{v['per_process']})"
+        for name, v in budget["breakdown"].items()
+    )
+    message = (
+        "PostgreSQL connection budget exceeded: "
+        f"{budget['total_required']} connections required > {budget['usable']} usable "
+        f"(max_connections={budget['server_max_connections']} - "
+        f"{budget['reserved_superuser']} reserved). Breakdown: {detail}. "
+        "Lower DB_POOL_SIZE/DB_MAX_OVERFLOW, set DB_PROCESS_ROLE per service, or raise "
+        "PostgreSQL max_connections."
+    )
+    if strict:
+        raise RuntimeError(message)
+    logger.warning(message)
+    return {"enforced": False, "ok": False, **budget}
+
+
+def _is_production_mode() -> bool:
+    """Local copy to avoid importing core.security at module import time.
+
+    ``core.security`` imports request-handling dependencies; ``db_engine`` is imported by
+    the worker and by CLI scripts that must not drag the web stack in.
+    """
+    from core.security import is_production_mode as _prod
+    return _prod()
 
 
 def get_pool_status() -> Dict[str, Any]:
@@ -144,6 +453,16 @@ class CompatRow(dict):
         return self._columns
 
 
+# Tables that carry an auto-increment `id` primary key.
+#
+# P1-01 (B-03): this used to be a hand-maintained set that omitted
+# `comment_automations` and `tracked_links`, so on PostgreSQL `lastrowid` stayed
+# `None` and callers received rows with `id: None`.
+#
+# The set is now only a *bootstrap cache*. `_has_serial_id_column()` resolves the
+# truth from the live catalog, so adding a table can never silently reintroduce the
+# bug. The static set is kept so the compat layer still works for a table created
+# inside the same transaction (before the catalog cache is refreshed).
 _SERIAL_ID_TABLES = {
     "registrations",
     "messages",
@@ -156,7 +475,75 @@ _SERIAL_ID_TABLES = {
     "appointments",
     "task_jobs",
     "audit_logs",
+    "comment_automations",
+    "tracked_links",
 }
+
+# Cache of tables verified (via information_schema) to have a serial `id`.
+_VERIFIED_SERIAL_TABLES: Set[str] = set()
+_SERIAL_CACHE_LOCK = threading.Lock()
+
+
+def _has_serial_id_column(table: str, conn=None) -> bool:
+    """
+    Тухайн хүснэгтэд auto-increment `id` багана байгаа эсэхийг каталог/схемээс тодорхойл.
+
+    `RETURNING id`-г зөвхөн үнэхээр `id` баганатай хүснэгтэд нэмнэ. Эс бөгөөс
+    PostgreSQL "column id does not exist" алдаа шидэж, INSERT бүхэлдээ унана.
+    """
+    tbl = str(table or "").strip().lower()
+    if not tbl:
+        return False
+
+    with _SERIAL_CACHE_LOCK:
+        if tbl in _VERIFIED_SERIAL_TABLES:
+            return True
+
+    probe_conn = conn
+    own_conn = False
+    try:
+        if probe_conn is None:
+            probe_conn = get_db_connection()
+            own_conn = True
+        cur = probe_conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = %s
+                  AND column_name = 'id'
+                LIMIT 1
+                """,
+                (tbl,),
+            )
+            found = cur.fetchone() is not None
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+    except Exception:
+        # Catalog unavailable (e.g. mid-DDL): fall back to the static bootstrap set.
+        return tbl in _SERIAL_ID_TABLES
+    finally:
+        if own_conn and probe_conn is not None:
+            try:
+                probe_conn.close()
+            except Exception:
+                pass
+
+    if found:
+        with _SERIAL_CACHE_LOCK:
+            _VERIFIED_SERIAL_TABLES.add(tbl)
+    return bool(found)
+
+
+def reset_serial_table_cache() -> None:
+    """Test helper: forget catalog lookups (used after schema changes)."""
+    with _SERIAL_CACHE_LOCK:
+        _VERIFIED_SERIAL_TABLES.clear()
 
 
 def translate_sql_for_postgres(sql: str) -> str:
@@ -254,7 +641,7 @@ class PostgresCompatCursor:
         added_returning = False
         if m_ins:
             tbl = m_ins.group(1).lower()
-            if tbl in _SERIAL_ID_TABLES and "RETURNING " not in pg_sql.upper():
+            if _has_serial_id_column(tbl) and "RETURNING " not in pg_sql.upper():
                 pg_sql = pg_sql.rstrip().rstrip(";") + " RETURNING id"
                 added_returning = True
 
@@ -346,6 +733,19 @@ class PostgresCompatConnection:
         if not self._closed:
             self._closed = True
             try:
+                # Phase 20: `close()` used to hand the raw connection straight back to the
+                # SQLAlchemy pool WITHOUT rolling back. psycopg2 opens a transaction on the
+                # first statement, so a reader that only ever SELECTed handed the pool a
+                # connection that was still `idle in transaction` — holding its locks until
+                # the next borrower happened to end the transaction. Nothing noticed until
+                # a DDL operation needed ACCESS EXCLUSIVE: `_reset_public_schema` waited out
+                # `lock_timeout`, and the restore rollback that exists to undo a bad restore
+                # could not run. Rolling back first matches `sqlite3.Connection.close()`,
+                # which discards the pending transaction, and releases the locks immediately.
+                self._conn.rollback()
+            except Exception:
+                pass
+            try:
                 self._conn.close()
             except Exception:
                 pass
@@ -361,6 +761,30 @@ class PostgresCompatConnection:
                 self.rollback()
         finally:
             self.close()
+
+    def __del__(self):
+        # Phase 20: last-resort release. `database.py` has dozens of helpers shaped
+        # ```conn = get_connection(); ...; conn.close()``` with no `try/finally`, so an
+        # exception anywhere in the middle skips `close()` and the connection goes back to
+        # the pool — except it never goes back, it stays checked out and, because psycopg2
+        # opened a transaction on the first statement, it is `idle in transaction` holding
+        # its row locks. Those locks outlive the failed call for the life of the process.
+        #
+        # This is not theoretical: it is what made the restore rollback hang. A restore test
+        # raised a foreign-key error, leaked one such connection, and the rollback that
+        # followed could not take ACCESS EXCLUSIVE on `pages` — so the atomic rollback that
+        # exists to undo a bad restore reported ROLLBACK_FAILED, and the suite waited out a
+        # 180 s psql timeout. Reproduced by lock inspection: the blocking session's last
+        # statement was `RELEASE SAVEPOINT sp_gerege_120`, i.e. one of these cursors.
+        #
+        # CPython releases the frame's locals deterministically when the exception unwinds,
+        # so this reclaims the connection at the same moment `try/finally` would have. It is
+        # a net, not a substitute: new code should still use `try/finally` or `with`.
+        if not getattr(self, "_closed", True):
+            try:
+                self.close()
+            except Exception:
+                pass
 
 
 def get_db_connection(sqlite_path: Optional[str] = None):
@@ -387,62 +811,30 @@ def get_db_connection(sqlite_path: Optional[str] = None):
 
 
 def verify_schema_drift() -> Dict[str, Any]:
+    """Compare the live database with `core/models.py`, types included.
+
+    **This used to be blind.** The previous implementation AST-parsed
+    `core/models.py` and `0001_initial_enterprise_schema.py` and compared the set of
+    column *names*, so it reported "no drift" for two schemas whose column types and
+    nullability disagreed on 58 columns, and it never looked at the live database at
+    all (P2-01).
+
+    It now delegates to `core.schema_manager.drift_report()`, which uses Alembic's
+    autogenerate machinery with `compare_type=True` against the real database.
+
+    Returns a dict; `has_drift` is False only when the database matches the models
+    exactly, including types, indexes, and constraints.
     """
-    `core/models.py`, `migrations/versions/0001_initial_enterprise_schema.py` болон
-    ажиллаж буй өгөгдлийн сангийн 15 хүснэгт ба баганыг тулгаж Schema Drift байгаа эсэхийг шалгах.
-    """
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    models_path = os.path.join(root_dir, "core", "models.py")
-    mig_path = os.path.join(root_dir, "migrations", "versions", "0001_initial_enterprise_schema.py")
+    from core.schema_manager import drift_report
 
-    # 1. Extract tables & columns from core/models.py via AST
-    models_tree = ast.parse(open(models_path, "r", encoding="utf-8").read(), filename="core/models.py")
-    model_tables: Dict[str, Set[str]] = {}
-    for node in models_tree.body:
-        if isinstance(node, ast.ClassDef):
-            tname = None
-            cols: Set[str] = set()
-            for item in node.body:
-                if isinstance(item, ast.Assign):
-                    for target in item.targets:
-                        if isinstance(target, ast.Name):
-                            if target.id == "__tablename__" and isinstance(item.value, ast.Constant):
-                                tname = str(item.value.value)
-                            elif isinstance(item.value, ast.Call):
-                                func = item.value.func
-                                fname = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-                                if fname == "Column":
-                                    cols.add(target.id)
-            if tname:
-                model_tables[tname] = cols
-
-    # 2. Extract tables & columns from Alembic 0001_initial_enterprise_schema.py via AST
-    mig_tree = ast.parse(open(mig_path, "r", encoding="utf-8").read(), filename="0001_initial_enterprise_schema.py")
-    mig_tables: Dict[str, Set[str]] = {}
-    for node in ast.walk(mig_tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "create_table":
-            if node.args and isinstance(node.args[0], ast.Constant):
-                tname = str(node.args[0].value)
-                cols = set()
-                for arg in node.args[1:]:
-                    if isinstance(arg, ast.Call) and getattr(arg.func, "attr", "") == "Column":
-                        if arg.args and isinstance(arg.args[0], ast.Constant):
-                            cols.add(str(arg.args[0].value))
-                mig_tables[tname] = cols
-
-    # 3. Compare model_tables vs mig_tables
-    drift_details: Dict[str, Any] = {}
-    for tname, m_cols in model_tables.items():
-        a_cols = mig_tables.get(tname, set())
-        if m_cols != a_cols:
-            drift_details[tname] = {
-                "in_models_only": sorted(m_cols - a_cols),
-                "in_alembic_only": sorted(a_cols - m_cols),
-            }
-
+    report = drift_report()
     return {
-        "has_drift": bool(drift_details) or (set(model_tables.keys()) != set(mig_tables.keys())),
-        "table_count": len(model_tables),
-        "tables": sorted(model_tables.keys()),
-        "drift_details": drift_details,
+        "has_drift": report.get("has_drift", True),
+        "table_count": 0,  # retained for backward compatibility
+        "tables": [],  # retained for backward compatibility
+        "drift_details": report.get("by_kind", {}),
+        "diff_count": report.get("count", 0),
+        "current_revision": report.get("current_revision"),
+        "head_revision": report.get("head_revision"),
+        "comparison": "alembic.autogenerate(compare_type=True)",
     }

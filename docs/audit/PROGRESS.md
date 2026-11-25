@@ -1,4 +1,4 @@
-# Gerege AI Agent — Phase 0 to Phase 11 Engineering Progress Log
+# Gerege AI Agent — Phase 0 to Phase 12 Engineering Progress Log
 
 ## Phase 0: Baseline Inspection & Evidence Audit
 - **Inspected Commit**: `ee490ea` on `main` (`AriukagiinTuvshoo/gerege-ai-agent`).
@@ -23,6 +23,7 @@
 | **Phase 6** | AI Reliability & Deterministic CI Fallback | **COMPLETED** | `agent.py`, `tests/test_ai_eval_suite.py` -> all 11 AI evaluation categories pass both with live Gemini and with `default_client = None`. |
 | **Phase 7** | API & Multi-Tenant CRM Regression | **COMPLETED** | `tests/test_enterprise_phases.py` -> all 16 enterprise tests pass 100%. |
 | **Phase 8** | CI/CD Quality Gate (`.github/workflows/ci.yml`) | **COMPLETED** | Configured with SQLite + PostgreSQL 16 + Redis 7 service containers, zero-drift check, migration check, 3 test suites, and Docker build. |
-| **Phase 9** | Observability, Readiness & Pool/Queue Metrics | **COMPLETED** | `core/monitoring.py`, `main.py` -> `/api/ready` returns `503` on DB outage; `/api/admin/metrics` reports `db_pool`, `queue`, `disk_free_mb`, and redacted errors. |
-| **Phase 10** | 20-Scenario Failure & Chaos Suite | **COMPLETED** | `tests/test_failure_scenarios.py` -> all 20 failure/chaos scenarios executed and passed (`exit code 0`). |
-| **Phase 11** | Complete Production Documentation (9 Files) | **COMPLETED** | All 9 architecture, security, migration, operations, testing, and audit documents authored and verified. |
+| **Phase 9** | Observability, Readiness & Pool/Queue Metrics | **COMPLETED** | `core/monitoring.py`, `main.py` -> `/api/ready` returns `503` on DB outage; `/api/admin/metrics` reports `db_pool`, `queue`, `disk_free_mb`, and redacted errors. The three scale measurements Phase 9 left out (two workers on one heartbeat key, `kill -9` liveness, cross-process scheduler exclusion) are in `docs/audit/PHASE_9_MEASUREMENTS.md` and pinned by `tests/test_e09_worker_scale_measurements.py`. |
+| **Phase 10** | 20-Scenario Failure & Chaos Suite | **COMPLETED** | `tests/test_failure_scenarios.py` -> 20 scenarios, 20 passing. The CI step ran pytest bare, so a skipped scenario reported the same as a passing one; it now writes a log and asserts `--min-passed 20`. |
+| **Phase 11** | Complete Production Documentation (9 Files) | **COMPLETED with corrections** | Nine topics across fifteen files, checked by `tests/test_e11_documentation_verification.py`: 22 links that pointed at the author's `file:///c:/` disk now resolve in-repo, the architecture diagram no longer names a `core/repositories.py` that does not exist, and the table counts say 18 (models) / 17 (migrated) instead of a stale 15. See `docs/audit/PHASE_10_11_12_VERIFICATION.md`. |
+| **Phase 12** | — | **NOT RECORDED** | This log has no Phase 12 row, and nothing in the repository refers to one. Not reconstructable from the artefact, so not claimed. See the same report. |

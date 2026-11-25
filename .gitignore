@@ -9,6 +9,13 @@ __pycache__/
 *.pyd
 
 # Local Databases & Logs
+# Test-suite artefacts. The suites that rebind DB_PATH leave a database file behind;
+# committing one carries a developer's rows into the repository, and the size of the
+# diff is whoever ran the suite last.
+gerege_crm_next.db
+gerege_crm_next.db-journal
+gerege_crm_next.db-wal
+gerege_crm_next.db-shm
 leads.db
 leads.db-journal
 leads.db-wal
@@ -17,6 +24,7 @@ leads.csv
 *.log
 backups/
 .pytest_cache/
+.scratch/
 .last_working_commit
 
 # Static Generated Files (QRCodes)
@@ -26,3 +34,28 @@ static/qrcodes/*.png
 .vercel
 .vscode/
 .idea/
+
+# ---------------------------------------------------------------------------
+# Backup secrets and artifacts (Phase 18)
+#
+# `docker-compose.prod.yml` mounts the backup encryption key from ./secrets as a file.
+# Phase 17 confirmed neither `secrets/` nor `*.key` was ignored, so `git add -A` would
+# have committed the key that decrypts every tenant backup. Backup artifacts are ignored
+# too: a plaintext dump must never be committable, by accident or otherwise.
+# ---------------------------------------------------------------------------
+secrets/
+*.key
+*.pem
+backup.key
+# encrypted archives and their sidecars
+*.sql.gz
+*.db.gz
+*.sql.gz.enc
+*.db.gz.enc
+*.sha256
+*.meta.json
+# staging / partial artifacts (private working directories, atomic-rename targets)
+.staging-*/
+.restore-*/
+*.partial-*
+*.raw.tmp
