@@ -21,7 +21,21 @@ logger = logging.getLogger("database")
 #: observe the same file the application actually uses.
 _DEFAULT_DB_PATH = get_sqlite_db_path(None)
 DB_PATH = _DEFAULT_DB_PATH
-CSV_PATH = os.path.join(os.path.dirname(__file__), "leads.csv")
+#: The CSV mirror that `sync_to_csv()` rewrites after every lead insert/update.
+#:
+#: Phase 48A (F-48A-1): this path used to be pinned next to this module while the
+#: *database* was redirectable through `DB_PATH`. A run that pointed `DB_PATH` at a
+#: disposable database therefore still overwrote `leads.csv` in the repository root with
+#: that throwaway database's rows: a developer's exported mirror was destroyed by a smoke
+#: test, and the two files silently described different data. Measured during the Phase 48A
+#: local startup run — `leads.db` and `gerege_crm_next.db` kept their hashes while
+#: `leads.csv` was rewritten by the disposable database.
+#:
+#: `CSV_PATH` from the environment now redirects the mirror. The default is byte-for-byte
+#: the old value, so an existing install (and `docker-compose.yml`, which bind-mounts
+#: `./leads.csv`) behaves exactly as before unless it opts in. Read at import time, which
+#: is after `core.db_engine` has loaded `.env`, so a `.env` value takes effect.
+CSV_PATH = os.getenv("CSV_PATH", "").strip() or os.path.join(os.path.dirname(__file__), "leads.csv")
 DEFAULT_PAGE_ID = "100799479495809"
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ADMIN2026")
 
