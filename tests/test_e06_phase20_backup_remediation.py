@@ -772,15 +772,21 @@ def test_p20_31_a_stranded_connection_releases_its_locks(tmp_path, monkeypatch):
     from core import backup_service
     from core import db_engine
 
+    # Phase 43, F-42-B. These guards used to `print("[SKIP] ..."); return`, which pytest
+    # records as PASSED: the case runs, does nothing, and leaves no SKIPPED line for the
+    # CI skip gate to find. Measured: with the opt-in unset both destructive cases were
+    # "2 passed" while printing their skip notice into the captured-output trap.
+    #
+    # `pytest.skip()` is the honest form. It is recorded as a skip, the reason is written
+    # into the log, and the gate can then fail the step. A reviewer reading a green run
+    # sees "skipped", not a pass that verified nothing.
     if not db_engine.is_postgres():
-        print("[SKIP] Not connected to live PostgreSQL")
-        return
+        pytest.skip("not connected to a live PostgreSQL target")
     if os.getenv("GEREGE_DESTRUCTIVE_TESTS") != "1":
         # This test disposes the shared engine and empties the schema, so it cannot share a
         # database with the rest of the suite (doing so broke 24 unrelated tests). CI runs
         # this module in its own step, where the flag is set and it must run.
-        print("[SKIP] set GEREGE_DESTRUCTIVE_TESTS=1 to run (uses the live database)")
-        return
+        pytest.skip("GEREGE_DESTRUCTIVE_TESTS=1 is required (uses the live database)")
 
     import gc
 
@@ -857,12 +863,13 @@ def test_p20_32_schema_reset_actually_empties_the_schema(monkeypatch):
     from core import backup_service
     from core import db_engine
 
+    # Phase 43, F-42-B: `pytest.skip()`, not `print(...); return`. See the note in
+    # test_p20_31 above - a silent return is counted as a pass and is invisible to the
+    # CI skip gate, which is exactly how six "skipped" cases passed the step in Phase 42.
     if not db_engine.is_postgres():
-        print("[SKIP] Not connected to live PostgreSQL")
-        return
+        pytest.skip("not connected to a live PostgreSQL target")
     if os.getenv("GEREGE_DESTRUCTIVE_TESTS") != "1":
-        print("[SKIP] set GEREGE_DESTRUCTIVE_TESTS=1 to run (drops every object in public)")
-        return
+        pytest.skip("GEREGE_DESTRUCTIVE_TESTS=1 is required (drops every object in public)")
 
     import psycopg2
     import sqlalchemy as sa

@@ -24,7 +24,8 @@ import sys
 
 USAGE = (
     "usage: check_pytest_log.py <logfile> [--min-passed N] [--require-summary] "
-    "[--allow-skip TESTNAME] [--allow-skip-file PATH] [--no-skip-check] [--min-collected N]"
+    "[--allow-skip TESTNAME] [--allow-skip-file PATH] [--no-skip-check] [--min-collected N] "
+    "[--require-run TESTNAME]"
 )
 
 #: Lines pytest writes for a failed or errored test. `-v` prints "FAILED path::test" and
@@ -57,6 +58,28 @@ def main(argv: list[str]) -> int:
     ]
     min_passed = None
     require_summary = "--require-summary" in argv
+    # `--require-run NAME` asserts that a named case produced a PASSED line.
+    #
+    # Phase 43, finding F-42-B (and the worse shape found while fixing it). A test that
+    # guards its body with
+    #
+    #     if os.getenv("SOMETHING") != "1":
+    #         print("[SKIP] ...")
+    #         return
+    #
+    # does not skip in pytest's eyes: it RETURNS, so pytest records PASSED and the
+    # `== 1 passed ==` summary contains no skip at all. No skip gate can catch that,
+    # because there is nothing in the log to catch - the evidence is the *absence* of a
+    # PASSED line for work that was supposed to happen. Measured in Phase 43: with
+    # GEREGE_DESTRUCTIVE_TESTS unset, test_p20_31 and test_p20_32 print their skip notice
+    # into the captured-output trap and are reported as two passes.
+    #
+    # A count floor cannot catch it either: the cases do run, they just do nothing.
+    # So the check is per name - this case must appear as PASSED - which is the only form
+    # of evidence that survives a silent return.
+    required_tests = [
+        argv[i + 1] for i, a in enumerate(argv) if a == "--require-run" and i + 1 < len(argv)
+    ]
     # `--min-collected N` asserts how many cases were *collected*, which is stable across
     # environments, unlike `--min-passed`: a suite whose skips depend on a live service
     # reports fewer passes in CI than locally while collecting exactly the same tests.
@@ -242,6 +265,44 @@ def main(argv: list[str]) -> int:
         if min_passed is not None and passed < min_passed:
             print(f"::error::{log_path}: only {passed} passed, expected at least {min_passed}")
             return 1
+        # `--require-run`: every named case must appear on a line that says PASSED.
+        #
+        # The requirement is PASSED specifically, not merely "the name appears". A name
+        # can appear on a SKIPPED line, and that must NOT satisfy this: Phase 43 measured
+        # exactly that mistake - a first version of this check tested `name in text`,
+        # which is true for a skipped case, so the gate passed a log where both
+        # destructive cases had skipped. The skip gate below catches an honest skip, but
+        # only if it runs, and a `--no-skip-check` step does not run it. Requiring PASSED
+        # makes this check stand on its own rather than depending on another flag.
+        def _ran(name: str) -> bool:
+            return any(
+                name in line and "PASSED" in line
+                for line in text.splitlines()
+                if not line.strip().startswith("SKIPPED")
+            )
+
+        missing = [name for name in required_tests if not _ran(name)]
+        if missing:
+            for name in missing:
+                skipped = any(
+                    name in line and "SKIPPED" in line for line in text.splitlines()
+                )
+                detail = (
+                    "it SKIPPED, so the work it guards did not happen"
+                    if skipped
+                    else "it is not in the log as PASSED, which is what a silent "
+                    "`print(...); return` guard looks like: pytest records it as PASSED "
+                    "only when the body actually returns through the normal path, and a "
+                    "guard that returns early is indistinguishable from work that ran"
+                )
+                print(
+                    f"::error::{log_path}: required case {name!r} did not pass - {detail}. "
+                    "Either enable what it needs, or make it call pytest.skip() so the skip "
+                    "gate and this check both see it."
+                )
+            return 1
+        for name in required_tests:
+            print(f"  {log_path}: required case passed: {name}")
         print(f"  {log_path}: {passed} passed, 0 failed")
 
     return 0

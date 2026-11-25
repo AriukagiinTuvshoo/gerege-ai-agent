@@ -1421,7 +1421,22 @@ jobs:
           # failing still satisfies ">= 62". The guard reads the recorded FAILED lines;
           # the count assertion is kept so a suite that silently under-collects (a
           # renamed file, a wrong selection) is caught too.
-          python scripts/check_pytest_log.py /tmp/p20suite.log --min-passed 24 --require-summary --no-skip-check
+          #
+          # Phase 43, F-42-B. This gate carried --no-skip-check, which switched the skip
+          # check off wholesale. Removing it is necessary but NOT sufficient here, because
+          # the two destructive cases (31 and 32) do not call pytest.skip(): they print a
+          # notice and RETURN, so pytest records PASSED and the summary reports no skip at
+          # all. Measured: with GEREGE_DESTRUCTIVE_TESTS unset they are "2 passed".
+          #
+          # So the policy is now enforced twice and neither half relies on the env var:
+          #   * no --no-skip-check  -> a real skip in this module fails the step;
+          #   * --require-run       -> a case that silently returned fails the step, which
+          #                            no skip gate and no count floor can detect.
+          # The opt-in below stays: it is what makes the destructive work SAFE, and this
+          # gate is what makes its absence FAIL rather than pass quietly.
+          python scripts/check_pytest_log.py /tmp/p20suite.log --min-passed 24 --require-summary \
+            --require-run test_p20_31_a_stranded_connection_releases_its_locks \
+            --require-run test_p20_32_schema_reset_actually_empties_the_schema
 
       # Phase 20: the critical property, asserted against the REAL CLI rather than a
       # mocked service. Phase 19 found that `maintenance.py backup` published plaintext

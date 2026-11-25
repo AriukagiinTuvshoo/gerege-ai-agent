@@ -228,7 +228,11 @@ def test_each_steps_skip_policy_is_preserved_exactly():
         "/tmp/e05.log": (True, []),
         "/tmp/p16.log": (True, []),
         "/tmp/p18suite.log": (True, []),
-        "/tmp/p20suite.log": (False, []),
+        # Phase 43: F-42-B closed. The step no longer passes --no-skip-check, so a real
+        # skip in this module now fails it. The two destructive cases are additionally
+        # pinned by --require-run, because they return early instead of skipping and no
+        # skip gate can see them.
+        "/tmp/p20suite.log": (True, []),
         "/tmp/p24suite.log": (True, []),
         "/tmp/p27suite.log": (True, []),
         "/tmp/p28suite.log": (True, []),
