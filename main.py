@@ -33,6 +33,7 @@ import appointment_service
 from core import security as core_security
 from core import rate_limit as core_rate_limit
 from core import login_identity as core_login_identity
+from core import secret_guard as core_secret_guard
 from core.pinned_http import download_remote_image
 from core.monitoring import telemetry
 from routers import system_router, automation_router
@@ -107,6 +108,21 @@ async def lifespan(app: FastAPI):
         raise
     except Exception as exc:  # never let the guard itself block startup
         logger.warning(f"connection budget check skipped: {exc}")
+
+    # Phase 45 (F-44-F): every required production secret, checked the way the account key
+    # already was. Phase 44 found this rule existed for ONE credential and was documentation
+    # for the rest - which is how a deployment could serve traffic with `META_VERIFY_TOKEN`
+    # falling back to a value published in this repository.
+    #
+    # Deliberately LAST among the startup guards. Each guard above names a specific
+    # misconfiguration ("REDIS_URL is required when running in production", "E02_ACCOUNT_
+    # KEY_SECRET is too short"), and those messages are what an operator needs. Placing a
+    # broad secret sweep first made it mask them: measured, four existing suites asserted
+    # that a missing REDIS_URL is named in the failure, and instead received "META_APP_SECRET:
+    # missing". A guard must not hide a more specific diagnosis of the same failure. In
+    # production an unusable secret still raises and the process still exits; development
+    # logs a warning and continues. Names and reasons only - never a value.
+    core_secret_guard.validate_production_secrets()
 
     scheduler_task = None
     if os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1":
@@ -184,7 +200,10 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-ManyChat-Secret", "X-Webhook-Secret"],
 )
 
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "agent_verify_secret_token_123")
+# Phase 45 (F-44-B): no fallback. An unset variable is now an empty string, which
+# `core_security.meta_verify_token_is_usable` rejects in production instead of
+# silently substituting a value that is published in this repository.
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "").strip()
 META_PAGE_ACCESS_TOKEN = os.getenv("META_PAGE_ACCESS_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_MANAGER_CHAT_ID = os.getenv("TELEGRAM_MANAGER_CHAT_ID", "")
@@ -504,7 +523,28 @@ async def verify_meta_webhook(
     hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
     hub_challenge: Optional[str] = Query(None, alias="hub.challenge")
 ):
-    expected_token = os.getenv("META_VERIFY_TOKEN", META_VERIFY_TOKEN).strip()
+    """Meta subscription handshake.
+
+    Phase 45 (F-44-B). The expected value used to be
+    ``os.getenv("META_VERIFY_TOKEN", "agent_verify_secret_token_123")``, so an unset
+    variable fell back to a string published in this repository and the handshake
+    succeeded anyway. `meta_verify_token_is_usable` now refuses an empty or placeholder
+    value in production, which makes the endpoint fail closed there.
+
+    The refusal is logged without the value and answered exactly like a wrong token, so
+    the endpoint does not tell an unauthenticated caller whether the deployment is
+    misconfigured or merely guessed wrong.
+    """
+    configured = os.getenv("META_VERIFY_TOKEN", "")
+    if not core_security.meta_verify_token_is_usable(configured):
+        if core_security.is_production_mode():
+            logger.error(
+                "Meta webhook fail-closed: META_VERIFY_TOKEN is unset, empty or still the "
+                "published placeholder. The subscription handshake is refused in production."
+            )
+        return Response(content="Verification failed", status_code=403)
+
+    expected_token = configured.strip()
     if hub_mode == "subscribe" and core_security.constant_time_equal(hub_verify_token, expected_token):
         logger.info("Meta Webhook баталгаажлаа!")
         return Response(content=hub_challenge, media_type="text/plain")

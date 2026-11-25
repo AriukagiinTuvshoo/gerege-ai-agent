@@ -138,7 +138,10 @@ class RegistrationModel(Base):
     __tablename__ = "registrations"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    page_id = Column(String(128), PageFK(), default="100799479495809", index=True)
+    # Phase 45 (F-44-A): NOT NULL, so "a lead with no tenant" is not representable.
+    # The column had a default but allowed NULL, which is what made a NULL-tenant row
+    # possible and what a fail-closed IDOR guard must not have to reason about.
+    page_id = Column(String(128), PageFK(), default="100799479495809", nullable=False, index=True)
     name = Column(String(255), nullable=False)
     phone = Column(String(64), nullable=False)
     service = Column(String(255), nullable=True)

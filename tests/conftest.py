@@ -206,3 +206,53 @@ def _backup_encryption_key(tmp_path_factory, monkeypatch):
         key_file.chmod(0o600)
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_file))
     monkeypatch.delenv("BACKUP_ENCRYPTION", raising=False)
+
+
+#: Phase 45 (F-44-F): the secrets a production startup requires.
+#:
+#: `core.secret_guard` refuses to start a production process whose required secrets are
+#: missing, default or too short. Suites that set `ENV=production` in order to exercise the
+#: real startup path therefore need a valid set, exactly as a real deployment does - without
+#: them they fail on the secret sweep instead of on the behaviour they are testing.
+#:
+#: The values are generated per run and are obviously not secrets. A test that needs to prove
+#: the *refusal* behaviour deletes or blanks one itself with `monkeypatch.delenv`/`setenv`;
+#: `test_e45_final_hardening.py` does exactly that.
+_TEST_SECRET = os.urandom(24).hex()
+
+
+@pytest.fixture(autouse=True)
+def _production_secrets_present(monkeypatch):
+    """Supply valid production secrets for the whole suite.
+
+    Autouse and non-destructive: it uses `setenv`, so `monkeypatch` restores the previous
+    values after every test, and any test that deletes or overrides one still sees its own
+    change because its `monkeypatch` calls run after this fixture.
+    """
+    # Which variables, and why not the others.
+    #
+    # META_VERIFY_TOKEN and E02_ACCOUNT_KEY_SECRET are set because production startup
+    # refuses without them and no suite reads them to make a decision in development.
+    #
+    # META_APP_SECRET is NOT set. Setting it turns on `X-Hub-Signature-256` enforcement for
+    # every webhook test in the suite, and the existing ones post unsigned bodies by design -
+    # they exercise routing and SSRF containment, not signatures. Measured: setting it turned
+    # `test_meta_webhook_image_url_cannot_reach_loopback` from skipped into a 403 failure.
+    # The signature path has its own tests and is unchanged by this phase.
+    #
+    # ADMIN_PASSWORD is NOT set, and is not checked by `core.secret_guard` at all: it is
+    # enforced at the point of use by `database._verify_admin_password`, which is the stronger
+    # guarantee and is already covered by its own suite.
+    # Only E02_ACCOUNT_KEY_SECRET. It is required by production startup and no suite reads it
+    # to make a routing decision.
+    #
+    # META_VERIFY_TOKEN is deliberately NOT set. Setting it makes META_APP_SECRET conditionally
+    # required (the pair means "the Meta integration is configured"), and setting *that*
+    # switches on `X-Hub-Signature-256` enforcement for every webhook test - measured to turn
+    # `test_meta_webhook_image_url_cannot_reach_loopback` from a skip into a 403. Suites that
+    # enter a production startup and need the handshake configured set the pair themselves;
+    # `test_e45_final_hardening.py` does exactly that.
+    for name in ("E02_ACCOUNT_KEY_SECRET",):
+        monkeypatch.setenv(name, _TEST_SECRET)
+
+

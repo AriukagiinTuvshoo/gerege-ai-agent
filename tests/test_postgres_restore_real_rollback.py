@@ -16,6 +16,8 @@ import uuid
 import hashlib
 import subprocess
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import database
@@ -26,6 +28,33 @@ from core import backup_service
 
 def _is_pg():
     return db_engine.is_postgres()
+
+
+#: Phase 45 (F-44-C). These six cases used to guard with
+#:
+#:     print("[SKIP] Not connected to live PostgreSQL"); return
+#:
+#: which pytest records as **PASSED**. Phase 44 measured the consequence: with
+#: `DATABASE_URL` unset the step reported "8 passed" while every one of these cases ran no
+#: assertion. It was not exploitable in CI - the step hardcodes a valid URL - but it meant a
+#: broken PostgreSQL service container would have turned the step green while verifying
+#: nothing, which is the same class of defect as F-42-B in Phase 43.
+#:
+#: `pytest.skip()` makes the absence visible: a SKIPPED line with a reason, counted in the
+#: summary, and caught by any skip gate on this log. CI supplies a real disposable database
+#: for this step, so in CI these cases RUN; locally, without one, they are honestly skipped
+#: rather than silently passed.
+_PG_REQUIRED_REASON = (
+    "requires a live PostgreSQL target: this module proves that a real restore and a real "
+    "rollback preserve data, which a SQLite stand-in cannot demonstrate. Set DATABASE_URL "
+    "to a disposable PostgreSQL database."
+)
+
+
+def _require_postgres() -> None:
+    """Skip honestly when there is no PostgreSQL, instead of passing while doing nothing."""
+    if not _is_pg():
+        pytest.skip(_PG_REQUIRED_REASON)
 
 
 def _compute_tables_checksum(tables=("pages", "registrations")) -> str:
@@ -54,9 +83,7 @@ def _compute_tables_checksum(tables=("pages", "registrations")) -> str:
 
 def test_postgres_restore_checksum_invariant_across_failed_restore_and_rollback():
     """Real rollback test: Two tables (pages, registrations) preserve identical data checksum."""
-    if not _is_pg():
-        print("[SKIP] Not connected to live PostgreSQL")
-        return
+    _require_postgres()
 
     # Seed distinct data across two tables
     tenant_id = f"chk_tenant_{uuid.uuid4().hex[:8]}"
@@ -109,9 +136,7 @@ def test_postgres_restore_checksum_invariant_across_failed_restore_and_rollback(
 
 def test_postgres_restore_success_verifies_data():
     """1. Valid PostgreSQL restore restores data and marks post_restore_verified=True."""
-    if not _is_pg():
-        print("[SKIP] Not connected to live PostgreSQL")
-        return
+    _require_postgres()
 
     canary_id = f"canary_good_{uuid.uuid4().hex[:8]}"
     database.save_page(page_id=canary_id, name="Canary Restore Good")
@@ -152,9 +177,7 @@ def test_postgres_restore_success_verifies_data():
 
 def test_postgres_restore_verification_failure_restores_presnapshot():
     """2. Verification failure triggers real rollback to pre-restore snapshot and restores state."""
-    if not _is_pg():
-        print("[SKIP] Not connected to live PostgreSQL")
-        return
+    _require_postgres()
 
     # Seed pre-restore baseline data
     baseline_id = f"baseline_must_survive_{uuid.uuid4().hex[:8]}"
@@ -198,9 +221,7 @@ def test_postgres_restore_verification_failure_restores_presnapshot():
 
 def test_postgres_restore_sql_failure_rolls_back():
     """3. SQL syntax/execution failure in psql aborts transaction and preserves database."""
-    if not _is_pg():
-        print("[SKIP] Not connected to live PostgreSQL")
-        return
+    _require_postgres()
 
     canary_id = f"canary_sql_fail_{uuid.uuid4().hex[:8]}"
     database.save_page(page_id=canary_id, name="Canary Before SQL Fail")
@@ -261,9 +282,7 @@ def test_postgres_restore_does_not_claim_rollback_without_recovery():
 
 def test_postgres_restore_preserves_existing_data_on_failure():
     """6. Pre-existing registrations survive a failed restore attempt."""
-    if not _is_pg():
-        print("[SKIP] Not connected to live PostgreSQL")
-        return
+    _require_postgres()
 
     test_phone = f"99{uuid.uuid4().hex[:6]}"
     database.save_registration(
@@ -326,9 +345,7 @@ def test_rollback_removes_tables_created_by_the_failed_restore():
     drops the tables the dump itself contains, so a table introduced by the rejected
     restore survives and the database no longer matches `core/models.py`.
     """
-    if not _is_pg():
-        print("[SKIP] Not connected to live PostgreSQL")
-        return
+    _require_postgres()
 
     marker = f"_leaked_by_rollback_{uuid.uuid4().hex[:8]}"
     tenant_id = f"rb_tenant_{uuid.uuid4().hex[:8]}"

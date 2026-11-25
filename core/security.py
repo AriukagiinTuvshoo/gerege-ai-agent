@@ -418,6 +418,28 @@ def verify_resource_tenant_ownership(
     """
     Тухайн обьект (Lead, Session, Invoice, Cargo, Appointment) нь
     нэвтэрсэн хэрэглэгчийн салбарт харьяалагдаж буй эсэхийг шалгах (IDOR хамгаалалт)
+
+    Phase 45 (F-44-A): this guard **fails closed on a missing tenant**. The previous
+    condition was
+
+        ``if not user_pid or (resource_page_id and str(resource_page_id) != str(user_pid))``
+
+    whose second clause is falsy when ``resource_page_id`` is ``None`` or ``""`` - so a
+    resource with no tenant of its own was **allowed to every tenant-scoped user**:
+
+        resource_page_id='pageA' -> ALLOWED      (correct)
+        resource_page_id='pageB' -> DENIED 403   (correct)
+        resource_page_id=None    -> ALLOWED      (WRONG - the bug)
+        resource_page_id=''      -> ALLOWED      (WRONG - the bug)
+
+    That was reachable in principle because ``registrations.page_id`` is nullable. It is
+    no longer reachable after Phase 45 made the column ``NOT NULL`` (migration 0008), but
+    a guard that depends on a schema invariant somewhere else is one migration away from
+    being wrong again. The rule now lives here, where the decision is made: a resource
+    that cannot name its tenant cannot be proven to belong to the caller, so it is denied.
+
+    Admins are unaffected - they are allowed across tenants by design, and the tenant
+    check below never applied to them either.
     """
     if not user:
         if require_auth or is_production_mode():
@@ -425,12 +447,68 @@ def verify_resource_tenant_ownership(
         return
     role = str(user.get("role") or "").strip().lower()
     if not is_admin_role(role):
-        user_pid = user.get("page_id")
-        if not user_pid or (resource_page_id and str(resource_page_id) != str(user_pid)):
+        user_pid = str(user.get("page_id") or "").strip()
+        resource_pid = "" if resource_page_id is None else str(resource_page_id).strip()
+        # Missing owner on either side is a denial, not an exemption. `not resource_pid`
+        # comes first so the reason is explicit rather than implied by string inequality.
+        if not user_pid or not resource_pid or resource_pid != user_pid:
             raise HTTPException(
                 status_code=403,
                 detail="Энэхүү бүртгэл танай салбарт хамаарахгүй байна! (IDOR Forbidden)",
             )
+
+
+#: Phase 45 (F-44-B). The string that shipped as the fallback for `META_VERIFY_TOKEN`,
+#: the `pages.verify_token` column default and the request-body default. It is in this
+#: repository, in every published install and in the migrations, so it is a *published*
+#: value: treating it as a secret is the defect, not an oversight to be documented.
+PUBLIC_VERIFY_TOKEN_PLACEHOLDER = "agent_verify_secret_token_123"
+
+
+def meta_verify_token_is_placeholder(token: Optional[str]) -> bool:
+    """True when ``token`` carries no secrecy at all.
+
+    Two shapes count: the published default itself, and anything a template would leave
+    behind (`changeme`, `<generate: …>`, `your-…`). Comparison is case-insensitive and
+    whitespace-trimmed, because those are the variations an operator actually types.
+    """
+    value = str(token or "").strip()
+    if not value:
+        return True
+    lowered = value.lower()
+    if lowered == PUBLIC_VERIFY_TOKEN_PLACEHOLDER:
+        return True
+    placeholders = ("changeme", "change_me", "placeholder", "your-", "<generate", "todo", "xxx")
+    return any(marker in lowered for marker in placeholders)
+
+
+def meta_verify_token_is_usable(token: Optional[str]) -> bool:
+    """Whether the Meta handshake may proceed with ``token`` as the expected value.
+
+    Phase 45 (F-44-B). The GET `/webhook` handler used
+
+        ``expected_token = os.getenv("META_VERIFY_TOKEN", "agent_verify_secret_token_123")``
+
+    so a deployment that never set the variable completed Meta's subscription handshake
+    with a value that is printed in this repository. Phase 44 measured it: under
+    ``ENV=production`` with the variable unset, the endpoint still accepted the public
+    string.
+
+    The rule is now the same one `_verify_admin_password` already applies to the admin
+    password: in production (or `STRICT_SECURITY`), an unset, empty or placeholder value
+    is **not usable**, and the caller must fail closed. Outside production the published
+    default stays usable, because local development and the test suite rely on it and
+    nothing is exposed there.
+
+    This function decides only *whether a value may be used*. It never returns the value
+    and never logs it, so it cannot leak the configured secret.
+    """
+    value = str(token or "").strip()
+    if not value:
+        return False
+    if is_production_mode() and meta_verify_token_is_placeholder(value):
+        return False
+    return True
 
 
 def verify_meta_webhook_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
