@@ -27,7 +27,9 @@ echo ========================================================
 echo   ✅ БҮХ СИСТЕМ АМЖИЛТТАЙ АСЛАА!
 echo.
 echo   - Дотоод хаяг:   http://localhost:8000
-echo   - Админ нууц үг: ADMIN2026
+echo   - Админ нууц үг: .env файлын ADMIN_PASSWORD (дэлгэцэнд хэвлэгдэхгүй)
+echo     .env байхгүй бол .env.example-аас хуулж, нууц үгийг доорх командаар үүсгэ:
+echo     python -c "import secrets; print(secrets.token_urlsafe(24))"
 echo   - Онлайн хаягийг Cloudflare цонхноос харна уу.
 echo ========================================================
 echo.
