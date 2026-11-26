@@ -987,7 +987,8 @@ def update_page_google_sheets(page_id: str, sheets_url: str) -> bool:
     """, (sheets_url.strip(), page_id))
     conn.commit()
     conn.close()
-    return True
+    # Phase 54: `True` unconditionally, so the sheets endpoint could not report a failed write.
+    return cursor.rowcount > 0
 
 def update_page_gemini_key(page_id: str, gemini_key: str, monthly_limit: Optional[int] = None) -> bool:
     """Харилцагчийн хувийн Gemini API түлхүүр болон лимитийг шинэчлэх"""
@@ -1007,7 +1008,11 @@ def update_page_gemini_key(page_id: str, gemini_key: str, monthly_limit: Optiona
         """, (gemini_key.strip(), page_id))
     conn.commit()
     conn.close()
-    return True
+    # Phase 54 (F-54-1): this returned `True` unconditionally, so a caller could not tell a
+    # write from a no-op - which is how `POST /api/pages/{page_id}/gemini_key` answered
+    # "амжилттай шинэчлэгдлээ" for a page id that does not exist. No test calls this function
+    # directly (measured), and its one caller is that handler.
+    return cursor.rowcount > 0
 
 def increment_page_tokens(page_id: str, tokens: int) -> int:
     """Токен ашиглалтыг нэмэгдүүлж тооцох"""

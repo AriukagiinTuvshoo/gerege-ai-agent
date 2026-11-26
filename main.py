@@ -1240,7 +1240,7 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
 @app.post("/api/pages/gemini_key")
 @app.post("/api/pages/{page_id}/gemini_key")
 async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Request, page_id: Optional[str] = None):
-    """Харилцагчийн хувийн Gemini API түлхүүр шинэчлэх (Админ болон тухайн Client өөрөө засаж болно)"""
+    """Харилцагчийн хувийн Gemini API түлхүүр шинэчлэх (Админ болон тухайн Client өөрөө засах)"""
     raw_target = payload.get("page_id") or page_id
     if not raw_target:
         return JSONResponse({"error": "page_id missing"}, status_code=400)
@@ -1252,15 +1252,126 @@ async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Requ
         permission="knowledge:write",
     )
 
-    gemini_key = str(payload.get("gemini_api_key", "")).strip()
-    monthly_limit = payload.get("monthly_token_limit")
-    if monthly_limit is not None:
-        try: monthly_limit = int(monthly_limit)
-        except Exception: monthly_limit = None
+    # Phase 54 (F-54-1). This endpoint read `payload.get("gemini_api_key", "")` and handed the
+    # result straight to an UPDATE, so a body that named only the quota stored an empty string
+    # over the tenant's key. Measured live on a disposable page:
+    #
+    #   stored:                       key = 35 chars, limit = 5000
+    #   POST {"monthly_token_limit": 7000}
+    #   response: {"status":"success","message":"Gemini API тохиргоо амжилттай шинэчлэгдлээ!"}
+    #   stored:                       key = 0 chars,  limit = 7000   audit rows written: 0
+    #
+    # and that exact partial body is what `dashboard.html` posts from the Client Access modal
+    # (`body: JSON.stringify({page_id, monthly_token_limit})`, no key), so one Save click on a
+    # quota silently destroyed a tenant's own API key and moved them onto the operator's paid
+    # quota, while the UI showed only a success toast. Same shape as F-53-1/F-53-5, same fix:
+    # absent means unchanged, a named empty value is an explicit clear, a named mask is not a
+    # credential.
+    body = dict(payload)
+    ignored: List[str] = []
+    if "monthly_token_limit" in body:
+        try:
+            quota = int(str(body["monthly_token_limit"]).strip())
+        except (TypeError, ValueError):
+            quota = 0
+        if quota > 0:
+            body["monthly_token_limit"] = quota
+        else:
+            # Unparseable or non-positive: drop the key so the stored quota survives, and say so
+            # in the response instead of storing a quota of 0 that would block the tenant.
+            body.pop("monthly_token_limit")
+            ignored.append("monthly_token_limit")
 
-    database.update_page_gemini_key(str(target_id), gemini_key, monthly_limit)
-    agent.reset_sessions(str(target_id))
-    return {"status": "success", "message": "Gemini API тохиргоо амжилттай шинэчлэгдлээ!"}
+    stored = database.get_page(str(target_id)) or {}
+    values, changed, preserved, cleared, mask_echoes = _merged_settings(
+        body, stored, GEMINI_SETTINGS_SPEC
+    )
+
+    # `update_page_gemini_key` used to `return True` unconditionally, so the handler could not
+    # tell a write from a no-op. It now returns `rowcount > 0` and this reports it.
+    written = database.update_page_gemini_key(
+        str(target_id),
+        str(values["gemini_api_key"]),
+        int(values["monthly_token_limit"]),
+    )
+    if not written:
+        # HTTP 200, not 404: this endpoint's contract has always been
+        # `{"status": ..., "message": ...}` and the dashboard branches on `data.status`.
+        message = f"'{target_id}' хуудас олдсонгүй - ямар ч тохиргоо хадгалагдсангүй."
+        return JSONResponse(
+            {
+                "status": "error",
+                "success": False,
+                "written": False,
+                "page_id": str(target_id),
+                "changed": [],
+                "preserved": preserved,
+                "cleared": [],
+                "mask_echoes": mask_echoes,
+                "ignored_fields": ignored,
+                "error": message,
+                "message": message,
+            }
+        )
+
+    if changed:
+        # Sessions are reset only when something actually moved: a re-save of the same key used
+        # to throw away every in-flight conversation for the tenant.
+        agent.reset_sessions(str(target_id))
+
+    # Phase 54 (F-54-1). This endpoint wrote no audit row at all, and
+    # `database.update_page_gemini_key` contains none either, so a tenant's API key and quota
+    # could be changed or destroyed with nothing in `audit_logs` to show it. Names, booleans and
+    # the quota only - never the key, never its mask.
+    if changed:
+        actor = await _settings_actor(request)
+        audit_failure = _audit_or_report(
+            "page.gemini_key.cleared" if "gemini_api_key" in cleared else "page.gemini_key.updated",
+            operation="page gemini key update",
+            page_id=str(target_id),
+            actor_role=actor["actor_role"],
+            actor_id=actor["actor_id"],
+            resource_type="page_gemini_key",
+            resource_id=str(target_id),
+            details={
+                "via": "api",
+                "changed_fields": changed,
+                "preserved_fields": preserved,
+                "cleared_fields": cleared,
+                "mask_echo_fields": mask_echoes,
+                "ignored_fields": ignored,
+                "has_gemini_key": bool(values["gemini_api_key"]),
+                "gemini_key_changed": "gemini_api_key" in changed,
+                "monthly_token_limit": int(values["monthly_token_limit"]),
+                "session_ref": actor["session_ref"],
+            },
+            ip_address=core_rate_limit.resolve_client_ip(request),
+        )
+        if audit_failure is not None:
+            return audit_failure
+
+    if not changed:
+        message = (
+            "Gemini API тохиргоо өөрчлөгдөөгүй - хадгалагдсан утгууд хэвээр үлдлээ."
+            if not mask_echoes
+            else "Илгээсэн утга нь API-ын харуулсан mask байна - хадгалагдсан түлхүүр хэвээр үлдлээ."
+        )
+    elif cleared:
+        message = "Gemini API түлхүүр устгагдлаа - хуудас админы квот ашиглана."
+    else:
+        message = "Gemini API тохиргоо амжилттай шинэчлэгдлээ!"
+    return {
+        "status": "success",
+        "success": True,
+        "written": True,
+        "page_id": str(target_id),
+        "changed": changed,
+        "preserved": preserved,
+        "cleared": cleared,
+        "mask_echoes": mask_echoes,
+        "ignored_fields": ignored,
+        "message": message,
+    }
 
 @app.post("/api/pages/credentials")
 @app.post("/api/pages/{page_id}/credentials")
@@ -1601,15 +1712,53 @@ async def update_page_google_sheets_endpoint(page_id: str, payload: Dict[str, An
         require_auth=True,
         permission="knowledge:write",
     )
-    url = payload.get("google_sheets_url", "").strip()
-    if url:
+    # Phase 54. `payload.get("google_sheets_url", "")` meant a body that did not name the URL
+    # cleared it: the same replace-not-merge shape as F-54-1, on the column that says where this
+    # tenant's knowledge comes from. Absent now means unchanged. The SSRF validation is
+    # untouched and still runs for any non-empty URL the caller names, so
+    # `test_phase1_google_sheets_ssrf_blocked` keeps its 400.
+    stored = database.get_page(page_id) or {}
+    values, changed, preserved, cleared, mask_echoes = _merged_settings(
+        payload, stored, SHEETS_SETTINGS_SPEC
+    )
+    url = str(values["google_sheets_url"])
+    if "google_sheets_url" in payload and url:
         try:
             sheets_service.normalize_sheet_csv_url(url)
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
-    database.update_page_google_sheets(page_id, url)
-    agent.reset_sessions(page_id)
-    return {"success": True, "page_id": page_id, "google_sheets_url": url}
+
+    # `update_page_google_sheets` used to `return True` unconditionally; it now reports rowcount.
+    written = database.update_page_google_sheets(page_id, url)
+    if not written:
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "page_id": page_id,
+                "google_sheets_url": "",
+                "changed": [],
+                "preserved": preserved,
+                "message": f"'{page_id}' хуудас олдсонгүй - ямар ч тохиргоо хадгалагдсангүй.",
+            }
+        )
+
+    if changed:
+        agent.reset_sessions(page_id)
+
+    # Not audited, deliberately: a sheet URL is a knowledge source, not a credential and not an
+    # authorisation fact, which is the line Phase 53 drew for retention rules too. The merge and
+    # the truthful `written` are the fix here.
+    return {
+        "success": True,
+        "written": True,
+        "page_id": page_id,
+        "google_sheets_url": url,
+        "changed": changed,
+        "preserved": preserved,
+        "cleared": cleared,
+        "mask_echoes": mask_echoes,
+    }
 
 def _save_page_sheets_list(page_id: str, sheets_list: List[Dict[str, Any]]):
     page_obj = database.get_page(page_id)
@@ -2890,6 +3039,21 @@ def _settings_hours(value: Any) -> int:
         return 2
 
 
+def _settings_quota(value: Any) -> int:
+    """The stored form of a monthly token quota: a non-negative int.
+
+    Phase 54. The handler refuses a non-positive or unparseable quota BEFORE merging (it drops
+    the key so the stored quota survives, and names the field in `ignored_fields`), so this only
+    ever sees something already validated or a value read back from the row. The floor of 0
+    keeps a stored NULL from becoming a negative number.
+    """
+    try:
+        quota = int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+    return quota if quota > 0 else 0
+
+
 #: Every settings form that writes several stored columns from one JSON body. Each entry maps
 #: the payload key to ``(stored column, default when the row has none, coerce, mask_style)``.
 #: ``mask_styles`` is empty only for a non-credential, and says which mask shapes the API shows
@@ -2910,6 +3074,19 @@ RETENTION_RULE_SPEC = {
     "delay_hours": ("delay_hours", 2, _settings_hours, None),
     "message_template": ("message_template", "", _settings_text, None),
     "is_active": ("is_active", 1, _settings_flag, None),
+}
+#: Phase 54 (F-54-1). The per-tenant Gemini key and its quota are one form, so they merge by the
+#: same rule as the settings forms above. `mask_styles` is `("bullets",)` because
+#: `database._sanitize_page_secrets` ships `gemini_api_key_masked = mask_secret(key, 4, 4)`, and
+#: a client that echoes that mask back must not have the mask stored as its key.
+GEMINI_SETTINGS_SPEC = {
+    "gemini_api_key": ("gemini_api_key", "", _settings_text, ("bullets",)),
+    "monthly_token_limit": ("monthly_token_limit", 100000, _settings_quota, None),
+}
+#: Phase 54. One column, but it merged by the same rule as the rest: an absent key keeps the
+#: stored sheet URL instead of clearing it. No mask style - a sheet URL is not a credential.
+SHEETS_SETTINGS_SPEC = {
+    "google_sheets_url": ("google_sheets_url", "", _settings_text, None),
 }
 _MASK_BULLET = "\u2022"
 
