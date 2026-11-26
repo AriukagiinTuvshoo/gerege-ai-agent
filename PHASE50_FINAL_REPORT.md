@@ -477,7 +477,7 @@ recorded as an observation, not fixed (§13).
 | Remote branch tip before | `1a3bcbd` — in sync, so the push is a fast-forward |
 | `origin/main` before **and** after | `aedeca46c473dad10ad250c6187aadce1f461225` — **unchanged** |
 | Ancestry | remote tip is an ancestor of HEAD → fast-forward, **no** `--force` |
-| Change set | 11 files, 2262 insertions, 17 deletions (2 new source/test files + 1 new test module + 1 new report) |
+| Change set | 11 files, 2301 insertions, 17 deletions (1 new module, 2 new test modules, 1 new report) |
 | `.env` tracked by git | **No** — `git ls-files --error-unmatch .env` fails; `.gitignore:2` |
 | The Gemini key in any tracked file | **0** files (`git grep` for the literal value) |
 | Live secrets in the two reports | **0** occurrences of `ADMIN_PASSWORD`, `E02_ACCOUNT_KEY_SECRET`, `META_VERIFY_TOKEN`, or the Gemini key. The key's sha256 fingerprint (`5c83e611e4ce565a…`) is quoted so a leak could be recognised without publishing the value |
@@ -486,7 +486,25 @@ recorded as an observation, not fixed (§13).
 
 ### 12.2 Commit and push
 
-*(filled in by the documentation-only follow-up commit, which cannot describe its own push)*
+```
+commit  fca3ddc4e8d02345443b29f3605bd129ca2da985   (arena/d78ebf88-gerege-ai-agent)
+parent  1a3bcbd365e33bd4e768d3d120b11887760a2ffa   (Phase 49)
+date    2026-11-26T06:43:34Z
+stats   11 files, +2301 / -17
+push    1a3bcbd..fca3ddc  arena/d78ebf88-gerege-ai-agent -> arena/d78ebf88-gerege-ai-agent
+        (fast-forward, exit code 0)
+```
+
+Post-push verification: `git ls-remote origin arena/d78ebf88-gerege-ai-agent` → `fca3ddc…`;
+local HEAD == remote tip; `origin/main` still `aedeca4…`;
+`gh api …/commits/fca3ddc` confirms the SHA, the parent and the stats above. The commit diff was
+grepped for the literal Gemini key: **0 occurrences**.
+
+**Follow-up commit.** This section cannot describe its own push record, so it was completed by
+one documentation-only commit *after* `fca3ddc` was pushed. That commit changes
+`PHASE50_FINAL_REPORT.md` and nothing else — no code, no test, no configuration — so **the change
+set under review is `fca3ddc`**, and `git diff fca3ddc..HEAD -- . ':!PHASE50_FINAL_REPORT.md'`
+is empty.
 
 ### 12.3 CI
 
