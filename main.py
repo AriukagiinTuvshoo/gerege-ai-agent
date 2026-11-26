@@ -2060,10 +2060,131 @@ async def readiness_check():
         },
     )
 
+#: `POST /api/update-keys` payload field -> the `.env` key it owns. Only a field the admin
+#: actually submitted is written (F-51-3): the endpoint used to rebuild the whole file from a
+#: fixed 8-key map, which deleted every other setting it did not know about.
+UPDATE_KEYS_ENV_NAMES = {
+    "gemini_key": "GEMINI_API_KEY",
+    "meta_token": "META_PAGE_ACCESS_TOKEN",
+    "meta_verify": "META_VERIFY_TOKEN",
+    "tg_token": "TELEGRAM_BOT_TOKEN",
+    "tg_manager_id": "TELEGRAM_MANAGER_CHAT_ID",
+    "admin_password": "ADMIN_PASSWORD",
+}
+
+
+def merge_env_file(updates: Dict[str, str], path: str = ".env") -> Dict[str, Any]:
+    """Write `updates` into an existing dotenv file, losing nothing else in it.
+
+    F-51-3. `POST /api/update-keys` used to do this::
+
+        with open(".env", "w") as f:
+            for k, v in keys_map.items():      # exactly 8 fixed keys
+                f.write(f"{k}={v}\\n")
+
+    That is truncation, not an update. Measured against this repository's own `.env`
+    (170 lines, 42 keys): saving one field from the dashboard left an 8-line file. Gone were
+    `DATABASE_URL`, `DB_PATH`, `CSV_PATH`, `REDIS_URL`, `ALLOWED_ORIGINS`, `TRUSTED_PROXIES`,
+    `E02_ACCOUNT_KEY_SECRET`, `MANYCHAT_WEBHOOK_SECRET` and the whole `BACKUP_*` block, so the
+    next restart came up on SQLite, with no shared rate-limit store, with the account-key
+    secret missing (the limiter silently degrades to a per-worker counter), with the ManyChat
+    webhook secret gone and with no offsite backup configuration. Every explanatory comment
+    was lost too, so the file stopped being readable as documentation.
+
+    This merges instead: a key already in the file is updated on its own line, a key that is
+    not there is appended, and every other line - including comments and blank lines - is
+    preserved byte for byte. The write is atomic (`mkstemp` in the same directory, then
+    `os.replace`) and keeps the file's existing mode, so a concurrent reader never sees a
+    half-written `.env` and a 0600 file does not become 0644.
+
+    A value containing a newline is refused rather than written. `os.replace` would happily
+    store `"x\\nADMIN_PASSWORD=pwned"` as two lines, which is a credential write nobody
+    submitted - the payload arrives over HTTP, so the newline is attacker-shaped input even
+    though the caller is an authenticated admin.
+
+    Returns a report so a caller (or a test) can assert what happened::
+
+        {"path": ..., "updated": [names], "appended": [names], "preserved": int, "mode": "0o600"}
+
+    `preserved` counts assignment keys that were already in the file and were *not* touched.
+    Raises `FileNotFoundError` when the file does not exist: creating a brand new `.env` from
+    one submitted key is the same data loss in the other direction, and the caller has
+    already decided that writing is allowed at all.
+    """
+    import stat
+    import tempfile
+
+    for name, value in updates.items():
+        if "\n" in value or "\r" in value:
+            raise ValueError(
+                f"{name}: refusing to write a value containing a newline - it would inject "
+                f"extra keys into {path}"
+            )
+
+    with open(path, "r", encoding="utf-8") as fh:
+        original = fh.read()
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+
+    lines = original.split("\n")
+    index_of: Dict[str, int] = {}
+    for i, line in enumerate(lines):
+        if line.startswith("#") or "=" not in line:
+            continue
+        name = line.split("=", 1)[0].strip()
+        if name and name.replace("_", "").isalnum():
+            index_of[name] = i          # the last assignment wins, as dotenv itself does
+
+    updated: List[str] = []
+    appended: List[str] = []
+    for name, value in updates.items():
+        if name in index_of:
+            lines[index_of[name]] = f"{name}={value}"
+            updated.append(name)
+        else:
+            appended.append(name)
+    if appended:
+        while lines and lines[-1] == "":   # keep the file's trailing-newline convention
+            lines.pop()
+        lines.extend(f"{name}={updates[name]}" for name in appended)
+        lines.append("")
+
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".env.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write("\n".join(lines))
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    return {
+        "path": path,
+        "updated": sorted(updated),
+        "appended": sorted(appended),
+        "preserved": len([n for n in index_of if n not in updates]),
+        "mode": oct(mode),
+    }
+
+
 @app.post("/api/update-keys")
 async def update_keys(payload: Dict[str, str], request: Request):
     """Админы системийн түлхүүрүүд засах (Зөвхөн Админ — P0-2)"""
     await core_security.require_admin(request)
+
+    # F-51-3: refuse a newline before anything is mutated. The value is about to be written
+    # into `.env`, where a newline means "and also set this other key" (see merge_env_file).
+    for _field in UPDATE_KEYS_ENV_NAMES:
+        _value = str(payload.get(_field, "") or "")
+        if "\n" in _value or "\r" in _value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{_field}: a value containing a line break is rejected",
+            )
 
     for k in ["gemini_key", "meta_token", "meta_verify", "tg_token", "tg_manager_id", "admin_password"]:
         v = payload.get(k, "").strip()
@@ -2085,22 +2206,26 @@ async def update_keys(payload: Dict[str, str], request: Request):
 
     # Production горимд plaintext .env файл руу бичихгүй
     if not core_security.is_production_mode() and os.getenv("ALLOW_ENV_FILE_WRITE", "0") == "1":
-        keys_map = {
-            "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
-            "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-            "META_PAGE_ACCESS_TOKEN": os.getenv("META_PAGE_ACCESS_TOKEN", ""),
-            "META_VERIFY_TOKEN": os.getenv("META_VERIFY_TOKEN", ""),
-            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            "TELEGRAM_MANAGER_CHAT_ID": os.getenv("TELEGRAM_MANAGER_CHAT_ID", ""),
-            "ADMIN_PASSWORD": os.getenv("ADMIN_PASSWORD", database.DEFAULT_ADMIN_PASSWORD),
-            "PORT": os.getenv("PORT", "8000")
+        # F-51-3: write only what this request actually submitted. The previous code rebuilt
+        # the whole file from a fixed 8-key map, which deleted ~34 other settings - including
+        # GEMINI_MODEL and PORT, which this endpoint does not even accept as input.
+        updates = {
+            UPDATE_KEYS_ENV_NAMES[field]: os.environ[UPDATE_KEYS_ENV_NAMES[field]]
+            for field in UPDATE_KEYS_ENV_NAMES
+            if str(payload.get(field, "") or "").strip()
+            and UPDATE_KEYS_ENV_NAMES[field] in os.environ
         }
-        try:
-            with open(".env", "w", encoding="utf-8") as f:
-                for k, v in keys_map.items():
-                    f.write(f"{k}={v}\n")
-        except Exception as env_err:
-            logger.warning(f"Could not write .env file (read-only fs): {env_err}")
+        if updates:
+            try:
+                report = merge_env_file(updates)
+                logger.info(
+                    ".env updated: wrote %s; %d other key(s) preserved",
+                    ", ".join(report["updated"] + report["appended"]),
+                    report["preserved"],
+                )
+            except Exception as env_err:
+                # Names and counts only - never a value, which is a credential.
+                logger.warning(f"Could not update .env file: {env_err}")
 
     return {"status": "success", "message": "Тохиргоо амжилттай хадгалагдлаа!"}
 

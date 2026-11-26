@@ -1,4 +1,5 @@
 import os
+import hmac
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -7,6 +8,7 @@ import httpx
 from dotenv import load_dotenv
 
 import database
+from core import security as core_security
 
 load_dotenv(override=True)
 logger = logging.getLogger("executive_bot")
@@ -128,14 +130,42 @@ async def handle_owner_command(chat_id: str, text: str, page_id: Optional[str] =
     if cmd.startswith("/start"):
         parts = text.strip().split()
         provided_secret = parts[1] if len(parts) > 1 else ""
-        expected_secret = os.getenv("VERIFY_TOKEN", "GEREGE_VERIFY_2026").strip()
+        # F-51-5: this line used to read
+        #     expected_secret = os.getenv("VERIFY_TOKEN", "GEREGE_VERIFY_2026").strip()
+        # which made a string published in this repository — and documented in no template,
+        # no compose file and no doc — the credential that decides WHO receives the executive
+        # reports. A Telegram bot is public by username, so any stranger who sent
+        # `/start GEREGE_VERIFY_2026` became the owner: the daily report (revenue, invoices,
+        # cargo, customers) went to their chat, the on-demand commands answered to them, and
+        # the real owner was locked out by the P0-7 guard just below. With VERIFY_TOKEN set
+        # but empty the hole was wider still: `provided_secret == expected_secret` was
+        # `"" == ""`, so a bare `/start` from anybody took ownership.
+        #
+        # The expected value is now accepted only if it is a secret at all, and the comparison
+        # is constant-time. With no usable secret the flow degrades to the safe one: a
+        # registered owner keeps working, a stranger is refused, and a first `/start` still
+        # claims an empty slot (the documented onboarding flow, unchanged).
+        expected_secret = os.getenv("VERIFY_TOKEN", "").strip()
+        secret_is_usable = core_security.owner_command_secret_is_usable(expected_secret)
+        if expected_secret and not secret_is_usable:
+            # Named, never valued: the operator must learn their setting was refused, and the
+            # point of the finding is that this value travels no further than this line.
+            logger.error(
+                "VERIFY_TOKEN is set to a published or placeholder value, so it is refused as "
+                "the owner-command secret (F-51-5): no /start secret can re-register the report "
+                "recipient until it is replaced, e.g. "
+                'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
+        secret_matches = bool(secret_is_usable) and hmac.compare_digest(
+            provided_secret.strip(), expected_secret
+        )
 
         # Хэрэв өмнө нь эзэн бүртгэгдсэн бол өөр хүн /start бичихэд эзний эрхийг булаахгүй байх хамгаалалт (P0-7)
-        if existing_mgr_id and str(existing_mgr_id) != str(chat_id) and provided_secret != expected_secret:
+        if existing_mgr_id and str(existing_mgr_id) != str(chat_id) and not secret_matches:
             return None
 
         # Эзний Chat ID-г хадгалах (анх удаа холбож буй эсвэл нууц кодоор баталгаажсан үед)
-        if not existing_mgr_id or str(existing_mgr_id) == str(chat_id) or provided_secret == expected_secret:
+        if not existing_mgr_id or str(existing_mgr_id) == str(chat_id) or secret_matches:
             os.environ["TELEGRAM_MANAGER_CHAT_ID"] = str(chat_id)
             if page_id:
                 database.update_page_telegram_settings(

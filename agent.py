@@ -507,6 +507,16 @@ class AIAgent:
             sheet_context = sheets_service.get_page_sheets_lookup_context(page_data, text) or ""
 
         if client:
+            # F-51-4: this try-block spans three unrelated kinds of failure, and all three
+            # used to be logged as "Gemini API алдаа" — context assembly (database and
+            # memory reads, tool definitions), the generation call itself, and
+            # post-processing (payment order, token accounting, registration, message log).
+            # An operator chasing an AI outage was handed database errors, and a database
+            # error announced itself as an AI outage. The phase is tracked so the label can
+            # name what actually failed; the historical string is kept verbatim for the
+            # generation phase because existing log greps match it. Initialised *outside*
+            # the try so the handler can never hit an unbound local.
+            phase = "context"
             try:
                 from google.genai import types
 
@@ -628,6 +638,9 @@ class AIAgent:
                 agent_tools = [register_customer, check_sheet_cargo_status, create_payment_invoice, book_service_appointment]
 
                 session_key = f"{page_id}_{sender_id}"
+                # F-51-4: from here a failure belongs to the provider — session creation
+                # and the generation call are both network calls to Google.
+                phase = "generation"
                 # F-50-1: whose key this call will use, so a tenant's key cannot be recorded
                 # as a verdict on the platform key (and vice versa).
                 ai_scope = "page" if is_custom_key else "default"
@@ -703,6 +716,13 @@ class AIAgent:
                 if not reply_text:
                     reply_text = f"Сайн байна уу? {page_name}-д тавтай морилно уу! Танд ямар мэдээлэл хэрэгтэй байна вэ?"
 
+                # F-51-4: the reply now exists. Everything below is local work — the
+                # payment order, token accounting, registration and the message log touch
+                # the database, not the AI provider — so a failure here must not be
+                # reported as an AI outage, and the readiness verdict recorded by
+                # _send_generation is left alone (the call genuinely succeeded).
+                phase = "post-processing"
+
                 # 5. ТӨЛБӨРИЙН ХҮСЭЛТ ШАЛГАХ (QPAY EXPLICIT INTENT FALLBACK)
                 payment_keywords = ["төлбөр төлье", "төлбөрөө төлье", "qpay линк", "qpay-ээр төлье", "нэхэмжлэх авъя", "хандив өгье"]
                 is_payment_intent = any(pk in text.lower() for pk in payment_keywords)
@@ -771,7 +791,14 @@ class AIAgent:
             except Exception as e:
                 # F-50-2: redacted. The readiness verdict was already recorded against the
                 # call itself (see _send_generation); this line is the operator's breadcrumb.
-                logger.error("Gemini API алдаа: %s", ai_readiness.redacted(e))
+                # F-51-4: and it now names the phase that failed, so a database or payment
+                # error is no longer reported as an AI outage. Control flow is unchanged —
+                # every phase still falls through to the alternative providers below.
+                detail = ai_readiness.redacted(e)
+                if phase == "generation":
+                    logger.error("Gemini API алдаа: %s", detail)
+                else:
+                    logger.error("Chat алдаа — шат: %s (Gemini API биш): %s", phase, detail)
 
         # 4.5. Олон төрлийн AI Provider Fallback (OpenAI / DeepSeek / Anthropic — Phase 3)
         if text:

@@ -511,6 +511,67 @@ def meta_verify_token_is_usable(token: Optional[str]) -> bool:
     return True
 
 
+#: Phase 51 (F-51-5). The fallback `executive_bot_service.handle_owner_command` used for
+#: `VERIFY_TOKEN` — the secret in a Telegram `/start <secret>` message that decides WHO
+#: receives the executive reports. It is published in this repository and it appeared in no
+#: template at all: not `.env.example`, not `docker-compose.prod.yml`, not
+#: `docker-compose.staging.yml`, not `docs/`. `grep -rn GEREGE_VERIFY_2026` matched exactly
+#: one line in the whole tree — the default itself — so no operator was ever told it existed,
+#: let alone told to replace it.
+PUBLIC_OWNER_COMMAND_SECRET = "GEREGE_VERIFY_2026"
+
+
+def owner_command_secret_is_usable(value: Optional[str]) -> bool:
+    """Whether ``value`` may serve as the expected Telegram ``/start <secret>`` owner secret.
+
+    Phase 51 (F-51-5). The handler used
+
+        expected_secret = os.getenv("VERIFY_TOKEN", "GEREGE_VERIFY_2026").strip()
+        ...
+        if not existing_mgr_id or str(existing_mgr_id) == str(chat_id) or provided_secret == expected_secret:
+            os.environ["TELEGRAM_MANAGER_CHAT_ID"] = str(chat_id)
+            database.update_page_telegram_settings(..., manager_chat_id=str(chat_id))
+
+    so anybody who sent the bot `/start GEREGE_VERIFY_2026` became the owner: the daily
+    executive report (revenue, invoices, cargo, customers) was redirected to their chat, the
+    on-demand commands `/today`, `/report`, `/qpay` and `/cargo` answered to them, and the
+    real owner was locked out by the guard that protects a registered manager. A Telegram bot
+    is public by username, so the attacker needs no access to this deployment — only the
+    string that is in this file. With `VERIFY_TOKEN` set but empty the hole was wider still:
+    `provided_secret == expected_secret` became `"" == ""`, so a bare `/start` from a stranger
+    took ownership.
+
+    This is the third instance of one defect in this codebase — a value published in the
+    repository being accepted as a credential. F-44-B closed it for `META_VERIFY_TOKEN`
+    (the Meta handshake) and F-49-1 for the ManyChat webhook; both were found by following a
+    published default to the place it was compared. This one was found the other way round,
+    by listing every environment variable the code reads that no template documents.
+
+    Unlike :func:`meta_verify_token_is_usable` this refuses the published value in **every**
+    environment, not only in production. That function stays permissive in development
+    because sixteen suites authenticate with the published Meta default and nothing is
+    exposed by it there; nothing depends on this one (no test and no template ever named it),
+    and development permissiveness is exactly how a published literal reaches production
+    unnoticed. An operator who wants secret-based re-registration generates a value:
+
+        VERIFY_TOKEN=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+
+    With no usable secret the flow degrades to the safe one: a registered owner keeps working,
+    a stranger is refused, and a first `/start` still claims an unregistered slot — which is
+    the documented onboarding behaviour and is unchanged here.
+
+    Decides only *whether a value may be used*. It never returns the value and never logs it.
+    """
+    candidate = str(value or "").strip()
+    if not candidate:
+        return False
+    if candidate.lower() == PUBLIC_OWNER_COMMAND_SECRET.lower():
+        return False
+    # Also refuses the other published literal (an operator who copied the Meta default into
+    # VERIFY_TOKEN) and the unfilled-template shapes.
+    return not meta_verify_token_is_placeholder(candidate)
+
+
 def verify_meta_webhook_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
     """
     Meta X-Hub-Signature-256 шалгалт.
