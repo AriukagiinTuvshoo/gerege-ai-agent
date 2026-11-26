@@ -44,10 +44,27 @@ if config.config_file_name is not None and not config.attributes.get("skip_loggi
 # Alembic migrates one database while the application reads another.
 _pinned = (config.get_main_option("sqlalchemy.url") or "").strip()
 _environ_url = get_database_url()
-if not os.getenv("DATABASE_URL", "").strip() and _pinned.startswith("sqlite:"):
+_named_url = bool(os.getenv("DATABASE_URL", "").strip())
+_named_path = bool(os.getenv("DB_PATH", "").strip())
+if not _named_url and _pinned.startswith("sqlite:"):
     _url = _pinned
 else:
     _url = _environ_url
+
+# B5: `alembic.ini` no longer names a database. With nothing set, `get_database_url()` falls
+# through `get_sqlite_db_path()` to the repository's own `leads.db`, so a shell run would
+# migrate the checkout's database in place and report success. Measured before this guard:
+# `python -m alembic upgrade head` with an empty environment rewrote `leads.db`. Refusing is
+# the only outcome that cannot be mistaken for a successful migration of the intended file.
+# Programmatic callers are unaffected: `core.schema_manager._alembic_config()` pins the URL,
+# which is what `_pinned` is for.
+if not (_named_url or _named_path or _pinned):
+    raise RuntimeError(
+        "Alembic was invoked without a target database. Set DATABASE_URL (or DB_PATH for a "
+        "SQLite file) and re-run; refusing to fall back to the repository's own leads.db. "
+        "Programmatic runs through core.schema_manager pin the URL and never reach this."
+    )
+
 config.set_main_option("sqlalchemy.url", _url)
 target_metadata = Base.metadata
 

@@ -44,6 +44,7 @@ failed because the file came back with 8 keys, and `merge_env_file` did not exis
 
 import io
 import os
+import re
 import stat
 import sys
 
@@ -419,11 +420,33 @@ class TestTheSourceContract:
         assert "merge_env_file(updates)" in body
 
     def test_the_gate_is_unchanged(self):
-        """Not production AND ALLOW_ENV_FILE_WRITE=1 — the fix must not widen it."""
-        body = self._read("main.py")
-        assert (
-            'if not core_security.is_production_mode() and os.getenv("ALLOW_ENV_FILE_WRITE", "0") == "1":'
-            in body
+        """Not production AND ALLOW_ENV_FILE_WRITE=1 — the fix must not widen it.
+
+        Phase 52 (O-51-6) lifted the same two conditions into a named `write_gate_open`,
+        because the response now has to report which side of the gate the request landed on.
+        So this pin follows the conditions instead of the line's punctuation, and it is
+        stronger than the one it replaces: the single `merge_env_file(updates)` call must not
+        merely exist somewhere in the file, it must sit *inside* the gate's block.
+        """
+        code = self._code_only(self._read("main.py"))
+        # The closing paren is anchored to its own line: `(.*?)\)\n` would stop at the first
+        # `)` before a newline, which is `is_production_mode()`'s own (measured: it did).
+        gate = re.search(r"write_gate_open = \(\n(.*?)\n\s*\)\n", code, re.S)
+        assert gate, "the write gate must still be one named expression"
+        conditions = " ".join(gate.group(1).split())
+        assert conditions == (
+            "not core_security.is_production_mode() "
+            'and os.getenv("ALLOW_ENV_FILE_WRITE", "0") == "1"'
+        ), f"the gate was widened or narrowed: {conditions!r}"
+
+        lines = code.splitlines()
+        gate_at = next(i for i, ln in enumerate(lines) if ln.strip() == "if write_gate_open:")
+        calls = [i for i, ln in enumerate(lines) if "merge_env_file(updates)" in ln]
+        assert len(calls) == 1, f"expected exactly one gated write, found {len(calls)}"
+        assert calls[0] > gate_at, "the write must come after the gate, not before it"
+        indent = lambda ln: len(ln) - len(ln.lstrip())  # noqa: E731
+        assert indent(lines[calls[0]]) > indent(lines[gate_at]), (
+            "the write must be inside the gate's block, not beside it"
         )
 
     def test_the_endpoint_writes_only_the_keys_it_accepts(self):

@@ -178,7 +178,11 @@ def init_db():
             "Tuvshok Кино & Драма Суваг",
             "entertainment",
             page_token,
-            "agent_verify_secret_token_123",
+            # B1 (Phase 52): was the published literal, so the default page of every fresh
+            # install carried a verify token that this repository prints. An operator now
+            # sets one deliberately; until then the value is empty and
+            # `meta_verify_token_is_usable` refuses the handshake in production.
+            "",
             k_json,
             "tuvshok",
             magic
@@ -1118,7 +1122,7 @@ def save_page(
     name: str,
     category: str = "general",
     page_access_token: str = "",
-    verify_token: str = "agent_verify_secret_token_123",
+    verify_token: str = "",
     knowledge_json: str = "{}",
     gemini_api_key: str = "",
     monthly_token_limit: int = 100000,

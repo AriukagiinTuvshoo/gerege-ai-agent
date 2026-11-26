@@ -1896,7 +1896,13 @@
         <div class="space-y-4 text-xs">
           <div>
             <label class="text-stone-400 block mb-1 font-semibold">Facebook Page Access Token:</label>
-            <input id="settings-meta-token" type="password" placeholder="EAAQP..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono">
+              <input id="settings-meta-token" type="password" placeholder="EAAQP..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono">
+            <!-- B6 (Phase 52): the box above used to be filled from `p.page_access_token`,
+                 a field the API deliberately removes (Phase 49, F-49-2), so it rendered empty
+                 for every page — including the ones with a token stored. This note is where
+                 the truth now lives: whether a token exists, and what leaving the box empty
+                 does. Filled by updatePageUI(). -->
+            <p id="settings-meta-token-note" class="mt-1.5 text-[11px] leading-relaxed text-stone-400"></p>
           </div>
 
           <div class="p-4 rounded-xl bg-stone-50 border border-stone-200 space-y-3 text-xs">
@@ -3010,8 +3016,39 @@
       document.getElementById('kb-page-subtitle').innerText = `${p.name} өртөөний цадиг түүх, судар`;
       renderIndustryWorkspace(p);
 
-      // Token display
-      document.getElementById('settings-meta-token').value = p.page_access_token || '';
+        // Token display.
+      //
+      // B6 (Phase 52). This line used to read
+      //
+      //     document.getElementById('settings-meta-token').value = p.page_access_token || '';
+      //
+      // `p.page_access_token` does not exist. `database._sanitize_page_secrets()` pops the real
+      // value out of every page dict before it leaves the API (Phase 49, F-49-2) and ships
+      // `page_access_token_masked` plus `has_page_token` in its place, so the field was blank
+      // for every page — including the ones that DO have a token stored. An empty password box
+      // reads as "no token configured", which is a statement about the system that the client
+      // was not in a position to make, and it was wrong for every configured tenant.
+      //
+      // The masked value goes into `placeholder`, never into `value`. A placeholder is not
+      // submitted, so `saveCurrentPageSettings()` still posts an empty string and `save_page`'s
+      // `COALESCE(NULLIF(excluded.page_access_token,''), pages.page_access_token)` preserves the
+      // stored token. Putting the masked text into `value` would post it back; `save_page`
+      // clears a `•`/`****` echo to "" instead of storing it, but relying on that guard to undo
+      // a mistake the UI should never make is not a design.
+      const metaTokenElem = document.getElementById('settings-meta-token');
+      if (metaTokenElem) {
+        metaTokenElem.value = '';
+        const masked = (p.page_access_token_masked || '').trim();
+        metaTokenElem.placeholder = (p.has_page_token && masked) ? masked : 'EAAQP...';
+      }
+      const metaTokenNote = document.getElementById('settings-meta-token-note');
+      if (metaTokenNote) {
+        metaTokenNote.innerText = p.has_page_token
+          ? 'Token хадгалагдсан (' + (p.page_access_token_masked || '') + '). API жинхэнэ утгыг '
+            + 'буцаадаггүй тул энэ хайрцгийг хоосон орхивол хадгалагдсан token хэвээр үлдэнэ; '
+            + 'шинэ утга бичиж хадгалвал солигдоно.'
+          : 'Token хадгалагдаагүй. Facebook Page Access Token-оо энд оруулна уу.';
+      }
 
       // Webhook Callback URL display dynamically
       const webhookElem = document.getElementById('settings-webhook-callback-url');

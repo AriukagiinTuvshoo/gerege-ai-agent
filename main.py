@@ -2204,8 +2204,21 @@ async def update_keys(payload: Dict[str, str], request: Request):
 
     database.record_audit_log("system.keys.updated", actor_role="admin", details={"updated_fields": [k for k in payload if payload.get(k)]})
 
+    # O-51-6 (Phase 52). Which fields this request actually mutated in `os.environ`. The loop
+    # above only assigns on a non-empty value, so the list is computed the same way rather than
+    # taken from the payload's keys.
+    applied_fields = [
+        field for field in UPDATE_KEYS_ENV_NAMES
+        if str(payload.get(field, "") or "").strip()
+    ]
+    persisted = False
+    write_gate_open = (
+        not core_security.is_production_mode()
+        and os.getenv("ALLOW_ENV_FILE_WRITE", "0") == "1"
+    )
+
     # Production горимд plaintext .env файл руу бичихгүй
-    if not core_security.is_production_mode() and os.getenv("ALLOW_ENV_FILE_WRITE", "0") == "1":
+    if write_gate_open:
         # F-51-3: write only what this request actually submitted. The previous code rebuilt
         # the whole file from a fixed 8-key map, which deleted ~34 other settings - including
         # GEMINI_MODEL and PORT, which this endpoint does not even accept as input.
@@ -2218,6 +2231,7 @@ async def update_keys(payload: Dict[str, str], request: Request):
         if updates:
             try:
                 report = merge_env_file(updates)
+                persisted = True
                 logger.info(
                     ".env updated: wrote %s; %d other key(s) preserved",
                     ", ".join(report["updated"] + report["appended"]),
@@ -2227,7 +2241,58 @@ async def update_keys(payload: Dict[str, str], request: Request):
                 # Names and counts only - never a value, which is a credential.
                 logger.warning(f"Could not update .env file: {env_err}")
 
-    return {"status": "success", "message": "Тохиргоо амжилттай хадгалагдлаа!"}
+    # O-51-6 (Phase 52). The response used to be an unconditional "saved successfully" for a
+    # change that, with the write gate closed, no file recorded and no restart survives. The
+    # consequence was not cosmetic. `TELEGRAM_MANAGER_CHAT_ID` in `os.environ` is one of the two
+    # sources `executive_bot_service.handle_owner_command` reads to decide who owns the
+    # executive reports, so an admin call to this endpoint with the gate closed produced a
+    # process that believed a different owner was registered from the one in the database - and
+    # from the one the WORKER process believed, since the worker is a separate process that
+    # never sees this assignment and is what actually sends the 08:30 report. Nothing reconciled
+    # the two except a restart, and nothing told the operator a restart was needed.
+    #
+    # The in-process update is kept: `tests/test_e51_env_write_merge.py` documents it as the
+    # intended behaviour ("the in-process update still succeeds") and an admin rotating a key
+    # mid-run should not have to restart to use it. What changes is that the response and the log
+    # now say which of the two happened, so the state of the system can be read instead of
+    # inferred. Names only, never values.
+    process_only = [] if persisted else sorted(
+        UPDATE_KEYS_ENV_NAMES[field] for field in applied_fields
+    )
+    if process_only:
+        reason = "production mode" if core_security.is_production_mode() else (
+            "ALLOW_ENV_FILE_WRITE is not 1"
+        )
+        warning = (
+            f"Applied to this process only, not written to .env ({reason}); a restart reverts "
+            f"it and no other process ever saw it: {', '.join(process_only)}."
+        )
+        if "TELEGRAM_MANAGER_CHAT_ID" in process_only:
+            warning += (
+                " This one is worse than the others: the executive-report recipient is per "
+                "page in the database, and the worker - a separate process, and the one that "
+                "actually sends the 08:30 report - reads that row. This process and the worker "
+                "now disagree about who owns the reports. Register it with POST "
+                "/api/executive/settings, or persist .env and restart, to make it durable."
+            )
+        logger.warning("update-keys: %s", warning)
+        message = (
+            "Тохиргоо энэ процессод хэрэглэгдлээ, гэхдээ .env файлд хадгалагдсангүй "
+            "(дахин ачааллахад буцна)."
+        )
+    else:
+        warning = None
+        message = "Тохиргоо амжилттай хадгалагдлаа!"
+
+    return {
+        "status": "success",
+        "message": message,
+        # O-51-6: the truth about durability, for a client that would rather read a field than
+        # parse a sentence.
+        "persisted": persisted,
+        "process_only": process_only,
+        "warning": warning,
+    }
 
 # -------------------------------------------------------------
 # 8. ФИНТЕК & ТӨЛБӨРИЙН АВТОМАТЖУУЛАЛТ (QPAY v2, DEEP LINKS, E-BARIMT)

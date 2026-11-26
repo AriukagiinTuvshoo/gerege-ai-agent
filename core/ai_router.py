@@ -198,6 +198,9 @@ class CircuitBreaker:
         self.cooldown_seconds = cooldown_seconds
         self.failures = 0
         self.opened_at: Optional[float] = None
+        # O-51-2 (Phase 52): the class of the failures that tripped this breaker, so an OPEN
+        # breaker can say why instead of presenting as an unclassified error.
+        self.last_failure_class: Optional[str] = None
 
     def allow_request(self) -> bool:
         if self.opened_at is None:
@@ -211,14 +214,76 @@ class CircuitBreaker:
         self.failures = 0
         self.opened_at = None
 
-    def record_failure(self) -> None:
+    def record_failure(self, cause: Any = None) -> None:
         self.failures += 1
+        if cause is not None:
+            # O-51-2 (Phase 52). `cause` is classified at the moment it happens, when it still
+            # carries its own type, status attribute and text. Doing it here rather than when
+            # the breaker trips matters: the failure that opens the breaker is not necessarily
+            # the last one recorded before a later call is refused, and the refused call has no
+            # cause of its own to classify. `classify_error` never raises.
+            try:
+                from core import ai_readiness
+
+                self.last_failure_class = ai_readiness.classify_error(cause)
+            except Exception:  # noqa: BLE001 - a classifier must never break the breaker
+                pass
         if self.failures >= self.failure_threshold:
             self.opened_at = time.time()
-            logger.warning(f"CircuitBreaker [{self.name}] OPENED after {self.failures} consecutive failures.")
+            logger.warning(
+                "CircuitBreaker [%s] OPENED after %d consecutive failures (last class: %s).",
+                self.name, self.failures, self.last_failure_class or "unclassified",
+            )
 
 
 _CIRCUIT_BREAKERS: Dict[str, CircuitBreaker] = {}
+
+
+class _ProviderStatus(Exception):
+    """A non-2xx answer, carrying only its status code.
+
+    O-51-2 (Phase 52). The two fallback paths used to call ``cb.record_failure()`` with no
+    argument after a non-200 response, so the reason was thrown away at the moment it was
+    known. ``core.ai_readiness.classify_error`` reads ``status_code`` off an exception before
+    it looks at text, which is the reliable channel for a bare HTTP status: a 429 is quota and
+    a 503 is server whatever the body says.
+    """
+
+    def __init__(self, provider: str, status_code: int):
+        super().__init__(f"{provider} answered HTTP {status_code}")
+        self.status_code = int(status_code)
+
+
+def _circuit_open_error(cb: "CircuitBreaker", provider_name: str) -> RuntimeError:
+    """The error a refused call raises while ``cb`` is OPEN.
+
+    O-51-2 (Phase 52). The message used to be only
+
+        CircuitBreaker 'gemini' is currently OPEN; skipping call
+
+    which ``core.ai_readiness.classify_error`` matched against no needle at all, so it landed in
+    ``other``. Measured on this instance, where egress to Google is closed: the first five
+    failures classified ``network``, the breaker opened, and every call after that reported
+    ``other`` — so ``gemini_error_class`` on ``/api/health`` said "unclassified" for exactly the
+    condition that had a known, operator-actionable cause. An operator reading ``other`` has
+    nothing to act on; the same operator reading ``network`` checks egress.
+
+    The cause is carried two ways. In the text, because a human reads the log line and the
+    excerpt ``snapshot()`` keeps. And as an attribute, because text is a poor channel for a fact
+    the raiser already knows: ``classify_error`` honours ``gerege_error_class`` when it names a
+    member of ``ERROR_CLASSES``, so no needle had to be invented and the pinned vocabulary is
+    unchanged. ``ERROR_CLASSES`` gains nothing here — extending it would have meant editing the
+    exact-tuple assertion in ``tests/test_e50_ai_readiness_truth.py`` that pins it, which is a
+    security assertion and not something a classification fix should need to touch.
+    """
+    why = cb.last_failure_class
+    reason = f" after {cb.failures} consecutive {why} failure(s)" if why else ""
+    error = RuntimeError(
+        f"CircuitBreaker '{provider_name}' is currently OPEN{reason}; skipping call"
+    )
+    if why:
+        error.gerege_error_class = why
+    return error
 
 
 def get_circuit_breaker(provider_name: str) -> CircuitBreaker:
@@ -247,7 +312,7 @@ def execute_with_retry(
     """Түр зуурын сүлжээний эсвэл 429/5xx алдаа гарвал Exponential Backoff + CircuitBreaker-ээр дахин оролдох"""
     cb = get_circuit_breaker(provider_name)
     if not cb.allow_request():
-        raise RuntimeError(f"CircuitBreaker '{provider_name}' is currently OPEN; skipping call")
+        raise _circuit_open_error(cb, provider_name)
 
     last_exc = None
     for attempt in range(max_retries + 1):
@@ -264,7 +329,7 @@ def execute_with_retry(
                 sleep_sec = base_delay * (2 ** attempt)
                 logger.warning(f"AI call retry {attempt + 1}/{max_retries} after {sleep_sec:.1f}s due to: {e}")
                 time.sleep(sleep_sec)
-    cb.record_failure()
+    cb.record_failure(last_exc)
     raise last_exc
 
 
@@ -282,6 +347,12 @@ def call_openai_compatible_fallback(
         return None
     cb = get_circuit_breaker("openai")
     if not cb.allow_request():
+        # O-51-2: a skipped fallback used to be indistinguishable from one that was never
+        # configured. Still not an error - the provider is opt-in - but it is now recorded.
+        logger.info(
+            "OpenAI fallback skipped: circuit breaker open after %d failure(s), last class %s.",
+            cb.failures, cb.last_failure_class or "unclassified",
+        )
         return None
 
     key = api_key or os.getenv("OPENAI_API_KEY", "").strip()
@@ -316,9 +387,9 @@ def call_openai_compatible_fallback(
                 choices = data.get("choices") or []
                 if choices:
                     return choices[0].get("message", {}).get("content", "")
-            cb.record_failure()
+            cb.record_failure(_ProviderStatus("openai", resp.status_code))
     except Exception as e:
-        cb.record_failure()
+        cb.record_failure(e)
         logger.warning(f"OpenAI fallback error: {e}")
     return None
 
@@ -336,6 +407,10 @@ def call_anthropic_fallback(
         return None
     cb = get_circuit_breaker("anthropic")
     if not cb.allow_request():
+        logger.info(
+            "Anthropic fallback skipped: circuit breaker open after %d failure(s), last class %s.",
+            cb.failures, cb.last_failure_class or "unclassified",
+        )
         return None
 
     key = api_key or os.getenv("ANTHROPIC_API_KEY", "").strip()
@@ -374,9 +449,9 @@ def call_anthropic_fallback(
                 content_blocks = data.get("content") or []
                 if content_blocks and isinstance(content_blocks, list):
                     return content_blocks[0].get("text", "")
-            cb.record_failure()
+            cb.record_failure(_ProviderStatus("anthropic", resp.status_code))
     except Exception as e:
-        cb.record_failure()
+        cb.record_failure(e)
         logger.warning(f"Anthropic fallback error: {e}")
     return None
 
