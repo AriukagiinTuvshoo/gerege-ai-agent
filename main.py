@@ -1967,7 +1967,15 @@ async def health_check():
     summary_available = None not in (total_pages, total_leads, active_sessions)
     return JSONResponse({
         "status": "healthy",
-        "gemini_ready": agent.is_gemini_ready(),
+        # F-50-1: on its own, `gemini_ready` has always meant "a key is configured" while
+        # reading as "the AI works". `genai.Client(api_key=...)` makes no network call, so it
+        # reported true for a wrong, revoked or unreachable key too — measured live with
+        # every generation attempt failing and every reply coming from the deterministic
+        # fallback. The observed verdict is now published beside it, and the historical field
+        # keeps its historical value so no existing consumer changes behaviour.
+        # Counters and a closed enum only: this endpoint is unauthenticated, so it carries no
+        # exception text — the rule /api/ready states in its own comment.
+        **agent.gemini_status(),
         "model": agent.get_model_name(),
         # SEC-07: lets an operator confirm limits are actually shared across workers
         # rather than silently per-process.

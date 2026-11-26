@@ -282,6 +282,15 @@ class TestManyChatWebhookSecret:
         `assert "secret" not in caplog.text` that captures nothing is a free pass, so this
         test does not depend on the global logging configuration at all. The stub records
         what the module actually emitted; the assertions are unchanged.
+
+        The mechanism was identified in Phase 50 and is fixed at its source (F-50-4):
+        `migrations/env.py` called `logging.config.fileConfig(alembic.ini)`, which defaults to
+        `disable_existing_loggers=True`, so any migration run disabled every logger created
+        before it — `core.security` among them. On an already-migrated database
+        `core.schema_manager.ensure_schema()` returns before invoking Alembic, which is
+        exactly why the warm-database run captured and the cold one did not. See
+        tests/test_e50_migration_logging_truth.py. This test keeps the stub logger: being
+        independent of global logging state is a property worth keeping even now.
         """
         emitted = []
 

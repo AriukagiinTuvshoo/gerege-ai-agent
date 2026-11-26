@@ -70,6 +70,15 @@ def _alembic_config():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cfg = Config(os.path.join(root, "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(root, "migrations"))
+    # F-50-4: this process already configured its own logging (`main.py` calls
+    # `logging.basicConfig`, `worker.py` installs a timestamped format). Alembic's `env.py`
+    # would otherwise call `fileConfig()`, which replaces the root handlers, drops root to
+    # WARN and disables every logger that already exists — measured: 10 of 15 application
+    # loggers silenced for the lifetime of a process that ran a first-boot migration. Running
+    # Alembic as a library must not reconfigure the caller's logging, so `env.py` skips it
+    # when this attribute is set. A CLI run (`alembic upgrade head`) does not set it and keeps
+    # Alembic's own logging configuration.
+    cfg.attributes["skip_logging_config"] = True
     sqlite_path = _resolved_sqlite_path()
     if sqlite_path:
         # `env.py` re-reads the URL from the environment; `sqlalchemy.url` here keeps

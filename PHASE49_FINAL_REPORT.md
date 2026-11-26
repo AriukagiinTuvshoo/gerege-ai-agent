@@ -628,6 +628,26 @@ unmet.
 
 ---
 
+## 11.1 Addendum (Phase 50) — two lines of this report were superseded within a day
+
+* **AI / chat integration: the reason changed, the verdict did not.** This report said AI was
+  BLOCKED because no `GEMINI_API_KEY` existed. A key has since been configured in the local
+  `.env` (git-ignored, never committed) and the application accepts it — but generation still
+  cannot be exercised from this sandbox, because it has no route to
+  `generativelanguage.googleapis.com` (TLS closed immediately; only github.com, api.github.com,
+  pypi.org and registry.npmjs.org are reachable). `/api/chat` still answers 200 with
+  `"model":"fallback"`. Verdict: **still BLOCKED / NOT VERIFIED**, now for a network reason
+  rather than a missing credential. The key's validity could not be tested either way.
+* **The §8 `caplog` hazard has a name.** This report recorded that a `caplog` assertion captured
+  nothing when the schema was created inside the session and passed against an already-migrated
+  database, and stated the mechanism was *not identified*. It is now identified and fixed at the
+  source: `migrations/env.py` called `logging.config.fileConfig(alembic.ini)`, which defaults to
+  `disable_existing_loggers=True`, so a migration run disabled every logger created before it —
+  10 of 15 application loggers on a first boot, in production as well as in tests. See
+  `PHASE50_FINAL_REPORT.md` §6 and `tests/test_e50_migration_logging_truth.py`. The stub-logger
+  approach this report adopted stays correct: being independent of global logging state is worth
+  keeping even after the cause is fixed.
+
 ## 12. Startup / shutdown (unchanged from Phase 48A §10)
 
 ```bash
