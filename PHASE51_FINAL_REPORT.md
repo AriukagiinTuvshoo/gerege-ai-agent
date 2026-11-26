@@ -22,7 +22,8 @@ output is reproduced in this file or in a test that is now part of the suite.
 | B4 | `POST /api/update-keys` rewrote `.env` down to 8 keys | **FIXED** | `.env` 42 keys → 8 keys (35 destroyed) → **all 42 preserved, 170 of 171 lines byte-identical**; 29 tests |
 | B7 | the AI `except` block labelled every error a Gemini error | **FIXED** | `phase` tracked (`context` / `generation` / `post-processing`); historical string kept for the generation phase only; 13 tests |
 | F-51-5 | **new** — a literal published in this repository was the Telegram *owner* credential | **FIXED** | pre-fix **32 failed / 31 passed** → **63 passed**; live refusal demonstrated against the real module |
-| — | Test floor | **RAISED** | **2106 → 2218 passed**, 0 failed, skips unchanged at 59, xfail unchanged at 1 (698.07 s) |
+| F-51-6 | **new** — nothing in the suite inspected template *values*, which is why CI passed the leaked key | **FIXED** (authorised after the finding) | `tests/test_e51_template_credential_guard.py`, 48 tests; against `main`'s template it reports `line 9: GEMINI_API_KEY is a probable real credential [53 chars, …]` and **2 failed / 46 passed**, while printing no part of the value |
+| — | Test floor | **RAISED** | **2106 → 2218 → 2266 passed**, 0 failed, skips unchanged at 59, xfail unchanged at 1 |
 | — | Live verification | **37 PASS / 0 FAIL** | plus 1 N/A with the reason stated and the behaviour demonstrated separately (§9.4) |
 | — | No test removed, skipped, weakened or converted | **PASS** | §10 |
 | — | No security check silenced | **PASS** | `core/secret_guard.py` *gained* a refused value; no assertion was relaxed (§10) |
@@ -442,29 +443,31 @@ logs mode 600, **`DB_PATH` deliberately left unset** — setting it to a nonexis
 false failures in tests that call `copy_sqlite_database(database.DB_PATH, …)`, a trap recorded in
 Phase 50.
 
-| | log | B2 fix | Result |
+| | log | What changed since the previous run | Result |
 |---|---|---|---|
-| run 1 | `/tmp/p51_full_suite.log` (07:34, 698.07 s) | first version — incomplete | `2218 passed, 59 skipped, 1 xfailed, 376 warnings` |
-| **run 2** | `/tmp/p51_full_suite2.log` (08:04, 690.74 s) | **completed (triple pin)** | **`2218 passed, 59 skipped, 1 xfailed, 376 warnings`** |
+| run 1 | `/tmp/p51_full_suite.log` (07:34, 698.07 s) | — (B2 fix incomplete) | `2218 passed, 59 skipped, 1 xfailed` |
+| run 2 | `/tmp/p51_full_suite2.log` (08:04, 690.74 s) | B2 fix completed (triple pin) | `2218 passed, 59 skipped, 1 xfailed` |
+| **run 3** | `/tmp/p51_full_suite3.log` (09:42, 686.59 s) | **F-51-6 guard added (§17)** | **`2266 passed, 59 skipped, 1 xfailed, 376 warnings`** |
 
-`FAILED` lines in run 2: **0**. `ERROR` lines: **0**.
+`FAILED` lines in run 3: **0**. `ERROR` lines: **0**. Collected: **2326** = 2278 + 48.
 
 | | Phase 50 | Phase 51 | Δ |
 |---|---|---|---|
-| passed | 2106 | **2218** | **+112** |
+| passed | 2106 | **2266** | **+160** |
 | skipped | 59 | 59 | 0 |
 | xfailed | 1 | 1 | 0 |
 | failed | 0 | **0** | 0 |
-| collected | 2166 | **2278** | **+112** |
+| collected | 2166 | **2326** | **+160** |
 
 The delta reconciles exactly, which is the point of publishing the collected row too:
 
 ```
-test_e45_final_hardening.py       54 -> 61   (+7)
-test_e51_owner_command_secret.py   0 -> 63   (+63)
-test_e51_env_write_merge.py        0 -> 29   (+29)
-test_e51_ai_error_attribution.py   0 -> 13   (+13)
-                                          = +112  == 2278 - 2166  == 2218 - 2106
+test_e45_final_hardening.py            54 -> 61   (+7)
+test_e51_owner_command_secret.py        0 -> 63   (+63)
+test_e51_env_write_merge.py             0 -> 29   (+29)
+test_e51_ai_error_attribution.py        0 -> 13   (+13)
+test_e51_template_credential_guard.py   0 -> 48   (+48)
+                                             = +160  == 2326 - 2166  == 2266 - 2106
 ```
 
 Skips and xfail are unchanged, so no test was skipped, deselected or converted to reach this number.
@@ -560,10 +563,10 @@ check that reads the wrong database is worse than one that fails.
 
 | Restriction | Status |
 |---|---|
-| No test removed, skipped, weakened or converted | **PASS** — collected 2166 → 2278, skipped 59 → 59, xfailed 1 → 1. Full marker accounting in §10.1 |
+| No test removed, skipped, weakened or converted | **PASS** — collected 2166 → 2326, skipped 59 → 59, xfailed 1 → 1; every change is an addition. Full marker accounting in §10.1 |
 | No security check silenced | **PASS** — `core/secret_guard.py` gained a refused value; `tests/test_e45_final_hardening.py`'s `upgraded` assertion was never relaxed |
 | Every item classified with before/after measurements | **PASS** — §1 and each item's own section; every "pre-fix" number was produced by temporarily reverting the fix and re-running, then restoring |
-| Test floor ≥ 2106 passed / 0 failed | **PASS** — 2218 / 0 |
+| Test floor ≥ 2106 passed / 0 failed | **PASS** — 2266 / 0 |
 | Push only to `arena/d78ebf88-gerege-ai-agent`; never `main`, no force push, no history rewrite | **PASS** — §12 |
 | No PR, merge, deploy or key rotation without fresh authorisation | **PASS** — none attempted; 0 open PRs |
 | Never commit, log or echo a secret value | **PASS** — 11 files scanned for the live `GEMINI_API_KEY` and `ADMIN_PASSWORD`: 0 occurrences. The refused-literal demos assert the value is *absent* from logs |
@@ -600,10 +603,11 @@ done.
  tests/test_e45_final_hardening.py | 272 ++++++++++++++++++++++--  B2
  7 files changed, 683 insertions(+), 31 deletions(-)
 
- new: tests/test_e51_owner_command_secret.py    617 lines, 63 tests  (B3 + F-51-5)
-      tests/test_e51_env_write_merge.py         436 lines, 29 tests  (B4)
-      tests/test_e51_ai_error_attribution.py    368 lines, 13 tests  (B7)
-      PHASE51_FINAL_REPORT.md                   this file
+ new: tests/test_e51_owner_command_secret.py        617 lines, 63 tests  (B3 + F-51-5)
+      tests/test_e51_env_write_merge.py             436 lines, 29 tests  (B4)
+      tests/test_e51_ai_error_attribution.py        368 lines, 13 tests  (B7)
+      tests/test_e51_template_credential_guard.py   548 lines, 48 tests  (F-51-6, §17)
+      PHASE51_FINAL_REPORT.md                       this file
 ```
 
 `.env` is git-ignored and unchanged by any of this work: sha256 prefix `2c90cc39177b2402`, mode 600,
@@ -814,16 +818,122 @@ credentials; this is a real credential accepted as a placeholder.
 3. Decide about history: `c809654` keeps the value readable. After rotation the historical value is
    worthless, which is why rotation — not a rewrite — is the priority. A rewrite of a public default
    branch is destructive and needs its own explicit authorisation.
-4. Then, optionally, close the gate: a test that reads every tracked template and refuses an assigned
-   value that is long, high-entropy and not an obvious placeholder would have failed this commit.
-   That is F-51-6's fix and it was **not** implemented here — it is outside the approved scope, and on
-   `main` today it would turn CI red until step 2 is done, which is a decision for the operator, not
-   for this phase.
+4. Closing the gate was **authorised by the operator after the finding** and is implemented in §17.
+   Note what that means in practice: on `main` as it stands today this guard **fails**, so CI on
+   `main` goes red the moment the guard lands there — until step 2 blanks the value. That is the
+   intended behaviour of a fail-closed check, and the operator chose it with that consequence known.
+   Steps 1 to 3 remain operator actions; nothing here rotates a key or rewrites history.
 
 ### What this session did about it
 
-Nothing inside the repository, because every available action needs authorisation it does not have:
-pushing to `main` is forbidden, opening a PR was declined by the operator this phase, and rewriting
-history is forbidden. The finding is reported, measured, and left where the operator can act on it.
-This branch's own `.env.example` does not contain the key, and a merge conflict would have to be
-resolved before this work could land on `main` at all (§15.4).
+Nothing to `main`, because every available action there needs authorisation it does not have: pushing
+to `main` is forbidden, opening a PR was declined by the operator this phase, and rewriting history is
+forbidden. The operator's decision, asked for explicitly, was **"nothing in the repo — I'll rotate the
+key myself"**. The finding is reported, measured, and left where the operator can act on it. This
+branch's own `.env.example` does not contain the key, and a merge conflict would have to be resolved
+before this work could land on `main` at all (§15.4).
+
+The one thing that *was* authorised is the gate itself — §17.
+
+---
+
+## 17. F-51-6 closed — the guard, and a leak inside the guard
+
+Asked whether to add the missing check, the operator chose **"yes — add it on the feature branch"**,
+accepting that it turns `main`'s CI red until the key is blanked.
+
+### What it scans
+
+`tests/test_e51_template_credential_guard.py`, **48 tests**. The file list is derived from
+`git ls-files`, not frozen, so a template added later is scanned by default; the three files
+`core/secret_guard.py`'s docstring names are asserted to be in that list so the two cannot drift. If
+git cannot answer (a tarball checkout) it falls back to walking the tree.
+
+**The repository's own `.env` is never scanned**, and a test pins that boundary: it is git-ignored, it
+is where a deployment's real credentials live, and reading it would fail for every developer who has
+configured the app — and would print a real secret into a test report.
+
+### What it accepts, measured against the templates as they exist
+
+| Shape | Example from a tracked template |
+|---|---|
+| blank | `GEMINI_API_KEY=` |
+| angle-bracket hint | `ADMIN_PASSWORD=<generate: openssl rand -base64 24>`, `GEMINI_API_KEY=<from Google AI Studio>` |
+| compose reference | `${POSTGRES_OWNER_PASSWORD:?}` |
+| flag or number under a credential-shaped name | `ALLOW_QUERY_TOKEN=0`, `DISALLOW_QUERY_TOKEN=0` |
+| a name that holds a location, not a secret | `BACKUP_ENCRYPTION_KEY_FILE=backups/.backup.key` |
+| a URL whose password is itself a hint | `DATABASE_OWNER_URL=postgresql://gerege_owner:<password>@db:5432/gerege_crm` |
+
+### What it refuses
+
+Any other non-empty value on a credential-shaped name, and any URL carrying a literal password. Two
+decisions inside that rule are worth stating because they were chosen deliberately:
+
+* **The structural hint is checked before the published-placeholder list, and that order is
+  load-bearing.** `core.secret_guard.PLACEHOLDER_MARKERS` contains `<generate` and `<from`, so testing
+  the marker list first refused the exact hint style every template uses. The first run of this file
+  failed 8 tests for that reason.
+* **A bare placeholder word is refused, not accepted.** `ADMIN_PASSWORD=changeme` is not
+  documentation; copied into a deployment it is a working credential printed in this repository —
+  F-44-B, F-49-1 and F-51-5 again. `secret_guard`'s own list is the authority, so `changeme`,
+  `change-me`, `your-key-here`, `example`, `password`, `secret`, `todo` and `ADMIN2026` all fail.
+  Angle brackets are the convention that passes.
+
+### The true positive, measured
+
+`main`'s `.env.example` was checked out over this branch's copy, the module run, and the file restored
+byte-identical afterwards (verified by sha both times):
+
+```
+against this branch's template : 48 passed
+against main's template        : 2 failed, 46 passed
+
+  line 9: GEMINI_API_KEY is a probable real credential: long, and not a hint
+          or a placeholder [53 chars, lower+upper+digit+punct]
+  .env.example holds a literal value for: ['GEMINI_API_KEY (53 chars, lower+upper+digit+punct)']
+```
+
+The message tells the operator the file, the line, the variable, the value's shape, and that
+*"If this value is real, rotate it — removing the line does not un-publish it."*
+
+### The guard leaked the credential it was written to catch
+
+The first version reported the shape correctly in `_message`, and then undid it one test later:
+
+```python
+assert match.group(1).strip() == "", f"{rel} gave {name} a literal value"
+```
+
+Pytest's assertion rewriting prints the **operands** of a failed assert, so the failure output
+contained the live key once and its first twelve characters twice. Measured, against `main`'s
+template:
+
+```
+live key occurrences      : 1
+first 12 chars of the key : 2
+```
+
+A security check that publishes what it detects into a CI log has leaked the secret a second time, in
+a place with a wider audience than the file it was protecting. Fixed structurally rather than by
+wording: **no assertion in the file has a credential as an operand**. Checks compute a boolean, or a
+list of variable *names* with a shape description (`_literal_secret_names`, `_shape`), and assert on
+that. The rule is documented in the module docstring so the next author does not reintroduce it.
+
+Re-measured against `main`'s template after the fix:
+
+```
+live key occurrences      : 0
+first 12 chars of the key : 0
+first 6 chars of the key  : 0
+AIza-shaped tokens        : 0
+```
+
+The synthetic values used to prove the predicate are synthetic — a real credential is never written
+into a test file, not even to demonstrate that it would be caught.
+
+### Suite effect
+
+Run 3 (§8): **2266 passed, 59 skipped, 1 xfailed, 0 failed** in 686.59 s; collected 2326. Skips and
+xfail unchanged, so nothing was converted to make room for the guard. Side effects of the run,
+declared as before: `leads.db` `c8b417d8770778c3` → `c7c5359ae6d1f22b`, `backups/` 3533 → 3556 files,
+`.env` restored intact at sha256 prefix `2c90cc39177b2402`.
