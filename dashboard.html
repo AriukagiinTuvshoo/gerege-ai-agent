@@ -1900,10 +1900,15 @@
           </div>
 
           <div class="p-4 rounded-xl bg-stone-50 border border-stone-200 space-y-3 text-xs">
-            <div class="font-bold text-stone-200 flex items-center justify-between">
-              <span>Meta Webhook холболтын мэдээлэл:</span>
-              <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Бэлэн</span>
-            </div>
+                <div class="font-bold text-stone-200 flex items-center justify-between">
+                  <span>Meta Webhook холболтын мэдээлэл:</span>
+                  <!-- Phase 49 (F-49-2): this badge was a hardcoded "Бэлэн" (Ready). It said
+                       the Meta webhook was ready on an instance where META_VERIFY_TOKEN was
+                       unset and /webhook answers 403 in production — measured:
+                       /api/health reported meta_token_configured:false while the badge read
+                       "Ready". updatePageUI() now sets it from that same health response. -->
+                  <span id="settings-webhook-status-badge" class="text-[10px] px-2 py-0.5 rounded bg-stone-500/10 text-stone-400 border border-stone-500/20">Шалгаж байна…</span>
+                </div>
             
             <div class="space-y-1.5">
               <label class="text-stone-400 block text-[11px]">Callback URL:</label>
@@ -1916,14 +1921,24 @@
             </div>
 
             <div class="space-y-1.5">
-              <label class="text-stone-400 block text-[11px]">Verify Token:</label>
+              <label class="text-stone-400 block text-[11px]">Verify Token (ManyChat <code class="font-mono">/api/manychat</code>):</label>
               <div class="flex gap-2">
-                <input id="settings-webhook-verify-token" readonly value="agent_verify_secret_token_123" type="text" class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 font-mono text-xs text-stone-700 select-all focus:outline-none">
-                <button type="button" onclick="copyWebhookVerifyToken()" class="px-3 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-stone-800 border border-zinc-700 font-semibold transition flex items-center gap-1 shrink-0">
-                  <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
-                </button>
+                  <!-- Phase 49 (F-49-2): this input carried a hardcoded
+                       `agent_verify_secret_token_123` — a string published in this
+                       repository — and the copy button next to it told the operator that was
+                       their webhook token. Production refuses that value
+                       (core.security.meta_verify_token_is_usable), so following the
+                       instruction produced a Meta subscription that could never verify, and
+                       in development it handed out a credential everybody can read. The field
+                       is now filled from the page's own record by updatePageUI(), and the note
+                       below states plainly when there is nothing usable to copy. -->
+                  <input id="settings-webhook-verify-token" readonly value="" placeholder="Тохиргоогүй" type="text" class="flex-1 bg-[#FAF8F5] border border-stone-200/80 rounded-xl px-3 py-2 font-mono text-xs text-stone-700 select-all focus:outline-none">
+                  <button type="button" onclick="copyWebhookVerifyToken()" class="px-3 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-stone-800 border border-zinc-700 font-semibold transition flex items-center gap-1 shrink-0">
+                    <i class="fa-solid fa-copy"></i> <span>Хуулах</span>
+                  </button>
+                </div>
+                <p id="settings-webhook-verify-token-note" class="text-[10px] text-stone-500 leading-snug"></p>
               </div>
-            </div>
           </div>
 
           <div class="flex justify-between items-center pt-3">
@@ -3004,6 +3019,63 @@
         webhookElem.value = window.location.origin + '/webhook';
       }
 
+      // Verify Token + readiness (Phase 49 / F-49-2).
+      //
+      // This panel used to show ONE hardcoded "Verify Token" — a string published in this
+      // repository — next to the Meta callback URL, with a copy button and a static "Ready"
+      // badge. Two different secrets were being conflated, and the value displayed was
+      // neither of them: `/webhook` compares `hub.verify_token` against META_VERIFY_TOKEN
+      // from `.env`, while the page's own `verify_token` is what `/api/manychat` compares
+      // against. An operator who followed the panel pasted a public string into Meta and got
+      // a handshake that production refuses with 403.
+      //
+      // The input now carries the page's real ManyChat token, the note says which endpoint it
+      // authenticates and whether the value carries any secrecy at all (the server decides
+      // that — `verify_token_is_placeholder` — so the published string is not duplicated
+      // here), and the badge reports the Meta handshake status from /api/health, which only
+      // ever says configured/not-configured and never returns the value.
+      const verifyElem = document.getElementById('settings-webhook-verify-token');
+      if (verifyElem) {
+        const storedToken = (p.verify_token || '').trim();
+        const isPublished = !!p.verify_token_is_placeholder;
+        verifyElem.value = (storedToken && !isPublished) ? storedToken : '';
+
+        let verifyNote;
+        if (storedToken && !isPublished) {
+          verifyNote = 'ManyChat webhook (/api/manychat) энэ утгаар баталгаажна — хуулж болно.';
+        } else if (storedToken) {
+          verifyNote = 'Хадгалагдсан утга нь энэ репозиторт нийтлэгдсэн анхдагч утга тул нууц биш: '
+            + 'production горимд /api/manychat үүнийг хүлээж авахгүй. .env дотор MANYCHAT_WEBHOOK_SECRET '
+            + 'эсвэл салбарын verify_token-ийг шинэ утгаар (openssl rand -hex 16) тохируулна уу.';
+        } else {
+          verifyNote = 'ManyChat webhook-ийн нууц тохируулаагүй: production горимд хүсэлт хүлээж '
+            + 'авахгүй (fail-closed). .env дотор MANYCHAT_WEBHOOK_SECRET тохируулна уу.';
+        }
+        const noteElem = document.getElementById('settings-webhook-verify-token-note');
+        if (noteElem) noteElem.innerText = verifyNote;
+      }
+
+      const badgeElem = document.getElementById('settings-webhook-status-badge');
+      fetch('/api/health').then(r => r.json()).then(h => {
+        const configured = !!(h && h.meta_token_configured);
+        if (badgeElem) {
+          badgeElem.innerText = configured ? 'Бэлэн' : 'Тохиргоогүй';
+          badgeElem.className = configured
+            ? 'text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+            : 'text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-500 border border-amber-500/20';
+        }
+        const noteElem = document.getElementById('settings-webhook-verify-token-note');
+        if (noteElem) {
+          noteElem.innerText += configured
+            ? ' Meta handshake (META_VERIFY_TOKEN): тохируулсан.'
+            : ' Meta handshake (META_VERIFY_TOKEN): ТОХИРУУЛААГҮЙ — production горимд /webhook '
+              + 'баталгаажуулалт 403 буцаана. .env дотор META_VERIFY_TOKEN тохируулж серверийг '
+              + 'дахин эхлүүлнэ үү.';
+        }
+      }).catch(() => {
+        if (badgeElem) badgeElem.innerText = 'Шалгах боломжгүй';
+      });
+
       // Delete button visibility (hide on default)
       const delBtn = document.getElementById('btn-delete-page');
       if (p.page_id === '100799479495809') {
@@ -3022,14 +3094,20 @@
       }
     }
 
-    function copyWebhookVerifyToken() {
-      const el = document.getElementById('settings-webhook-verify-token');
-      if (el) {
+      function copyWebhookVerifyToken() {
+        const el = document.getElementById('settings-webhook-verify-token');
+        if (!el) return;
+        // Phase 49 (F-49-2): copying an empty field used to report success, so the operator
+        // believed a token was on the clipboard and pasted nothing into ManyChat. It now says
+        // there is nothing to copy and names the setting that produces one.
+        if (!el.value.trim()) {
+          showToast('Хуулах утга алга: MANYCHAT_WEBHOOK_SECRET эсвэл салбарын verify_token тохируулаагүй.');
+          return;
+        }
         el.select();
         navigator.clipboard.writeText(el.value);
         showToast('Verify Token хуулагдлаа!');
       }
-    }
 
     // ==================== FINTECH & QPAY v2 MODULE ====================
     async function loadFintechData() {

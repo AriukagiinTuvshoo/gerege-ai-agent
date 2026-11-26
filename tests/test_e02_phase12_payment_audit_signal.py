@@ -114,6 +114,12 @@ def audit_loss_reports():
     # it silently captures nothing depending on which test ran first. See the audit
     # record for this phase: the same hazard applies to production if the import order
     # in `main.py` is ever changed.
+    #
+    # Phase 50 measured that production case and fixed it at the source (F-50-4): a first
+    # boot left 10 of 15 application loggers disabled, `agent` among them. `env.py` now
+    # skips logging configuration for programmatic callers and never disables existing
+    # loggers; see tests/test_e50_migration_logging_truth.py. This fixture keeps the
+    # defensive re-enable, so it stays correct whichever way the global state lands.
     previous_disabled = logger.disabled
     logger.addHandler(handler)
     logger.setLevel(logging.ERROR)

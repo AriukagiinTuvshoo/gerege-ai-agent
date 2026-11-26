@@ -229,6 +229,22 @@ class TestWorkerHealthcheck:
 
         monkeypatch.setenv("DB_PATH", os.path.join(REPO_ROOT, "p37_hc_probe.db"))
         monkeypatch.setenv("REDIS_URL", os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+        # Phase 49 (F-49-5). `clear()` removes only THIS process's key — Phase 41 made the
+        # key per worker, and clearing the whole prefix would make a healthy pool look dead —
+        # so on the default prefix any *other* worker beating on the same Redis left an
+        # `alive` heartbeat behind and the probe exited 0. "No heartbeat" could not be set up
+        # at all, and the test reported a failure that had nothing to do with the code under
+        # test. Reproduced with a local `python worker.py` running: `clear()` returned, the
+        # child still read `status: alive`.
+        #
+        # `WORKER_HEARTBEAT_KEY` is the documented override, and the child inherits the
+        # environment, so this test and the probe it spawns share an isolated namespace. The
+        # prefix is also wiped, because a key left by an interrupted run would answer the
+        # question this test is asking.
+        monkeypatch.setenv("WORKER_HEARTBEAT_KEY", "gerege:test:p37-healthcheck")
+        client = worker_heartbeat._redis()
+        for stale in client.keys(worker_heartbeat._prefix() + "*"):
+            client.delete(stale)
         worker_heartbeat.clear()
 
         no_beat = subprocess.run(
@@ -250,7 +266,11 @@ class TestWorkerHealthcheck:
             f"with a fresh heartbeat the probe must report healthy; got "
             f"{with_beat.returncode}: {with_beat.stderr[-400:]}"
         )
-        worker_heartbeat.clear()
+        # `clear()` removes this process's key, and the beat above was written under
+        # `worker_id="p37"`. The isolated prefix is wiped so nothing is left behind on a
+        # Redis other tests and a developer's own worker share.
+        for stale in client.keys(worker_heartbeat._prefix() + "*"):
+            client.delete(stale)
 
 
 # --------------------------------------------------------------- port exposure (rebuilt)

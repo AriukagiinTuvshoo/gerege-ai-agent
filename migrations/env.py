@@ -20,8 +20,24 @@ from core.db_engine import get_database_url
 from core.models import Base
 
 config = context.config
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# F-50-4: `fileConfig()` defaults to `disable_existing_loggers=True`, and `alembic.ini` sets
+# `[logger_root] level = WARN`. Together those two defaults silenced the application that ran
+# the migration: `main.py` imports — and therefore creates the loggers of — `agent`,
+# `database`, `core.security`, `core.secret_guard`, `core.ai_router`, `core.monitoring`,
+# `core.task_queue`, `core.rate_limit` and `fintech_service` *before* `database.init_db()`
+# reaches this file. Measured on a first boot (empty database, so the migrations do run):
+# 10 of 15 application loggers left permanently disabled, root's level replaced by WARN, and
+# an error logged afterwards by `agent` or `core.ai_readiness` reached no handler at all. A
+# freshly deployed instance therefore ran blind exactly when an operator most needs the log,
+# while looking completely healthy.
+#
+# `core.schema_manager.ensure_schema()` skips this on purpose when it calls Alembic as a
+# library: the application has already configured logging, and a library call must not undo
+# it. `disable_existing_loggers=False` is the second guard, so a CLI `alembic upgrade head`
+# run alongside a live process cannot silence that process either. Alembic's own output is
+# unaffected — its loggers are named in alembic.ini and are configured either way.
+if config.config_file_name is not None and not config.attributes.get("skip_logging_config"):
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # A programmatic caller (`core.schema_manager`) may have pinned a specific SQLite file,
 # normally `database.DB_PATH`. That must win over the generic environment default, or

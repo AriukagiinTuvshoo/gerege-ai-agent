@@ -84,8 +84,19 @@ async def executive_scheduler_loop():
             logger.error(f"Executive & Retention scheduler error: {e}")
         await asyncio.sleep(45)
 
+#: Phase 49 (F-48A-3). What THIS process actually did with its inline scheduler, recorded
+#: by `lifespan`. `/api/admin/worker/health` reports this instead of quoting
+#: `DISABLE_INLINE_SCHEDULER`, because the variable states what an operator asked for while
+#: this states what happened — and the two can disagree: `main.py` re-runs
+#: `load_dotenv(override=True)` inside `/api/health`, so the environment of a long-running
+#: process can change after startup without the scheduler task changing (F-48A-4).
+#: `None` means the lifespan has not run (a router mounted in a test app, for example).
+INLINE_SCHEDULER_STARTED: Optional[bool] = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global INLINE_SCHEDULER_STARTED
     # E-02 Phase 4.1: validate BEFORE serving. In production a missing, blank or too-short
     # E02_ACCOUNT_KEY_SECRET raises here and the process exits, instead of logging a warning
     # and silently running with account-level throttling disabled. Development and tests are
@@ -125,7 +136,8 @@ async def lifespan(app: FastAPI):
     core_secret_guard.validate_production_secrets()
 
     scheduler_task = None
-    if os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1":
+    INLINE_SCHEDULER_STARTED = os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1"
+    if INLINE_SCHEDULER_STARTED:
         scheduler_task = asyncio.create_task(executive_scheduler_loop())
     yield
     if scheduler_task:
@@ -1100,17 +1112,52 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
     raw_page_id = str(payload.get("page_id", "")).strip()
     page_id = database.sanitize_page_id(raw_page_id)
     name = str(payload.get("name", "")).strip()
-    category = str(payload.get("category", "general")).strip()
-    token = str(payload.get("page_access_token", "")).strip()
-    verify_token = str(payload.get("verify_token", "agent_verify_secret_token_123")).strip()
-    gemini_key = str(payload.get("gemini_api_key", "")).strip()
-    monthly_limit = int(payload.get("monthly_token_limit", 100000))
-    k_json = payload.get("knowledge_json", "{}")
-    if isinstance(k_json, dict):
-        k_json = json.dumps(k_json, ensure_ascii=False)
 
     if not page_id or not name:
         return JSONResponse({"error": "Page ID болон Нэр шаардлагатай"}, status_code=400)
+
+    # Phase 49 (F-49-4). This endpoint is an upsert, but it read every column with a
+    # literal default -- `payload.get("category", "general")`,
+    # `payload.get("verify_token", "<the published placeholder>")`,
+    # `payload.get("monthly_token_limit", 100000)` -- so a payload that simply did not
+    # mention a column *reset* it. The dashboard's "Тохиргоо хадгалах" button posts
+    # {page_id, name, page_access_token, knowledge_json}, and measured against a running
+    # instance that single click:
+    #
+    #   verify_token        'real-49-verify-token-do-not-lose' -> 'agent_verify_secret_token_123'
+    #   monthly_token_limit 5000                               -> 100000
+    #
+    # i.e. it replaced the page's webhook secret with a string published in this repository
+    # (which `verify_manychat_webhook_secret` then accepted as a credential -- F-49-1) and
+    # multiplied the tenant's token quota twenty times over. `category` and `is_active` were
+    # reset the same way, the latter re-enabling a tenant somebody had disabled.
+    #
+    # Omitted now means *unchanged*: the stored row supplies the value. An explicit value in
+    # the payload still wins, including an explicit null-free empty string for the two
+    # columns whose emptiness is meaningful (`page_access_token`, `gemini_api_key`), which
+    # `save_page` already preserves through COALESCE(NULLIF(...)).
+    existing = database.get_page(page_id) or {}
+
+    category = str(payload.get("category") or existing.get("category") or "general").strip()
+    token = str(payload.get("page_access_token", "")).strip()
+    verify_token = str(payload.get("verify_token") or existing.get("verify_token") or "").strip()
+    gemini_key = str(payload.get("gemini_api_key", "")).strip()
+    raw_limit = payload.get("monthly_token_limit")
+    if raw_limit is None:
+        raw_limit = existing.get("monthly_token_limit")
+    monthly_limit = int(raw_limit) if raw_limit is not None else 100000
+    raw_active = payload.get("is_active")
+    if raw_active is None:
+        # A NULL column must not be read as "disabled": absent means the schema default.
+        raw_active = existing.get("is_active")
+        if raw_active is None:
+            raw_active = 1
+    is_active = 1 if raw_active in (1, True, "1", "true", "True") else 0
+    k_json = payload.get("knowledge_json")
+    if k_json is None:
+        k_json = existing.get("knowledge_json") or "{}"
+    if isinstance(k_json, dict):
+        k_json = json.dumps(k_json, ensure_ascii=False)
 
     try:
         database.save_page(
@@ -1121,7 +1168,8 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
             verify_token=verify_token,
             knowledge_json=k_json,
             gemini_api_key=gemini_key,
-            monthly_token_limit=monthly_limit
+            monthly_token_limit=monthly_limit,
+            is_active=is_active
         )
     except Exception as exc:
         # E-02 Phase 10 (R16). A page_id must not equal any other tenant's login
@@ -1146,7 +1194,10 @@ async def create_or_update_page(payload: Dict[str, Any], request: Request):
         resource_id=page_id,
         # Explicitly enumerated, and deliberately excluding `token`, `verify_token` and
         # `gemini_key`: an audit log that records secrets is itself a disclosure.
-        details={"name": name, "category": category, "is_active": True},
+        # Phase 49 (F-49-4): `is_active` was a hardcoded `True`, so the audit row asserted a
+        # state the request never set — and after the fix above the endpoint genuinely can
+        # write 0. The row now records what was written.
+        details={"name": name, "category": category, "is_active": bool(is_active)},
     )
     if audit_error is not None:
         return audit_error
@@ -1579,10 +1630,15 @@ def _save_page_sheets_list(page_id: str, sheets_list: List[Dict[str, Any]]):
         name=page_obj.get("name", "Салбар"),
         category=page_obj.get("category", "general"),
         page_access_token=page_obj.get("page_access_token", ""),
-        verify_token=page_obj.get("verify_token", "agent_verify_secret_token_123"),
+        # Phase 49 (F-49-4): carry the stored value through, and never substitute the
+        # published placeholder — `save_page` preserves the stored secret on an empty one.
+        verify_token=page_obj.get("verify_token") or "",
         knowledge_json=json.dumps(kj, ensure_ascii=False, indent=2),
         gemini_api_key=page_obj.get("gemini_api_key", ""),
-        monthly_token_limit=page_obj.get("monthly_token_limit", 100000)
+        monthly_token_limit=page_obj.get("monthly_token_limit", 100000),
+        # `save_page`'s default is 1, so a sheet edit used to re-enable a tenant that had
+        # been disabled. The stored state is carried through instead.
+        is_active=(0 if page_obj.get("is_active") in (0, False) else 1)
     )
     agent.reset_sessions()
 
@@ -1796,10 +1852,15 @@ async def update_knowledge(payload: Dict[str, Any], request: Request, page_id: O
             name=page_obj.get("name", "Page"),
             category=page_obj.get("category", "general"),
             page_access_token=page_obj.get("page_access_token", ""),
-            verify_token=page_obj.get("verify_token", "agent_verify_secret_token_123"),
+            # Phase 49 (F-49-4): carry the stored value through, and never substitute the
+            # published placeholder — `save_page` preserves the stored secret on an empty one.
+            verify_token=page_obj.get("verify_token") or "",
             knowledge_json=k_str,
             gemini_api_key=page_obj.get("gemini_api_key", ""),
-            monthly_token_limit=page_obj.get("monthly_token_limit", 100000)
+            monthly_token_limit=page_obj.get("monthly_token_limit", 100000),
+            # `save_page`'s default is 1, so a knowledge edit used to re-enable a tenant
+            # that had been disabled. The stored state is carried through instead.
+            is_active=(0 if page_obj.get("is_active") in (0, False) else 1)
         )
     if target_id == database.DEFAULT_PAGE_ID:
         knowledge_base.save_knowledge(payload)
@@ -1906,7 +1967,15 @@ async def health_check():
     summary_available = None not in (total_pages, total_leads, active_sessions)
     return JSONResponse({
         "status": "healthy",
-        "gemini_ready": agent.is_gemini_ready(),
+        # F-50-1: on its own, `gemini_ready` has always meant "a key is configured" while
+        # reading as "the AI works". `genai.Client(api_key=...)` makes no network call, so it
+        # reported true for a wrong, revoked or unreachable key too — measured live with
+        # every generation attempt failing and every reply coming from the deterministic
+        # fallback. The observed verdict is now published beside it, and the historical field
+        # keeps its historical value so no existing consumer changes behaviour.
+        # Counters and a closed enum only: this endpoint is unauthenticated, so it carries no
+        # exception text — the rule /api/ready states in its own comment.
+        **agent.gemini_status(),
         "model": agent.get_model_name(),
         # SEC-07: lets an operator confirm limits are actually shared across workers
         # rather than silently per-process.

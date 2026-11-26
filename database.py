@@ -1032,6 +1032,22 @@ def _sanitize_page_secrets(d: Dict[str, Any], include_magic_token: bool = False)
     d["gemini_api_key_masked"] = mask_secret(d.get("gemini_api_key"), 4, 4)
     d["qpay_password_masked"] = mask_secret(d.get("qpay_password"), 2, 2)
     d["telegram_bot_token_masked"] = mask_secret(d.get("telegram_bot_token"), 6, 4)
+    # Phase 49 (F-49-2). `verify_token` itself is deliberately NOT masked: it is the value
+    # an operator has to paste into the Meta/ManyChat webhook configuration, so hiding it
+    # would make the dashboard's copy button useless. What the client cannot work out on its
+    # own is whether the value carries any secrecy at all, so that judgement is made here by
+    # the one function that owns the published-placeholder rule, and shipped as a boolean.
+    # Without it `dashboard.html` had no way to warn that the token it was offering to copy
+    # is printed in this repository and is refused in production. Environment-independent on
+    # purpose: a published value is published in development too.
+    try:
+        from core.security import meta_verify_token_is_placeholder
+
+        d["verify_token_is_placeholder"] = bool(
+            meta_verify_token_is_placeholder(d.get("verify_token"))
+        )
+    except Exception:  # pragma: no cover - import cycle during early bootstrap
+        d["verify_token_is_placeholder"] = False
     # Жинхэнэ нууц түлхүүрүүдийг устгах (API-аар хэзээ ч задрахгүй)
     d.pop("page_access_token", None)
     d.pop("gemini_api_key", None)
@@ -1108,11 +1124,33 @@ def save_page(
     monthly_token_limit: int = 100000,
     is_active: int = 1
 ) -> bool:
+    """Insert one tenant, or update it without discarding what the caller omitted.
+
+    Phase 49 (F-49-4). This is an upsert, and the columns did not agree on what an omitted
+    value means. ``page_access_token`` and ``gemini_api_key`` used
+    ``COALESCE(NULLIF(excluded.x, ''), pages.x)`` — empty preserves the stored value — while
+    ``verify_token`` was ``excluded.verify_token``, so an upsert that did not mention it
+    overwrote the stored secret with this function's default, which is the *published*
+    placeholder. ``POST /api/pages`` is what the dashboard's "Тохиргоо хадгалах" button
+    calls, and it sends only ``page_id``, ``name``, ``page_access_token`` and
+    ``knowledge_json``. Measured against a running instance:
+
+        before upsert  verify_token = 'real-49-verify-token-do-not-lose'
+        after  upsert  verify_token = 'agent_verify_secret_token_123'
+
+    Saving a page's settings therefore silently replaced its webhook secret with a string
+    printed in this repository — and ``verify_manychat_webhook_secret`` then accepted that
+    string as a credential (F-49-1). ``verify_token`` now preserves like the other two
+    secrets, and a masked value echoed back by a client is cleared to "" (preserve) rather
+    than stored literally, which is what the neighbouring guards already did for the tokens.
+    """
     clean_id = sanitize_page_id(page_id)
     if "•" in (page_access_token or "") or "****" in (page_access_token or ""):
         page_access_token = ""
     if "•" in (gemini_api_key or "") or "****" in (gemini_api_key or ""):
         gemini_api_key = ""
+    if "•" in (verify_token or "") or "****" in (verify_token or ""):
+        verify_token = ""
     conn = get_connection()
     cursor = conn.cursor()
     magic = secrets.token_urlsafe(24)
@@ -1127,7 +1165,7 @@ def save_page(
                 name = excluded.name,
                 category = excluded.category,
                 page_access_token = COALESCE(NULLIF(excluded.page_access_token, ''), pages.page_access_token),
-                verify_token = excluded.verify_token,
+                verify_token = COALESCE(NULLIF(excluded.verify_token, ''), pages.verify_token),
                 is_active = excluded.is_active,
                 knowledge_json = excluded.knowledge_json,
                 gemini_api_key = COALESCE(NULLIF(excluded.gemini_api_key, ''), pages.gemini_api_key),

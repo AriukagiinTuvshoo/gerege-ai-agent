@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import hashlib
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ import sheets_service
 import fintech_service
 import cargo_service
 import core.ai_router as ai_router
+from core import ai_readiness
 
 load_dotenv(override=True)
 
@@ -177,12 +179,30 @@ class AIAgent:
         self.clients_cache: Dict[str, Any] = {}  # api_key -> genai.Client
         self.model_name = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
         self.chat_sessions: Dict[str, Any] = {}
+        # Fingerprint (never the value) of the key the current AI-readiness verdict is about.
+        # See _init_default_gemini: a verdict about a previous key must not survive a rotation.
+        self._ai_key_fingerprint: Optional[str] = None
         self._init_default_gemini()
 
     def _init_default_gemini(self):
         load_dotenv(override=True)
         self.default_api_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.model_name = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+
+        # F-50-1: building a client proves nothing — genai.Client(api_key=...) makes no
+        # network call — so a recorded success/failure belongs to the key that was configured
+        # when it happened. If the key changed (rotation, a tenant fix, a .env edit picked up
+        # by get_client_for_page), the old verdict is about a different credential and would
+        # otherwise keep reporting "verified" for a key that has never been tried.
+        fingerprint = (
+            hashlib.sha256(self.default_api_key.encode("utf-8")).hexdigest()[:16]
+            if self.default_api_key
+            else ""
+        )
+        if fingerprint != self._ai_key_fingerprint:
+            self._ai_key_fingerprint = fingerprint
+            ai_readiness.reset(scope="default")
+
         if self.default_api_key:
             try:
                 from google import genai
@@ -190,10 +210,19 @@ class AIAgent:
                 self.clients_cache[self.default_api_key] = self.default_client
                 logger.info(f"Gemini AI Үндсэн Client холбогдлоо. Model: {self.model_name}")
             except Exception as e:
-                logger.error(f"Gemini Client холболтын алдаа: {e}")
+                # Redacted: an SDK error can quote the request it was building.
+                logger.error(f"Gemini Client холболтын алдаа: {ai_readiness.redacted(e)}")
                 self.default_client = None
         else:
-            logger.warning("GEMINI_API_KEY тохируулаагүй байна.")
+            # F-50-3: dropping the client is what makes "no key configured" true. Without
+            # this, clearing GEMINI_API_KEY left the previous client in place, so the app
+            # kept billing a credential an operator had just removed and /api/health kept
+            # reporting it as configured.
+            if self.default_client is not None:
+                logger.warning("GEMINI_API_KEY устгагдсан тул Gemini client-г зогсоов.")
+            else:
+                logger.warning("GEMINI_API_KEY тохируулаагүй байна.")
+            self.default_client = None
 
     def get_client_for_page(self, page_data: Optional[Dict[str, Any]]) -> Tuple[Optional[Any], bool]:
         """
@@ -241,7 +270,10 @@ class AIAgent:
         active_client = client or self.default_client
         if not active_client:
             return {"is_receipt": False, "details": "AI холбогдоогүй"}
-        
+
+        # F-50-1: a tenant's own key proving itself says nothing about the platform key.
+        ai_scope = "page" if client is not None else "default"
+
         try:
             img = Image.open(io.BytesIO(image_bytes))
             prompt = """
@@ -253,10 +285,18 @@ class AIAgent:
 Хэрэв банкны гүйлгээний баримт мөн бөгөөд амжилттай болсон бол яг эхний мөрөнд: "VALID_RECEIPT|Дүн" гэж бичээд доор нь товч тайлбарла.
 Хэрэв баримт биш эсвэл амжилтгүй бол яг эхний мөрөнд: "INVALID_RECEIPT|Шалтгаан" гэж хариул.
 """
-            resp = active_client.models.generate_content(
-                model=self.model_name,
-                contents=[prompt, img]
-            )
+            resp = None
+            try:
+                resp = active_client.models.generate_content(
+                    model=self.model_name,
+                    contents=[prompt, img]
+                )
+            except Exception as gen_err:
+                # Only the generation call is a readiness signal. Image.open() failures above
+                # are bad input, not a broken key, and must not be filed as one.
+                ai_readiness.record_failure(gen_err, scope=ai_scope, model=self.model_name)
+                raise
+            ai_readiness.record_success(scope=ai_scope, model=self.model_name)
             text = (resp.text or "").strip()
             first_line = text.splitlines()[0].strip().upper() if text else ""
             # Нарийн шалгалт: "INVALID_RECEIPT" дотор "VALID_RECEIPT" багтдаг тул startswith ашиглана
@@ -272,8 +312,12 @@ class AIAgent:
                 "analysis": text
             }
         except Exception as e:
-            logger.error(f"Зураг шинжлэхэд алдаа гарлаа: {e}")
-            return {"is_receipt": False, "details": str(e)}
+            # F-50-2: this text is both logged and returned to an API caller, so an SDK
+            # message that quotes the request it was building must not survive it. Redacted,
+            # collapsed to one line and length-bounded by core.redaction.
+            safe_details = ai_readiness.redacted(e)
+            logger.error(f"Зураг шинжлэхэд алдаа гарлаа: {safe_details}")
+            return {"is_receipt": False, "details": safe_details}
 
     def process_message(
         self,
@@ -584,6 +628,9 @@ class AIAgent:
                 agent_tools = [register_customer, check_sheet_cargo_status, create_payment_invoice, book_service_appointment]
 
                 session_key = f"{page_id}_{sender_id}"
+                # F-50-1: whose key this call will use, so a tenant's key cannot be recorded
+                # as a verdict on the platform key (and vice versa).
+                ai_scope = "page" if is_custom_key else "default"
                 if session_key not in self.chat_sessions:
                     config = types.GenerateContentConfig(
                         system_instruction=sys_instruction,
@@ -609,11 +656,33 @@ class AIAgent:
                     if sheet_context:
                         message_payload = f"{wrapped_text}\n\n{sheet_context}"
 
+                def _send_generation(chat_obj):
+                    """One generation attempt, recorded as an AI-readiness signal (F-50-1).
+                
+                    Only the call itself is recorded: if it returns, the credential authenticated and
+                    the network path worked, whatever parsing the response does afterwards. Both call
+                    sites go through here so a retry cannot be mistaken for a first attempt, and a
+                    failure anywhere in this block is filed against the key that was actually used.
+                    """
+                    try:
+                        resp = ai_router.execute_with_retry(
+                            lambda: chat_obj.send_message(message_payload), max_retries=1
+                        )
+                    except Exception as call_err:
+                        ai_readiness.record_failure(call_err, scope=ai_scope, model=self.model_name)
+                        raise
+                    ai_readiness.record_success(scope=ai_scope, model=self.model_name)
+                    return resp
+
                 try:
-                    response = ai_router.execute_with_retry(lambda: chat.send_message(message_payload), max_retries=1)
+                    response = _send_generation(chat)
                     reply_text = response.text or ""
                 except Exception as send_err:
-                    logger.warning(f"Chat session send_message error, refreshing session: {send_err}")
+                    # F-50-2: redacted — an SDK message can quote the request it was building.
+                    logger.warning(
+                        "Chat session send_message error, refreshing session: %s",
+                        ai_readiness.redacted(send_err),
+                    )
                     self.chat_sessions.pop(session_key, None)
                     config = types.GenerateContentConfig(
                         system_instruction=sys_instruction,
@@ -625,7 +694,7 @@ class AIAgent:
                         config=config
                     )
                     self.chat_sessions[session_key] = new_chat
-                    response = ai_router.execute_with_retry(lambda: new_chat.send_message(message_payload), max_retries=1)
+                    response = _send_generation(new_chat)
                     reply_text = response.text or ""
 
                 # AI Response Evaluation (Phase 3)
@@ -700,7 +769,9 @@ class AIAgent:
                     "tokens_spent": tokens_spent
                 }
             except Exception as e:
-                logger.error(f"Gemini API алдаа: {e}")
+                # F-50-2: redacted. The readiness verdict was already recorded against the
+                # call itself (see _send_generation); this line is the operator's breadcrumb.
+                logger.error("Gemini API алдаа: %s", ai_readiness.redacted(e))
 
         # 4.5. Олон төрлийн AI Provider Fallback (OpenAI / DeepSeek / Anthropic — Phase 3)
         if text:
@@ -722,7 +793,10 @@ class AIAgent:
                             "is_custom_key": False,
                         }
             except Exception as alt_err:
-                logger.warning(f"Alternative AI provider fallback error: {alt_err}")
+                # F-50-2: redacted — an OpenAI-compatible base_url can carry a key in the URL.
+                logger.warning(
+                    "Alternative AI provider fallback error: %s", ai_readiness.redacted(alt_err)
+                )
 
         # 5. Нөөц хариу (Deterministic fallback when external AI providers are unconfigured or unreachable)
         detected = extract_phone_and_name_fallback(text)
@@ -797,7 +871,47 @@ def _init_default_gemini():
 
 # Module-level accessors
 def is_gemini_ready() -> bool:
+    """True when a default Gemini client exists — i.e. when a key is **configured**.
+
+    Kept with this exact meaning for compatibility (``/api/health`` has published it as
+    ``gemini_ready`` since Phase 5). It is *not* evidence that the key works: building
+    ``genai.Client(api_key=...)`` performs no network I/O, so a wrong, revoked or
+    unreachable key still returns True here. Use :func:`gemini_status` for the distinction.
+    """
     return bool(agent.default_client)
+
+def is_gemini_configured() -> bool:
+    """The honest name for what :func:`is_gemini_ready` has always measured."""
+    return bool(agent.default_client)
+
+def gemini_status() -> Dict[str, Any]:
+    """Configuration plus what generation calls actually did since startup (F-50-1).
+
+    Safe for an unauthenticated endpoint: a closed error-class enum, counters and static
+    text. No exception message, no key, no URL — see ``core/ai_readiness.health_fields``.
+
+    A diagnostic must never be the reason a health endpoint fails, so if reporting the
+    observation raises for any reason, the caller still gets the configuration truth and an
+    explicit statement that nothing more could be observed.
+    """
+    configured = bool(agent.default_client)
+    try:
+        return ai_readiness.health_fields(configured=configured, scope="default")
+    except Exception:  # noqa: BLE001 - the endpoint must answer even if the diagnostic dies
+        return {
+            "gemini_ready": configured,
+            "gemini_configured": configured,
+            "gemini_verified": None,
+            "gemini_error_class": None,
+            "gemini_attempts": 0,
+            "gemini_note": (
+                "AI readiness could not be observed; this reports configuration only."
+            ),
+        }
+
+def gemini_observation(scope: str = "default") -> Dict[str, Any]:
+    """Full observed state, including the redacted excerpt. Logs/tests/admin only."""
+    return ai_readiness.snapshot(scope=scope)
 
 def get_model_name() -> str:
     return agent.model_name
