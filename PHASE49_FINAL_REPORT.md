@@ -503,7 +503,7 @@ neither removes root handlers nor disables the `core.security` logger, so the me
 | No production deployment | ✅ none — nothing here deploys; `.github/workflows/ci.yml` has a single `test-and-security-audit` job and no deploy/release/publish job |
 | No staging infrastructure change | ✅ none — `docker-compose.staging.yml` / `.prod.yml` untouched (only *read*, by the F-49-5 test) |
 | No direct push to `main`, no force push, no history rewrite | ✅ see §10 |
-| No deleting existing databases, volumes or backups | ✅ `gerege_crm_next.db` and `knowledge.json` untouched; `BACKUP_DIR` still redirected to `/tmp/p48a/backups` (never written); only disposable probe databases in `/tmp` were created and removed |
+| No deleting existing databases, volumes or backups | ✅ nothing deleted — see §9.1, which also declares the 31 files the test suite *added* to the git-ignored `backups/` directory |
 | Never overwrite `.env` | ✅ moved aside for suite runs and moved back; never rewritten |
 | Never lower the test floor / remove or skip tests to pass | ✅ floor raised (§8); one existing test made hermetic with both assertions intact (§3.7) |
 | Never silence a security check | ✅ the opposite: two consumers of a published value now fail closed |
@@ -511,6 +511,23 @@ neither removes root handlers nor disables the `core.security` logger, so the me
 | Disposable data only | ✅ probe pages (`p49_*`), one marker lead, and `/tmp/p49*` databases |
 
 ---
+
+### 9.1 Side effects of the verification runs (declared)
+
+Nothing was deleted anywhere, but the verification was not side-effect free and the side
+effects are stated here rather than glossed over. All of them sit in paths that `.gitignore`
+excludes, and none of them reached the commit (§10.1's diffstat is 19 files, all source,
+tests or documentation).
+
+| Path | What happened | Why | Assessment |
+|---|---|---|---|
+| `backups/` (repo root, git-ignored) | **+31 files**, all timestamped `20261126_025107_*` | the authoritative suite run moves `.env` aside (it must — `load_dotenv(override=True)` would otherwise defeat every exported variable, F-48A-2), so `BACKUP_DIR=/tmp/p48a/backups` was unset and the backup-service tests used the default directory | **No existing backup was modified or deleted**: the directory held 3419 files before and 3450 after, the oldest still dated Nov 17, and every file with a today-mtime is one of the 31 new ones. They were **not** deleted afterwards either — the standing rule is never to delete backups, and this directory mixes them with older artifacts, so distinguishing "disposable" here was not a gamble worth taking |
+| `leads.csv` (repo root, git-ignored) | **untouched** — `5e9a18e8e03e1de4` before and after the full run | `CSV_PATH=/tmp/p49_suite_leads.csv` | the F-48A-1 fix working; the first suite run in this project that left it byte-identical (Phase 48A's run rewrote it) |
+| `gerege_crm_next.db`, `knowledge.json` | **untouched** — `4ccd2b197c82fd8a`, `3f0c6cac3907bd29` | `DB_PATH` pointed at disposable databases | real data safe |
+| PostgreSQL `gerege_e05_test` | written by the suite | it is the disposable test database | expected |
+| Redis `gerege:*` (6379) | written by the suite; the F-49-5 test's keys were wiped by the test itself | disposable instance | expected |
+| `/tmp/p48a/p48a_smoke.db` | +4 probe pages (`p49_final` etc.), 1 lead status change | live verification target | disposable |
+| `/tmp/p49*` | probe databases, logs, cookie jars, JSON captures | scratch | disposable |
 
 ## 10. Git record
 
@@ -544,10 +561,11 @@ Post-push verification: `git ls-remote origin arena/d78ebf88-gerege-ai-agent` �
 `bcbb2eb…`; local HEAD == local `origin/<branch>` == remote tip; `origin/main` still
 `aedeca4…`; `gh api …/commits/bcbb2eb` confirms the SHA, the parent and the stats above.
 
-**Follow-up commit.** This section could not describe its own push record, so it was
-completed by one documentation-only commit *after* `bcbb2eb` was pushed. That commit changes
-`PHASE49_FINAL_REPORT.md` and nothing else — no code, no test, no configuration — and the
-change set under review remains `bcbb2eb`.
+**Follow-up commits.** This section cannot describe its own push record, and one factual
+correction (§9.1) was found after `bcbb2eb` was pushed, so the report was completed by
+documentation-only commit(s) *after* it. They change `PHASE49_FINAL_REPORT.md` and nothing
+else — no code, no test, no configuration — so **the change set under review is `bcbb2eb`**,
+and `git diff bcbb2eb..HEAD -- . ':!PHASE49_FINAL_REPORT.md'` is empty.
 
 The commit also brings the seven earlier phase reports (`PHASE43`…`PHASE48A`) into version
 control. They existed only as untracked workspace files, so every "report" instruction up to
