@@ -589,7 +589,36 @@ already refused by two predicates, and is not a secret.
 
 ### 14.3 Commits
 
-<<COMMITS>>
+Two commits, both on `arena/d78ebf88-gerege-ai-agent`, both pushed to that branch and nowhere
+else.
+
+| # | sha | parent | contents |
+|---|---|---|---|
+| 1 | `730e112` | `e89c230` | all 13 files: the seven fixes, revision `0009`, the new test module, the reshaped gate assertion, and this report (606 lines) |
+| 2 | *cannot be recorded here* | `730e112` | this report only: §14.3 filled in. A commit does not contain its own hash, so commit 2's sha is not written inside commit 2 — `git log --oneline` on the branch is the authority for it, and it is reported to the operator in the session rather than here. |
+
+Commit 1's push, verified:
+
+```
+git push origin arena/d78ebf88-gerege-ai-agent
+   e89c230..730e112  arena/d78ebf88-gerege-ai-agent -> arena/d78ebf88-gerege-ai-agent
+```
+
+Commit 2 is pushed by the same command immediately afterwards, so the range it prints starts
+where the one above ends.
+
+Verified after commit 1's push: `HEAD` == `origin/arena/d78ebf88-gerege-ai-agent` == `730e112`,
+working tree 0 entries, **5 commits ahead of `origin/main` (`c809654`)**, 0 open pull requests;
+after commit 2 the branch is 6 ahead. `git diff --cached` was scanned for credentials before
+each commit (§14.2). The pushed tree contains no secret value: the only credential-shaped
+literal this phase added is the published `agent_verify_secret_token_123` inside `0009`, which
+is the value the revision removes as a default and must be able to restore on a downgrade.
+
+One note on how this section was produced. Commit 2 was amended twice before being pushed —
+once to fill in commit 1's real sha, and once to remove a sha it had wrongly recorded for
+itself (the amend had changed it, so the table named a commit that no longer existed). Both
+amends were of an **unpushed** commit, so no published history was rewritten; the branch's
+pushed history is a straight fast-forward from `e89c230`.
 
 ### 14.4 Authorisation
 
