@@ -2612,15 +2612,83 @@ async def save_fintech_settings_api(
         require_auth=True,
         permission="fintech:write",
     )
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    stored = database.get_page(target_page_id) or {}
+
+    # Phase 53 (F-53-5): a partial body used to store empty strings over the merchant's
+    # payment credentials. Measured live: `{"ebarimt_enabled": 1}` alone wiped qpay_username,
+    # qpay_password and qpay_invoice_code and answered success:true.
+    values, changed, preserved, cleared, mask_echoes = _merged_settings(
+        payload, stored, FINTECH_SETTINGS_SPEC
+    )
 
     success = database.update_page_qpay_settings(
-        page_id=pid,
-        username=payload.get("qpay_username", ""),
-        password=payload.get("qpay_password", ""),
-        invoice_code=payload.get("qpay_invoice_code", ""),
-        ebarimt_enabled=payload.get("ebarimt_enabled", 1)
+        page_id=target_page_id,
+        username=values["qpay_username"],
+        password=values["qpay_password"],
+        invoice_code=values["qpay_invoice_code"],
+        ebarimt_enabled=values["ebarimt_enabled"],
     )
-    return {"success": success}
+    if not success:
+        return {
+            "success": False,
+            "written": False,
+            "page_id": target_page_id,
+            "changed": [],
+            "preserved": preserved,
+            "cleared": [],
+            "mask_echoes": mask_echoes,
+            "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч тохиргоо хадгалагдсангүй.",
+        }
+
+    # Phase 53 (F-53-6): the audit table held ZERO rows for any payment-credential change,
+    # on the endpoint that stores the merchant's QPay password. Money moves with these
+    # values, so the change is recorded - names and booleans only, never the password or
+    # even its mask.
+    if changed:
+        action = (
+            "fintech.credentials.cleared"
+            if ("qpay_password" in cleared or "qpay_username" in cleared)
+            else "fintech.credentials.updated"
+        )
+        actor = await _settings_actor(request)
+        audit_failure = _audit_or_report(
+            action,
+            operation="fintech settings update",
+            page_id=target_page_id,
+            actor_role=actor["actor_role"],
+            actor_id=actor["actor_id"],
+            resource_type="fintech_credentials",
+            resource_id=target_page_id,
+            details={
+                "via": "api",
+                "changed_fields": changed,
+                "preserved_fields": preserved,
+                "cleared_fields": cleared,
+                "mask_echo_fields": mask_echoes,
+                "has_qpay": bool(values["qpay_username"] and values["qpay_password"]),
+                "ebarimt_enabled": values["ebarimt_enabled"],
+                "session_ref": actor["session_ref"],
+            },
+            ip_address=core_rate_limit.resolve_client_ip(request),
+        )
+        if audit_failure is not None:
+            return audit_failure
+
+    return {
+        "success": True,
+        "written": True,
+        "page_id": target_page_id,
+        "changed": changed,
+        "preserved": preserved,
+        "cleared": cleared,
+        "mask_echoes": mask_echoes,
+        "message": (
+            "QPay болон И-Баримт тохиргоо амжилттай хадгалагдлаа"
+            if changed
+            else "Тохиргоо хэвээр үлдлээ - ямар ч утга өөрчлөгдөөгүй."
+        ),
+    }
 
 @app.post("/api/fintech/create-invoice")
 async def create_invoice_manual_api(
@@ -2792,6 +2860,172 @@ async def send_executive_report_api(payload: Dict[str, Any], request: Request):
     )
     return res
 
+# ---------------------------------------------------------------------------
+# Phase 53 — settings forms MERGE, they do not replace (F-53-1 … F-53-9)
+# ---------------------------------------------------------------------------
+def _settings_text(value: Any) -> str:
+    """The stored form of a text field: a string, stripped, never None."""
+    return "" if value is None else str(value).strip()
+
+
+def _settings_flag(value: Any) -> int:
+    """The stored form of an on/off field: 1 or 0.
+
+    The rule before Phase 53 was ``1 if payload.get(key, True) else 0``. Two defects, both
+    measured live: an ABSENT key meant "on", so a partial save that named only the report
+    time re-enabled daily reports the operator had turned off (F-53-2, and `worker.py` plus
+    the scheduler loop in this file act on that column), and the string "0" was truthy, so
+    it meant "on" too.
+    """
+    if isinstance(value, str):
+        return 0 if value.strip().lower() in ("", "0", "false", "no", "off") else 1
+    return 1 if value else 0
+
+
+def _settings_hours(value: Any) -> int:
+    """The stored form of a delay in hours: an int, falling back to the schema default."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 2
+
+
+#: Every settings form that writes several stored columns from one JSON body. Each entry maps
+#: the payload key to ``(stored column, default when the row has none, coerce, mask_style)``.
+#: ``mask_styles`` is empty only for a non-credential, and says which mask shapes the API shows
+#: for that field, so an echo of one is recognised instead of being stored as a new secret.
+EXECUTIVE_SETTINGS_SPEC = {
+    "telegram_bot_token": ("telegram_bot_token", "", _settings_text, ("ellipsis", "bullets")),
+    "telegram_manager_chat_id": ("telegram_manager_chat_id", "", _settings_text, None),
+    "daily_report_time": ("daily_report_time", "08:30", _settings_text, None),
+    "daily_report_enabled": ("daily_report_enabled", 1, _settings_flag, None),
+}
+FINTECH_SETTINGS_SPEC = {
+    "qpay_username": ("qpay_username", "", _settings_text, None),
+    "qpay_password": ("qpay_password", "", _settings_text, ("bullets",)),
+    "qpay_invoice_code": ("qpay_invoice_code", "", _settings_text, None),
+    "ebarimt_enabled": ("ebarimt_enabled", 1, _settings_flag, None),
+}
+RETENTION_RULE_SPEC = {
+    "delay_hours": ("delay_hours", 2, _settings_hours, None),
+    "message_template": ("message_template", "", _settings_text, None),
+    "is_active": ("is_active", 1, _settings_flag, None),
+}
+_MASK_BULLET = "\u2022"
+
+
+def _is_mask_echo(incoming: str, stored_value: str, mask_styles) -> bool:
+    """True when `incoming` is a mask this API showed, not a credential.
+
+    Three recognised shapes, and the first two do NOT depend on anything being stored:
+
+    * ``head...tail`` — what `GET /api/executive/settings` builds for the bot token;
+    * a value containing the bullet character — what `database.mask_secret` ships for the
+      QPay password and for `telegram_bot_token_masked` on `GET /api/pages`;
+    * an exact match against the mask of the value that IS stored, in any of the three
+      widths the API uses.
+
+    Measured, the first version of this function required a non-empty `stored_value` before
+    it looked at the incoming text, so a mask posted at a field that had just been emptied
+    was STORED AS THE CREDENTIAL: the probe page ended up holding a QPay password made of
+    bullets and a bot token of `111222...TIC`. A payment credential that is really a mask
+    fails in the most confusing way available, so the shape rules now apply to an empty
+    field as well.
+
+    The consequence, stated rather than hidden: a credential whose real value contains the
+    bullet character cannot be stored through these forms, because it cannot be told apart
+    from a mask. The bullet is this API's own mask character and no QPay password or Telegram
+    bot token uses it; the response names the field in `mask_echoes`, so a caller can see the
+    value was not stored instead of wondering why.
+    """
+    if not mask_styles or not incoming:
+        return False
+    if "ellipsis" in mask_styles and "..." in incoming:
+        return True
+    if "bullets" in mask_styles and _MASK_BULLET in incoming:
+        return True
+    if not stored_value:
+        return False
+    return any(
+        incoming == database.mask_secret(stored_value, head, tail)
+        for head, tail in ((6, 4), (4, 4), (2, 2))
+    )
+
+
+def _merged_settings(payload: Dict[str, Any], stored: Dict[str, Any], spec: Dict[str, tuple]):
+    """Merge one settings form over what is already stored.
+
+    Returns ``(values, changed, preserved, cleared, mask_echoes)``. ``values`` holds what to
+    store; every list holds **field names only**, so a response or an audit row built from
+    them can say what moved without carrying a credential. `mask_echoes` names the fields
+    where the caller posted a mask and the stored value was kept instead.
+
+    The rule, which is the whole fix:
+
+    * a key the payload does not NAME keeps the value already stored — `preserved`;
+    * a key named with an empty value is an EXPLICIT clear — that is the documented way to
+      unregister a report recipient (O-51-5) and the live checks depend on it, so it stays;
+    * a key named with the mask the API showed is treated as unchanged, not stored.
+
+    Before this, all three handlers read ``payload.get(key, "")`` and handed the result
+    straight to an UPDATE, so a body that named one field stored empty strings over every
+    other field. Measured live on a disposable page: `POST /api/executive/settings
+    {"daily_report_time": "09:15"}` destroyed the stored bot token AND the recipient
+    (F-53-1), and `POST /api/fintech/settings {"ebarimt_enabled": 1}` destroyed the QPay
+    merchant username, password and invoice code (F-53-5). This is the same defect class B4
+    fixed for `POST /api/update-keys`, which destroyed 35 keys the same way.
+    """
+    values: Dict[str, Any] = {}
+    changed, preserved, cleared = [], [], []
+    mask_echoes = []
+    for key, (stored_key, default, coerce, mask_styles) in spec.items():
+        raw_stored = stored.get(stored_key)
+        stored_value = coerce(default if raw_stored is None else raw_stored)
+        if key not in payload:
+            values[key] = stored_value
+            preserved.append(key)
+            continue
+        incoming = coerce(payload.get(key))
+        if _is_mask_echo(str(incoming), str(stored_value), mask_styles):
+            values[key] = stored_value
+            preserved.append(key)
+            mask_echoes.append(key)
+            continue
+        values[key] = incoming
+        if incoming == stored_value:
+            preserved.append(key)
+        else:
+            changed.append(key)
+            if isinstance(incoming, str) and not incoming and stored_value not in ("", 0):
+                # a stored value was removed. An on/off field is 1 or 0, not "cleared".
+                cleared.append(key)
+    return (
+        values,
+        sorted(set(changed)),
+        sorted(set(preserved)),
+        sorted(set(cleared)),
+        sorted(set(mask_echoes)),
+    )
+
+
+async def _settings_actor(request: Request) -> Dict[str, str]:
+    """Who is acting, in a form that carries no credential.
+
+    `enforce_tenant_scope` resolves the user and returns only the page id, so this resolves
+    it once more: one extra indexed `sessions` lookup per settings save, on endpoints an
+    operator clicks a few times a day. The session token is a bearer credential, so it is
+    recorded only as a 12-hex-character SHA-256 prefix — enough for an auditor to tie
+    several rows to one login, not enough to replay it.
+    """
+    user = await core_security.resolve_current_user(request) or {}
+    token = str(user.get("session_token") or "")
+    return {
+        "actor_role": str(user.get("role") or "unknown"),
+        "actor_id": str(user.get("page_id") or ""),
+        "session_ref": hashlib.sha256(token.encode("utf-8")).hexdigest()[:12] if token else "",
+    }
+
+
 @app.get("/api/executive/settings")
 async def get_executive_settings_api(request: Request, page_id: Optional[str] = Query(None)):
     """Telegram бот болон өглөөний тайлангийн тохиргоог авах"""
@@ -2821,23 +3055,104 @@ async def update_executive_settings_api(payload: Dict[str, Any], request: Reques
         require_auth=True,
         permission="executive:write",
     )
-    bot_token = payload.get("telegram_bot_token", "")
-    manager_chat_id = payload.get("telegram_manager_chat_id", "")
-    daily_report_time = payload.get("daily_report_time", "08:30")
-    daily_report_enabled = 1 if payload.get("daily_report_enabled", True) else 0
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    stored = database.get_page(target_page_id) or {}
 
-    if bot_token and "..." in bot_token:
-        page = database.get_page(pid or database.DEFAULT_PAGE_ID) or {}
-        bot_token = page.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-    database.update_page_telegram_settings(
-        page_id=pid or database.DEFAULT_PAGE_ID,
-        bot_token=bot_token,
-        manager_chat_id=manager_chat_id,
-        report_time=daily_report_time,
-        report_enabled=daily_report_enabled
+    # Phase 53 (F-53-1, F-53-2): merge over what is stored instead of replacing it.
+    values, changed, preserved, cleared, mask_echoes = _merged_settings(
+        payload, stored, EXECUTIVE_SETTINGS_SPEC
     )
-    return {"success": True, "message": "Telegram болон өглөөний тайлангийн тохиргоо амжилттай хадгалагдлаа"}
+
+    wrote = database.update_page_telegram_settings(
+        page_id=target_page_id,
+        bot_token=values["telegram_bot_token"],
+        manager_chat_id=values["telegram_manager_chat_id"],
+        report_time=values["daily_report_time"],
+        report_enabled=values["daily_report_enabled"],
+    )
+    if not wrote:
+        # F-53-4: no row matched, so nothing was stored. This handler used to answer
+        # success:true here - measured against a page that was never created, it wrote 0
+        # rows and reported "амжилттай хадгалагдлаа". The status stays 200 because the
+        # dashboard branches on `data.success`, and the message now says what happened.
+        return {
+            "success": False,
+            "written": False,
+            "page_id": target_page_id,
+            "changed": [],
+            "preserved": preserved,
+            "cleared": [],
+            "mask_echoes": mask_echoes,
+            "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч тохиргоо хадгалагдсангүй.",
+        }
+
+    # Phase 53 (F-53-3): this is the path that changes WHO receives the daily executive
+    # report with `executive:write`, and it wrote no audit row at all - measured, four
+    # recipient changes left the audit table at 78 rows. O-51-4 (Phase 52) audited the
+    # `/start` path in `executive_bot_service`; the same state change reached through the
+    # API was still invisible, so an auditor querying `executive.recipient.%` saw only the
+    # unauthenticated path. The action names come from that same vocabulary, so one query
+    # now covers both. A save that changes nothing writes nothing: unlike an unauthenticated
+    # `/start`, where "the same identity asked again" is itself evidence, a repeated form
+    # save is not an event.
+    previous_manager = _settings_text(stored.get("telegram_manager_chat_id"))
+    new_manager = values["telegram_manager_chat_id"]
+    if previous_manager != new_manager:
+        if not previous_manager:
+            action = "executive.recipient.registered"
+        elif not new_manager:
+            action = "executive.recipient.cleared"
+        else:
+            action = "executive.recipient.transferred"
+    elif changed:
+        action = "executive.settings.updated"
+    else:
+        action = None
+
+    if action:
+        actor = await _settings_actor(request)
+        audit_failure = _audit_or_report(
+            action,
+            operation="executive settings update",
+            page_id=target_page_id,
+            actor_role=actor["actor_role"],
+            actor_id=actor["actor_id"],
+            resource_type="executive_recipient",
+            resource_id=target_page_id,
+            details={
+                "via": "api",
+                "chat_id": new_manager,
+                "previous_chat_id": previous_manager,
+                "changed_fields": changed,
+                "preserved_fields": preserved,
+                "cleared_fields": cleared,
+                "mask_echo_fields": mask_echoes,
+                # the bot token is named as a fact, never as a value or a mask
+                "bot_token_changed": "telegram_bot_token" in changed,
+                "bot_token_cleared": "telegram_bot_token" in cleared,
+                "has_bot_token": bool(values["telegram_bot_token"]),
+                "daily_report_enabled": values["daily_report_enabled"],
+                "session_ref": actor["session_ref"],
+            },
+            ip_address=core_rate_limit.resolve_client_ip(request),
+        )
+        if audit_failure is not None:
+            return audit_failure
+
+    return {
+        "success": True,
+        "written": True,
+        "page_id": target_page_id,
+        "changed": changed,
+        "preserved": preserved,
+        "cleared": cleared,
+        "mask_echoes": mask_echoes,
+        "message": (
+            "Telegram болон өглөөний тайлангийн тохиргоо амжилттай хадгалагдлаа"
+            if changed
+            else "Тохиргоо хэвээр үлдлээ - ямар ч утга өөрчлөгдөөгүй."
+        ),
+    }
 
 # -------------------------------------------------------------
 # 12. АВТОМАТ МАРКЕТИНГ & ХАРИЛЦАГЧИЙГ СЭРГЭЭХ API (RETENTION & BROADCAST)
@@ -2863,22 +3178,45 @@ async def update_retention_rule_api(payload: Dict[str, Any], request: Request):
         require_auth=True,
         permission="retention:write",
     )
-    rule_type = payload.get("rule_type")
-    delay_hours = payload.get("delay_hours", 2)
-    message_template = payload.get("message_template", "")
-    is_active = payload.get("is_active", True)
-    
-    if not rule_type or not message_template:
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    rule_type = _settings_text(payload.get("rule_type"))
+    if not rule_type:
         raise HTTPException(status_code=400, detail="rule_type and message_template are required")
-        
-    database.update_automated_rule(
-        page_id=pid or database.DEFAULT_PAGE_ID,
-        rule_type=rule_type,
-        delay_hours=int(delay_hours),
-        message_template=message_template,
-        is_active=bool(is_active)
+
+    # Phase 53 (F-53-9): `payload.get("delay_hours", 2)` and `payload.get("is_active", True)`
+    # were written straight into an upsert, so a body naming only the message reset the delay
+    # to 2 hours and re-activated a rule the operator had switched off - which then messages
+    # customers on its own schedule. `rule_type` stays required because it is half of the
+    # upsert key; the other columns merge over the stored row.
+    stored_rows = {
+        str(row.get("rule_type")): row
+        for row in database.get_automated_rules(target_page_id)
+    }
+    values, changed, preserved, _cleared, _mask_echoes = _merged_settings(
+        payload, stored_rows.get(rule_type, {}), RETENTION_RULE_SPEC
     )
-    return {"success": True, "message": "Дүрэм амжилттай хадгалагдлаа"}
+    if not values["message_template"]:
+        raise HTTPException(status_code=400, detail="rule_type and message_template are required")
+
+    database.update_automated_rule(
+        page_id=target_page_id,
+        rule_type=rule_type,
+        delay_hours=values["delay_hours"],
+        message_template=values["message_template"],
+        is_active=bool(values["is_active"]),
+    )
+    # Deliberately not audited. A retention rule is marketing content, not an authorisation
+    # fact or a credential, and this codebase audits the first two; adding a row per rule
+    # edit would bury the recipient and payment rows that matter. Recorded here so the
+    # omission is a decision, not an oversight.
+    return {
+        "success": True,
+        "page_id": target_page_id,
+        "rule_type": rule_type,
+        "changed": changed,
+        "preserved": preserved,
+        "message": "Дүрэм амжилттай хадгалагдлаа",
+    }
 
 @app.post("/api/retention/broadcast")
 async def send_broadcast_api(payload: Dict[str, Any], request: Request):
