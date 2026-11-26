@@ -514,9 +514,73 @@ neither removes root handlers nor disables the `core.security` logger, so the me
 
 ## 10. Git record
 
-*(filled in after the push — see §10.1)*
+### 10.1 Pre-push verification
 
-### 10.1 Push
+| Check | Value |
+|---|---|
+| Branch | `arena/d78ebf88-gerege-ai-agent` (the session's pinned branch; not renamed, not switched) |
+| Branch HEAD before | `b84969aebdfec8087e707b8027e65075fc0b4bfc` (Phase 48A, already merged to main) |
+| Remote branch tip before | `b84969a` — local and remote in sync, so the push is a fast-forward |
+| `origin/main` before **and** after | `aedeca46c473dad10ad250c6187aadce1f461225` — **unchanged** |
+| Ancestry | `origin/arena/d78ebf88-gerege-ai-agent` is an ancestor of HEAD → fast-forward, **no** `--force` |
+| Working tree before commit | 9 modified, 9 untracked (2 new tests + 8 reports); after commit **0 entries** |
+| Secret scan of the staged diff | 4539 lines: live `ADMIN_PASSWORD` **0**, live `E02_ACCOUNT_KEY_SECRET` **0**, live `META_VERIFY_TOKEN` **0**. The 9 `ADMIN2026` and 2 `Password123!` hits are *negative assertions and warnings about published defaults* — exactly what they should be |
+| Secret scan of the 8 reports | **0** live secrets in any of them |
+| `.env` tracked by git | **No** (`git ls-files --error-unmatch .env` fails) |
+| Open PRs at push time | **0** — nothing was merged into `main` |
+
+### 10.2 Commit and push
+
+```
+commit  bcbb2eb31d9829e1b086ef5680ab756feffb5910   (HEAD, arena/d78ebf88-gerege-ai-agent)
+parent  b84969aebdfec8087e707b8027e65075fc0b4bfc   (Phase 48A)
+date    2026-11-26T02:56:43Z
+stats   4186 changed lines — 4140 additions, 46 deletions, 19 files
+push    b84969a..bcbb2eb  arena/d78ebf88-gerege-ai-agent -> arena/d78ebf88-gerege-ai-agent
+        (fast-forward, exit code 0)
+```
+
+Post-push verification: `git ls-remote origin arena/d78ebf88-gerege-ai-agent` →
+`bcbb2eb…`; local HEAD == local `origin/<branch>` == remote tip; `origin/main` still
+`aedeca4…`; `gh api …/commits/bcbb2eb` confirms the SHA, the parent and the stats above.
+
+**Follow-up commit.** This section could not describe its own push record, so it was
+completed by one documentation-only commit *after* `bcbb2eb` was pushed. That commit changes
+`PHASE49_FINAL_REPORT.md` and nothing else — no code, no test, no configuration — and the
+change set under review remains `bcbb2eb`.
+
+The commit also brings the seven earlier phase reports (`PHASE43`…`PHASE48A`) into version
+control. They existed only as untracked workspace files, so every "report" instruction up to
+Phase 48A had been satisfied on disk but not in git; they contain no live secrets (§10.1).
+
+### 10.3 CI
+
+**No CI run was triggered by this push, by design.** `.github/workflows/ci.yml` triggers on
+`push: branches: ["main"]` and `pull_request: branches: ["main"]`; this is a feature-branch
+push with **no open PR**, so neither matches. Confirmed with
+`gh run list --branch arena/d78ebf88-gerege-ai-agent`: the newest runs are all
+`pull_request` events on earlier heads (`b84969a` → run `45728154558` success,
+`5402ab9` → `45625942590` success); nothing for `bcbb2eb`.
+
+That does **not** mean the code is unverified — it means CI will run when a PR is opened.
+Verification of this commit is therefore local and complete: the full suite at
+**2003 passed / 59 skipped / 1 xfailed / 0 failed** (§8) plus the 13 live checks (§5), both
+against the merged code.
+
+Also relevant: the workflow contains a single `test-and-security-audit` job and **no**
+deploy/release/publish job, so even a merge to `main` cannot start a production deployment
+from CI.
+
+### 10.4 What was *not* done, and what needs authorisation
+
+| Action | Status |
+|---|---|
+| Push to `main` | **NOT DONE** — not authorised; `main` is untouched at `aedeca4` |
+| Pull request for `bcbb2eb` | **NOT OPENED** — the instruction was "finish and push", not "open a PR / merge". Opening a PR is the next step if wanted; it would trigger CI (`pull_request: branches: ["main"]`) |
+| Merge into `main` | **NOT DONE** — requires fresh authorisation |
+| Force push / history rewrite | **NOT DONE** |
+| Branch protection | `gh api …/rulesets` → `[]`; `branches/main/protection` → 403 "Resource not accessible by integration" (unchanged since Phase 47). Main is protected by process, not by configuration |
+| Production deployment / staging change | **NOT DONE** |
 
 ---
 
