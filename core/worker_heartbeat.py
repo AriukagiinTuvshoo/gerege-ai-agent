@@ -49,7 +49,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger("core.worker_heartbeat")
 
@@ -61,16 +61,110 @@ logger = logging.getLogger("core.worker_heartbeat")
 #: between beats was therefore ~38 s, so a 30 s window would have false-staled a healthy
 #: worker mid-batch. With the beat on a 10 s timer the gap is 10 s plus Redis latency, and
 #: 30 s tolerates two missed beats.
-FRESH_WINDOW_SECONDS = int(os.getenv("WORKER_HEARTBEAT_FRESH_SECONDS", "30"))
+DEFAULT_FRESH_WINDOW_SECONDS = 30
 
 #: How long a key survives after its last beat. Must exceed the fresh window so there is a
 #: "stale" band before the key vanishes: "stale" means wedged, "missing" means gone, and an
 #: operator treats those differently.
-DEFAULT_TTL_SECONDS = int(os.getenv("WORKER_HEARTBEAT_TTL_SECONDS", "90"))
+DEFAULT_KEY_TTL_SECONDS = 90
 
 #: How often the worker's liveness timer beats. Well under the fresh window, so two
 #: consecutive Redis failures do not make a healthy worker look stale.
-BEAT_INTERVAL_SECONDS = float(os.getenv("WORKER_HEARTBEAT_BEAT_SECONDS", "10"))
+DEFAULT_BEAT_INTERVAL_SECONDS = 10.0
+
+FRESH_WINDOW_ENV = "WORKER_HEARTBEAT_FRESH_SECONDS"
+KEY_TTL_ENV = "WORKER_HEARTBEAT_TTL_SECONDS"
+BEAT_INTERVAL_ENV = "WORKER_HEARTBEAT_BEAT_SECONDS"
+
+#: Phase 49 (F-48A-5). The three numbers above used to be read once, at import:
+#:
+#:     FRESH_WINDOW_SECONDS = int(os.getenv("WORKER_HEARTBEAT_FRESH_SECONDS", "30"))
+#:
+#: This module does not load `.env` itself — `core/db_engine.py` does, on behalf of
+#: `database.py` — so whichever module was imported first decided whether the operator's
+#: configuration existed yet. Measured in Phase 48A with `.env` setting
+#: `WORKER_HEARTBEAT_BEAT_SECONDS=7.5`: a process that imported this module directly saw
+#: **10.0**, and a process that imported `database` first saw **7.5**. Same code, same
+#: `.env`, two configurations, chosen by import order and reported nowhere. A non-numeric
+#: value was worse: `int()` raised at import, so the failure surfaced as an ImportError from
+#: an unrelated module.
+#:
+#: They are now read when they are used, so no import order can bypass them, and a value
+#: that is not a positive number falls back to the documented default with one warning
+#: instead of killing the process. The historical module-level names still resolve (see
+#: `__getattr__` at the bottom of this file), so `worker_heartbeat.DEFAULT_TTL_SECONDS`
+#: keeps working for existing callers; it now returns the current value rather than a
+#: snapshot taken at import.
+_config_warnings: Set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Log a configuration problem once per distinct problem.
+
+    `read()` and `beat()` run on timers and on every health request, so a warning per call
+    would bury the log. The message names the variable and the default that was used; it
+    never repeats the value, because a tuning variable is not the only thing an operator can
+    accidentally put in an environment.
+    """
+    if key in _config_warnings:
+        return
+    _config_warnings.add(key)
+    logger.warning(message)
+
+
+def _positive_number(env_name: str, default: float, cast) -> Any:
+    """One tuning value, read now, with a safe fallback instead of an exception."""
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return cast(default)
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        _warn_once(
+            f"{env_name}:not-a-number",
+            f"heartbeat config: {env_name} is not a number; using the default {default}",
+        )
+        return cast(default)
+    if value <= 0:
+        _warn_once(
+            f"{env_name}:not-positive",
+            f"heartbeat config: {env_name} is not a positive number; using the default {default}",
+        )
+        return cast(default)
+    return value
+
+
+def fresh_window_seconds() -> int:
+    """How old a heartbeat may be and still count as ``alive``."""
+    return _positive_number(FRESH_WINDOW_ENV, DEFAULT_FRESH_WINDOW_SECONDS, int)
+
+
+def beat_interval_seconds() -> float:
+    """How often the worker's liveness timer writes a heartbeat."""
+    return _positive_number(BEAT_INTERVAL_ENV, DEFAULT_BEAT_INTERVAL_SECONDS, float)
+
+
+def key_ttl_seconds() -> int:
+    """How long a heartbeat key survives, kept wide enough for the ``stale`` band to exist.
+
+    The TTL has to exceed the fresh window or the key expires before it can ever be judged
+    stale, and the two states this module exists to distinguish — "wedged" and "gone" —
+    collapse into one. Nothing enforced that before: `WORKER_HEARTBEAT_FRESH_SECONDS=120`
+    with the default 90 s TTL silently removed the band. It is enforced here, by widening
+    the TTL and saying so, rather than by refusing to start: liveness reporting is a
+    diagnostic and must never be the reason a worker does not run.
+    """
+    fresh = fresh_window_seconds()
+    ttl = _positive_number(KEY_TTL_ENV, DEFAULT_KEY_TTL_SECONDS, int)
+    if ttl <= fresh:
+        widened = fresh * 3
+        _warn_once(
+            f"{KEY_TTL_ENV}:too-short:{fresh}",
+            f"heartbeat config: {KEY_TTL_ENV} must exceed {FRESH_WINDOW_ENV} or a wedged "
+            f"worker can never be reported stale; using {widened}s",
+        )
+        return widened
+    return ttl
 
 #: Exactly the extra keys a caller may publish. An open ``extra`` dict looked convenient
 #: but meant any caller could push an arbitrary value -- including a token -- into a
@@ -203,7 +297,7 @@ def beat(
     if loop_count is not None:
         body["loop_count"] = int(loop_count)
     try:
-        client.set(_key(worker_id), json.dumps(body), ex=DEFAULT_TTL_SECONDS)
+        client.set(_key(worker_id), json.dumps(body), ex=key_ttl_seconds())
         return True
     except Exception as exc:
         logger.warning(f"heartbeat write failed: {exc}")
@@ -222,7 +316,7 @@ def _state_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         if key not in ("worker_id", "loop_count", "at", "pid"):
             body[key] = value
     return {
-        "status": "alive" if age <= FRESH_WINDOW_SECONDS else "stale",
+        "status": "alive" if age <= fresh_window_seconds() else "stale",
         "age_seconds": round(age, 1),
         "heartbeat": body,
     }
@@ -252,8 +346,8 @@ def read(worker_id: Optional[str] = None) -> Dict[str, Any]:
         return {
             "status": "unknown",
             "heartbeat": None,
-            "fresh_window_seconds": FRESH_WINDOW_SECONDS,
-            "ttl_seconds": DEFAULT_TTL_SECONDS,
+            "fresh_window_seconds": fresh_window_seconds(),
+            "ttl_seconds": key_ttl_seconds(),
             "reason": "redis unavailable; worker liveness cannot be determined",
         }
     if worker_id:
@@ -266,8 +360,8 @@ def _read_one(client, worker_id: str) -> Dict[str, Any]:
         "status": "unknown",
         "heartbeat": None,
         "worker_id": worker_id,
-        "fresh_window_seconds": FRESH_WINDOW_SECONDS,
-        "ttl_seconds": DEFAULT_TTL_SECONDS,
+        "fresh_window_seconds": fresh_window_seconds(),
+        "ttl_seconds": key_ttl_seconds(),
     }
     try:
         raw = client.get(_key(worker_id))
@@ -305,8 +399,8 @@ def _read_pool(client) -> Dict[str, Any]:
         "worker_count": 0,
         "alive_count": 0,
         "stale_count": 0,
-        "fresh_window_seconds": FRESH_WINDOW_SECONDS,
-        "ttl_seconds": DEFAULT_TTL_SECONDS,
+        "fresh_window_seconds": fresh_window_seconds(),
+        "ttl_seconds": key_ttl_seconds(),
     }
     prefix = _prefix() + ":"
     legacy_key = _prefix()
@@ -440,3 +534,24 @@ def deregister(worker_id: str) -> bool:
         return True
     except Exception:
         return False
+
+
+#: Phase 49 (F-48A-5). The historical module-level names, kept resolving so that
+#: ``worker_heartbeat.DEFAULT_TTL_SECONDS`` and friends keep working for `worker.py` and the
+#: existing suites. PEP 562 only runs for names the module does not define, so these three
+#: are now computed on access rather than snapshotted at import -- which is the whole point:
+#: an import order that used to bypass `.env` cannot bypass a value read at use time.
+#: Assigning to one of them (``monkeypatch.setattr``) creates a real module attribute and
+#: takes precedence, so test isolation is unaffected.
+_LATE_BOUND = {
+    "FRESH_WINDOW_SECONDS": fresh_window_seconds,
+    "DEFAULT_TTL_SECONDS": key_ttl_seconds,
+    "BEAT_INTERVAL_SECONDS": beat_interval_seconds,
+}
+
+
+def __getattr__(name: str) -> Any:
+    resolver = _LATE_BOUND.get(name)
+    if resolver is not None:
+        return resolver()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

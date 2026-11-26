@@ -1,3 +1,4 @@
+import os
 from typing import Dict, Any
 from fastapi import APIRouter, Request, Depends
 from fastapi.responses import JSONResponse
@@ -9,6 +10,33 @@ from core.monitoring import telemetry
 from core.task_queue import task_queue
 
 router = APIRouter(prefix="/api/admin", tags=["System Administration, Backups & Monitoring"])
+
+
+def _inline_scheduler_running_in_api() -> bool:
+    """Whether THIS API process is running its own inline scheduler loop.
+
+    Phase 49 (F-48A-3). `/api/admin/worker/health` used to answer that question with a
+    constant string — "the API runs with DISABLE_INLINE_SCHEDULER=1" — regardless of what
+    the process was doing. Phase 48A measured the API running with
+    `DISABLE_INLINE_SCHEDULER=0` and its inline loop started ("Executive Daily Briefing &
+    Retention scheduler loop started"), so the endpoint asserted the opposite of the actual
+    configuration to the one person trying to diagnose it.
+
+    The answer comes from `main.INLINE_SCHEDULER_STARTED`, which `lifespan` sets to what it
+    actually did, rather than from the environment variable: `main.py` re-runs
+    `load_dotenv(override=True)` inside `/api/health`, so the variable can change after
+    startup while the scheduler task does not (F-48A-4). The variable is the fallback for a
+    router mounted in an app whose lifespan never ran.
+    """
+    try:
+        import main as _main
+
+        started = getattr(_main, "INLINE_SCHEDULER_STARTED", None)
+        if started is not None:
+            return bool(started)
+    except Exception:  # pragma: no cover - main not importable in this context
+        pass
+    return os.getenv("DISABLE_INLINE_SCHEDULER", "0") != "1"
 
 
 @router.get("/backups")
@@ -85,6 +113,7 @@ async def worker_health_endpoint(_admin: Dict[str, Any] = Depends(require_admin)
     from core import worker_heartbeat
 
     worker_state = worker_heartbeat.read()
+    inline_scheduler_in_api = _inline_scheduler_running_in_api()
     try:
         stats = task_queue.get_queue_stats()
     except Exception as exc:
@@ -127,9 +156,23 @@ async def worker_health_endpoint(_admin: Dict[str, Any] = Depends(require_admin)
                 # In this topology the scheduler runs inside the worker.
                 "location": "worker",
                 "healthy": healthy,
+                # Phase 49 (F-48A-3): reported rather than asserted. When the API also runs
+                # its own inline loop the response says so, because that is a *duplicate*
+                # scheduler (two processes can send the same daily report) and it is not
+                # what the old constant text claimed.
+                "inline_scheduler_in_api": inline_scheduler_in_api,
                 "note": (
                     "the API runs with DISABLE_INLINE_SCHEDULER=1, so a stopped worker "
                     "also stops scheduled reports and retention"
+                    if not inline_scheduler_in_api
+                    else (
+                        "the API runs with DISABLE_INLINE_SCHEDULER=0, so it ALSO runs its "
+                        "own inline scheduler while the worker runs one too: scheduled "
+                        "reports and retention can fire twice. Set "
+                        "DISABLE_INLINE_SCHEDULER=1 in the API process so the worker owns "
+                        "the schedule; a stopped worker then also stops scheduled reports "
+                        "and retention"
+                    )
                 ),
             },
             "queue": stats,

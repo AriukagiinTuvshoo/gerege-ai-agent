@@ -550,16 +550,62 @@ def verify_telegram_webhook_secret(secret_header: Optional[str]) -> bool:
     return hmac.compare_digest(secret_header.strip(), tg_secret)
 
 
+def usable_webhook_secret(value: Optional[str]) -> str:
+    """``value`` if it may serve as an *expected* webhook secret, else ``""``.
+
+    Phase 49 (F-49-1). ``verify_manychat_webhook_secret`` used to accept any non-empty
+    string as the expected secret, including the page-level ``verify_token`` whose default
+    is ``agent_verify_secret_token_123`` — a value printed in this repository, in migration
+    ``0001``, in ``core/models.py`` and in ``dashboard.html``. Measured against a running
+    instance (development, ``WEBHOOK_FAIL_CLOSED=0``, no ``MANYCHAT_WEBHOOK_SECRET``):
+
+        POST /api/manychat  X-ManyChat-Secret: agent_verify_secret_token_123  -> 200
+        POST /api/manychat  X-ManyChat-Secret: definitely-not-the-token       -> 403
+
+    so the published string was a *working credential* for a webhook that writes into the
+    CRM. Production was not protected either: the fail-closed branch below only runs when
+    ``expected`` is **empty**, and a placeholder default is not empty, so the comparison
+    happily succeeded. Two defects, one cause — a published value being treated as a
+    secret, exactly what F-44-B already established for ``META_VERIFY_TOKEN``.
+
+    The rule is now the same one: ``meta_verify_token_is_usable`` decides, so an unset,
+    empty or placeholder candidate is not a secret and the caller falls through to the
+    fail-closed path. Development keeps accepting the published default (the suite and
+    local runs depend on it and nothing is exposed there), production does not.
+
+    Returns the value rather than a boolean because the caller needs it for
+    ``hmac.compare_digest``; it never logs it.
+    """
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    if not meta_verify_token_is_usable(candidate):
+        return ""
+    return candidate
+
+
 def verify_manychat_webhook_secret(request: Request, page_id: Optional[str] = None) -> bool:
     """
     ManyChat webhook secret / token шалгалт.
     Fail-closed горимд MANYCHAT_WEBHOOK_SECRET эсвэл тухайн салбарын verify_token-той тулгаж шалгана.
+
+    Phase 49 (F-49-1): neither source is trusted as a secret until
+    ``usable_webhook_secret`` accepts it, so the published ``pages.verify_token`` default
+    can no longer authenticate a webhook in production. A rejected candidate is treated as
+    *not configured*, which routes to the existing fail-closed branch below rather than to
+    a comparison against a value that is in this repository.
     """
-    expected = os.getenv("MANYCHAT_WEBHOOK_SECRET", "").strip()
+    env_candidate = os.getenv("MANYCHAT_WEBHOOK_SECRET", "").strip()
+    expected = usable_webhook_secret(env_candidate)
+    # Only for the diagnosis below: a candidate existed but was refused, which is a
+    # different operator error from never configuring one. The value itself is never
+    # logged or returned.
+    refused_candidate = bool(env_candidate)
     if not expected and page_id:
         page_cfg = database.get_page(page_id)
-        if page_cfg and page_cfg.get("verify_token"):
-            expected = str(page_cfg.get("verify_token")).strip()
+        page_candidate = str((page_cfg or {}).get("verify_token") or "").strip()
+        refused_candidate = refused_candidate or bool(page_candidate)
+        expected = usable_webhook_secret(page_candidate)
 
     header_secret = (
         request.headers.get("X-ManyChat-Secret")
@@ -573,7 +619,14 @@ def verify_manychat_webhook_secret(request: Request, page_id: Optional[str] = No
 
     if not expected:
         if is_webhook_fail_closed():
-            logger.error("ManyChat webhook fail-closed: MANYCHAT_WEBHOOK_SECRET is not configured")
+            if refused_candidate:
+                logger.error(
+                    "ManyChat webhook fail-closed: the configured secret is empty or a "
+                    "published placeholder, so it was refused (set MANYCHAT_WEBHOOK_SECRET "
+                    "or a per-page verify_token to a generated value)"
+                )
+            else:
+                logger.error("ManyChat webhook fail-closed: MANYCHAT_WEBHOOK_SECRET is not configured")
             return False
         return True
 
