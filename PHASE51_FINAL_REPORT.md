@@ -680,25 +680,31 @@ launcher **NOT VERIFIED**; staging **BLOCKED**; production **NOT READY**.
 | Check | Result |
 |---|---|
 | Authoritative suite, run 2 (completed B2 fix) | `2218 passed, 59 skipped, 1 xfailed, 0 failed` in 690.74 s |
+| Authoritative suite, run 3 (F-51-6 guard added) | `2266 passed, 59 skipped, 1 xfailed, 0 failed` in 686.59 s |
 | Live verification, run D against the final build | **37 PASS / 0 FAIL**, 1 N/A |
 | Final instance state | `/api/health` 200 `status=healthy`, `gemini_configured=true`, `gemini_verified=null`, `attempts=0`; admin login 200; executive recipient empty in both the database row and the process environment |
-| Credential scan of the **staged diff** (3149 lines) | live `GEMINI_API_KEY`: **0** occurrences; live `ADMIN_PASSWORD`: **0** |
+| Credential scan of the **staged diffs** | commit 1 (3149 lines) and commit 3 (773 lines): live `GEMINI_API_KEY` **0** occurrences, live `ADMIN_PASSWORD` **0**, in both |
 | `.env` | untouched — mode 600, 170 lines, sha256 prefix `2c90cc39177b2402` |
-| working tree after commit | clean, 0 entries |
+| working tree after the last commit | clean, 0 entries |
 
-### 15.2 Commit and push
+### 15.2 Commits and pushes
+
+Three commits, all pushed to `arena/d78ebf88-gerege-ai-agent` and nowhere else:
+
+| # | sha | parent | date (UTC) | Contents | Files |
+|---|---|---|---|---|---|
+| 1 | `37eabea1b1af629e7b75ef7089c2617aaca162fb` | `7b48dfc` | 08:19:23 | B2, B3, B4, B7, F-51-5, and this report | 11, +2792/-31 |
+| 2 | `ac9cbc2` | `37eabea` | 08:29:34 | doc-only: §15 git record and §16, the credential found on `main` | 1, +161 |
+| 3 | `f69565aee568034f4e4a20b798fd7556933fdbc7` | `ac9cbc2` | 09:55:58 | F-51-6 guard (§17) and the report sections it produced | 2, +686/-28 |
 
 ```
-commit 37eabea1b1af629e7b75ef7089c2617aaca162fb   (Phase 51)
-parent 7b48dfcc33b418ad13e4b9dbc649b1890b9e0c2f   (Phase 50 report)
-date   2026-11-26T08:19:23Z
-11 files changed, +2792 / -31
-
 push: 7b48dfc..37eabea  arena/d78ebf88-gerege-ai-agent -> arena/d78ebf88-gerege-ai-agent
+push: 37eabea..ac9cbc2  arena/d78ebf88-gerege-ai-agent -> arena/d78ebf88-gerege-ai-agent
+push: ac9cbc2..f69565a  arena/d78ebf88-gerege-ai-agent -> arena/d78ebf88-gerege-ai-agent
 ```
 
-Pushed to the feature branch only. `origin/main` was never a push target, no force push, no history
-rewrite. Per-file:
+`origin/main` was never a push target, no force push, no history rewrite, no PR opened. Per-file for
+commit 1:
 
 ```
 m .env.example                            +146/-3     B3
@@ -747,10 +753,23 @@ while this branch restructured that block and left the assignment empty at line 
 branch's side of the conflict removes the credential from the template. It does **not** remove it from
 `main`'s history — see §16.
 
-### 15.5 Not done, needing fresh authorisation
+### 15.5 The operator's three decisions, asked for explicitly after §16 was found
+
+| Question | Decision | What this session did with it |
+|---|---|---|
+| the live key on public `main` | **"Nothing in the repo — I'll rotate the key myself"** | no change to `main`, no removal attempted, no history touched. The finding stays measured in §16 for the operator to act on |
+| add the missing template guard (F-51-6) | **"Yes — add it on the feature branch"** | `tests/test_e51_template_credential_guard.py`, 48 tests, commit 3 (§17) |
+| open a PR for Phase 51 | **"No PR — leave it on the branch"** | no PR opened; 0 open PRs re-verified. The conflict in §15.4 therefore stays unresolved, on purpose |
+
+### 15.6 Not done, needing fresh authorisation
 
 Opening a pull request; merging; any push to `main`; removing the credential from `main`; rewriting
 history; rotating any key; deploying.
+
+The branch is now **three commits ahead of `origin/main`**, and a PR from it would conflict in
+`.env.example` (§15.4). Resolving that conflict by taking this branch's side removes the leaked value
+from the template — but not from `main`'s history, and not from whoever has already cloned it. Only
+rotation does that.
 
 ---
 
