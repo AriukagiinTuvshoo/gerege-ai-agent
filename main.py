@@ -182,6 +182,17 @@ async def telemetry_and_error_tracking_middleware(request: Request, call_next):
     except Exception as exc:
         dur = (time.perf_counter() - t0) * 1000.0
         telemetry.record_request(request.url.path, request.method, 500, dur, error_detail=str(exc), request_id=req_id)
+        # Phase 55 (F-55-3). This branch recorded `str(exc)` into telemetry and returned a
+        # generic 500, and logged nothing: across the 500s measured on a running instance the
+        # backend log held ZERO tracebacks, so neither an operator nor this agent could tell
+        # what had failed without attaching a debugger to the live process. The client response
+        # stays generic - a traceback is not for the caller - but the log now says what
+        # happened, where, and which request id it belongs to.
+        logger.error(
+            "unhandled exception on %s %s (request_id=%s): %s",
+            request.method, request.url.path, req_id, type(exc).__name__,
+            exc_info=exc,
+        )
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal server error", "request_id": req_id},
@@ -906,7 +917,7 @@ async def web_chat_endpoint(payload: Dict[str, Any], request: Request, backgroun
             status_code=429,
             headers={"Retry-After": str(_limit_hit["retry_after"])},
         )
-    message = payload.get("message", "").strip()
+    message = _payload_text(payload, "message")
     sender_id = payload.get("sender_id", "web_user")
     
     # Хэрэв client нэвтэрсэн бол зөвхөн өөрийн хуудсаар хязгаарлана
@@ -1214,9 +1225,23 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
 
     await core_security.require_admin(request)
 
-    success = database.delete_page(str(target_id))
-    if not success:
-        return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
+    deleted = database.delete_page(str(target_id))
+    if not deleted:
+        if str(target_id) == database.DEFAULT_PAGE_ID:
+            return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
+        # Phase 55 (F-54-4). `delete_page` returned True for anything that was not the default
+        # page, so a page that never existed was reported as deleted AND audited as deleted.
+        # HTTP 200 with the truth in the body, matching Phase 53/54: this endpoint's contract is
+        # {"status": ...} and the dashboard reads the body rather than the status code. No audit
+        # row and no session reset for a deletion that deleted nothing.
+        return JSONResponse(
+            {
+                "status": "not_found",
+                "deleted": False,
+                "page_id": str(target_id),
+                "message": f"'{target_id}' хуудас олдсонгүй - устгах зүйл байсангүй.",
+            }
+        )
     audit_error = _audit_or_report(
         "page.delete",
         operation=f"Хуудас ({target_id}) устгах",
@@ -1235,7 +1260,7 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
     if audit_error is not None:
         return audit_error
     agent.reset_sessions(str(target_id))
-    return {"status": "deleted", "page_id": target_id}
+    return {"status": "deleted", "deleted": True, "page_id": target_id}
 
 @app.post("/api/pages/gemini_key")
 @app.post("/api/pages/{page_id}/gemini_key")
@@ -1383,10 +1408,32 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
     if not target_page_id:
         return JSONResponse({"error": "Хуудасны ID шаардлагатай"}, status_code=400)
 
-    username = str(payload.get("username", "")).strip()
-    password = payload.get("password")
+    username = _payload_text(payload, "username")
+    # Phase 55 (F-55-7): `set_client_credentials` calls `password.strip()`, so a numeric
+    # password in a JSON body crashed the request with an AttributeError 500. Absent stays
+    # absent - that is this endpoint's "leave the password alone" signal - and anything
+    # present becomes text.
+    password = None if payload.get("password") is None else _payload_text(payload, "password")
     if not username:
         return JSONResponse({"error": "Хэрэглэгчийн нэр оруулна уу"}, status_code=400)
+
+    # Phase 55 (F-55-4). Nothing here checked that the page exists. For a page id that had
+    # never been created, `set_client_credentials` updated 0 rows and the audit INSERT then hit
+    # `audit_logs.page_id`'s foreign key to `pages`, so `_audit_or_report` produced a 500 whose
+    # own text asserted the opposite of the truth. Measured live, before the fix:
+    #   POST /api/pages/p55_never_d/credentials
+    #     -> HTTP 500 {"error": "Хуудас (p55_never_d) нэвтрэх эрх шинэчлэх хийгдсэн боловч ..."}
+    # with 0 rows written. This endpoint already answers its validation problems with an HTTP
+    # error and an `error` body - which is what the dashboard branches on (`!credRes.ok ||
+    # credData.error`) - so a missing page is a 404 in that same shape, not a 500.
+    if not database.get_page(str(target_page_id)):
+        return JSONResponse(
+            {
+                "error": f"'{target_page_id}' хуудас олдсонгүй - ямар ч нэвтрэх эрх шинэчлэгдсэнгүй.",
+                "written": False,
+            },
+            status_code=404,
+        )
 
     # E-02 Phase 6, R10: a username owned by another tenant is a conflict, not an update.
     # Previously this silently rewrote the other tenant's row (cross-tenant takeover). It is
@@ -1569,7 +1616,7 @@ async def manager_send_message(sender_id: str, payload: Dict[str, str], request:
     E-01: the outbound message is written to, and the conversation read from, the tenant
     that owns the authenticated session. `payload["page_id"]` is no longer trusted.
     """
-    text = payload.get("message", "").strip()
+    text = _payload_text(payload, "message")
     target_page = await core_security.enforce_tenant_scope(
         request,
         requested_page_id=page_id,
@@ -1648,10 +1695,40 @@ async def update_lead(lead_id: int, payload: Dict[str, Any], request: Request):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     core_security.verify_resource_tenant_ownership(user, lead.get("page_id"), require_auth=True)
-    status = payload.get("status", "шинэ")
-    notes = payload.get("notes")
+    # Phase 55 (F-55-8). Two defects, both measured live on this deployment:
+    #   POST /api/leads/1/status {"status": {"a": 1}} -> HTTP 500 (ProgrammingError)
+    #   POST /api/leads/1/status {"status": null}     -> HTTP 200 {"status": "updated"}, and the
+    #       lead's stored status became NULL. `payload.get("status", "шинэ")` returns the default
+    #       only for an ABSENT key; an explicit null is a value, and it was written as one, so the
+    #       caller was told the update succeeded while the row lost its stage. Lead 1 in this
+    #       deployment was corrupted that way and had to be restored.
+    # The vocabulary is free-form Mongolian text (`"шинэ"` is only the default), so no enum is
+    # imposed - but the field must be a non-empty string, and `notes` must be text or absent.
+    raw_status = payload.get("status", "шинэ")
+    if raw_status is None or isinstance(raw_status, (dict, list, tuple, set)):
+        return JSONResponse(
+            {
+                "status": "error",
+                "updated": False,
+                "lead_id": lead_id,
+                "message": "Төлөв нь хоосон биш текст байх ёстой. Одоогийн төлөв өөрчлөгдсөнгүй.",
+            },
+            status_code=400,
+        )
+    status = str(raw_status).strip()
+    if not status:
+        return JSONResponse(
+            {
+                "status": "error",
+                "updated": False,
+                "lead_id": lead_id,
+                "message": "Төлөв хоосон байж болохгүй. Одоогийн төлөв өөрчлөгдсөнгүй.",
+            },
+            status_code=400,
+        )
+    notes = None if payload.get("notes") is None else _payload_text(payload, "notes")
     database.update_lead_status(lead_id, status, notes)
-    return {"status": "updated", "lead_id": lead_id}
+    return {"status": "updated", "updated": True, "lead_id": lead_id, "lead_status": status}
 
 @app.get("/api/export/csv")
 async def export_csv(
@@ -1938,7 +2015,7 @@ async def test_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any],
         permission="knowledge:read",
     )
     
-    url = payload.get("google_sheets_url", "").strip()
+    url = _payload_text(payload, "google_sheets_url")
     if not url:
         return JSONResponse({"success": False, "error": "Google Sheets холбоос оруулаагүй байна."}, status_code=400)
     
@@ -2336,7 +2413,10 @@ async def update_keys(payload: Dict[str, str], request: Request):
             )
 
     for k in ["gemini_key", "meta_token", "meta_verify", "tg_token", "tg_manager_id", "admin_password"]:
-        v = payload.get(k, "").strip()
+        # Phase 55 (F-55-7): the thirteenth unguarded `.strip()`, in the endpoint that writes
+        # secrets into `.env`. The newline check above already coerces with `str(...)`, so a
+        # numeric value survived it and then crashed here with an AttributeError 500.
+        v = _payload_text(payload, k)
         if k == "gemini_key" and v:
             os.environ["GEMINI_API_KEY"] = v
             agent._init_default_gemini()
@@ -2889,7 +2969,7 @@ async def scan_cargo_package_api(payload: Dict[str, Any], request: Request):
         require_auth=True,
         permission="cargo:write",
     )
-    code = payload.get("tracking_code", "").strip()
+    code = _payload_text(payload, "tracking_code")
     if not code:
         return JSONResponse(status_code=400, content={"error": "tracking_code is required"})
     loc = payload.get("location", "УБ Төв Агуулах")
@@ -3015,6 +3095,39 @@ async def send_executive_report_api(payload: Dict[str, Any], request: Request):
 def _settings_text(value: Any) -> str:
     """The stored form of a text field: a string, stripped, never None."""
     return "" if value is None else str(value).strip()
+
+
+#: The closed set `appointments.status` accepts (Phase 55, F-55-8). `is_slot_available` and
+#: `get_upcoming_appointments` filter on ``status = 'CONFIRMED'``, so a value outside this set
+#: does not merely look wrong in the UI - it takes the booking out of the availability check.
+APPOINTMENT_STATUSES = ("CONFIRMED", "COMPLETED", "CANCELLED")
+
+
+def _payload_text(payload: Dict[str, Any], key: str, default: str = "") -> str:
+    """Phase 55 (F-55-7): the text form of a request field, or a 400 that names the field.
+
+    Twelve sites across six handlers read a body field as ``payload.get(key, "").strip()``,
+    which assumes the client sent a string. Measured live, a body that sends a number or an
+    object instead crashed the request with a bare 500 and no log line (see F-55-3):
+
+        POST /api/appointments {"notes": 12345}
+            -> AttributeError: 'int' object has no attribute 'strip'
+        POST /api/pages/{id}/credentials {"password": 12345}
+            -> AttributeError, raised inside database.set_client_credentials
+        POST /api/retention/broadcast {"target_segment": {"a": 1}}
+            -> ProgrammingError: the dict reached a SQL parameter unchanged
+
+    A malformed body is the caller's error, so it is answered with 400 naming the field. A
+    number is accepted as its text form because that is what the stored column wants. An
+    object or a list is refused rather than stringified: ``str({"a": 1})`` would write Python
+    syntax into a marketing row.
+    """
+    value = payload.get(key, default)
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple, set)):
+        raise HTTPException(status_code=400, detail=f"{key} must be a string")
+    return str(value).strip()
 
 
 def _settings_flag(value: Any) -> int:
@@ -3360,6 +3473,28 @@ async def update_retention_rule_api(payload: Dict[str, Any], request: Request):
     if not rule_type:
         raise HTTPException(status_code=400, detail="rule_type and message_template are required")
 
+    # Phase 55 (F-55-2). `automated_rules.page_id` carries a foreign key to `pages`, so a body
+    # naming a page that does not exist raised `IntegrityError: FOREIGN KEY constraint failed`
+    # out of `update_automated_rule` and the caller saw a bare 500 "Internal server error".
+    # Measured live, before the fix:
+    #   POST /api/retention/rules {"page_id": "p55_never_exists", ...} -> HTTP 500, 0 rows
+    # and, because that function had no try/finally, the connection leaked while holding a write
+    # lock (F-55-1) - which is what turned an unrelated DELETE into a 500 in the same session.
+    # `enforce_tenant_scope` hands back the requested page id for an admin without an existence
+    # check, so the page is verified here instead, and the answer tells the truth either way.
+    if not database.get_page(target_page_id):
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "page_id": target_page_id,
+                "rule_type": rule_type,
+                "changed": [],
+                "preserved": [],
+                "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч дүрэм хадгалагдсангүй.",
+            }
+        )
+
     # Phase 53 (F-53-9): `payload.get("delay_hours", 2)` and `payload.get("is_active", True)`
     # were written straight into an upsert, so a body naming only the message reset the delay
     # to 2 hours and re-activated a rule the operator had switched off - which then messages
@@ -3404,16 +3539,38 @@ async def send_broadcast_api(payload: Dict[str, Any], request: Request):
         require_auth=True,
         permission="retention:write",
     )
-    title = payload.get("title", "").strip()
-    message = payload.get("message", "").strip()
-    target_segment = payload.get("target_segment", "all")
-    channel = payload.get("channel", "all")
+    title = _payload_text(payload, "title")
+    message = _payload_text(payload, "message")
+    # Phase 55 (F-55-7): both are declared `str` and go straight into
+    # `INSERT INTO marketing_campaigns (... target_segment, channel ...)`, so an object here
+    # reached a SQL parameter and raised ProgrammingError. `or "all"` keeps an explicit null
+    # meaning "the default segment", which is what it meant before.
+    target_segment = _payload_text(payload, "target_segment", "all") or "all"
+    channel = _payload_text(payload, "channel", "all") or "all"
     
     if not title or not message:
         raise HTTPException(status_code=400, detail="Гарчиг болон зурвасын эх бичвэр шаардлагатай")
         
+    # Phase 55 (F-55-6). Same foreign key, one layer deeper: send_broadcast_api ->
+    # retention_service.send_broadcast -> database.create_marketing_campaign, whose INSERT into
+    # `marketing_campaigns.page_id` raised `IntegrityError` for a page that does not exist.
+    # Measured live, before the fix:
+    #   POST /api/retention/broadcast {"page_id": "p55_never_f", ...} -> HTTP 500
+    # HTTP 200 with success:false because the dashboard alerts `data.message` on that branch.
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    if not database.get_page(target_page_id):
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "sent": 0,
+                "page_id": target_page_id,
+                "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч кампэйн үүсгэсэнгүй.",
+            }
+        )
+
     res = await retention_service.send_broadcast(
-        page_id=pid or database.DEFAULT_PAGE_ID,
+        page_id=target_page_id,
         title=title,
         message=message,
         target_segment=target_segment,
@@ -3497,18 +3654,37 @@ async def create_appointment_manual_api(payload: Dict[str, Any], request: Reques
         require_auth=True,
         permission="appointments:write",
     )
-    name = payload.get("customer_name", "").strip()
-    phone = payload.get("customer_phone", "").strip()
-    service = payload.get("service_name", "").strip()
-    date_val = payload.get("appointment_date", "").strip()
-    time_val = payload.get("appointment_time", "").strip()
-    notes = payload.get("notes", "").strip()
+    name = _payload_text(payload, "customer_name")
+    phone = _payload_text(payload, "customer_phone")
+    service = _payload_text(payload, "service_name")
+    date_val = _payload_text(payload, "appointment_date")
+    time_val = _payload_text(payload, "appointment_time")
+    notes = _payload_text(payload, "notes")
 
     if not name or not phone or not date_val or not time_val:
         raise HTTPException(status_code=400, detail="Нэр, утас, огноо, цаг заавал шаардлагатай")
 
+    # Phase 55 (F-55-6). `appointments.page_id` carries a foreign key to `pages`, and nothing
+    # here checked the page existed, so `create_appointment` raised
+    # `sqlite3.IntegrityError: FOREIGN KEY constraint failed` and the operator saw a bare 500.
+    # Measured live, before the fix:
+    #   POST /api/appointments {"page_id": "p55_never_f", ...} -> HTTP 500 "Internal server error"
+    # The dashboard branches on `json.success` and alerts `json.message`, so this answers with
+    # HTTP 200 and success:false carrying the reason; an HTTPException would deliver `detail`
+    # instead and the dashboard would alert its slot-conflict fallback - the wrong diagnosis.
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    if not database.get_page(target_page_id):
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "page_id": target_page_id,
+                "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч цаг захиалга хадгалагдсангүй.",
+            }
+        )
+
     appt = database.create_appointment(
-        page_id=pid or database.DEFAULT_PAGE_ID,
+        page_id=target_page_id,
         customer_name=name,
         customer_phone=phone,
         service_name=service or "Үйлчилгээ",
@@ -3529,9 +3705,40 @@ async def update_appointment_status_api(appointment_id: int, payload: Dict[str, 
     if not appt:
         raise HTTPException(status_code=404, detail="Appointment not found")
     core_security.verify_resource_tenant_ownership(user, appt.get("page_id"), require_auth=True)
-    new_status = payload.get("status", "CONFIRMED")
+    # Phase 55 (F-55-8). `status` was written through unchecked, and the column is a closed set:
+    # `database.is_slot_available` and `get_upcoming_appointments` both filter on
+    # `status = 'CONFIRMED'`, and the dashboard renders exactly these three. Measured live,
+    # before the fix:
+    #   POST /api/appointments/1/status {"status": {"a": 1}} -> HTTP 500 (ProgrammingError: the
+    #       dict reached the SQL parameter)
+    #   POST /api/appointments/1/status {"status": 12345}    -> HTTP 200, and the row then held
+    #       status '12345' - which no longer matches `status = 'CONFIRMED'`, so the slot the
+    #       customer had booked silently became bookable again for somebody else.
+    # HTTP 400 carries success:false and message because the dashboard reads `json.message` on
+    # its failure branch whatever the status code is.
+    # Checked inline rather than through `_payload_text` so that BOTH refusals - a value of the
+    # wrong type and a value outside the enum - carry the same `{success, written, message}`
+    # body. The dashboard alerts `json.message` on this branch, and `_payload_text` answers with
+    # `{"detail": ...}`, which would have made the operator see the generic fallback for one bad
+    # input and the real reason for another.
+    raw_status = payload.get("status", "CONFIRMED")
+    new_status = "" if raw_status is None or isinstance(raw_status, (dict, list, tuple, set)) \
+        else str(raw_status).strip()
+    if not new_status:
+        new_status = "CONFIRMED" if raw_status is None else ""
+    if new_status not in APPOINTMENT_STATUSES:
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "status": None,
+                "message": f"Цаг захиалгын төлөв нь {'/'.join(APPOINTMENT_STATUSES)}-ын нэг байх ёстой "
+                           f"(ирсэн утга: {raw_status!r}).",
+            },
+            status_code=400,
+        )
     success = database.update_appointment_status(appointment_id, new_status)
-    return {"success": success, "status": new_status}
+    return {"success": success, "written": bool(success), "status": new_status}
 
 @app.get("/api/appointments/summary")
 async def get_appointments_summary_api(request: Request, page_id: Optional[str] = Query(None)):

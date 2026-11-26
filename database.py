@@ -150,78 +150,82 @@ def init_db():
     )
 
     conn = get_connection()
-    cursor = conn.cursor()
-
-    # Анхны Tuvshok хуудсыг автоматаар бүртгэж үүсгэх
-    cursor.execute("SELECT page_id FROM pages WHERE page_id = ?", (DEFAULT_PAGE_ID,))
-    row = cursor.fetchone()
-    if not row:
-        knowledge_file = os.path.join(os.path.dirname(__file__), "knowledge.json")
-        k_json = "{}"
-        if os.path.exists(knowledge_file):
-            try:
-                with open(knowledge_file, "r", encoding="utf-8") as f:
-                    k_json = f.read()
-            except Exception:
-                pass
-        
-        page_token = os.getenv("META_PAGE_ACCESS_TOKEN", "").strip()
-        magic = secrets.token_urlsafe(24)
-        cursor.execute("""
-            INSERT INTO pages (
-                page_id, name, category, page_access_token, verify_token, is_active, 
-                knowledge_json, client_username, client_magic_token, monthly_token_limit, tokens_used
-            )
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, 200000, 0)
-        """, (
-            DEFAULT_PAGE_ID,
-            "Tuvshok Кино & Драма Суваг",
-            "entertainment",
-            page_token,
-            # B1 (Phase 52): was the published literal, so the default page of every fresh
-            # install carried a verify token that this repository prints. An operator now
-            # sets one deliberately; until then the value is empty and
-            # `meta_verify_token_is_usable` refuses the handshake in production.
-            "",
-            k_json,
-            "tuvshok",
-            magic
-        ))
-    else:
-        # Magic token байхгүй бол нөхөх
-        cursor.execute("SELECT client_magic_token FROM pages WHERE page_id = ?", (DEFAULT_PAGE_ID,))
-        m_row = cursor.fetchone()
-        if not m_row or not m_row[0]:
-            cursor.execute("UPDATE pages SET client_magic_token = ? WHERE page_id = ?", (secrets.token_urlsafe(24), DEFAULT_PAGE_ID))
-
-    # URL маягийн буруу page_id-тай (жишээ нь https://...) хуудсуудыг цэвэрлэх
     try:
-        cursor.execute("SELECT page_id FROM pages WHERE page_id LIKE '%/%'")
-        for (old_id,) in cursor.fetchall():
-            new_id = sanitize_page_id(old_id)
-            if new_id and new_id != old_id:
-                cursor.execute("UPDATE OR IGNORE pages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
-                cursor.execute("UPDATE OR IGNORE registrations SET page_id = ? WHERE page_id = ?", (new_id, old_id))
-                cursor.execute("UPDATE OR IGNORE messages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
-                # E-01: `UPDATE OR IGNORE` silently skips a row when the rewritten
-                # (page_id, sender_id) already exists, which would leave that customer's
-                # session behind on the old page_id. Report instead of silently dropping.
-                cursor.execute("SELECT COUNT(*) FROM session_states WHERE page_id = ?", (old_id,))
-                pending = cursor.fetchone()[0]
-                cursor.execute("UPDATE OR IGNORE session_states SET page_id = ? WHERE page_id = ?", (new_id, old_id))
-                cursor.execute("SELECT COUNT(*) FROM session_states WHERE page_id = ?", (old_id,))
-                left = cursor.fetchone()[0]
-                if left:
-                    logger.warning(
-                        f"page_id sanitisation left {left} of {pending} session rows on {old_id!r}: "
-                        f"the rewritten identity already exists on {new_id!r}. Review manually."
-                    )
-    except Exception as e:
-        logger.error(f"Migration page_id sanitization error: {e}")
+        cursor = conn.cursor()
 
-    conn.commit()
-    conn.commit()
-    conn.close()
+        # Анхны Tuvshok хуудсыг автоматаар бүртгэж үүсгэх
+        cursor.execute("SELECT page_id FROM pages WHERE page_id = ?", (DEFAULT_PAGE_ID,))
+        row = cursor.fetchone()
+        if not row:
+            knowledge_file = os.path.join(os.path.dirname(__file__), "knowledge.json")
+            k_json = "{}"
+            if os.path.exists(knowledge_file):
+                try:
+                    with open(knowledge_file, "r", encoding="utf-8") as f:
+                        k_json = f.read()
+                except Exception:
+                    pass
+            
+            page_token = os.getenv("META_PAGE_ACCESS_TOKEN", "").strip()
+            magic = secrets.token_urlsafe(24)
+            cursor.execute("""
+                INSERT INTO pages (
+                    page_id, name, category, page_access_token, verify_token, is_active, 
+                    knowledge_json, client_username, client_magic_token, monthly_token_limit, tokens_used
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, 200000, 0)
+            """, (
+                DEFAULT_PAGE_ID,
+                "Tuvshok Кино & Драма Суваг",
+                "entertainment",
+                page_token,
+                # B1 (Phase 52): was the published literal, so the default page of every fresh
+                # install carried a verify token that this repository prints. An operator now
+                # sets one deliberately; until then the value is empty and
+                # `meta_verify_token_is_usable` refuses the handshake in production.
+                "",
+                k_json,
+                "tuvshok",
+                magic
+            ))
+        else:
+            # Magic token байхгүй бол нөхөх
+            cursor.execute("SELECT client_magic_token FROM pages WHERE page_id = ?", (DEFAULT_PAGE_ID,))
+            m_row = cursor.fetchone()
+            if not m_row or not m_row[0]:
+                cursor.execute("UPDATE pages SET client_magic_token = ? WHERE page_id = ?", (secrets.token_urlsafe(24), DEFAULT_PAGE_ID))
+
+        # URL маягийн буруу page_id-тай (жишээ нь https://...) хуудсуудыг цэвэрлэх
+        try:
+            cursor.execute("SELECT page_id FROM pages WHERE page_id LIKE '%/%'")
+            for (old_id,) in cursor.fetchall():
+                new_id = sanitize_page_id(old_id)
+                if new_id and new_id != old_id:
+                    cursor.execute("UPDATE OR IGNORE pages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                    cursor.execute("UPDATE OR IGNORE registrations SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                    cursor.execute("UPDATE OR IGNORE messages SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                    # E-01: `UPDATE OR IGNORE` silently skips a row when the rewritten
+                    # (page_id, sender_id) already exists, which would leave that customer's
+                    # session behind on the old page_id. Report instead of silently dropping.
+                    cursor.execute("SELECT COUNT(*) FROM session_states WHERE page_id = ?", (old_id,))
+                    pending = cursor.fetchone()[0]
+                    cursor.execute("UPDATE OR IGNORE session_states SET page_id = ? WHERE page_id = ?", (new_id, old_id))
+                    cursor.execute("SELECT COUNT(*) FROM session_states WHERE page_id = ?", (old_id,))
+                    left = cursor.fetchone()[0]
+                    if left:
+                        logger.warning(
+                            f"page_id sanitisation left {left} of {pending} session rows on {old_id!r}: "
+                            f"the rewritten identity already exists on {new_id!r}. Review manually."
+                        )
+        except Exception as e:
+            logger.error(f"Migration page_id sanitization error: {e}")
+
+        conn.commit()
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. `init_db` runs at startup in every
+        # process, so a connection leaked here is leaked before the app can serve anything.
+    finally:
+        conn.close()
 
 # ----------------- AUTHENTICATION & RBAC SESSIONS -----------------
 def create_session(role: str, page_id: Optional[str] = None, hours: int = 72, ip_address: Optional[str] = None) -> str:
@@ -229,13 +233,21 @@ def create_session(role: str, page_id: Optional[str] = None, hours: int = 72, ip
     token = secrets.token_urlsafe(32)
     expires_at = datetime.utcnow() + timedelta(hours=hours)
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO sessions (session_token, role, page_id, revoked, ip_address, expires_at)
-        VALUES (?, ?, ?, 0, ?, ?)
-    """, (token, role, page_id, ip_address, expires_at.strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO sessions (session_token, role, page_id, revoked, ip_address, expires_at)
+            VALUES (?, ?, ?, 0, ?, ?)
+        """, (token, role, page_id, ip_address, expires_at.strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return token
 
 def get_session(token: str) -> Optional[Dict[str, Any]]:
@@ -243,17 +255,22 @@ def get_session(token: str) -> Optional[Dict[str, Any]]:
     if not token:
         return None
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT session_token, role, page_id, revoked, created_at, expires_at
-        FROM sessions
-        WHERE session_token = ?
-          AND COALESCE(revoked, 0) = 0
-          AND datetime(expires_at) > datetime('now')
-    """, (token,))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT session_token, role, page_id, revoked, created_at, expires_at
+            FROM sessions
+            WHERE session_token = ?
+              AND COALESCE(revoked, 0) = 0
+              AND datetime(expires_at) > datetime('now')
+        """, (token,))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return dict(row) if row else None
 
 def revoke_session(token: str) -> bool:
@@ -261,16 +278,24 @@ def revoke_session(token: str) -> bool:
     if not token:
         return False
     conn = get_connection()
-    cursor = conn.cursor()
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("""
-        UPDATE sessions
-        SET revoked = 1, revoked_at = ?
-        WHERE session_token = ?
-    """, (now_str, token))
-    changed = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+            UPDATE sessions
+            SET revoked = 1, revoked_at = ?
+            WHERE session_token = ?
+        """, (now_str, token))
+        changed = cursor.rowcount > 0
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return changed
 
 def revoke_all_page_sessions(page_id: str) -> int:
@@ -278,16 +303,24 @@ def revoke_all_page_sessions(page_id: str) -> int:
     if not page_id:
         return 0
     conn = get_connection()
-    cursor = conn.cursor()
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("""
-        UPDATE sessions
-        SET revoked = 1, revoked_at = ?
-        WHERE page_id = ? AND COALESCE(revoked, 0) = 0
-    """, (now_str, str(page_id)))
-    count = cursor.rowcount
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+            UPDATE sessions
+            SET revoked = 1, revoked_at = ?
+            WHERE page_id = ? AND COALESCE(revoked, 0) = 0
+        """, (now_str, str(page_id)))
+        count = cursor.rowcount
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return count
 
 def delete_session(token: str):
@@ -480,57 +513,80 @@ def record_audit_log(
 
 def list_audit_logs(page_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    if page_id:
-        cursor.execute("SELECT * FROM audit_logs WHERE page_id = ? ORDER BY id DESC LIMIT ?", (str(page_id), limit))
-    else:
-        cursor.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,))
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        if page_id:
+            cursor.execute("SELECT * FROM audit_logs WHERE page_id = ? ORDER BY id DESC LIMIT ?", (str(page_id), limit))
+        else:
+            cursor.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,))
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 
 def delete_customer_data(page_id: str, sender_id: Optional[str] = None, phone: Optional[str] = None) -> Dict[str, int]:
     """Хэрэглэгчийн хувийн мэдээлэл ба санах ойг устгах (Privacy Policy 'Бүртгэл устгах' эрх)"""
     conn = get_connection()
-    cursor = conn.cursor()
-    deleted = {"registrations": 0, "memories": 0, "messages": 0}
-    if sender_id:
-        cursor.execute("DELETE FROM user_memories WHERE page_id = ? AND user_id = ?", (str(page_id), str(sender_id)))
-        deleted["memories"] += max(0, cursor.rowcount)
-        cursor.execute("DELETE FROM registrations WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
-        deleted["registrations"] += max(0, cursor.rowcount)
-        cursor.execute("DELETE FROM session_states WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
-    if phone:
-        cursor.execute("DELETE FROM registrations WHERE page_id = ? AND phone = ?", (str(page_id), str(phone)))
-        deleted["registrations"] += max(0, cursor.rowcount)
-        cursor.execute("DELETE FROM user_memories WHERE page_id = ? AND phone = ?", (str(page_id), str(phone)))
-        deleted["memories"] += max(0, cursor.rowcount)
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        deleted = {"registrations": 0, "memories": 0, "messages": 0}
+        if sender_id:
+            cursor.execute("DELETE FROM user_memories WHERE page_id = ? AND user_id = ?", (str(page_id), str(sender_id)))
+            deleted["memories"] += max(0, cursor.rowcount)
+            cursor.execute("DELETE FROM registrations WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
+            deleted["registrations"] += max(0, cursor.rowcount)
+            cursor.execute("DELETE FROM session_states WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
+        if phone:
+            cursor.execute("DELETE FROM registrations WHERE page_id = ? AND phone = ?", (str(page_id), str(phone)))
+            deleted["registrations"] += max(0, cursor.rowcount)
+            cursor.execute("DELETE FROM user_memories WHERE page_id = ? AND phone = ?", (str(page_id), str(phone)))
+            deleted["memories"] += max(0, cursor.rowcount)
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return deleted
 
 
 def get_lead_by_id(lead_id: int) -> Optional[Dict[str, Any]]:
     """Бүртгэлийг ID-аар нь авч салбарын харьяаллыг (page_id) шалгах"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM registrations WHERE id = ?", (lead_id,))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM registrations WHERE id = ?", (lead_id,))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return dict(row) if row else None
 
 
 def get_appointment_by_id(appointment_id: int) -> Optional[Dict[str, Any]]:
     """Цаг захиалгыг ID-аар нь авч салбарын харьяаллыг (page_id) шалгах"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return dict(row) if row else None
 
 def sanitize_page_id(page_id: str) -> str:
@@ -660,70 +716,73 @@ def authenticate_client_detailed(identifier: str, password: Optional[str] = None
         return None, "Байгууллагын нэвтрэх нэр эсвэл шууд холбоос оруулна уу."
     ident = identifier.strip()
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    # 1. 1-товчлуурт Magic Token-оор шалгах
-    cursor.execute("SELECT * FROM pages WHERE client_magic_token = ? AND is_active = 1", (ident,))
-    row = cursor.fetchone()
-    if row:
-        conn.close()
-        return dict(row), None
+        # 1. 1-товчлуурт Magic Token-оор шалгах
+        cursor.execute("SELECT * FROM pages WHERE client_magic_token = ? AND is_active = 1", (ident,))
+        row = cursor.fetchone()
+        if row:
+            return dict(row), None
 
-    # 2. Username эсвэл Page ID-аар хайх (Case-insensitive)
-    #
-    # E-02 Phase 4.2, audit B. `pages.client_username` has only a non-unique index, so the
-    # schema permits two tenants sharing one login name. Without an ORDER BY this `fetchone()`
-    # returned whichever row the engine produced first — in practice rowid order — while
-    # `resolve_canonical_account()` (which the account throttle keys on) deliberately picks
-    # the LOWEST page_id. The two could therefore disagree: the throttle charged one tenant
-    # while another tenant authenticated. Measured before the fix: the account the throttle
-    # charged could not log in with its own correct password.
-    #
-    # The ORDER BY makes authentication select exactly what the resolver selects, so the
-    # counter and the authenticated identity are the same account by construction. Which of
-    # two colliding tenants wins is still arbitrary from a product standpoint — that needs a
-    # schema decision (a unique constraint) and is not made here; the point is that the
-    # choice is deterministic and identical in both places.
-    cursor.execute("""
-        SELECT * FROM pages 
-        WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?)) 
-          AND is_active = 1
-        ORDER BY page_id
-        LIMIT 1
-    """, (ident, ident))
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
-        # E-02 Phase 4: no account means no password to check, which would return in ~6 ms
-        # instead of ~38 ms and disclose which tenant names exist. Spend the same work on a
-        # throwaway credential first.
-        dummy_password_verify(password)
-        return None, f"'{ident}' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
+        # 2. Username эсвэл Page ID-аар хайх (Case-insensitive)
+        #
+        # E-02 Phase 4.2, audit B. `pages.client_username` has only a non-unique index, so the
+        # schema permits two tenants sharing one login name. Without an ORDER BY this `fetchone()`
+        # returned whichever row the engine produced first — in practice rowid order — while
+        # `resolve_canonical_account()` (which the account throttle keys on) deliberately picks
+        # the LOWEST page_id. The two could therefore disagree: the throttle charged one tenant
+        # while another tenant authenticated. Measured before the fix: the account the throttle
+        # charged could not log in with its own correct password.
+        #
+        # The ORDER BY makes authentication select exactly what the resolver selects, so the
+        # counter and the authenticated identity are the same account by construction. Which of
+        # two colliding tenants wins is still arbitrary from a product standpoint — that needs a
+        # schema decision (a unique constraint) and is not made here; the point is that the
+        # choice is deterministic and identical in both places.
+        cursor.execute("""
+            SELECT * FROM pages 
+            WHERE (LOWER(TRIM(client_username)) = LOWER(?) OR LOWER(TRIM(page_id)) = LOWER(?)) 
+              AND is_active = 1
+            ORDER BY page_id
+            LIMIT 1
+        """, (ident, ident))
+        row = cursor.fetchone()
+        if not row:
+            # E-02 Phase 4: no account means no password to check, which would return in ~6 ms
+            # instead of ~38 ms and disclose which tenant names exist. Spend the same work on a
+            # throwaway credential first.
+            dummy_password_verify(password)
+            return None, f"'{ident}' нэртэй харилцагчийн салбар олдсонгүй. Админ самбараас нэрээ шалгана уу."
 
-    p_dict = dict(row)
-    stored_hash = p_dict.get("client_password_hash")
-    salt = p_dict.get("client_salt")
+        p_dict = dict(row)
+        stored_hash = p_dict.get("client_password_hash")
+        salt = p_dict.get("client_salt")
 
-    if not stored_hash or not salt:
-        conn.close()
-        # Same equalisation: this branch is only reachable for a REAL account, so without it
-        # "exists but unconfigured" would answer faster than "exists with a password".
-        dummy_password_verify(password)
-        return None, f"'{p_dict.get('name')}' салбарт одоогоор нууц үг хадгалаагүй байна. Админ самбарын 'Хандалт' цонхноос шинэ нууц үг хадгалж өгөх эсвэл Magic Link-ээр орно уу."
+        if not stored_hash or not salt:
+            # Same equalisation: this branch is only reachable for a REAL account, so without it
+            # "exists but unconfigured" would answer faster than "exists with a password".
+            dummy_password_verify(password)
+            return None, f"'{p_dict.get('name')}' салбарт одоогоор нууц үг хадгалаагүй байна. Админ самбарын 'Хандалт' цонхноос шинэ нууц үг хадгалж өгөх эсвэл Magic Link-ээр орно уу."
 
-    if not password or not password.strip():
-        conn.close()
-        # verify_password() also returns early on an empty password, so equalise here too.
-        dummy_password_verify(password)
-        return None, "Нууц үгээ оруулна уу."
+        if not password or not password.strip():
+            # verify_password() also returns early on an empty password, so equalise here too.
+            dummy_password_verify(password)
+            return None, "Нууц үгээ оруулна уу."
 
-    if verify_password(password.strip(), stored_hash, salt):
+        if verify_password(password.strip(), stored_hash, salt):
+            return p_dict, None
+        else:
+            return None, "Нууц үг буруу байна! Нүдний дүрс 👁️ дээр даран нууц үгээ шалгана уу."
+        # Phase 55 (F-55-1): released in a `finally`, and the six hand-written `conn.close()`
+        # calls are gone. This function has four refusal branches and two success paths, and
+        # each used to remember the close by hand; an exception raised anywhere - a bad
+        # parameter type reaching SQL, say - skipped all six. The last of them was also the
+        # only statement in an `else:` branch, which is why this wrap reaches to the end of
+        # the function rather than stopping at the final close.
+    finally:
         conn.close()
-        return p_dict, None
-    else:
-        conn.close()
-        return None, "Нууц үг буруу байна! Нүдний дүрс 👁️ дээр даран нууц үгээ шалгана уу."
 
 def authenticate_client(identifier: str, password: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Харилцагчийн нэвтрэлтийг шалгах"""
@@ -789,8 +848,14 @@ def set_client_credentials(page_id: str, username: str, password: Optional[str] 
         ``{"username", "magic_token"}`` as before. The magic token is regenerated on every
         call, and the page's sessions are revoked — unchanged from the previous behaviour.
     """
-    u_clean = username.strip()
-    p_clean = page_id.strip()
+    # Phase 55 (F-55-7). `username`, `page_id` and `password` are all declared `str`, and all
+    # three were `.strip()`ed unguarded, so a caller that passed a number raised
+    # AttributeError out of the write path - measured live as an HTTP 500 from
+    # POST /api/pages/{id}/credentials with {"password": 12345}. Coerced here rather than only
+    # at the HTTP boundary because `repositories/tenant_repo.py` reaches this function too, and
+    # the lowest common layer is the one that has to hold.
+    u_clean = str(username).strip() if username is not None else ""
+    p_clean = str(page_id).strip() if page_id is not None else ""
     if not p_clean:
         raise ValueError("page_id is required")
     clean_pid = sanitize_page_id(p_clean)
@@ -880,7 +945,7 @@ def set_client_credentials(page_id: str, username: str, password: Optional[str] 
 
         if owner_page_id is not None:
             if password:
-                pw_hash, salt = hash_password(password.strip())
+                pw_hash, salt = hash_password(str(password).strip())
                 cursor.execute(
                     "UPDATE pages SET client_username = ?, client_password_hash = ?, "
                     "client_salt = ?, client_magic_token = ? WHERE page_id = ?",
@@ -979,54 +1044,72 @@ def _is_username_uniqueness_violation(exc: BaseException) -> bool:
 def update_page_google_sheets(page_id: str, sheets_url: str) -> bool:
     """Хуудасны Google Sheets холбоосыг шинэчлэх"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE pages 
-        SET google_sheets_url = ?
-        WHERE page_id = ?
-    """, (sheets_url.strip(), page_id))
-    conn.commit()
-    conn.close()
-    # Phase 54: `True` unconditionally, so the sheets endpoint could not report a failed write.
-    return cursor.rowcount > 0
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE pages 
+            SET google_sheets_url = ?
+            WHERE page_id = ?
+        """, (sheets_url.strip(), page_id))
+        # Phase 55 (F-55-1): released in a `finally`, and `rowcount` is read BEFORE the close
+        # rather than after it. Reading a cursor attribute of a closed connection happens to work
+        # on sqlite3 and is not something to depend on - and Phase 54 made this return value
+        # load-bearing, because the handler reports `written` from it.
+        # Phase 54: `True` unconditionally, so the sheets endpoint could not report a failed write.
+        written = cursor.rowcount > 0
+        conn.commit()
+    finally:
+        conn.close()
+    return written
 
 def update_page_gemini_key(page_id: str, gemini_key: str, monthly_limit: Optional[int] = None) -> bool:
     """Харилцагчийн хувийн Gemini API түлхүүр болон лимитийг шинэчлэх"""
     conn = get_connection()
-    cursor = conn.cursor()
-    if monthly_limit is not None:
-        cursor.execute("""
-            UPDATE pages 
-            SET gemini_api_key = ?, monthly_token_limit = ?
-            WHERE page_id = ?
-        """, (gemini_key.strip(), monthly_limit, page_id))
-    else:
-        cursor.execute("""
-            UPDATE pages 
-            SET gemini_api_key = ?
-            WHERE page_id = ?
-        """, (gemini_key.strip(), page_id))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        if monthly_limit is not None:
+            cursor.execute("""
+                UPDATE pages 
+                SET gemini_api_key = ?, monthly_token_limit = ?
+                WHERE page_id = ?
+            """, (gemini_key.strip(), monthly_limit, page_id))
+        else:
+            cursor.execute("""
+                UPDATE pages 
+                SET gemini_api_key = ?
+                WHERE page_id = ?
+            """, (gemini_key.strip(), page_id))
+        # Phase 55 (F-55-1): released in a `finally`, and `rowcount` read before the close - see
+        # the same note on `update_page_google_sheets`. This writer holds a tenant's own API key,
+        # so a lock leaked here would stall every other write behind it.
+        written = cursor.rowcount > 0
+        conn.commit()
+    finally:
+        conn.close()
     # Phase 54 (F-54-1): this returned `True` unconditionally, so a caller could not tell a
     # write from a no-op - which is how `POST /api/pages/{page_id}/gemini_key` answered
     # "амжилттай шинэчлэгдлээ" for a page id that does not exist. No test calls this function
     # directly (measured), and its one caller is that handler.
-    return cursor.rowcount > 0
+    return written
 
 def increment_page_tokens(page_id: str, tokens: int) -> int:
     """Токен ашиглалтыг нэмэгдүүлж тооцох"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE pages 
-        SET tokens_used = COALESCE(tokens_used, 0) + ?
-        WHERE page_id = ?
-    """, (tokens, page_id))
-    cursor.execute("SELECT tokens_used, monthly_token_limit FROM pages WHERE page_id = ?", (page_id,))
-    row = cursor.fetchone()
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE pages 
+            SET tokens_used = COALESCE(tokens_used, 0) + ?
+            WHERE page_id = ?
+        """, (tokens, page_id))
+        cursor.execute("SELECT tokens_used, monthly_token_limit FROM pages WHERE page_id = ?", (page_id,))
+        row = cursor.fetchone()
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return row[0] if row else 0
 
 # ----------------- PAGES / TENANTS CRUD -----------------
@@ -1070,11 +1153,16 @@ def _sanitize_page_secrets(d: Dict[str, Any], include_magic_token: bool = False)
 
 def get_all_pages(mask_secrets: bool = True, include_magic_token: bool = False) -> List[Dict]:
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pages ORDER BY created_at ASC")
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM pages ORDER BY created_at ASC")
+        rows = cursor.fetchall()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     
     result = []
     for r in rows:
@@ -1104,15 +1192,20 @@ def get_page(page_id: str, mask_secrets: bool = False, include_magic_token: bool
         return None
     p_id = str(page_id).strip()
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM pages WHERE page_id = ?", (p_id,))
-    row = cursor.fetchone()
-    if not row and "/" in p_id:
-        clean_id = sanitize_page_id(p_id)
-        cursor.execute("SELECT * FROM pages WHERE page_id = ?", (clean_id,))
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM pages WHERE page_id = ?", (p_id,))
         row = cursor.fetchone()
-    conn.close()
+        if not row and "/" in p_id:
+            clean_id = sanitize_page_id(p_id)
+            cursor.execute("SELECT * FROM pages WHERE page_id = ?", (clean_id,))
+            row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     if not row:
         return None
     d = dict(row)
@@ -1224,11 +1317,26 @@ def delete_page(page_id: str) -> bool:
     if page_id == DEFAULT_PAGE_ID:
         return False  # Үндсэн хуудсыг устгахгүй
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM pages WHERE page_id = ?", (page_id,))
-    conn.commit()
-    conn.close()
-    return True
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM pages WHERE page_id = ?", (page_id,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
+    # Phase 55 (F-54-4). This returned True for anything that was not DEFAULT_PAGE_ID, so
+    # deleting a page that never existed reported a deletion - and `DELETE /api/pages/{id}`
+    # then wrote a `page.delete` audit row naming a page that had never existed. Measured
+    # live: `DELETE /api/pages/p55_never_a -> 200 {"status":"deleted"}`. The two reasons for
+    # False are told apart by the caller: the default page is refused, a missing page is
+    # reported as missing.
+    return deleted
 
 # ----------------- LEADS CRUD -----------------
 def save_registration(
@@ -1287,25 +1395,38 @@ def save_registration(
 
 def update_lead_status(lead_id: int, status: str, notes: Optional[str] = None):
     conn = get_connection()
-    cursor = conn.cursor()
-    if notes is not None:
-        cursor.execute("UPDATE registrations SET status = ?, notes = ? WHERE id = ?", (status, notes, lead_id))
-    else:
-        cursor.execute("UPDATE registrations SET status = ? WHERE id = ?", (status, lead_id))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        if notes is not None:
+            cursor.execute("UPDATE registrations SET status = ?, notes = ? WHERE id = ?", (status, notes, lead_id))
+        else:
+            cursor.execute("UPDATE registrations SET status = ? WHERE id = ?", (status, lead_id))
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     sync_to_csv()
 
 def get_all_registrations(page_id: Optional[str] = None) -> List[Dict]:
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    if page_id:
-        cursor.execute("SELECT * FROM registrations WHERE page_id = ? ORDER BY created_at DESC", (page_id,))
-    else:
-        cursor.execute("SELECT * FROM registrations ORDER BY created_at DESC")
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        if page_id:
+            cursor.execute("SELECT * FROM registrations WHERE page_id = ? ORDER BY created_at DESC", (page_id,))
+        else:
+            cursor.execute("SELECT * FROM registrations ORDER BY created_at DESC")
+        rows = cursor.fetchall()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return [dict(row) for row in rows]
 
 def sync_to_csv(page_id: Optional[str] = None) -> str:
@@ -1461,23 +1582,31 @@ def generate_excel(page_id: Optional[str] = None) -> io.BytesIO:
 # ----------------- MESSAGES & SESSIONS -----------------
 def log_message(sender_id: str, channel: str, sender_type: str, content: str, page_id: str = DEFAULT_PAGE_ID):
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO messages (page_id, sender_id, channel, sender_type, content)
-        VALUES (?, ?, ?, ?, ?)
-    """, (page_id, sender_id, channel, sender_type, content))
-    
-    # E-01: the session identity is (page_id, sender_id). Conflict target and update are
-    # both tenant-scoped, so one tenant's traffic can never move or overwrite another's row.
-    cursor.execute("""
-        INSERT INTO session_states (sender_id, page_id, channel, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(page_id, sender_id) DO UPDATE SET
-            updated_at = CURRENT_TIMESTAMP
-    """, (sender_id, page_id, channel))
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO messages (page_id, sender_id, channel, sender_type, content)
+            VALUES (?, ?, ?, ?, ?)
+        """, (page_id, sender_id, channel, sender_type, content))
+        
+        # E-01: the session identity is (page_id, sender_id). Conflict target and update are
+        # both tenant-scoped, so one tenant's traffic can never move or overwrite another's row.
+        cursor.execute("""
+            INSERT INTO session_states (sender_id, page_id, channel, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(page_id, sender_id) DO UPDATE SET
+                updated_at = CURRENT_TIMESTAMP
+        """, (sender_id, page_id, channel))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
 
 def save_chat_message(page_id: str, sender_id: str, channel: str, sender_type: str, content: str):
     return log_message(sender_id=sender_id, channel=channel, sender_type=sender_type, content=content, page_id=page_id)
@@ -1493,16 +1622,21 @@ def get_conversation_history(sender_id: str, limit: int = 50, page_id: Optional[
     if not page_id:
         raise ValueError("get_conversation_history requires page_id (tenant scope, E-01)")
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT * FROM messages
-        WHERE sender_id = ? AND page_id = ?
-        ORDER BY created_at ASC
-        LIMIT ?
-    """, (sender_id, str(page_id), limit))
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM messages
+            WHERE sender_id = ? AND page_id = ?
+            ORDER BY created_at ASC
+            LIMIT ?
+        """, (sender_id, str(page_id), limit))
+        rows = cursor.fetchall()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return [dict(row) for row in rows]
 
 def get_active_sessions(page_id: Optional[str] = None) -> List[Dict]:
@@ -1517,19 +1651,24 @@ def get_active_sessions(page_id: Optional[str] = None) -> List[Dict]:
     if not page_id:
         raise ValueError("get_active_sessions requires page_id (tenant scope, E-01)")
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT s.sender_id, s.page_id, s.channel, s.is_human_takeover, s.customer_name, s.customer_phone, s.updated_at,
-               (SELECT content FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id ORDER BY id DESC LIMIT 1) as last_message,
-               (SELECT sender_type FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id ORDER BY id DESC LIMIT 1) as last_sender_type,
-               (SELECT COUNT(*) FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id) as message_count
-        FROM session_states s
-        WHERE s.page_id = ?
-        ORDER BY s.updated_at DESC
-    """, (str(page_id),))
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.sender_id, s.page_id, s.channel, s.is_human_takeover, s.customer_name, s.customer_phone, s.updated_at,
+                   (SELECT content FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id ORDER BY id DESC LIMIT 1) as last_message,
+                   (SELECT sender_type FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id ORDER BY id DESC LIMIT 1) as last_sender_type,
+                   (SELECT COUNT(*) FROM messages WHERE sender_id = s.sender_id AND page_id = s.page_id) as message_count
+            FROM session_states s
+            WHERE s.page_id = ?
+            ORDER BY s.updated_at DESC
+        """, (str(page_id),))
+        rows = cursor.fetchall()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return [dict(row) for row in rows]
 
 def session_belongs_to_page(sender_id: str, page_id: Optional[str] = None) -> bool:
@@ -1542,13 +1681,18 @@ def session_belongs_to_page(sender_id: str, page_id: Optional[str] = None) -> bo
     if not page_id:
         raise ValueError("session_belongs_to_page requires page_id (tenant scope, E-01)")
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT 1 FROM session_states WHERE sender_id = ? AND page_id = ? LIMIT 1",
-        (str(sender_id), str(page_id)),
-    )
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM session_states WHERE sender_id = ? AND page_id = ? LIMIT 1",
+            (str(sender_id), str(page_id)),
+        )
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return bool(row)
 
 
@@ -1557,27 +1701,40 @@ def set_human_takeover(sender_id: str, is_takeover: bool, page_id: Optional[str]
     if not page_id:
         raise ValueError("set_human_takeover requires page_id (tenant scope, E-01)")
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE session_states
-        SET is_human_takeover = ?
-        WHERE sender_id = ? AND page_id = ?
-    """, (1 if is_takeover else 0, str(sender_id), str(page_id)))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE session_states
+            SET is_human_takeover = ?
+            WHERE sender_id = ? AND page_id = ?
+        """, (1 if is_takeover else 0, str(sender_id), str(page_id)))
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
 
 def is_session_human_takeover(sender_id: str, page_id: Optional[str] = None) -> bool:
     """E-01: another tenant's takeover must not silence this tenant's bot."""
     if not page_id:
         raise ValueError("is_session_human_takeover requires page_id (tenant scope, E-01)")
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT is_human_takeover FROM session_states WHERE sender_id = ? AND page_id = ?",
-        (str(sender_id), str(page_id)),
-    )
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT is_human_takeover FROM session_states WHERE sender_id = ? AND page_id = ?",
+            (str(sender_id), str(page_id)),
+        )
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return bool(row and row[0] == 1)
 
 # ==================== 3-TIER CONVERSATION MEMORY (MEM0 & ZEP MODEL) ====================
@@ -1585,15 +1742,20 @@ def is_session_human_takeover(sender_id: str, page_id: Optional[str] = None) -> 
 def get_user_memory(page_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     """Хэрэглэгчийн санах ойг татаж авах (Нэр, утас, сонирхол, өмнөх хүсэлт)"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT page_id, user_id, customer_name, phone, interests, notes, last_topic, updated_at
-        FROM user_memories
-        WHERE page_id = ? AND user_id = ?
-    """, (str(page_id), str(user_id)))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT page_id, user_id, customer_name, phone, interests, notes, last_topic, updated_at
+            FROM user_memories
+            WHERE page_id = ? AND user_id = ?
+        """, (str(page_id), str(user_id)))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return dict(row) if row else None
 
 def upsert_user_memory(
@@ -1609,39 +1771,47 @@ def upsert_user_memory(
     if not page_id or not user_id:
         return
     conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Өмнөх мэдээлэл байгаа эсэхийг шалгах
-    cursor.execute("SELECT customer_name, phone, interests, notes, last_topic FROM user_memories WHERE page_id = ? AND user_id = ?", (str(page_id), str(user_id)))
-    existing = cursor.fetchone()
-    
-    if existing:
-        new_name = customer_name if customer_name else existing[0]
-        new_phone = phone if phone else existing[1]
+    try:
+        cursor = conn.cursor()
         
-        # Сонирхол нэмэгдсэн бол залгах
-        old_interests = existing[2] or ""
-        if interests and interests not in old_interests:
-            new_interests = f"{old_interests}, {interests}".strip(", ")
-        else:
-            new_interests = interests or old_interests
+        # Өмнөх мэдээлэл байгаа эсэхийг шалгах
+        cursor.execute("SELECT customer_name, phone, interests, notes, last_topic FROM user_memories WHERE page_id = ? AND user_id = ?", (str(page_id), str(user_id)))
+        existing = cursor.fetchone()
+        
+        if existing:
+            new_name = customer_name if customer_name else existing[0]
+            new_phone = phone if phone else existing[1]
             
-        new_notes = notes if notes else existing[3]
-        new_topic = last_topic if last_topic else existing[4]
-        
-        cursor.execute("""
-            UPDATE user_memories
-            SET customer_name = ?, phone = ?, interests = ?, notes = ?, last_topic = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE page_id = ? AND user_id = ?
-        """, (new_name, new_phone, new_interests, new_notes, new_topic, str(page_id), str(user_id)))
-    else:
-        cursor.execute("""
-            INSERT INTO user_memories (page_id, user_id, customer_name, phone, interests, notes, last_topic)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (str(page_id), str(user_id), customer_name, phone, interests, notes, last_topic))
-        
-    conn.commit()
-    conn.close()
+            # Сонирхол нэмэгдсэн бол залгах
+            old_interests = existing[2] or ""
+            if interests and interests not in old_interests:
+                new_interests = f"{old_interests}, {interests}".strip(", ")
+            else:
+                new_interests = interests or old_interests
+                
+            new_notes = notes if notes else existing[3]
+            new_topic = last_topic if last_topic else existing[4]
+            
+            cursor.execute("""
+                UPDATE user_memories
+                SET customer_name = ?, phone = ?, interests = ?, notes = ?, last_topic = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE page_id = ? AND user_id = ?
+            """, (new_name, new_phone, new_interests, new_notes, new_topic, str(page_id), str(user_id)))
+        else:
+            cursor.execute("""
+                INSERT INTO user_memories (page_id, user_id, customer_name, phone, interests, notes, last_topic)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (str(page_id), str(user_id), customer_name, phone, interests, notes, last_topic))
+            
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
 
 # -------------------------------------------------------------
 # 6. ФИНТЕК & ТӨЛБӨРИЙН УДИРДЛАГА (QPAY v2, DEEP LINKS, E-BARIMT)
@@ -1666,29 +1836,42 @@ def create_invoice(
     
     deep_links_json = json.dumps(deep_links or [], ensure_ascii=False)
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO invoices (
-            invoice_id, page_id, sender_id, channel, amount, currency, description,
-            status, qr_text, qr_image_url, deep_links_json, qpay_invoice_id
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
-    """, (
-        invoice_id, str(page_id), sender_id, channel, int(amount), str(currency or "MNT"), description,
-        qr_text, qr_image_url, deep_links_json, qpay_invoice_id
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO invoices (
+                invoice_id, page_id, sender_id, channel, amount, currency, description,
+                status, qr_text, qr_image_url, deep_links_json, qpay_invoice_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
+        """, (
+            invoice_id, str(page_id), sender_id, channel, int(amount), str(currency or "MNT"), description,
+            qr_text, qr_image_url, deep_links_json, qpay_invoice_id
+        ))
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return get_invoice(invoice_id) or {}
 
 def get_invoice(invoice_id: str) -> Optional[Dict[str, Any]]:
     """Нэхэмжлэхийн мэдээлэл авах"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM invoices WHERE invoice_id = ?", (invoice_id,))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM invoices WHERE invoice_id = ?", (invoice_id,))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     if not row:
         return None
     d = dict(row)
@@ -1707,55 +1890,68 @@ def mark_invoice_paid(
 ) -> Optional[Dict[str, Any]]:
     """Нэхэмжлэхийг төлөгдсөн төлөвт оруулах ба И-Баримт олгох"""
     conn = get_connection()
-    cursor = conn.cursor()
-    paid_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("""
-        UPDATE invoices
-        SET status = 'PAID',
-            paid_at = ?,
-            ebarimt_lottery = ?,
-            ebarimt_qr = ?,
-            provider_payment_id = COALESCE(?, provider_payment_id),
-            callback_verified = CASE WHEN ? > 0 THEN ? ELSE COALESCE(callback_verified, 0) END
-        WHERE invoice_id = ?
-    """, (
-        paid_at,
-        ebarimt_lottery,
-        ebarimt_qr,
-        provider_payment_id,
-        int(callback_verified),
-        int(callback_verified),
-        invoice_id,
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        paid_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+            UPDATE invoices
+            SET status = 'PAID',
+                paid_at = ?,
+                ebarimt_lottery = ?,
+                ebarimt_qr = ?,
+                provider_payment_id = COALESCE(?, provider_payment_id),
+                callback_verified = CASE WHEN ? > 0 THEN ? ELSE COALESCE(callback_verified, 0) END
+            WHERE invoice_id = ?
+        """, (
+            paid_at,
+            ebarimt_lottery,
+            ebarimt_qr,
+            provider_payment_id,
+            int(callback_verified),
+            int(callback_verified),
+            invoice_id,
+        ))
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return get_invoice(invoice_id)
 
 def list_invoices(page_id: Optional[str] = None, limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
     """Нэхэмжлэхүүдийн жагсаалт авах"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    query = "SELECT * FROM invoices"
-    params = []
-    conditions = []
-    if page_id:
-        conditions.append("page_id = ?")
-        params.append(str(page_id))
-    if status:
-        conditions.append("status = ?")
-        params.append(status)
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
         
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
+        query = "SELECT * FROM invoices"
+        params = []
+        conditions = []
+        if page_id:
+            conditions.append("page_id = ?")
+            params.append(str(page_id))
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+            
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+            
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
         
-    query += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
-    
-    cursor.execute(query, tuple(params))
-    rows = cursor.fetchall()
-    conn.close()
+        cursor.execute(query, tuple(params))
+        rows = cursor.fetchall()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     
     res = []
     for r in rows:
@@ -1793,33 +1989,38 @@ def day_range_bounds(date_str: Optional[str] = None) -> Tuple[str, str]:
 def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
     """Финтек хяналтын самбарын тоон үзүүлэлтүүд (KPIs)"""
     conn = get_connection()
-    cursor = conn.cursor()
-    
-    where_clause = " WHERE page_id = ?" if page_id else ""
-    params = (str(page_id),) if page_id else ()
-    
-    # Нийт төлөгдсөн дүн
-    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PAID'", params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-    paid_sum, paid_count = cursor.fetchone()
-    
-    # Хүлээгдэж буй нэхэмжлэхүүд
-    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PENDING'", params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-    pending_sum, pending_count = cursor.fetchone()
-    
-    # Өнөөдрийн орлого (P1-03: LIKE биш, хязгаарын харьцуулалт)
-    day_start, day_end = day_range_bounds()
-    today_params = (
-        (str(page_id), day_start, day_end) if page_id else (day_start, day_end)
-    )
-    today_where = (
-        " WHERE page_id = ? AND status = 'PAID' AND paid_at >= ? AND paid_at < ?"
-        if page_id
-        else " WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?"
-    )
-    cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{today_where}", today_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-    today_sum, today_count = cursor.fetchone()
+    try:
+        cursor = conn.cursor()
+        
+        where_clause = " WHERE page_id = ?" if page_id else ""
+        params = (str(page_id),) if page_id else ()
+        
+        # Нийт төлөгдсөн дүн
+        cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PAID'", params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+        paid_sum, paid_count = cursor.fetchone()
+        
+        # Хүлээгдэж буй нэхэмжлэхүүд
+        cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{where_clause} {'AND' if page_id else 'WHERE'} status = 'PENDING'", params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+        pending_sum, pending_count = cursor.fetchone()
+        
+        # Өнөөдрийн орлого (P1-03: LIKE биш, хязгаарын харьцуулалт)
+        day_start, day_end = day_range_bounds()
+        today_params = (
+            (str(page_id), day_start, day_end) if page_id else (day_start, day_end)
+        )
+        today_where = (
+            " WHERE page_id = ? AND status = 'PAID' AND paid_at >= ? AND paid_at < ?"
+            if page_id
+            else " WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?"
+        )
+        cursor.execute(f"SELECT COALESCE(SUM(amount), 0), COUNT(id) FROM invoices{today_where}", today_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+        today_sum, today_count = cursor.fetchone()
 
-    conn.close()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return {
         "total_revenue": int(paid_sum or 0),
         "paid_count": int(paid_count or 0),
@@ -1832,15 +2033,20 @@ def get_fintech_summary(page_id: Optional[str] = None) -> Dict[str, Any]:
 def update_page_qpay_settings(page_id: str, username: str, password: str, invoice_code: str, ebarimt_enabled: int = 1) -> bool:
     """Хуудасны QPay тохиргоог хадгалах"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE pages
-        SET qpay_username = ?, qpay_password = ?, qpay_invoice_code = ?, ebarimt_enabled = ?
-        WHERE page_id = ?
-    """, (username.strip(), password.strip(), invoice_code.strip(), int(ebarimt_enabled), str(page_id)))
-    success = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE pages
+            SET qpay_username = ?, qpay_password = ?, qpay_invoice_code = ?, ebarimt_enabled = ?
+            WHERE page_id = ?
+        """, (username.strip(), password.strip(), invoice_code.strip(), int(ebarimt_enabled), str(page_id)))
+        success = cursor.rowcount > 0
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return success
 
 # -------------------------------------------------------------
@@ -1862,58 +2068,76 @@ def upsert_cargo_package(
     """Карго ачааны бүртгэл үүсгэх эсвэл шинэчлэх (Idempotent Upsert)"""
     tracking_clean = tracking_code.strip().upper()
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO cargo_packages (
-            page_id, tracking_code, customer_name, customer_phone,
-            weight_kg, price_amount, status, warehouse_location, notes,
-            sender_id, channel
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(page_id, tracking_code) DO UPDATE SET
-            customer_name = COALESCE(excluded.customer_name, cargo_packages.customer_name),
-            customer_phone = COALESCE(excluded.customer_phone, cargo_packages.customer_phone),
-            weight_kg = CASE WHEN excluded.weight_kg > 0 THEN excluded.weight_kg ELSE cargo_packages.weight_kg END,
-            price_amount = CASE WHEN excluded.price_amount > 0 THEN excluded.price_amount ELSE cargo_packages.price_amount END,
-            warehouse_location = excluded.warehouse_location,
-            notes = COALESCE(excluded.notes, cargo_packages.notes)
-    """, (
-        str(page_id), tracking_clean, customer_name, customer_phone,
-        float(weight_kg or 0.0), int(price_amount or 0), status,
-        warehouse_location, notes, sender_id, channel
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO cargo_packages (
+                page_id, tracking_code, customer_name, customer_phone,
+                weight_kg, price_amount, status, warehouse_location, notes,
+                sender_id, channel
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(page_id, tracking_code) DO UPDATE SET
+                customer_name = COALESCE(excluded.customer_name, cargo_packages.customer_name),
+                customer_phone = COALESCE(excluded.customer_phone, cargo_packages.customer_phone),
+                weight_kg = CASE WHEN excluded.weight_kg > 0 THEN excluded.weight_kg ELSE cargo_packages.weight_kg END,
+                price_amount = CASE WHEN excluded.price_amount > 0 THEN excluded.price_amount ELSE cargo_packages.price_amount END,
+                warehouse_location = excluded.warehouse_location,
+                notes = COALESCE(excluded.notes, cargo_packages.notes)
+        """, (
+            str(page_id), tracking_clean, customer_name, customer_phone,
+            float(weight_kg or 0.0), int(price_amount or 0), status,
+            warehouse_location, notes, sender_id, channel
+        ))
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return get_cargo_package(page_id, tracking_clean) or {}
 
 def get_cargo_package(page_id: str, tracking_code: str) -> Optional[Dict[str, Any]]:
     """Нэг карго ачааг кодоор хайх"""
     tracking_clean = tracking_code.strip().upper()
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM cargo_packages WHERE page_id = ? AND tracking_code = ?", (str(page_id), tracking_clean))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM cargo_packages WHERE page_id = ? AND tracking_code = ?", (str(page_id), tracking_clean))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return dict(row) if row else None
 
 def find_cargo_by_phone_or_code(page_id: str, query: str) -> List[Dict[str, Any]]:
     """Утасны дугаар эсвэл карго кодоор ачаа хайх"""
     q_clean = query.strip().upper()
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT * FROM cargo_packages
-        WHERE page_id = ? AND (
-            tracking_code LIKE ? OR
-            customer_phone LIKE ? OR
-            customer_name LIKE ?
-        )
-        ORDER BY id DESC LIMIT 10
-    """, (str(page_id), f"%{q_clean}%", f"%{q_clean}%", f"%{q_clean}%"))
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM cargo_packages
+            WHERE page_id = ? AND (
+                tracking_code LIKE ? OR
+                customer_phone LIKE ? OR
+                customer_name LIKE ?
+            )
+            ORDER BY id DESC LIMIT 10
+        """, (str(page_id), f"%{q_clean}%", f"%{q_clean}%", f"%{q_clean}%"))
+        rows = cursor.fetchall()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return [dict(r) for r in rows]
 
 def scan_arrive_package(
@@ -1933,39 +2157,47 @@ def scan_arrive_package(
     arrived_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Хэрэв өмнө нь бүртгэлгүй байсан ч баркод уншуулсан бол шууд шинээр үүсгэнэ
-    cursor.execute("SELECT id FROM cargo_packages WHERE page_id = ? AND tracking_code = ?", (str(page_id), tracking_clean))
-    existing = cursor.fetchone()
-    if not existing:
-        cursor.execute("""
-            INSERT INTO cargo_packages (
-                page_id, tracking_code, status, warehouse_location,
-                weight_kg, price_amount, arrived_at, invoice_id
-            )
-            VALUES (?, ?, 'ARRIVED_UB', ?, ?, ?, ?, ?)
-        """, (
-            str(page_id), tracking_clean, location,
-            float(weight_kg or 0.0), int(price_amount or 0), arrived_at, invoice_id
-        ))
-    else:
-        cursor.execute("""
-            UPDATE cargo_packages
-            SET status = 'ARRIVED_UB',
-                warehouse_location = ?,
-                arrived_at = ?,
-                weight_kg = COALESCE(?, weight_kg),
-                price_amount = COALESCE(?, price_amount),
-                invoice_id = COALESCE(?, invoice_id)
-            WHERE page_id = ? AND tracking_code = ?
-        """, (
-            location, arrived_at, weight_kg, price_amount, invoice_id,
-            str(page_id), tracking_clean
-        ))
+    try:
+        cursor = conn.cursor()
         
-    conn.commit()
-    conn.close()
+        # Хэрэв өмнө нь бүртгэлгүй байсан ч баркод уншуулсан бол шууд шинээр үүсгэнэ
+        cursor.execute("SELECT id FROM cargo_packages WHERE page_id = ? AND tracking_code = ?", (str(page_id), tracking_clean))
+        existing = cursor.fetchone()
+        if not existing:
+            cursor.execute("""
+                INSERT INTO cargo_packages (
+                    page_id, tracking_code, status, warehouse_location,
+                    weight_kg, price_amount, arrived_at, invoice_id
+                )
+                VALUES (?, ?, 'ARRIVED_UB', ?, ?, ?, ?, ?)
+            """, (
+                str(page_id), tracking_clean, location,
+                float(weight_kg or 0.0), int(price_amount or 0), arrived_at, invoice_id
+            ))
+        else:
+            cursor.execute("""
+                UPDATE cargo_packages
+                SET status = 'ARRIVED_UB',
+                    warehouse_location = ?,
+                    arrived_at = ?,
+                    weight_kg = COALESCE(?, weight_kg),
+                    price_amount = COALESCE(?, price_amount),
+                    invoice_id = COALESCE(?, invoice_id)
+                WHERE page_id = ? AND tracking_code = ?
+            """, (
+                location, arrived_at, weight_kg, price_amount, invoice_id,
+                str(page_id), tracking_clean
+            ))
+            
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return get_cargo_package(page_id, tracking_clean) or {}
 
 def mark_cargo_delivered(page_id: str, tracking_code: str) -> Optional[Dict[str, Any]]:
@@ -1973,55 +2205,73 @@ def mark_cargo_delivered(page_id: str, tracking_code: str) -> Optional[Dict[str,
     tracking_clean = tracking_code.strip().upper()
     delivered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE cargo_packages
-        SET status = 'DELIVERED', delivered_at = ?
-        WHERE page_id = ? AND tracking_code = ?
-    """, (delivered_at, str(page_id), tracking_clean))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE cargo_packages
+            SET status = 'DELIVERED', delivered_at = ?
+            WHERE page_id = ? AND tracking_code = ?
+        """, (delivered_at, str(page_id), tracking_clean))
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return get_cargo_package(page_id, tracking_clean)
 
 def list_cargo_packages(page_id: str, status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
     """Карго ачаануудын жагсаалт"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    query = "SELECT * FROM cargo_packages WHERE page_id = ?"
-    params = [str(page_id)]
-    if status:
-        query += " AND status = ?"
-        params.append(status)
-    query += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
-    cursor.execute(query, tuple(params))
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        query = "SELECT * FROM cargo_packages WHERE page_id = ?"
+        params = [str(page_id)]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        cursor.execute(query, tuple(params))
+        rows = cursor.fetchall()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return [dict(r) for r in rows]
 
 def get_cargo_summary(page_id: str) -> Dict[str, Any]:
     """Карго хяналтын самбарын үзүүлэлтүүд"""
     conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Нийт ачаа
-    cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ?", (str(page_id),))
-    total_count = cursor.fetchone()[0] or 0
-    
-    # УБ-т ирсэн
-    cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ? AND status = 'ARRIVED_UB'", (str(page_id),))
-    arrived_count = cursor.fetchone()[0] or 0
-    
-    # Олгогдсон
-    cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ? AND status = 'DELIVERED'", (str(page_id),))
-    delivered_count = cursor.fetchone()[0] or 0
-    
-    # Төлбөр хүлээгдэж буй
-    cursor.execute("SELECT COUNT(id), COALESCE(SUM(price_amount), 0) FROM cargo_packages WHERE page_id = ? AND status = 'ARRIVED_UB' AND price_amount > 0", (str(page_id),))
-    pending_pay_count, pending_pay_sum = cursor.fetchone()
+    try:
+        cursor = conn.cursor()
+        
+        # Нийт ачаа
+        cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ?", (str(page_id),))
+        total_count = cursor.fetchone()[0] or 0
+        
+        # УБ-т ирсэн
+        cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ? AND status = 'ARRIVED_UB'", (str(page_id),))
+        arrived_count = cursor.fetchone()[0] or 0
+        
+        # Олгогдсон
+        cursor.execute("SELECT COUNT(id) FROM cargo_packages WHERE page_id = ? AND status = 'DELIVERED'", (str(page_id),))
+        delivered_count = cursor.fetchone()[0] or 0
+        
+        # Төлбөр хүлээгдэж буй
+        cursor.execute("SELECT COUNT(id), COALESCE(SUM(price_amount), 0) FROM cargo_packages WHERE page_id = ? AND status = 'ARRIVED_UB' AND price_amount > 0", (str(page_id),))
+        pending_pay_count, pending_pay_sum = cursor.fetchone()
 
-    conn.close()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return {
         "total_packages": int(total_count),
         "arrived_packages": int(arrived_count),
@@ -2042,71 +2292,81 @@ def update_page_telegram_settings(
 ) -> bool:
     """Хуудасны Telegram эзний тохиргоог хадгалах"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE pages
-        SET telegram_bot_token = ?, telegram_manager_chat_id = ?,
-            daily_report_time = ?, daily_report_enabled = ?
-        WHERE page_id = ?
-    """, (bot_token.strip(), manager_chat_id.strip(), report_time.strip(), int(report_enabled), str(page_id)))
-    success = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE pages
+            SET telegram_bot_token = ?, telegram_manager_chat_id = ?,
+                daily_report_time = ?, daily_report_enabled = ?
+            WHERE page_id = ?
+        """, (bot_token.strip(), manager_chat_id.strip(), report_time.strip(), int(report_enabled), str(page_id)))
+        success = cursor.rowcount > 0
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return success
 
 def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optional[str] = None) -> Dict[str, Any]:
     """Өчигдрийн эсвэл өнөөдрийн гүйцэтгэлийн нэгдсэн тайлангийн тоонууд"""
     conn = get_connection()
-    cursor = conn.cursor()
-    
-    if not date_str:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        cursor = conn.cursor()
+        
+        if not date_str:
+            date_str = datetime.now().strftime("%Y-%m-%d")
 
-    # P1-03 (B-04): range predicates work on both TEXT (ISO-8601) and TIMESTAMP columns.
-    day_start, day_end = day_range_bounds(date_str)
-    p_cond = " AND page_id = ?" if page_id else ""
-    p_params = [day_start, day_end, str(page_id)] if page_id else [day_start, day_end]
+        # P1-03 (B-04): range predicates work on both TEXT (ISO-8601) and TIMESTAMP columns.
+        day_start, day_end = day_range_bounds(date_str)
+        p_cond = " AND page_id = ?" if page_id else ""
+        p_params = [day_start, day_end, str(page_id)] if page_id else [day_start, day_end]
 
-    # 1. Шинэ харилцагч / Leads
-    cursor.execute(
-        f"SELECT COUNT(id) FROM registrations WHERE created_at >= ? AND created_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-        tuple(p_params),
-    )
-    leads_count = cursor.fetchone()[0] or 0
+        # 1. Шинэ харилцагч / Leads
+        cursor.execute(
+            f"SELECT COUNT(id) FROM registrations WHERE created_at >= ? AND created_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+            tuple(p_params),
+        )
+        leads_count = cursor.fetchone()[0] or 0
 
-    # 2. Чат харилцан ярианууд
-    cursor.execute(
-        f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at >= ? AND created_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-        tuple(p_params),
-    )
-    chats_count = cursor.fetchone()[0] or 0
+        # 2. Чат харилцан ярианууд
+        cursor.execute(
+            f"SELECT COUNT(DISTINCT sender_id) FROM messages WHERE created_at >= ? AND created_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+            tuple(p_params),
+        )
+        chats_count = cursor.fetchone()[0] or 0
 
-    # 3. Карго ачаанууд (ирсэн)
-    cursor.execute(
-        f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at >= ? AND arrived_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-        tuple(p_params),
-    )
-    cargo_arrived = cursor.fetchone()[0] or 0
+        # 3. Карго ачаанууд (ирсэн)
+        cursor.execute(
+            f"SELECT COUNT(id) FROM cargo_packages WHERE arrived_at >= ? AND arrived_at < ?{p_cond}",  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+            tuple(p_params),
+        )
+        cargo_arrived = cursor.fetchone()[0] or 0
 
-    # 4. QPay төлбөрүүд
-    cursor.execute(
-        f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices "  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-        f"WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?{p_cond}",
-        tuple(p_params),
-    )
-    paid_count, paid_amount = cursor.fetchone()
-    
-    # 5. Хүлээгдэж буй карго ачаа (төлөгдөөгүй)
-    pending_p_cond = " WHERE page_id = ?" if page_id else ""
-    pending_params = (str(page_id),) if page_id else ()
-    cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(price_amount), 0) FROM cargo_packages{pending_p_cond} {'AND' if page_id else 'WHERE'} status = 'ARRIVED_UB' AND price_amount > 0", pending_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-    pending_cargo_count, pending_cargo_amount = cursor.fetchone()
-    
-    # 6. Эскалаци / Хүнтэй ярих хүсэлт гаргасан
-    cursor.execute("SELECT COUNT(sender_id) FROM session_states WHERE is_human_takeover = 1" + (" AND page_id = ?" if page_id else ""), ((str(page_id),) if page_id else ()))  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-    escalated_count = cursor.fetchone()[0] or 0
-    
-    conn.close()
+        # 4. QPay төлбөрүүд
+        cursor.execute(
+            f"SELECT COUNT(id), COALESCE(SUM(amount), 0) FROM invoices "  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+            f"WHERE status = 'PAID' AND paid_at >= ? AND paid_at < ?{p_cond}",
+            tuple(p_params),
+        )
+        paid_count, paid_amount = cursor.fetchone()
+        
+        # 5. Хүлээгдэж буй карго ачаа (төлөгдөөгүй)
+        pending_p_cond = " WHERE page_id = ?" if page_id else ""
+        pending_params = (str(page_id),) if page_id else ()
+        cursor.execute(f"SELECT COUNT(id), COALESCE(SUM(price_amount), 0) FROM cargo_packages{pending_p_cond} {'AND' if page_id else 'WHERE'} status = 'ARRIVED_UB' AND price_amount > 0", pending_params)  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+        pending_cargo_count, pending_cargo_amount = cursor.fetchone()
+        
+        # 6. Эскалаци / Хүнтэй ярих хүсэлт гаргасан
+        cursor.execute("SELECT COUNT(sender_id) FROM session_states WHERE is_human_takeover = 1" + (" AND page_id = ?" if page_id else ""), ((str(page_id),) if page_id else ()))  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+        escalated_count = cursor.fetchone()[0] or 0
+        
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return {
         "date": date_str,
         "leads_count": int(leads_count),
@@ -2125,59 +2385,72 @@ def get_daily_executive_metrics(page_id: Optional[str] = None, date_str: Optiona
 def get_automated_rules(page_id: str) -> List[Dict[str, Any]]:
     """Хуудасны автомат сэргээлтийн дүрмүүд (байхгүй бол анхны утгуудыг үүсгэнэ)"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    default_rules = [
-        (
-            page_id,
-            "abandoned_chat",
-            2,
-            "Сайн байна уу? Танд үйлчилгээ болон үнийн мэдээлэл сонгоход тусламж хэрэгтэй юу? Та манай чатаар хүссэн асуултаа лавлаарай 😊",
-            1
-        ),
-        (
-            page_id,
-            "cargo_pickup",
-            48,
-            "Сайн байна уу? Таны ачаа агуулахад бэлэн ирсэн байгаа шүү. Та ирж авахдаа чатаар олголтын кодоо хэлээрэй 📦",
-            1
-        ),
-        (
-            page_id,
-            "retention_followup",
-            600,
-            "Сайн байна уу? Манайхаар үйлчлүүлснээс хойш сар орчим болжээ. Танд давтан үйлчилгээ эсвэл шинэ урамшууллын мэдээлэл хэрэгтэй бол бидэнд мэдэгдээрэй ✨",
-            1
-        )
-    ]
+        default_rules = [
+            (
+                page_id,
+                "abandoned_chat",
+                2,
+                "Сайн байна уу? Танд үйлчилгээ болон үнийн мэдээлэл сонгоход тусламж хэрэгтэй юу? Та манай чатаар хүссэн асуултаа лавлаарай 😊",
+                1
+            ),
+            (
+                page_id,
+                "cargo_pickup",
+                48,
+                "Сайн байна уу? Таны ачаа агуулахад бэлэн ирсэн байгаа шүү. Та ирж авахдаа чатаар олголтын кодоо хэлээрэй 📦",
+                1
+            ),
+            (
+                page_id,
+                "retention_followup",
+                600,
+                "Сайн байна уу? Манайхаар үйлчлүүлснээс хойш сар орчим болжээ. Танд давтан үйлчилгээ эсвэл шинэ урамшууллын мэдээлэл хэрэгтэй бол бидэнд мэдэгдээрэй ✨",
+                1
+            )
+        ]
 
-    for p, r_type, delay, msg, active in default_rules:
-        cursor.execute("""
-            INSERT OR IGNORE INTO automated_rules (page_id, rule_type, delay_hours, message_template, is_active)
-            VALUES (?, ?, ?, ?, ?)
-        """, (str(p), r_type, delay, msg, active))
-    conn.commit()
+        for p, r_type, delay, msg, active in default_rules:
+            cursor.execute("""
+                INSERT OR IGNORE INTO automated_rules (page_id, rule_type, delay_hours, message_template, is_active)
+                VALUES (?, ?, ?, ?, ?)
+            """, (str(p), r_type, delay, msg, active))
+        conn.commit()
 
-    cursor.execute("SELECT * FROM automated_rules WHERE page_id = ? ORDER BY id ASC", (str(page_id),))
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+        cursor.execute("SELECT * FROM automated_rules WHERE page_id = ? ORDER BY id ASC", (str(page_id),))
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 def update_automated_rule(page_id: str, rule_type: str, delay_hours: int, message_template: str, is_active: bool) -> bool:
     """Сэргээх дүрмийг шинэчлэх"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO automated_rules (page_id, rule_type, delay_hours, message_template, is_active)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(page_id, rule_type) DO UPDATE SET
-            delay_hours = excluded.delay_hours,
-            message_template = excluded.message_template,
-            is_active = excluded.is_active
-    """, (str(page_id), rule_type, int(delay_hours), message_template.strip(), 1 if is_active else 0))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO automated_rules (page_id, rule_type, delay_hours, message_template, is_active)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(page_id, rule_type) DO UPDATE SET
+                delay_hours = excluded.delay_hours,
+                message_template = excluded.message_template,
+                is_active = excluded.is_active
+        """, (str(page_id), rule_type, int(delay_hours), message_template.strip(), 1 if is_active else 0))
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return True
 
 def record_sent_followup(page_id: str, rule_type: str, sender_id: str, channel: str = "web") -> bool:
@@ -2200,144 +2473,169 @@ def record_sent_followup(page_id: str, rule_type: str, sender_id: str, channel: 
 def is_followup_sent(page_id: str, rule_type: str, sender_id: str) -> bool:
     """Өмнө нь энэ харилцагч руу энэ дүрмээр зурвас очсон эсэх"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id FROM sent_followups
-        WHERE page_id = ? AND rule_type = ? AND sender_id = ?
-    """, (str(page_id), rule_type, str(sender_id)))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id FROM sent_followups
+            WHERE page_id = ? AND rule_type = ? AND sender_id = ?
+        """, (str(page_id), rule_type, str(sender_id)))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return bool(row)
 
 def get_abandoned_chat_candidates(page_id: str, delay_hours: int = 2) -> List[Dict[str, Any]]:
     """Хаягдсан чат илрүүлэгч"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    threshold_iso = (datetime.now() - timedelta(hours=delay_hours)).strftime("%Y-%m-%d %H:%M:%S")
-    max_threshold_iso = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        threshold_iso = (datetime.now() - timedelta(hours=delay_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        max_threshold_iso = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # P1-07 (B-12): `GROUP BY m.sender_id` while selecting m.channel / m.content /
-    # m.created_at is invalid SQL. SQLite silently returns an arbitrary row; PostgreSQL
-    # raises `GroupingError: column "m.channel" must appear in the GROUP BY clause`.
-    # Effect on production: abandoned-chat detection raised on every worker tick, so
-    # `run_worker_tick` aborted before retention reminders were dispatched.
-    #
-    # Portable fix: pick the *latest* message per sender explicitly. `m2.id` breaks ties
-    # deterministically, and the correlated aggregate works on SQLite, PostgreSQL and
-    # MySQL (no window functions required).
-    cursor.execute("""
-        SELECT m.sender_id, m.channel, m.content, m.created_at
-        FROM messages m
-        WHERE m.page_id = ?
-          AND m.sender_type = 'user'
-          AND m.created_at <= ?
-          AND m.created_at >= ?
-          AND m.sender_id NOT IN (
-              SELECT DISTINCT sender_id FROM registrations WHERE page_id = ? AND sender_id IS NOT NULL
-          )
-          AND m.sender_id NOT IN (
-              SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'abandoned_chat'
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM messages m2
-              WHERE m2.page_id = m.page_id
-                AND m2.sender_id = m.sender_id
-                AND m2.sender_type = 'user'
-                AND (
-                    m2.created_at > m.created_at
-                    OR (m2.created_at = m.created_at AND m2.id > m.id)
-                )
-          )
-        ORDER BY m.created_at DESC
-        LIMIT 50
-    """, (str(page_id), threshold_iso, max_threshold_iso, str(page_id), str(page_id)))
+        # P1-07 (B-12): `GROUP BY m.sender_id` while selecting m.channel / m.content /
+        # m.created_at is invalid SQL. SQLite silently returns an arbitrary row; PostgreSQL
+        # raises `GroupingError: column "m.channel" must appear in the GROUP BY clause`.
+        # Effect on production: abandoned-chat detection raised on every worker tick, so
+        # `run_worker_tick` aborted before retention reminders were dispatched.
+        #
+        # Portable fix: pick the *latest* message per sender explicitly. `m2.id` breaks ties
+        # deterministically, and the correlated aggregate works on SQLite, PostgreSQL and
+        # MySQL (no window functions required).
+        cursor.execute("""
+            SELECT m.sender_id, m.channel, m.content, m.created_at
+            FROM messages m
+            WHERE m.page_id = ?
+              AND m.sender_type = 'user'
+              AND m.created_at <= ?
+              AND m.created_at >= ?
+              AND m.sender_id NOT IN (
+                  SELECT DISTINCT sender_id FROM registrations WHERE page_id = ? AND sender_id IS NOT NULL
+              )
+              AND m.sender_id NOT IN (
+                  SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'abandoned_chat'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages m2
+                  WHERE m2.page_id = m.page_id
+                    AND m2.sender_id = m.sender_id
+                    AND m2.sender_type = 'user'
+                    AND (
+                        m2.created_at > m.created_at
+                        OR (m2.created_at = m.created_at AND m2.id > m.id)
+                    )
+              )
+            ORDER BY m.created_at DESC
+            LIMIT 50
+        """, (str(page_id), threshold_iso, max_threshold_iso, str(page_id), str(page_id)))
 
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 def get_cargo_pickup_candidates(page_id: str, delay_hours: int = 48) -> List[Dict[str, Any]]:
     """Ачаагаа аваагүй байгаа хэрэглэгчид (ARRIVED_UB төлөвтэй, delay_hours өнгөрсөн)"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    threshold_iso = (datetime.now() - timedelta(hours=delay_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        threshold_iso = (datetime.now() - timedelta(hours=delay_hours)).strftime("%Y-%m-%d %H:%M:%S")
 
-    cursor.execute("""
-        SELECT c.*
-        FROM cargo_packages c
-        WHERE c.page_id = ?
-          AND c.status = 'ARRIVED_UB'
-          AND c.arrived_at <= ?
-          AND c.sender_id IS NOT NULL
-          AND c.sender_id != ''
-          AND c.sender_id NOT IN (
-              SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'cargo_pickup'
-          )
-        LIMIT 50
-    """, (str(page_id), threshold_iso, str(page_id)))
+        cursor.execute("""
+            SELECT c.*
+            FROM cargo_packages c
+            WHERE c.page_id = ?
+              AND c.status = 'ARRIVED_UB'
+              AND c.arrived_at <= ?
+              AND c.sender_id IS NOT NULL
+              AND c.sender_id != ''
+              AND c.sender_id NOT IN (
+                  SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'cargo_pickup'
+              )
+            LIMIT 50
+        """, (str(page_id), threshold_iso, str(page_id)))
 
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 def get_retention_candidates(page_id: str, delay_days: int = 25) -> List[Dict[str, Any]]:
     """25+ хоногийн өмнө бүртгэл үүссэн харилцагчид (хумс будалт, давтан үйлчилгээ)"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    threshold_iso = (datetime.now() - timedelta(days=delay_days)).strftime("%Y-%m-%d %H:%M:%S")
+        threshold_iso = (datetime.now() - timedelta(days=delay_days)).strftime("%Y-%m-%d %H:%M:%S")
 
-    cursor.execute("""
-        SELECT r.*
-        FROM registrations r
-        WHERE r.page_id = ?
-          AND r.created_at <= ?
-          AND r.sender_id IS NOT NULL
-          AND r.sender_id != ''
-          AND r.sender_id NOT IN (
-              SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'retention_followup'
-          )
-        LIMIT 50
-    """, (str(page_id), threshold_iso, str(page_id)))
+        cursor.execute("""
+            SELECT r.*
+            FROM registrations r
+            WHERE r.page_id = ?
+              AND r.created_at <= ?
+              AND r.sender_id IS NOT NULL
+              AND r.sender_id != ''
+              AND r.sender_id NOT IN (
+                  SELECT sender_id FROM sent_followups WHERE page_id = ? AND rule_type = 'retention_followup'
+              )
+            LIMIT 50
+        """, (str(page_id), threshold_iso, str(page_id)))
 
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 def get_broadcast_audience(page_id: str, segment: str = "all") -> List[Dict[str, Any]]:
     """1-Click Broadcast илгээх зорилтот харилцагчид"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    if segment == "leads_only":
-        cursor.execute("""
-            SELECT DISTINCT sender_id, channel, name, phone
-            FROM registrations
-            WHERE page_id = ? AND sender_id IS NOT NULL AND sender_id != ''
-        """, (str(page_id),))
-    elif segment == "unregistered":
-        cursor.execute("""
-            SELECT DISTINCT sender_id, channel, '' as name, '' as phone
-            FROM messages
-            WHERE page_id = ? AND sender_type = 'user' AND sender_id NOT IN (
-                SELECT DISTINCT sender_id FROM registrations WHERE page_id = ? AND sender_id IS NOT NULL
-            )
-        """, (str(page_id), str(page_id)))
-    else:  # all
-        cursor.execute("""
-            SELECT DISTINCT sender_id, channel, '' as name, '' as phone
-            FROM messages
-            WHERE page_id = ? AND sender_type = 'user'
-        """, (str(page_id),))
+        if segment == "leads_only":
+            cursor.execute("""
+                SELECT DISTINCT sender_id, channel, name, phone
+                FROM registrations
+                WHERE page_id = ? AND sender_id IS NOT NULL AND sender_id != ''
+            """, (str(page_id),))
+        elif segment == "unregistered":
+            cursor.execute("""
+                SELECT DISTINCT sender_id, channel, '' as name, '' as phone
+                FROM messages
+                WHERE page_id = ? AND sender_type = 'user' AND sender_id NOT IN (
+                    SELECT DISTINCT sender_id FROM registrations WHERE page_id = ? AND sender_id IS NOT NULL
+                )
+            """, (str(page_id), str(page_id)))
+        else:  # all
+            cursor.execute("""
+                SELECT DISTINCT sender_id, channel, '' as name, '' as phone
+                FROM messages
+                WHERE page_id = ? AND sender_type = 'user'
+            """, (str(page_id),))
 
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 def create_marketing_campaign(
@@ -2350,14 +2648,22 @@ def create_marketing_campaign(
 ) -> Dict[str, Any]:
     """1-Click Broadcast кампэйн үүсгэж хадгалах"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO marketing_campaigns (page_id, title, message, target_segment, channel, status, sent_count)
-        VALUES (?, ?, ?, ?, ?, 'COMPLETED', ?)
-    """, (str(page_id), title.strip(), message.strip(), target_segment, channel, sent_count))
-    c_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO marketing_campaigns (page_id, title, message, target_segment, channel, status, sent_count)
+            VALUES (?, ?, ?, ?, ?, 'COMPLETED', ?)
+        """, (str(page_id), title.strip(), message.strip(), target_segment, channel, sent_count))
+        c_id = cursor.lastrowid
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return {
         "id": c_id,
         "page_id": page_id,
@@ -2369,35 +2675,45 @@ def create_marketing_campaign(
 def list_marketing_campaigns(page_id: str, limit: int = 20) -> List[Dict[str, Any]]:
     """Өмнөх маркетинг кампэйнуудын жагсаалт"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT * FROM marketing_campaigns
-        WHERE page_id = ?
-        ORDER BY id DESC LIMIT ?
-    """, (str(page_id), limit))
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM marketing_campaigns
+            WHERE page_id = ?
+            ORDER BY id DESC LIMIT ?
+        """, (str(page_id), limit))
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 def get_marketing_summary(page_id: str) -> Dict[str, Any]:
     """Маркетингийн хураангуй тооцоолол"""
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(id) FROM marketing_campaigns WHERE page_id = ?", (str(page_id),))
-    total_campaigns = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(id) FROM marketing_campaigns WHERE page_id = ?", (str(page_id),))
+        total_campaigns = cursor.fetchone()[0] or 0
 
-    cursor.execute("SELECT COALESCE(SUM(sent_count), 0) FROM marketing_campaigns WHERE page_id = ?", (str(page_id),))
-    total_broadcast_sent = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COALESCE(SUM(sent_count), 0) FROM marketing_campaigns WHERE page_id = ?", (str(page_id),))
+        total_broadcast_sent = cursor.fetchone()[0] or 0
 
-    cursor.execute("SELECT COUNT(id) FROM sent_followups WHERE page_id = ?", (str(page_id),))
-    total_followups_sent = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(id) FROM sent_followups WHERE page_id = ?", (str(page_id),))
+        total_followups_sent = cursor.fetchone()[0] or 0
 
-    cursor.execute("SELECT COUNT(DISTINCT sender_id) FROM messages WHERE page_id = ? AND sender_type = 'user'", (str(page_id),))
-    total_audience = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(DISTINCT sender_id) FROM messages WHERE page_id = ? AND sender_type = 'user'", (str(page_id),))
+        total_audience = cursor.fetchone()[0] or 0
 
-    conn.close()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return {
         "total_campaigns": int(total_campaigns),
         "total_broadcast_sent": int(total_broadcast_sent),
@@ -2411,15 +2727,20 @@ def get_marketing_summary(page_id: str) -> Dict[str, Any]:
 def is_slot_available(page_id: str, appointment_date: str, appointment_time: str, service_name: Optional[str] = None) -> bool:
     """Тухайн өдөр болон цагт сул цаг байгаа эсэх"""
     conn = get_connection()
-    cursor = conn.cursor()
-    query = "SELECT id FROM appointments WHERE page_id = ? AND appointment_date = ? AND appointment_time = ? AND status != 'CANCELLED'"
-    params = [str(page_id), appointment_date.strip(), appointment_time.strip()]
-    if service_name:
-        query += " AND service_name = ?"
-        params.append(service_name.strip())
-    cursor.execute(query, tuple(params))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        query = "SELECT id FROM appointments WHERE page_id = ? AND appointment_date = ? AND appointment_time = ? AND status != 'CANCELLED'"
+        params = [str(page_id), appointment_date.strip(), appointment_time.strip()]
+        if service_name:
+            query += " AND service_name = ?"
+            params.append(service_name.strip())
+        cursor.execute(query, tuple(params))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return row is None
 
 def create_appointment(
@@ -2437,20 +2758,28 @@ def create_appointment(
     if not is_slot_available(page_id, appointment_date, appointment_time, service_name):
         return None
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO appointments (
-            page_id, customer_name, customer_phone, service_name,
-            appointment_date, appointment_time, sender_id, channel, notes, status
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIRMED')
-    """, (
-        str(page_id), customer_name.strip(), customer_phone.strip(), service_name.strip(),
-        appointment_date.strip(), appointment_time.strip(), sender_id, channel, notes.strip()
-    ))
-    a_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO appointments (
+                page_id, customer_name, customer_phone, service_name,
+                appointment_date, appointment_time, sender_id, channel, notes, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIRMED')
+        """, (
+            str(page_id), customer_name.strip(), customer_phone.strip(), service_name.strip(),
+            appointment_date.strip(), appointment_time.strip(), sender_id, channel, notes.strip()
+        ))
+        a_id = cursor.lastrowid
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
 
     # Сэжимд давхар хадгалах
     save_registration(
@@ -2468,11 +2797,16 @@ def create_appointment(
 def get_appointment(appointment_id: int) -> Optional[Dict[str, Any]]:
     """Цаг захиалгын мэдээлэл авах"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM appointments WHERE id = ?", (int(appointment_id),))
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM appointments WHERE id = ?", (int(appointment_id),))
+        row = cursor.fetchone()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return dict(row) if row else None
 
 def list_appointments(
@@ -2483,31 +2817,44 @@ def list_appointments(
 ) -> List[Dict[str, Any]]:
     """Цаг захиалгуудын жагсаалт"""
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    conditions = ["page_id = ?"]
-    params = [str(page_id)]
-    if date_str:
-        conditions.append("appointment_date = ?")
-        params.append(date_str)
-    if status:
-        conditions.append("status = ?")
-        params.append(status)
-    query = f"SELECT * FROM appointments WHERE {' AND '.join(conditions)} ORDER BY appointment_date ASC, appointment_time ASC LIMIT ?"  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
-    params.append(limit)
-    cursor.execute(query, tuple(params))
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        conditions = ["page_id = ?"]
+        params = [str(page_id)]
+        if date_str:
+            conditions.append("appointment_date = ?")
+            params.append(date_str)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        query = f"SELECT * FROM appointments WHERE {' AND '.join(conditions)} ORDER BY appointment_date ASC, appointment_time ASC LIMIT ?"  # nosec B608 - Phase 26: fragment is a literal-only conditional; every value is bound as a parameter
+        params.append(limit)
+        cursor.execute(query, tuple(params))
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 def update_appointment_status(appointment_id: int, status: str) -> bool:
     """Цаг захиалгын төлөв өөрчлөх ('CONFIRMED', 'COMPLETED', 'CANCELLED')"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE appointments SET status = ? WHERE id = ?", (status, int(appointment_id)))
-    success = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE appointments SET status = ? WHERE id = ?", (status, int(appointment_id)))
+        success = cursor.rowcount > 0
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return success
 
 def get_pending_appointment_reminders(hours_ahead: int = 2) -> List[Dict[str, Any]]:
@@ -2521,49 +2868,67 @@ def get_pending_appointment_reminders(hours_ahead: int = 2) -> List[Dict[str, An
     two_hours_later_str = (now + timedelta(hours=hours_ahead)).strftime("%H:%M")
 
     conn = get_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT * FROM appointments
-        WHERE appointment_date = ?
-          AND appointment_time >= ?
-          AND appointment_time <= ?
-          AND reminder_sent = 0
-          AND status = 'CONFIRMED'
-    """, (today_str, current_time_str, two_hours_later_str))
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM appointments
+            WHERE appointment_date = ?
+              AND appointment_time >= ?
+              AND appointment_time <= ?
+              AND reminder_sent = 0
+              AND status = 'CONFIRMED'
+        """, (today_str, current_time_str, two_hours_later_str))
+        rows = [dict(r) for r in cursor.fetchall()]
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return rows
 
 def mark_appointment_reminder_sent(appointment_id: int) -> bool:
     """Сануулга илгээгдсэнийг тэмдэглэх"""
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE appointments SET reminder_sent = 1 WHERE id = ?", (int(appointment_id),))
-    success = cursor.rowcount > 0
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE appointments SET reminder_sent = 1 WHERE id = ?", (int(appointment_id),))
+        success = cursor.rowcount > 0
+        conn.commit()
+        # Phase 55 (F-55-1): released in a `finally`. An exception between
+        # `get_connection()` and `conn.close()` used to leak this connection holding its
+        # write lock, so whichever request lost the race waited the full 5s busy_timeout
+        # and then failed with `database is locked` (SQLite) or lost a pool slot
+        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
+        # made the very next `save_page` raise `OperationalError`.
+    finally:
+        conn.close()
     return success
 
 def get_appointments_summary(page_id: str) -> Dict[str, Any]:
     """Цаг захиалгын самбарын хураангуй тооцоолол"""
     today_str = datetime.now().strftime("%Y-%m-%d")
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND appointment_date = ? AND status = 'CONFIRMED'", (str(page_id), today_str))
-    today_confirmed = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND appointment_date = ? AND status = 'CONFIRMED'", (str(page_id), today_str))
+        today_confirmed = cursor.fetchone()[0] or 0
 
-    cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND status = 'CONFIRMED'", (str(page_id),))
-    total_upcoming = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND status = 'CONFIRMED'", (str(page_id),))
+        total_upcoming = cursor.fetchone()[0] or 0
 
-    cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND status = 'COMPLETED'", (str(page_id),))
-    total_completed = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ? AND status = 'COMPLETED'", (str(page_id),))
+        total_completed = cursor.fetchone()[0] or 0
 
-    cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ?", (str(page_id),))
-    total_all = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(id) FROM appointments WHERE page_id = ?", (str(page_id),))
+        total_all = cursor.fetchone()[0] or 0
 
-    conn.close()
+        # Phase 55 (F-55-1): released in a `finally`. A reader that raised leaked its
+        # connection too - a pool slot under PostgreSQL, an open read transaction that
+        # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
+    finally:
+        conn.close()
     return {
         "today_confirmed": int(today_confirmed),
         "total_upcoming": int(total_upcoming),

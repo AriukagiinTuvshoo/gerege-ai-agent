@@ -3783,8 +3783,16 @@
 
     async function handleDeleteCurrentPage() {
       if (!confirm('Энэ хуудсыг системээс хасахдаа итгэлтэй байна уу?')) return;
-      await fetch('/api/pages/' + encodeURIComponent(activePageId), { method: 'DELETE' });
-      showToast('Хуудас устгагдлаа.');
+      // Phase 55 (F-55-5). The response was discarded and the toast claimed success
+      // unconditionally, so deleting a page that was already gone still said "устгагдлаа".
+      // The endpoint now answers status:"not_found" for exactly that case; read it.
+      const res = await fetch('/api/pages/' + encodeURIComponent(activePageId), { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.status !== 'deleted') {
+        showToast(data.message || data.error || 'Хуудас устгагдсангүй.');
+      } else {
+        showToast('Хуудас устгагдлаа.');
+      }
       activePageId = '100799479495809';
       await loadPages();
     }
@@ -4137,12 +4145,20 @@
     }
 
     async function changeLeadStatus(id, newStatus) {
-      await fetch('/api/leads/' + id + '/status', {
+      // Phase 55 (F-55-5). The response was discarded and the toast claimed success
+      // unconditionally; the endpoint now answers 400 with a `message` for a status it will
+      // not store, so read it instead of announcing a change that did not happen.
+      const res = await fetch('/api/leads/' + id + '/status', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus })
       });
-      showToast('Төлөв амжилттай шинэчлэгдлээ!');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.status !== 'updated') {
+        showToast(data.message || data.error || 'Төлөв шинэчлэгдсэнгүй.');
+      } else {
+        showToast('Төлөв амжилттай шинэчлэгдлээ!');
+      }
     }
 
     function viewLeadNotes(notes) {

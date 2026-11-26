@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
@@ -218,9 +219,15 @@ def _is_sqlite_connection(conn) -> bool:
     how this distinction was discovered - the SQLite backup path shares
     `_collect_db_table_counts()` with PostgreSQL.
     """
-    name = f"{type(conn).__module__}.{type(conn).__name__}".lower()
     # Positive identification first, in both directions: the connection object itself is
     # the authority on what it is, and this must not depend on the process environment.
+    # Phase 55 (F-55-9): the type hierarchy is the strongest form of that, and the name test
+    # below is kept for wrappers that are not subclasses. `RollbackOnCloseConnection` is a
+    # `sqlite3.Connection` subclass defined in `core.db_engine`, so its fully qualified name
+    # contains no "sqlite" and used to reach the weaker environment fallback instead.
+    if isinstance(conn, sqlite3.Connection):
+        return True
+    name = f"{type(conn).__module__}.{type(conn).__name__}".lower()
     if "sqlite" in name:
         return True
     if "psycopg" in name or "postgres" in name or "pg8000" in name:

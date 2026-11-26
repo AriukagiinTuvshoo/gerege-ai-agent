@@ -787,6 +787,35 @@ class PostgresCompatConnection:
                 pass
 
 
+class RollbackOnCloseConnection(sqlite3.Connection):
+    """Phase 55 (F-55-1): `close()` ends an open transaction before releasing the handle.
+
+    `PostgresCompatConnection.close()` has rolled back first since Phase 20, on the stated
+    assumption that doing so "matches `sqlite3.Connection.close()`". Measured in Phase 55, it
+    does not. When the exception that interrupted a write is still referenced - a traceback held
+    by a log record, an `exc_info` tuple, a test's `pytest.raises(...) as excinfo` - the frame
+    keeps the cursor alive, the handle is not fully released, and the write lock survives the
+    `close()`. The next writer then waits the whole `PRAGMA busy_timeout` and fails:
+
+        database.update_automated_rule(<missing page>)   -> IntegrityError, traceback retained
+        database.save_page(...)                          -> OperationalError: database is locked
+        gc.collect()  /  an explicit rollback()          -> released immediately (0.00s)
+
+    Ending the transaction in `close()` fixes every caller at once, including the 78 functions
+    in `database.py` whose `finally: conn.close()` is otherwise correct but not sufficient.
+    A rollback after a successful `commit()` is a no-op, and a pure reader has no transaction
+    open, so the happy path is unchanged.
+    """
+
+    def close(self):
+        try:
+            if self.in_transaction:
+                self.rollback()
+        except sqlite3.Error:
+            pass  # a connection that is already unusable still has to be released
+        super().close()
+
+
 def get_db_connection(sqlite_path: Optional[str] = None):
     """
     Нэгдсэн Authoritative Database Connection Factory:
@@ -799,7 +828,7 @@ def get_db_connection(sqlite_path: Optional[str] = None):
         return PostgresCompatConnection(raw_conn)
 
     path = get_sqlite_db_path(sqlite_path)
-    conn = sqlite3.connect(path, timeout=15.0)
+    conn = sqlite3.connect(path, timeout=15.0, factory=RollbackOnCloseConnection)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")
