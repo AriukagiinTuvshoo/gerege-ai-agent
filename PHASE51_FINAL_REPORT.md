@@ -666,3 +666,164 @@ place as a record, and are superseded here:
 Gemini key connected locally **PASS**; accepted by the app **PASS**; proven valid **NOT VERIFIED**;
 AI reply quality **BLOCKED**; Telegram / Meta / QPay **BLOCKED** (no real credentials); Windows
 launcher **NOT VERIFIED**; staging **BLOCKED**; production **NOT READY**.
+
+---
+
+## 15. Git record
+
+### 15.1 Pre-push verification
+
+| Check | Result |
+|---|---|
+| Authoritative suite, run 2 (completed B2 fix) | `2218 passed, 59 skipped, 1 xfailed, 0 failed` in 690.74 s |
+| Live verification, run D against the final build | **37 PASS / 0 FAIL**, 1 N/A |
+| Final instance state | `/api/health` 200 `status=healthy`, `gemini_configured=true`, `gemini_verified=null`, `attempts=0`; admin login 200; executive recipient empty in both the database row and the process environment |
+| Credential scan of the **staged diff** (3149 lines) | live `GEMINI_API_KEY`: **0** occurrences; live `ADMIN_PASSWORD`: **0** |
+| `.env` | untouched — mode 600, 170 lines, sha256 prefix `2c90cc39177b2402` |
+| working tree after commit | clean, 0 entries |
+
+### 15.2 Commit and push
+
+```
+commit 37eabea1b1af629e7b75ef7089c2617aaca162fb   (Phase 51)
+parent 7b48dfcc33b418ad13e4b9dbc649b1890b9e0c2f   (Phase 50 report)
+date   2026-11-26T08:19:23Z
+11 files changed, +2792 / -31
+
+push: 7b48dfc..37eabea  arena/d78ebf88-gerege-ai-agent -> arena/d78ebf88-gerege-ai-agent
+```
+
+Pushed to the feature branch only. `origin/main` was never a push target, no force push, no history
+rewrite. Per-file:
+
+```
+m .env.example                            +146/-3     B3
+a PHASE51_FINAL_REPORT.md                 +668/-0
+m agent.py                                 +28/-1     B7
+m core/secret_guard.py                     +12/-0     F-51-5
+m core/security.py                         +61/-0     F-51-5
+m executive_bot_service.py                 +33/-3     F-51-5
+m main.py                                 +140/-15    B4
+m tests/test_e45_final_hardening.py       +283/-9     B2
+a tests/test_e51_ai_error_attribution.py  +368/-0     B7
+a tests/test_e51_env_write_merge.py       +436/-0     B4
+a tests/test_e51_owner_command_secret.py  +617/-0     B3 + F-51-5
+```
+
+### 15.3 `main` moved while this phase was running
+
+`git fetch` after the push showed the local `origin/main` ref had been stale. The real sequence, all
+of it after Phase 50 was pushed and none of it done from this session:
+
+| When (UTC) | What |
+|---|---|
+| 07:12:10 | CI run `45773565714` (`pull_request`) on head `7b48dfc` — **success**, 17m22s |
+| 07:12:22 | **PR #3 merged into `main`** (`8f91d35`), carrying Phase 49 and Phase 50 |
+| 07:13:56 | commit **`c809654`** "Add example GEMINI_API_KEY to .env.example", author `Tuvshoo <tuvshoo0331@gmail.com>`, pushed directly to `main` — see §16 |
+| 07:14 | CI run `45773782793` (`push`, `main`) on `c809654` — **success**, 17m12s |
+
+`origin/main` is now `c80965432a5c7cf53824cf95e1afa12bb63f9cf5`. 0 open PRs; `rulesets` → `[]`;
+`branches/main/protection` → 403 (`Resource not accessible by integration`).
+
+So the Phase 49 and Phase 50 work described in the two previous reports **is now on `main`**, and the
+Phase 51 work in this report is **not**: `37eabea` is on the feature branch only, one commit ahead of
+`main`.
+
+### 15.4 A pull request from this branch would conflict — and resolving it fixes §16
+
+`git merge-tree --write-tree origin/main HEAD` exits 1:
+
+```
+Auto-merging .env.example
+CONFLICT (content): Merge conflict in .env.example
+```
+
+Both sides changed the same region: `main` put a 53-character value on `GEMINI_API_KEY=` at line 9,
+while this branch restructured that block and left the assignment empty at line 17. Taking this
+branch's side of the conflict removes the credential from the template. It does **not** remove it from
+`main`'s history — see §16.
+
+### 15.5 Not done, needing fresh authorisation
+
+Opening a pull request; merging; any push to `main`; removing the credential from `main`; rewriting
+history; rotating any key; deploying.
+
+---
+
+## 16. URGENT — a live credential is on the public default branch (§15.3, commit `c809654`)
+
+**This was not done by this session and is not part of the approved scope. It is reported first
+because it is the only item in this document that is actively getting worse with time.**
+
+### What is there
+
+`origin/main:.env.example`, line 9, contains a 53-character `GEMINI_API_KEY` value that is
+**byte-identical to the live key in this deployment's `.env`** — the key supplied by the operator in
+the Gemini-key task and written only to the git-ignored `.env` under an instruction that explicitly
+did not cover committing it or adding it to `.env.example`.
+
+Measured, with the value never printed:
+
+```
+main's .env.example contains the live GEMINI_API_KEY : True
+main's .env.example contains the live ADMIN_PASSWORD : False
+other assigned values >= 24 chars, not placeholders  : GEMINI_API_KEY(53), ALLOWED_ORIGINS(43), REDIS_URL(24)
+this branch's .env.example contains the live key     : False
+```
+
+`ALLOWED_ORIGINS` and `REDIS_URL` are configuration, not credentials. The Gemini key is the only
+secret exposed.
+
+### Blast radius
+
+* The repository is **public** (`private: false`, `visibility: public`, default branch `main`).
+* The key is on the default branch, so it is in the working tree of everyone who clones, and in the
+  GitHub UI at `https://github.com/AriukagiinTuvshoo/gerege-ai-agent/blob/main/.env.example`.
+* It is in `main`'s **history** at commit `c809654`. Deleting the line in a later commit does not
+  remove it from history; anyone can read `c809654` forever unless history is rewritten.
+* Google API keys of this type are usable by anyone who holds them: they consume the project's quota
+  and billing. The key has been public since 07:13:56 UTC.
+
+### Why CI passed — F-51-6, a hole in the security gate
+
+Run `45773782793` on `c809654` completed **success**. Nothing in the repository's 2278 tests detects
+a credential *value* in a tracked template:
+
+* `core/secret_guard.py`'s own docstring states the invariant — *"The templates (`.env.example`,
+  `docs/deployment/PRODUCTION_ENV_TEMPLATE.env`) leave every secret blank with a `generate:` hint"* —
+  but the module only ever evaluates the **process environment** (`evaluate_secrets(environ)`). It
+  never reads a tracked file.
+* `tests/test_e39_staging_operational_readiness.py`'s `TEMPLATES` checks (`.env.staging.example`,
+  `docs/deployment/PRODUCTION_ENV_TEMPLATE.env`, `.env.example`) assert which **variable names**
+  appear, and forbid a `BACKUP_KEY_FILE=` assignment. They do not inspect values.
+* The only key-shaped needles in the suite are synthetic fixtures for *redaction* tests
+  (`test_ai_eval_suite.py:183`, `test_e02_phase11_audit_contract.py:52`, `test_e34:331`), which test
+  that a key is not logged — not that one is not committed.
+
+So the stated invariant is real but unenforced, and a live credential reached a public default branch
+with the gate green. This is the same *class* as F-44-B / F-49-1 / F-51-5 — a rule that lives in
+documentation instead of code — with the polarity reversed: those were placeholder values accepted as
+credentials; this is a real credential accepted as a placeholder.
+
+### What only the operator can do
+
+1. **Rotate the key now** in Google AI Studio, and treat the exposed one as compromised. Rotation is
+   the only action that closes the exposure; nothing done inside this repository can.
+2. Remove the value from `.env.example` on `main` (blank assignment plus a `generate:` hint, matching
+   every other secret line in that file).
+3. Decide about history: `c809654` keeps the value readable. After rotation the historical value is
+   worthless, which is why rotation — not a rewrite — is the priority. A rewrite of a public default
+   branch is destructive and needs its own explicit authorisation.
+4. Then, optionally, close the gate: a test that reads every tracked template and refuses an assigned
+   value that is long, high-entropy and not an obvious placeholder would have failed this commit.
+   That is F-51-6's fix and it was **not** implemented here — it is outside the approved scope, and on
+   `main` today it would turn CI red until step 2 is done, which is a decision for the operator, not
+   for this phase.
+
+### What this session did about it
+
+Nothing inside the repository, because every available action needs authorisation it does not have:
+pushing to `main` is forbidden, opening a PR was declined by the operator this phase, and rewriting
+history is forbidden. The finding is reported, measured, and left where the operator can act on it.
+This branch's own `.env.example` does not contain the key, and a merge conflict would have to be
+resolved before this work could land on `main` at all (§15.4).
