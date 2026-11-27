@@ -28,7 +28,7 @@ at the end of Phase 57. Environment clock at closure: **2026-11-27 07:38 UTC**.
 | working tree | **clean** (`git status --porcelain` empty), 0 stashes |
 | open pull requests | **0** |
 | merged pull requests | #1 (Stage A+B), #2 (Phase 48A), #3 (Phases 49/Gemini-key/50) |
-| phase reports in Git | **33 files, 15106 lines** (`PHASE20_REPORT.md` … `PHASE57_FINAL_REPORT.md`) |
+| phase reports in Git | **19 files, 8280 lines** (`PHASE20_REPORT.md`, `PHASE41_REPORT.md` … `PHASE57_FINAL_REPORT.md`) |
 | test suite | **100 modules, 2337 `def test_`** → 2814 collected cases |
 | last full run | **2739 passed / 74 skipped / 1 xfailed / 0 failed in 699.33 s** (PostgreSQL) |
 
@@ -198,7 +198,8 @@ counts, and static AST/`node --check` scans where no runtime existed.
 
 **Durable, in Git** (this is the evidence that matters):
 
-* the 33 phase reports, `PHASE20_REPORT.md` … `PHASE57_FINAL_REPORT.md`;
+* the **19 phase reports**, `PHASE20_REPORT.md`, `PHASE41_REPORT.md` …
+  `PHASE57_FINAL_REPORT.md` — 8280 lines in total;
 * the test modules, including `tests/test_e57_silent_failure_truth.py` (1101 lines),
   `tests/test_e56_page_identity_truth.py` (1610), `tests/test_e55_write_path_truth.py`
   (1279), `tests/test_e50_ai_readiness_truth.py` and the rest of the 100 modules;
@@ -233,7 +234,17 @@ probes would need re-running against a started application.
 
 ---
 
-## 9. Closing statement
+## 9. A measurement error in this document, corrected
+
+*A measurement error, corrected rather than left in place.* The first version of
+this document reported "33 report files, 15106 lines". Both numbers came from a
+shell glob in which `PHASE*_REPORT.md` also matches `PHASE*_FINAL_REPORT.md`, so
+every final report was counted and concatenated twice. The tracked set, verified
+with `git ls-tree HEAD --name-only`, is **19 files / 8280 lines**.
+
+---
+
+## 10. Closing statement
 
 Phases 45–57 moved this repository from *"the endpoint answered 200"* to *"the answer
 states what was written, refuses what cannot be written, and logs what it had to
