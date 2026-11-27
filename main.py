@@ -182,6 +182,17 @@ async def telemetry_and_error_tracking_middleware(request: Request, call_next):
     except Exception as exc:
         dur = (time.perf_counter() - t0) * 1000.0
         telemetry.record_request(request.url.path, request.method, 500, dur, error_detail=str(exc), request_id=req_id)
+        # Phase 55 (F-55-3). This branch recorded `str(exc)` into telemetry and returned a
+        # generic 500, and logged nothing: across the 500s measured on a running instance the
+        # backend log held ZERO tracebacks, so neither an operator nor this agent could tell
+        # what had failed without attaching a debugger to the live process. The client response
+        # stays generic - a traceback is not for the caller - but the log now says what
+        # happened, where, and which request id it belongs to.
+        logger.error(
+            "unhandled exception on %s %s (request_id=%s): %s",
+            request.method, request.url.path, req_id, type(exc).__name__,
+            exc_info=exc,
+        )
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal server error", "request_id": req_id},
@@ -906,7 +917,7 @@ async def web_chat_endpoint(payload: Dict[str, Any], request: Request, backgroun
             status_code=429,
             headers={"Retry-After": str(_limit_hit["retry_after"])},
         )
-    message = payload.get("message", "").strip()
+    message = _payload_text(payload, "message")
     sender_id = payload.get("sender_id", "web_user")
     
     # Хэрэв client нэвтэрсэн бол зөвхөн өөрийн хуудсаар хязгаарлана
@@ -1214,9 +1225,23 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
 
     await core_security.require_admin(request)
 
-    success = database.delete_page(str(target_id))
-    if not success:
-        return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
+    deleted = database.delete_page(str(target_id))
+    if not deleted:
+        if str(target_id) == database.DEFAULT_PAGE_ID:
+            return JSONResponse({"error": "Үндсэн хуудсыг устгах боломжгүй"}, status_code=400)
+        # Phase 55 (F-54-4). `delete_page` returned True for anything that was not the default
+        # page, so a page that never existed was reported as deleted AND audited as deleted.
+        # HTTP 200 with the truth in the body, matching Phase 53/54: this endpoint's contract is
+        # {"status": ...} and the dashboard reads the body rather than the status code. No audit
+        # row and no session reset for a deletion that deleted nothing.
+        return JSONResponse(
+            {
+                "status": "not_found",
+                "deleted": False,
+                "page_id": str(target_id),
+                "message": f"'{target_id}' хуудас олдсонгүй - устгах зүйл байсангүй.",
+            }
+        )
     audit_error = _audit_or_report(
         "page.delete",
         operation=f"Хуудас ({target_id}) устгах",
@@ -1235,12 +1260,12 @@ async def delete_page_endpoint(request: Request, page_id: Optional[str] = None):
     if audit_error is not None:
         return audit_error
     agent.reset_sessions(str(target_id))
-    return {"status": "deleted", "page_id": target_id}
+    return {"status": "deleted", "deleted": True, "page_id": target_id}
 
 @app.post("/api/pages/gemini_key")
 @app.post("/api/pages/{page_id}/gemini_key")
 async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Request, page_id: Optional[str] = None):
-    """Харилцагчийн хувийн Gemini API түлхүүр шинэчлэх (Админ болон тухайн Client өөрөө засаж болно)"""
+    """Харилцагчийн хувийн Gemini API түлхүүр шинэчлэх (Админ болон тухайн Client өөрөө засах)"""
     raw_target = payload.get("page_id") or page_id
     if not raw_target:
         return JSONResponse({"error": "page_id missing"}, status_code=400)
@@ -1252,15 +1277,126 @@ async def update_page_gemini_key_endpoint(payload: Dict[str, Any], request: Requ
         permission="knowledge:write",
     )
 
-    gemini_key = str(payload.get("gemini_api_key", "")).strip()
-    monthly_limit = payload.get("monthly_token_limit")
-    if monthly_limit is not None:
-        try: monthly_limit = int(monthly_limit)
-        except Exception: monthly_limit = None
+    # Phase 54 (F-54-1). This endpoint read `payload.get("gemini_api_key", "")` and handed the
+    # result straight to an UPDATE, so a body that named only the quota stored an empty string
+    # over the tenant's key. Measured live on a disposable page:
+    #
+    #   stored:                       key = 35 chars, limit = 5000
+    #   POST {"monthly_token_limit": 7000}
+    #   response: {"status":"success","message":"Gemini API тохиргоо амжилттай шинэчлэгдлээ!"}
+    #   stored:                       key = 0 chars,  limit = 7000   audit rows written: 0
+    #
+    # and that exact partial body is what `dashboard.html` posts from the Client Access modal
+    # (`body: JSON.stringify({page_id, monthly_token_limit})`, no key), so one Save click on a
+    # quota silently destroyed a tenant's own API key and moved them onto the operator's paid
+    # quota, while the UI showed only a success toast. Same shape as F-53-1/F-53-5, same fix:
+    # absent means unchanged, a named empty value is an explicit clear, a named mask is not a
+    # credential.
+    body = dict(payload)
+    ignored: List[str] = []
+    if "monthly_token_limit" in body:
+        try:
+            quota = int(str(body["monthly_token_limit"]).strip())
+        except (TypeError, ValueError):
+            quota = 0
+        if quota > 0:
+            body["monthly_token_limit"] = quota
+        else:
+            # Unparseable or non-positive: drop the key so the stored quota survives, and say so
+            # in the response instead of storing a quota of 0 that would block the tenant.
+            body.pop("monthly_token_limit")
+            ignored.append("monthly_token_limit")
 
-    database.update_page_gemini_key(str(target_id), gemini_key, monthly_limit)
-    agent.reset_sessions(str(target_id))
-    return {"status": "success", "message": "Gemini API тохиргоо амжилттай шинэчлэгдлээ!"}
+    stored = database.get_page(str(target_id)) or {}
+    values, changed, preserved, cleared, mask_echoes = _merged_settings(
+        body, stored, GEMINI_SETTINGS_SPEC
+    )
+
+    # `update_page_gemini_key` used to `return True` unconditionally, so the handler could not
+    # tell a write from a no-op. It now returns `rowcount > 0` and this reports it.
+    written = database.update_page_gemini_key(
+        str(target_id),
+        str(values["gemini_api_key"]),
+        int(values["monthly_token_limit"]),
+    )
+    if not written:
+        # HTTP 200, not 404: this endpoint's contract has always been
+        # `{"status": ..., "message": ...}` and the dashboard branches on `data.status`.
+        message = f"'{target_id}' хуудас олдсонгүй - ямар ч тохиргоо хадгалагдсангүй."
+        return JSONResponse(
+            {
+                "status": "error",
+                "success": False,
+                "written": False,
+                "page_id": str(target_id),
+                "changed": [],
+                "preserved": preserved,
+                "cleared": [],
+                "mask_echoes": mask_echoes,
+                "ignored_fields": ignored,
+                "error": message,
+                "message": message,
+            }
+        )
+
+    if changed:
+        # Sessions are reset only when something actually moved: a re-save of the same key used
+        # to throw away every in-flight conversation for the tenant.
+        agent.reset_sessions(str(target_id))
+
+    # Phase 54 (F-54-1). This endpoint wrote no audit row at all, and
+    # `database.update_page_gemini_key` contains none either, so a tenant's API key and quota
+    # could be changed or destroyed with nothing in `audit_logs` to show it. Names, booleans and
+    # the quota only - never the key, never its mask.
+    if changed:
+        actor = await _settings_actor(request)
+        audit_failure = _audit_or_report(
+            "page.gemini_key.cleared" if "gemini_api_key" in cleared else "page.gemini_key.updated",
+            operation="page gemini key update",
+            page_id=str(target_id),
+            actor_role=actor["actor_role"],
+            actor_id=actor["actor_id"],
+            resource_type="page_gemini_key",
+            resource_id=str(target_id),
+            details={
+                "via": "api",
+                "changed_fields": changed,
+                "preserved_fields": preserved,
+                "cleared_fields": cleared,
+                "mask_echo_fields": mask_echoes,
+                "ignored_fields": ignored,
+                "has_gemini_key": bool(values["gemini_api_key"]),
+                "gemini_key_changed": "gemini_api_key" in changed,
+                "monthly_token_limit": int(values["monthly_token_limit"]),
+                "session_ref": actor["session_ref"],
+            },
+            ip_address=core_rate_limit.resolve_client_ip(request),
+        )
+        if audit_failure is not None:
+            return audit_failure
+
+    if not changed:
+        message = (
+            "Gemini API тохиргоо өөрчлөгдөөгүй - хадгалагдсан утгууд хэвээр үлдлээ."
+            if not mask_echoes
+            else "Илгээсэн утга нь API-ын харуулсан mask байна - хадгалагдсан түлхүүр хэвээр үлдлээ."
+        )
+    elif cleared:
+        message = "Gemini API түлхүүр устгагдлаа - хуудас админы квот ашиглана."
+    else:
+        message = "Gemini API тохиргоо амжилттай шинэчлэгдлээ!"
+    return {
+        "status": "success",
+        "success": True,
+        "written": True,
+        "page_id": str(target_id),
+        "changed": changed,
+        "preserved": preserved,
+        "cleared": cleared,
+        "mask_echoes": mask_echoes,
+        "ignored_fields": ignored,
+        "message": message,
+    }
 
 @app.post("/api/pages/credentials")
 @app.post("/api/pages/{page_id}/credentials")
@@ -1272,10 +1408,32 @@ async def set_page_credentials_endpoint(payload: Dict[str, Any], request: Reques
     if not target_page_id:
         return JSONResponse({"error": "Хуудасны ID шаардлагатай"}, status_code=400)
 
-    username = str(payload.get("username", "")).strip()
-    password = payload.get("password")
+    username = _payload_text(payload, "username")
+    # Phase 55 (F-55-7): `set_client_credentials` calls `password.strip()`, so a numeric
+    # password in a JSON body crashed the request with an AttributeError 500. Absent stays
+    # absent - that is this endpoint's "leave the password alone" signal - and anything
+    # present becomes text.
+    password = None if payload.get("password") is None else _payload_text(payload, "password")
     if not username:
         return JSONResponse({"error": "Хэрэглэгчийн нэр оруулна уу"}, status_code=400)
+
+    # Phase 55 (F-55-4). Nothing here checked that the page exists. For a page id that had
+    # never been created, `set_client_credentials` updated 0 rows and the audit INSERT then hit
+    # `audit_logs.page_id`'s foreign key to `pages`, so `_audit_or_report` produced a 500 whose
+    # own text asserted the opposite of the truth. Measured live, before the fix:
+    #   POST /api/pages/p55_never_d/credentials
+    #     -> HTTP 500 {"error": "Хуудас (p55_never_d) нэвтрэх эрх шинэчлэх хийгдсэн боловч ..."}
+    # with 0 rows written. This endpoint already answers its validation problems with an HTTP
+    # error and an `error` body - which is what the dashboard branches on (`!credRes.ok ||
+    # credData.error`) - so a missing page is a 404 in that same shape, not a 500.
+    if not database.get_page(str(target_page_id)):
+        return JSONResponse(
+            {
+                "error": f"'{target_page_id}' хуудас олдсонгүй - ямар ч нэвтрэх эрх шинэчлэгдсэнгүй.",
+                "written": False,
+            },
+            status_code=404,
+        )
 
     # E-02 Phase 6, R10: a username owned by another tenant is a conflict, not an update.
     # Previously this silently rewrote the other tenant's row (cross-tenant takeover). It is
@@ -1458,7 +1616,7 @@ async def manager_send_message(sender_id: str, payload: Dict[str, str], request:
     E-01: the outbound message is written to, and the conversation read from, the tenant
     that owns the authenticated session. `payload["page_id"]` is no longer trusted.
     """
-    text = payload.get("message", "").strip()
+    text = _payload_text(payload, "message")
     target_page = await core_security.enforce_tenant_scope(
         request,
         requested_page_id=page_id,
@@ -1537,10 +1695,40 @@ async def update_lead(lead_id: int, payload: Dict[str, Any], request: Request):
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     core_security.verify_resource_tenant_ownership(user, lead.get("page_id"), require_auth=True)
-    status = payload.get("status", "шинэ")
-    notes = payload.get("notes")
+    # Phase 55 (F-55-8). Two defects, both measured live on this deployment:
+    #   POST /api/leads/1/status {"status": {"a": 1}} -> HTTP 500 (ProgrammingError)
+    #   POST /api/leads/1/status {"status": null}     -> HTTP 200 {"status": "updated"}, and the
+    #       lead's stored status became NULL. `payload.get("status", "шинэ")` returns the default
+    #       only for an ABSENT key; an explicit null is a value, and it was written as one, so the
+    #       caller was told the update succeeded while the row lost its stage. Lead 1 in this
+    #       deployment was corrupted that way and had to be restored.
+    # The vocabulary is free-form Mongolian text (`"шинэ"` is only the default), so no enum is
+    # imposed - but the field must be a non-empty string, and `notes` must be text or absent.
+    raw_status = payload.get("status", "шинэ")
+    if raw_status is None or isinstance(raw_status, (dict, list, tuple, set)):
+        return JSONResponse(
+            {
+                "status": "error",
+                "updated": False,
+                "lead_id": lead_id,
+                "message": "Төлөв нь хоосон биш текст байх ёстой. Одоогийн төлөв өөрчлөгдсөнгүй.",
+            },
+            status_code=400,
+        )
+    status = str(raw_status).strip()
+    if not status:
+        return JSONResponse(
+            {
+                "status": "error",
+                "updated": False,
+                "lead_id": lead_id,
+                "message": "Төлөв хоосон байж болохгүй. Одоогийн төлөв өөрчлөгдсөнгүй.",
+            },
+            status_code=400,
+        )
+    notes = None if payload.get("notes") is None else _payload_text(payload, "notes")
     database.update_lead_status(lead_id, status, notes)
-    return {"status": "updated", "lead_id": lead_id}
+    return {"status": "updated", "updated": True, "lead_id": lead_id, "lead_status": status}
 
 @app.get("/api/export/csv")
 async def export_csv(
@@ -1601,15 +1789,53 @@ async def update_page_google_sheets_endpoint(page_id: str, payload: Dict[str, An
         require_auth=True,
         permission="knowledge:write",
     )
-    url = payload.get("google_sheets_url", "").strip()
-    if url:
+    # Phase 54. `payload.get("google_sheets_url", "")` meant a body that did not name the URL
+    # cleared it: the same replace-not-merge shape as F-54-1, on the column that says where this
+    # tenant's knowledge comes from. Absent now means unchanged. The SSRF validation is
+    # untouched and still runs for any non-empty URL the caller names, so
+    # `test_phase1_google_sheets_ssrf_blocked` keeps its 400.
+    stored = database.get_page(page_id) or {}
+    values, changed, preserved, cleared, mask_echoes = _merged_settings(
+        payload, stored, SHEETS_SETTINGS_SPEC
+    )
+    url = str(values["google_sheets_url"])
+    if "google_sheets_url" in payload and url:
         try:
             sheets_service.normalize_sheet_csv_url(url)
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
-    database.update_page_google_sheets(page_id, url)
-    agent.reset_sessions(page_id)
-    return {"success": True, "page_id": page_id, "google_sheets_url": url}
+
+    # `update_page_google_sheets` used to `return True` unconditionally; it now reports rowcount.
+    written = database.update_page_google_sheets(page_id, url)
+    if not written:
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "page_id": page_id,
+                "google_sheets_url": "",
+                "changed": [],
+                "preserved": preserved,
+                "message": f"'{page_id}' хуудас олдсонгүй - ямар ч тохиргоо хадгалагдсангүй.",
+            }
+        )
+
+    if changed:
+        agent.reset_sessions(page_id)
+
+    # Not audited, deliberately: a sheet URL is a knowledge source, not a credential and not an
+    # authorisation fact, which is the line Phase 53 drew for retention rules too. The merge and
+    # the truthful `written` are the fix here.
+    return {
+        "success": True,
+        "written": True,
+        "page_id": page_id,
+        "google_sheets_url": url,
+        "changed": changed,
+        "preserved": preserved,
+        "cleared": cleared,
+        "mask_echoes": mask_echoes,
+    }
 
 def _save_page_sheets_list(page_id: str, sheets_list: List[Dict[str, Any]]):
     page_obj = database.get_page(page_id)
@@ -1789,7 +2015,7 @@ async def test_page_google_sheet_endpoint(page_id: str, payload: Dict[str, Any],
         permission="knowledge:read",
     )
     
-    url = payload.get("google_sheets_url", "").strip()
+    url = _payload_text(payload, "google_sheets_url")
     if not url:
         return JSONResponse({"success": False, "error": "Google Sheets холбоос оруулаагүй байна."}, status_code=400)
     
@@ -1830,8 +2056,25 @@ async def get_knowledge(request: Request, page_id: Optional[str] = Query(None)):
     if page_obj and page_obj.get("knowledge_json"):
         try:
             return JSONResponse(json.loads(page_obj["knowledge_json"]))
-        except Exception:
-            pass
+        except Exception as exc:
+            # Phase 57 (F-57-4). This fallback was silent. A page whose stored `knowledge_json` is
+            # not valid JSON was served the deployment's DEFAULT knowledge base with HTTP 200 and
+            # no log line anywhere. Measured live with a corrupt value written into the row:
+            #
+            #     GET /api/knowledge?page_id=p57_probe
+            #         -> 200 {"company":{"name":"Tuvshok ", ...}}      (the global default)
+            #         -> WARNING/ERROR lines mentioning knowledge: 0
+            #         -> the corrupt row was still in the database, unchanged
+            #
+            # So the agent answers from the default knowledge while the operator believes the
+            # page's own bank-account details are in effect, and nothing records the substitution.
+            # The response shape is deliberately unchanged - consumers read arbitrary KB keys - but
+            # the substitution is logged with the page id and the parse error (F-55-3's rule).
+            logger.warning(
+                "knowledge_json for page '%s' is not valid JSON (%s: %s); serving the default "
+                "knowledge base instead. The stored value was left untouched.",
+                target_id, type(exc).__name__, exc,
+            )
     return JSONResponse(knowledge_base.load_knowledge())
 
 @app.post("/api/knowledge")
@@ -1846,22 +2089,46 @@ async def update_knowledge(payload: Dict[str, Any], request: Request, page_id: O
     page_obj = database.get_page(target_id)
     k_str = json.dumps(payload, ensure_ascii=False, indent=2)
 
-    if page_obj:
-        database.save_page(
-            page_id=target_id,
-            name=page_obj.get("name", "Page"),
-            category=page_obj.get("category", "general"),
-            page_access_token=page_obj.get("page_access_token", ""),
-            # Phase 49 (F-49-4): carry the stored value through, and never substitute the
-            # published placeholder — `save_page` preserves the stored secret on an empty one.
-            verify_token=page_obj.get("verify_token") or "",
-            knowledge_json=k_str,
-            gemini_api_key=page_obj.get("gemini_api_key", ""),
-            monthly_token_limit=page_obj.get("monthly_token_limit", 100000),
-            # `save_page`'s default is 1, so a knowledge edit used to re-enable a tenant
-            # that had been disabled. The stored state is carried through instead.
-            is_active=(0 if page_obj.get("is_active") in (0, False) else 1)
+    # Phase 56 (F-56-4). `if page_obj:` used to skip the save for a page that does not exist and
+    # then fall through to the same `{"status": "success"}` return, so the response claimed a
+    # knowledge-base update that had written nothing. Measured live:
+    #
+    #     POST /api/knowledge?page_id=p56_never_created  {"bank": {"account_name": "P56 probe bank"}}
+    #         -> HTTP 200 {"status":"success","message":"p56_never_created хуудасны мэдлэгийн сан
+    #            амжилттай шинэчлэгдлээ!"}
+    #         -> rows written: 0 (the page does not exist, so there was nothing to update)
+    #
+    # The positive control - the same body against a page that does exist - writes the row and
+    # returns a byte-identical message, so the two were indistinguishable to the caller. Both
+    # dashboard knowledge saves discarded the response entirely (F-56-6), which is how an operator
+    # came to be told that new bank-account details were saved while the agent kept answering from
+    # the stored ones. The refusal keeps this endpoint's own vocabulary (`status`), because that is
+    # what its consumer now branches on, and `agent.reset_sessions` is skipped: there is no page.
+    if not page_obj:
+        return JSONResponse(
+            {
+                "status": "error",
+                "written": False,
+                "page_id": target_id,
+                "message": f"'{target_id}' хуудас олдсонгүй - мэдлэгийн сан шинэчлэгдсэнгүй.",
+            }
         )
+
+    database.save_page(
+        page_id=target_id,
+        name=page_obj.get("name", "Page"),
+        category=page_obj.get("category", "general"),
+        page_access_token=page_obj.get("page_access_token", ""),
+        # Phase 49 (F-49-4): carry the stored value through, and never substitute the
+        # published placeholder — `save_page` preserves the stored secret on an empty one.
+        verify_token=page_obj.get("verify_token") or "",
+        knowledge_json=k_str,
+        gemini_api_key=page_obj.get("gemini_api_key", ""),
+        monthly_token_limit=page_obj.get("monthly_token_limit", 100000),
+        # `save_page`'s default is 1, so a knowledge edit used to re-enable a tenant
+        # that had been disabled. The stored state is carried through instead.
+        is_active=(0 if page_obj.get("is_active") in (0, False) else 1)
+    )
     if target_id == database.DEFAULT_PAGE_ID:
         knowledge_base.save_knowledge(payload)
 
@@ -2060,13 +2327,137 @@ async def readiness_check():
         },
     )
 
+#: `POST /api/update-keys` payload field -> the `.env` key it owns. Only a field the admin
+#: actually submitted is written (F-51-3): the endpoint used to rebuild the whole file from a
+#: fixed 8-key map, which deleted every other setting it did not know about.
+UPDATE_KEYS_ENV_NAMES = {
+    "gemini_key": "GEMINI_API_KEY",
+    "meta_token": "META_PAGE_ACCESS_TOKEN",
+    "meta_verify": "META_VERIFY_TOKEN",
+    "tg_token": "TELEGRAM_BOT_TOKEN",
+    "tg_manager_id": "TELEGRAM_MANAGER_CHAT_ID",
+    "admin_password": "ADMIN_PASSWORD",
+}
+
+
+def merge_env_file(updates: Dict[str, str], path: str = ".env") -> Dict[str, Any]:
+    """Write `updates` into an existing dotenv file, losing nothing else in it.
+
+    F-51-3. `POST /api/update-keys` used to do this::
+
+        with open(".env", "w") as f:
+            for k, v in keys_map.items():      # exactly 8 fixed keys
+                f.write(f"{k}={v}\\n")
+
+    That is truncation, not an update. Measured against this repository's own `.env`
+    (170 lines, 42 keys): saving one field from the dashboard left an 8-line file. Gone were
+    `DATABASE_URL`, `DB_PATH`, `CSV_PATH`, `REDIS_URL`, `ALLOWED_ORIGINS`, `TRUSTED_PROXIES`,
+    `E02_ACCOUNT_KEY_SECRET`, `MANYCHAT_WEBHOOK_SECRET` and the whole `BACKUP_*` block, so the
+    next restart came up on SQLite, with no shared rate-limit store, with the account-key
+    secret missing (the limiter silently degrades to a per-worker counter), with the ManyChat
+    webhook secret gone and with no offsite backup configuration. Every explanatory comment
+    was lost too, so the file stopped being readable as documentation.
+
+    This merges instead: a key already in the file is updated on its own line, a key that is
+    not there is appended, and every other line - including comments and blank lines - is
+    preserved byte for byte. The write is atomic (`mkstemp` in the same directory, then
+    `os.replace`) and keeps the file's existing mode, so a concurrent reader never sees a
+    half-written `.env` and a 0600 file does not become 0644.
+
+    A value containing a newline is refused rather than written. `os.replace` would happily
+    store `"x\\nADMIN_PASSWORD=pwned"` as two lines, which is a credential write nobody
+    submitted - the payload arrives over HTTP, so the newline is attacker-shaped input even
+    though the caller is an authenticated admin.
+
+    Returns a report so a caller (or a test) can assert what happened::
+
+        {"path": ..., "updated": [names], "appended": [names], "preserved": int, "mode": "0o600"}
+
+    `preserved` counts assignment keys that were already in the file and were *not* touched.
+    Raises `FileNotFoundError` when the file does not exist: creating a brand new `.env` from
+    one submitted key is the same data loss in the other direction, and the caller has
+    already decided that writing is allowed at all.
+    """
+    import stat
+    import tempfile
+
+    for name, value in updates.items():
+        if "\n" in value or "\r" in value:
+            raise ValueError(
+                f"{name}: refusing to write a value containing a newline - it would inject "
+                f"extra keys into {path}"
+            )
+
+    with open(path, "r", encoding="utf-8") as fh:
+        original = fh.read()
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+
+    lines = original.split("\n")
+    index_of: Dict[str, int] = {}
+    for i, line in enumerate(lines):
+        if line.startswith("#") or "=" not in line:
+            continue
+        name = line.split("=", 1)[0].strip()
+        if name and name.replace("_", "").isalnum():
+            index_of[name] = i          # the last assignment wins, as dotenv itself does
+
+    updated: List[str] = []
+    appended: List[str] = []
+    for name, value in updates.items():
+        if name in index_of:
+            lines[index_of[name]] = f"{name}={value}"
+            updated.append(name)
+        else:
+            appended.append(name)
+    if appended:
+        while lines and lines[-1] == "":   # keep the file's trailing-newline convention
+            lines.pop()
+        lines.extend(f"{name}={updates[name]}" for name in appended)
+        lines.append("")
+
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".env.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write("\n".join(lines))
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    return {
+        "path": path,
+        "updated": sorted(updated),
+        "appended": sorted(appended),
+        "preserved": len([n for n in index_of if n not in updates]),
+        "mode": oct(mode),
+    }
+
+
 @app.post("/api/update-keys")
 async def update_keys(payload: Dict[str, str], request: Request):
     """Админы системийн түлхүүрүүд засах (Зөвхөн Админ — P0-2)"""
     await core_security.require_admin(request)
 
+    # F-51-3: refuse a newline before anything is mutated. The value is about to be written
+    # into `.env`, where a newline means "and also set this other key" (see merge_env_file).
+    for _field in UPDATE_KEYS_ENV_NAMES:
+        _value = str(payload.get(_field, "") or "")
+        if "\n" in _value or "\r" in _value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{_field}: a value containing a line break is rejected",
+            )
+
     for k in ["gemini_key", "meta_token", "meta_verify", "tg_token", "tg_manager_id", "admin_password"]:
-        v = payload.get(k, "").strip()
+        # Phase 55 (F-55-7): the thirteenth unguarded `.strip()`, in the endpoint that writes
+        # secrets into `.env`. The newline check above already coerces with `str(...)`, so a
+        # numeric value survived it and then crashed here with an AttributeError 500.
+        v = _payload_text(payload, k)
         if k == "gemini_key" and v:
             os.environ["GEMINI_API_KEY"] = v
             agent._init_default_gemini()
@@ -2083,26 +2474,95 @@ async def update_keys(payload: Dict[str, str], request: Request):
 
     database.record_audit_log("system.keys.updated", actor_role="admin", details={"updated_fields": [k for k in payload if payload.get(k)]})
 
-    # Production горимд plaintext .env файл руу бичихгүй
-    if not core_security.is_production_mode() and os.getenv("ALLOW_ENV_FILE_WRITE", "0") == "1":
-        keys_map = {
-            "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
-            "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-            "META_PAGE_ACCESS_TOKEN": os.getenv("META_PAGE_ACCESS_TOKEN", ""),
-            "META_VERIFY_TOKEN": os.getenv("META_VERIFY_TOKEN", ""),
-            "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            "TELEGRAM_MANAGER_CHAT_ID": os.getenv("TELEGRAM_MANAGER_CHAT_ID", ""),
-            "ADMIN_PASSWORD": os.getenv("ADMIN_PASSWORD", database.DEFAULT_ADMIN_PASSWORD),
-            "PORT": os.getenv("PORT", "8000")
-        }
-        try:
-            with open(".env", "w", encoding="utf-8") as f:
-                for k, v in keys_map.items():
-                    f.write(f"{k}={v}\n")
-        except Exception as env_err:
-            logger.warning(f"Could not write .env file (read-only fs): {env_err}")
+    # O-51-6 (Phase 52). Which fields this request actually mutated in `os.environ`. The loop
+    # above only assigns on a non-empty value, so the list is computed the same way rather than
+    # taken from the payload's keys.
+    applied_fields = [
+        field for field in UPDATE_KEYS_ENV_NAMES
+        if str(payload.get(field, "") or "").strip()
+    ]
+    persisted = False
+    write_gate_open = (
+        not core_security.is_production_mode()
+        and os.getenv("ALLOW_ENV_FILE_WRITE", "0") == "1"
+    )
 
-    return {"status": "success", "message": "Тохиргоо амжилттай хадгалагдлаа!"}
+    # Production горимд plaintext .env файл руу бичихгүй
+    if write_gate_open:
+        # F-51-3: write only what this request actually submitted. The previous code rebuilt
+        # the whole file from a fixed 8-key map, which deleted ~34 other settings - including
+        # GEMINI_MODEL and PORT, which this endpoint does not even accept as input.
+        updates = {
+            UPDATE_KEYS_ENV_NAMES[field]: os.environ[UPDATE_KEYS_ENV_NAMES[field]]
+            for field in UPDATE_KEYS_ENV_NAMES
+            if str(payload.get(field, "") or "").strip()
+            and UPDATE_KEYS_ENV_NAMES[field] in os.environ
+        }
+        if updates:
+            try:
+                report = merge_env_file(updates)
+                persisted = True
+                logger.info(
+                    ".env updated: wrote %s; %d other key(s) preserved",
+                    ", ".join(report["updated"] + report["appended"]),
+                    report["preserved"],
+                )
+            except Exception as env_err:
+                # Names and counts only - never a value, which is a credential.
+                logger.warning(f"Could not update .env file: {env_err}")
+
+    # O-51-6 (Phase 52). The response used to be an unconditional "saved successfully" for a
+    # change that, with the write gate closed, no file recorded and no restart survives. The
+    # consequence was not cosmetic. `TELEGRAM_MANAGER_CHAT_ID` in `os.environ` is one of the two
+    # sources `executive_bot_service.handle_owner_command` reads to decide who owns the
+    # executive reports, so an admin call to this endpoint with the gate closed produced a
+    # process that believed a different owner was registered from the one in the database - and
+    # from the one the WORKER process believed, since the worker is a separate process that
+    # never sees this assignment and is what actually sends the 08:30 report. Nothing reconciled
+    # the two except a restart, and nothing told the operator a restart was needed.
+    #
+    # The in-process update is kept: `tests/test_e51_env_write_merge.py` documents it as the
+    # intended behaviour ("the in-process update still succeeds") and an admin rotating a key
+    # mid-run should not have to restart to use it. What changes is that the response and the log
+    # now say which of the two happened, so the state of the system can be read instead of
+    # inferred. Names only, never values.
+    process_only = [] if persisted else sorted(
+        UPDATE_KEYS_ENV_NAMES[field] for field in applied_fields
+    )
+    if process_only:
+        reason = "production mode" if core_security.is_production_mode() else (
+            "ALLOW_ENV_FILE_WRITE is not 1"
+        )
+        warning = (
+            f"Applied to this process only, not written to .env ({reason}); a restart reverts "
+            f"it and no other process ever saw it: {', '.join(process_only)}."
+        )
+        if "TELEGRAM_MANAGER_CHAT_ID" in process_only:
+            warning += (
+                " This one is worse than the others: the executive-report recipient is per "
+                "page in the database, and the worker - a separate process, and the one that "
+                "actually sends the 08:30 report - reads that row. This process and the worker "
+                "now disagree about who owns the reports. Register it with POST "
+                "/api/executive/settings, or persist .env and restart, to make it durable."
+            )
+        logger.warning("update-keys: %s", warning)
+        message = (
+            "Тохиргоо энэ процессод хэрэглэгдлээ, гэхдээ .env файлд хадгалагдсангүй "
+            "(дахин ачааллахад буцна)."
+        )
+    else:
+        warning = None
+        message = "Тохиргоо амжилттай хадгалагдлаа!"
+
+    return {
+        "status": "success",
+        "message": message,
+        # O-51-6: the truth about durability, for a client that would rather read a field than
+        # parse a sentence.
+        "persisted": persisted,
+        "process_only": process_only,
+        "warning": warning,
+    }
 
 # -------------------------------------------------------------
 # 8. ФИНТЕК & ТӨЛБӨРИЙН АВТОМАТЖУУЛАЛТ (QPAY v2, DEEP LINKS, E-BARIMT)
@@ -2422,15 +2882,83 @@ async def save_fintech_settings_api(
         require_auth=True,
         permission="fintech:write",
     )
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    stored = database.get_page(target_page_id) or {}
+
+    # Phase 53 (F-53-5): a partial body used to store empty strings over the merchant's
+    # payment credentials. Measured live: `{"ebarimt_enabled": 1}` alone wiped qpay_username,
+    # qpay_password and qpay_invoice_code and answered success:true.
+    values, changed, preserved, cleared, mask_echoes = _merged_settings(
+        payload, stored, FINTECH_SETTINGS_SPEC
+    )
 
     success = database.update_page_qpay_settings(
-        page_id=pid,
-        username=payload.get("qpay_username", ""),
-        password=payload.get("qpay_password", ""),
-        invoice_code=payload.get("qpay_invoice_code", ""),
-        ebarimt_enabled=payload.get("ebarimt_enabled", 1)
+        page_id=target_page_id,
+        username=values["qpay_username"],
+        password=values["qpay_password"],
+        invoice_code=values["qpay_invoice_code"],
+        ebarimt_enabled=values["ebarimt_enabled"],
     )
-    return {"success": success}
+    if not success:
+        return {
+            "success": False,
+            "written": False,
+            "page_id": target_page_id,
+            "changed": [],
+            "preserved": preserved,
+            "cleared": [],
+            "mask_echoes": mask_echoes,
+            "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч тохиргоо хадгалагдсангүй.",
+        }
+
+    # Phase 53 (F-53-6): the audit table held ZERO rows for any payment-credential change,
+    # on the endpoint that stores the merchant's QPay password. Money moves with these
+    # values, so the change is recorded - names and booleans only, never the password or
+    # even its mask.
+    if changed:
+        action = (
+            "fintech.credentials.cleared"
+            if ("qpay_password" in cleared or "qpay_username" in cleared)
+            else "fintech.credentials.updated"
+        )
+        actor = await _settings_actor(request)
+        audit_failure = _audit_or_report(
+            action,
+            operation="fintech settings update",
+            page_id=target_page_id,
+            actor_role=actor["actor_role"],
+            actor_id=actor["actor_id"],
+            resource_type="fintech_credentials",
+            resource_id=target_page_id,
+            details={
+                "via": "api",
+                "changed_fields": changed,
+                "preserved_fields": preserved,
+                "cleared_fields": cleared,
+                "mask_echo_fields": mask_echoes,
+                "has_qpay": bool(values["qpay_username"] and values["qpay_password"]),
+                "ebarimt_enabled": values["ebarimt_enabled"],
+                "session_ref": actor["session_ref"],
+            },
+            ip_address=core_rate_limit.resolve_client_ip(request),
+        )
+        if audit_failure is not None:
+            return audit_failure
+
+    return {
+        "success": True,
+        "written": True,
+        "page_id": target_page_id,
+        "changed": changed,
+        "preserved": preserved,
+        "cleared": cleared,
+        "mask_echoes": mask_echoes,
+        "message": (
+            "QPay болон И-Баримт тохиргоо амжилттай хадгалагдлаа"
+            if changed
+            else "Тохиргоо хэвээр үлдлээ - ямар ч утга өөрчлөгдөөгүй."
+        ),
+    }
 
 @app.post("/api/fintech/create-invoice")
 async def create_invoice_manual_api(
@@ -2444,18 +2972,41 @@ async def create_invoice_manual_api(
         require_auth=True,
         permission="fintech:write",
     )
-    amount = int(payload.get("amount", 10000))
+    # Phase 56 (F-56-3): five body shapes reached this handler as an unhandled 500 - three through
+    # the unguarded `int(...)` above and two through a dict that travelled into a SQL parameter
+    # (see `_payload_int` and `_payload_text` for the request_ids). Phase 55 swept this class by
+    # grepping for `.strip()`, which is why an `int(payload.get(...))` in the same class survived it.
+    amount = _payload_int(payload, "amount", 10000)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Мөнгөн дүн 0-ээс их байх ёстой")
-    desc = payload.get("description", "Үйлчилгээний төлбөр")
+    desc = _payload_text(payload, "description", "Үйлчилгээний төлбөр")
     # Phase 36 (F-36-3): honour a trusted proxy's X-Forwarded-Proto so a TLS-terminated
     # deployment does not mint http:// payment callbacks and pay-page links.
     base_url = core_rate_limit.build_external_base_url(request)
+    # Phase 56 (F-56-3). `fintech_service.create_payment_order` reads `database.get_page(page_id)
+    # or {}` to pick up the page's QPay credentials, so a page that does not exist is
+    # indistinguishable from a page that has no QPay settings: the write went ahead and
+    # `invoices.page_id`'s foreign key raised. Measured live:
+    #
+    #     POST /api/fintech/create-invoice {"page_id":"p56_never_created","amount":1500}
+    #         -> HTTP 500 {"detail":"Internal server error","request_id":"d443b6c6cbc4aa47"}
+    #         -> invoices rows: 0
+    #
+    # A 404 rather than a 200 with `success:false`, because this handler returns the order dict
+    # directly and already refuses a bad amount with `HTTPException(400)` - there is no `success`
+    # key in its vocabulary to set to false. The service itself is left unchanged: its other four
+    # callers (agent.py:591, :738, :865 and cargo_service.py:45) take the page from a stored row,
+    # not from a request body, and the dashboard's consumer is fixed in the same phase (F-56-6).
+    if not database.get_page(page_id or database.DEFAULT_PAGE_ID):
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{page_id}' хуудас олдсонгүй - ямар ч нэхэмжлэх үүсгэсэнгүй.",
+        )
     order = await fintech_service.create_payment_order(
         page_id=page_id or database.DEFAULT_PAGE_ID,
         amount=amount,
         description=desc,
-        sender_id=payload.get("sender_id", "admin_manual"),
+        sender_id=_payload_text(payload, "sender_id", "admin_manual"),
         channel="manual",
         base_url=base_url
     )
@@ -2482,7 +3033,7 @@ async def scan_cargo_package_api(payload: Dict[str, Any], request: Request):
         require_auth=True,
         permission="cargo:write",
     )
-    code = payload.get("tracking_code", "").strip()
+    code = _payload_text(payload, "tracking_code")
     if not code:
         return JSONResponse(status_code=400, content={"error": "tracking_code is required"})
     loc = payload.get("location", "УБ Төв Агуулах")
@@ -2602,6 +3153,270 @@ async def send_executive_report_api(payload: Dict[str, Any], request: Request):
     )
     return res
 
+# ---------------------------------------------------------------------------
+# Phase 53 — settings forms MERGE, they do not replace (F-53-1 … F-53-9)
+# ---------------------------------------------------------------------------
+def _settings_text(value: Any) -> str:
+    """The stored form of a text field: a string, stripped, never None."""
+    return "" if value is None else str(value).strip()
+
+
+#: The closed set `appointments.status` accepts (Phase 55, F-55-8). `is_slot_available` and
+#: `get_upcoming_appointments` filter on ``status = 'CONFIRMED'``, so a value outside this set
+#: does not merely look wrong in the UI - it takes the booking out of the availability check.
+APPOINTMENT_STATUSES = ("CONFIRMED", "COMPLETED", "CANCELLED")
+
+
+def _payload_text(payload: Dict[str, Any], key: str, default: str = "") -> str:
+    """Phase 55 (F-55-7): the text form of a request field, or a 400 that names the field.
+
+    Twenty call sites across ten handlers, covering twenty request fields (plus one site whose key
+    is not a literal, so it cannot be counted by name), read a body field as
+    ``payload.get(key, "").strip()`` (counted by walking the AST, not by grepping a literal),
+    which assumes the client sent a string. Measured live, a body that sends a number or an
+    object instead crashed the request with a bare 500 and no log line (see F-55-3):
+
+        POST /api/appointments {"notes": 12345}
+            -> AttributeError: 'int' object has no attribute 'strip'
+        POST /api/pages/{id}/credentials {"password": 12345}
+            -> AttributeError, raised inside database.set_client_credentials
+        POST /api/retention/broadcast {"target_segment": {"a": 1}}
+            -> ProgrammingError: the dict reached a SQL parameter unchanged
+
+    A malformed body is the caller's error, so it is answered with 400 naming the field. A
+    number is accepted as its text form because that is what the stored column wants. An
+    object or a list is refused rather than stringified: ``str({"a": 1})`` would write Python
+    syntax into a marketing row.
+
+    Phase 56 added the two `create-invoice` sites (`description`, `sender_id`), which is where the
+    count in the first line moved from eighteen to twenty; its sibling `_payload_int` below was
+    written for the third field of the same handler.
+    """
+    value = payload.get(key, default)
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple, set)):
+        raise HTTPException(status_code=400, detail=f"{key} must be a string")
+    return str(value).strip()
+
+
+def _payload_int(payload: Dict[str, Any], key: str, default: int) -> int:
+    """Phase 56 (F-56-3): the integer form of a request field, or a 400 that names the field.
+
+    ``int(payload.get(key, default))`` assumes the client sent a number. Measured live on
+    ``POST /api/fintech/create-invoice``, three body shapes became an unhandled 500:
+
+        {"amount": "abc"}    -> ValueError  (request_id c562394d1e30f977)
+        {"amount": null}     -> TypeError   (request_id bbe3073d879e584f)
+        {"amount": {"a": 1}} -> TypeError   (request_id 27017758da8851e0)
+
+    An absent key takes the default, which is what ``payload.get`` already did. A *present* null is
+    refused rather than defaulted: this field is an amount of money, and quietly invoicing the
+    default 10000 because a client sent ``null`` is a worse answer than 400. A numeric string is
+    accepted because that is what an HTML form posts. ``bool`` is refused explicitly even though it
+    is an ``int`` subclass, so ``{"amount": true}`` cannot become a 1₮ invoice.
+    """
+    value = payload.get(key, default)
+    if isinstance(value, bool) or value is None:
+        raise HTTPException(status_code=400, detail=f"{key} must be a number")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{key} must be a number") from None
+    raise HTTPException(status_code=400, detail=f"{key} must be a number")
+
+
+def _settings_flag(value: Any) -> int:
+    """The stored form of an on/off field: 1 or 0.
+
+    The rule before Phase 53 was ``1 if payload.get(key, True) else 0``. Two defects, both
+    measured live: an ABSENT key meant "on", so a partial save that named only the report
+    time re-enabled daily reports the operator had turned off (F-53-2, and `worker.py` plus
+    the scheduler loop in this file act on that column), and the string "0" was truthy, so
+    it meant "on" too.
+    """
+    if isinstance(value, str):
+        return 0 if value.strip().lower() in ("", "0", "false", "no", "off") else 1
+    return 1 if value else 0
+
+
+def _settings_hours(value: Any) -> int:
+    """The stored form of a delay in hours: an int, falling back to the schema default."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 2
+
+
+def _settings_quota(value: Any) -> int:
+    """The stored form of a monthly token quota: a non-negative int.
+
+    Phase 54. The handler refuses a non-positive or unparseable quota BEFORE merging (it drops
+    the key so the stored quota survives, and names the field in `ignored_fields`), so this only
+    ever sees something already validated or a value read back from the row. The floor of 0
+    keeps a stored NULL from becoming a negative number.
+    """
+    try:
+        quota = int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+    return quota if quota > 0 else 0
+
+
+#: Every settings form that writes several stored columns from one JSON body. Each entry maps
+#: the payload key to ``(stored column, default when the row has none, coerce, mask_style)``.
+#: ``mask_styles`` is empty only for a non-credential, and says which mask shapes the API shows
+#: for that field, so an echo of one is recognised instead of being stored as a new secret.
+EXECUTIVE_SETTINGS_SPEC = {
+    "telegram_bot_token": ("telegram_bot_token", "", _settings_text, ("ellipsis", "bullets")),
+    "telegram_manager_chat_id": ("telegram_manager_chat_id", "", _settings_text, None),
+    "daily_report_time": ("daily_report_time", "08:30", _settings_text, None),
+    "daily_report_enabled": ("daily_report_enabled", 1, _settings_flag, None),
+}
+FINTECH_SETTINGS_SPEC = {
+    "qpay_username": ("qpay_username", "", _settings_text, None),
+    "qpay_password": ("qpay_password", "", _settings_text, ("bullets",)),
+    "qpay_invoice_code": ("qpay_invoice_code", "", _settings_text, None),
+    "ebarimt_enabled": ("ebarimt_enabled", 1, _settings_flag, None),
+}
+RETENTION_RULE_SPEC = {
+    "delay_hours": ("delay_hours", 2, _settings_hours, None),
+    "message_template": ("message_template", "", _settings_text, None),
+    "is_active": ("is_active", 1, _settings_flag, None),
+}
+#: Phase 54 (F-54-1). The per-tenant Gemini key and its quota are one form, so they merge by the
+#: same rule as the settings forms above. `mask_styles` is `("bullets",)` because
+#: `database._sanitize_page_secrets` ships `gemini_api_key_masked = mask_secret(key, 4, 4)`, and
+#: a client that echoes that mask back must not have the mask stored as its key.
+GEMINI_SETTINGS_SPEC = {
+    "gemini_api_key": ("gemini_api_key", "", _settings_text, ("bullets",)),
+    "monthly_token_limit": ("monthly_token_limit", 100000, _settings_quota, None),
+}
+#: Phase 54. One column, but it merged by the same rule as the rest: an absent key keeps the
+#: stored sheet URL instead of clearing it. No mask style - a sheet URL is not a credential.
+SHEETS_SETTINGS_SPEC = {
+    "google_sheets_url": ("google_sheets_url", "", _settings_text, None),
+}
+_MASK_BULLET = "\u2022"
+
+
+def _is_mask_echo(incoming: str, stored_value: str, mask_styles) -> bool:
+    """True when `incoming` is a mask this API showed, not a credential.
+
+    Three recognised shapes, and the first two do NOT depend on anything being stored:
+
+    * ``head...tail`` — what `GET /api/executive/settings` builds for the bot token;
+    * a value containing the bullet character — what `database.mask_secret` ships for the
+      QPay password and for `telegram_bot_token_masked` on `GET /api/pages`;
+    * an exact match against the mask of the value that IS stored, in any of the three
+      widths the API uses.
+
+    Measured, the first version of this function required a non-empty `stored_value` before
+    it looked at the incoming text, so a mask posted at a field that had just been emptied
+    was STORED AS THE CREDENTIAL: the probe page ended up holding a QPay password made of
+    bullets and a bot token of `111222...TIC`. A payment credential that is really a mask
+    fails in the most confusing way available, so the shape rules now apply to an empty
+    field as well.
+
+    The consequence, stated rather than hidden: a credential whose real value contains the
+    bullet character cannot be stored through these forms, because it cannot be told apart
+    from a mask. The bullet is this API's own mask character and no QPay password or Telegram
+    bot token uses it; the response names the field in `mask_echoes`, so a caller can see the
+    value was not stored instead of wondering why.
+    """
+    if not mask_styles or not incoming:
+        return False
+    if "ellipsis" in mask_styles and "..." in incoming:
+        return True
+    if "bullets" in mask_styles and _MASK_BULLET in incoming:
+        return True
+    if not stored_value:
+        return False
+    return any(
+        incoming == database.mask_secret(stored_value, head, tail)
+        for head, tail in ((6, 4), (4, 4), (2, 2))
+    )
+
+
+def _merged_settings(payload: Dict[str, Any], stored: Dict[str, Any], spec: Dict[str, tuple]):
+    """Merge one settings form over what is already stored.
+
+    Returns ``(values, changed, preserved, cleared, mask_echoes)``. ``values`` holds what to
+    store; every list holds **field names only**, so a response or an audit row built from
+    them can say what moved without carrying a credential. `mask_echoes` names the fields
+    where the caller posted a mask and the stored value was kept instead.
+
+    The rule, which is the whole fix:
+
+    * a key the payload does not NAME keeps the value already stored — `preserved`;
+    * a key named with an empty value is an EXPLICIT clear — that is the documented way to
+      unregister a report recipient (O-51-5) and the live checks depend on it, so it stays;
+    * a key named with the mask the API showed is treated as unchanged, not stored.
+
+    Before this, all three handlers read ``payload.get(key, "")`` and handed the result
+    straight to an UPDATE, so a body that named one field stored empty strings over every
+    other field. Measured live on a disposable page: `POST /api/executive/settings
+    {"daily_report_time": "09:15"}` destroyed the stored bot token AND the recipient
+    (F-53-1), and `POST /api/fintech/settings {"ebarimt_enabled": 1}` destroyed the QPay
+    merchant username, password and invoice code (F-53-5). This is the same defect class B4
+    fixed for `POST /api/update-keys`, which destroyed 35 keys the same way.
+    """
+    values: Dict[str, Any] = {}
+    changed, preserved, cleared = [], [], []
+    mask_echoes = []
+    for key, (stored_key, default, coerce, mask_styles) in spec.items():
+        raw_stored = stored.get(stored_key)
+        stored_value = coerce(default if raw_stored is None else raw_stored)
+        if key not in payload:
+            values[key] = stored_value
+            preserved.append(key)
+            continue
+        incoming = coerce(payload.get(key))
+        if _is_mask_echo(str(incoming), str(stored_value), mask_styles):
+            values[key] = stored_value
+            preserved.append(key)
+            mask_echoes.append(key)
+            continue
+        values[key] = incoming
+        if incoming == stored_value:
+            preserved.append(key)
+        else:
+            changed.append(key)
+            if isinstance(incoming, str) and not incoming and stored_value not in ("", 0):
+                # a stored value was removed. An on/off field is 1 or 0, not "cleared".
+                cleared.append(key)
+    return (
+        values,
+        sorted(set(changed)),
+        sorted(set(preserved)),
+        sorted(set(cleared)),
+        sorted(set(mask_echoes)),
+    )
+
+
+async def _settings_actor(request: Request) -> Dict[str, str]:
+    """Who is acting, in a form that carries no credential.
+
+    `enforce_tenant_scope` resolves the user and returns only the page id, so this resolves
+    it once more: one extra indexed `sessions` lookup per settings save, on endpoints an
+    operator clicks a few times a day. The session token is a bearer credential, so it is
+    recorded only as a 12-hex-character SHA-256 prefix — enough for an auditor to tie
+    several rows to one login, not enough to replay it.
+    """
+    user = await core_security.resolve_current_user(request) or {}
+    token = str(user.get("session_token") or "")
+    return {
+        "actor_role": str(user.get("role") or "unknown"),
+        "actor_id": str(user.get("page_id") or ""),
+        "session_ref": hashlib.sha256(token.encode("utf-8")).hexdigest()[:12] if token else "",
+    }
+
+
 @app.get("/api/executive/settings")
 async def get_executive_settings_api(request: Request, page_id: Optional[str] = Query(None)):
     """Telegram бот болон өглөөний тайлангийн тохиргоог авах"""
@@ -2631,23 +3446,104 @@ async def update_executive_settings_api(payload: Dict[str, Any], request: Reques
         require_auth=True,
         permission="executive:write",
     )
-    bot_token = payload.get("telegram_bot_token", "")
-    manager_chat_id = payload.get("telegram_manager_chat_id", "")
-    daily_report_time = payload.get("daily_report_time", "08:30")
-    daily_report_enabled = 1 if payload.get("daily_report_enabled", True) else 0
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    stored = database.get_page(target_page_id) or {}
 
-    if bot_token and "..." in bot_token:
-        page = database.get_page(pid or database.DEFAULT_PAGE_ID) or {}
-        bot_token = page.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-    database.update_page_telegram_settings(
-        page_id=pid or database.DEFAULT_PAGE_ID,
-        bot_token=bot_token,
-        manager_chat_id=manager_chat_id,
-        report_time=daily_report_time,
-        report_enabled=daily_report_enabled
+    # Phase 53 (F-53-1, F-53-2): merge over what is stored instead of replacing it.
+    values, changed, preserved, cleared, mask_echoes = _merged_settings(
+        payload, stored, EXECUTIVE_SETTINGS_SPEC
     )
-    return {"success": True, "message": "Telegram болон өглөөний тайлангийн тохиргоо амжилттай хадгалагдлаа"}
+
+    wrote = database.update_page_telegram_settings(
+        page_id=target_page_id,
+        bot_token=values["telegram_bot_token"],
+        manager_chat_id=values["telegram_manager_chat_id"],
+        report_time=values["daily_report_time"],
+        report_enabled=values["daily_report_enabled"],
+    )
+    if not wrote:
+        # F-53-4: no row matched, so nothing was stored. This handler used to answer
+        # success:true here - measured against a page that was never created, it wrote 0
+        # rows and reported "амжилттай хадгалагдлаа". The status stays 200 because the
+        # dashboard branches on `data.success`, and the message now says what happened.
+        return {
+            "success": False,
+            "written": False,
+            "page_id": target_page_id,
+            "changed": [],
+            "preserved": preserved,
+            "cleared": [],
+            "mask_echoes": mask_echoes,
+            "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч тохиргоо хадгалагдсангүй.",
+        }
+
+    # Phase 53 (F-53-3): this is the path that changes WHO receives the daily executive
+    # report with `executive:write`, and it wrote no audit row at all - measured, four
+    # recipient changes left the audit table at 78 rows. O-51-4 (Phase 52) audited the
+    # `/start` path in `executive_bot_service`; the same state change reached through the
+    # API was still invisible, so an auditor querying `executive.recipient.%` saw only the
+    # unauthenticated path. The action names come from that same vocabulary, so one query
+    # now covers both. A save that changes nothing writes nothing: unlike an unauthenticated
+    # `/start`, where "the same identity asked again" is itself evidence, a repeated form
+    # save is not an event.
+    previous_manager = _settings_text(stored.get("telegram_manager_chat_id"))
+    new_manager = values["telegram_manager_chat_id"]
+    if previous_manager != new_manager:
+        if not previous_manager:
+            action = "executive.recipient.registered"
+        elif not new_manager:
+            action = "executive.recipient.cleared"
+        else:
+            action = "executive.recipient.transferred"
+    elif changed:
+        action = "executive.settings.updated"
+    else:
+        action = None
+
+    if action:
+        actor = await _settings_actor(request)
+        audit_failure = _audit_or_report(
+            action,
+            operation="executive settings update",
+            page_id=target_page_id,
+            actor_role=actor["actor_role"],
+            actor_id=actor["actor_id"],
+            resource_type="executive_recipient",
+            resource_id=target_page_id,
+            details={
+                "via": "api",
+                "chat_id": new_manager,
+                "previous_chat_id": previous_manager,
+                "changed_fields": changed,
+                "preserved_fields": preserved,
+                "cleared_fields": cleared,
+                "mask_echo_fields": mask_echoes,
+                # the bot token is named as a fact, never as a value or a mask
+                "bot_token_changed": "telegram_bot_token" in changed,
+                "bot_token_cleared": "telegram_bot_token" in cleared,
+                "has_bot_token": bool(values["telegram_bot_token"]),
+                "daily_report_enabled": values["daily_report_enabled"],
+                "session_ref": actor["session_ref"],
+            },
+            ip_address=core_rate_limit.resolve_client_ip(request),
+        )
+        if audit_failure is not None:
+            return audit_failure
+
+    return {
+        "success": True,
+        "written": True,
+        "page_id": target_page_id,
+        "changed": changed,
+        "preserved": preserved,
+        "cleared": cleared,
+        "mask_echoes": mask_echoes,
+        "message": (
+            "Telegram болон өглөөний тайлангийн тохиргоо амжилттай хадгалагдлаа"
+            if changed
+            else "Тохиргоо хэвээр үлдлээ - ямар ч утга өөрчлөгдөөгүй."
+        ),
+    }
 
 # -------------------------------------------------------------
 # 12. АВТОМАТ МАРКЕТИНГ & ХАРИЛЦАГЧИЙГ СЭРГЭЭХ API (RETENTION & BROADCAST)
@@ -2673,22 +3569,67 @@ async def update_retention_rule_api(payload: Dict[str, Any], request: Request):
         require_auth=True,
         permission="retention:write",
     )
-    rule_type = payload.get("rule_type")
-    delay_hours = payload.get("delay_hours", 2)
-    message_template = payload.get("message_template", "")
-    is_active = payload.get("is_active", True)
-    
-    if not rule_type or not message_template:
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    rule_type = _settings_text(payload.get("rule_type"))
+    if not rule_type:
         raise HTTPException(status_code=400, detail="rule_type and message_template are required")
-        
-    database.update_automated_rule(
-        page_id=pid or database.DEFAULT_PAGE_ID,
-        rule_type=rule_type,
-        delay_hours=int(delay_hours),
-        message_template=message_template,
-        is_active=bool(is_active)
+
+    # Phase 55 (F-55-2). `automated_rules.page_id` carries a foreign key to `pages`, so a body
+    # naming a page that does not exist raised `IntegrityError: FOREIGN KEY constraint failed`
+    # out of `update_automated_rule` and the caller saw a bare 500 "Internal server error".
+    # Measured live, before the fix:
+    #   POST /api/retention/rules {"page_id": "p55_never_exists", ...} -> HTTP 500, 0 rows
+    # and, because that function had no try/finally, the connection leaked while holding a write
+    # lock (F-55-1) - which is what turned an unrelated DELETE into a 500 in the same session.
+    # `enforce_tenant_scope` hands back the requested page id for an admin without an existence
+    # check, so the page is verified here instead, and the answer tells the truth either way.
+    if not database.get_page(target_page_id):
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "page_id": target_page_id,
+                "rule_type": rule_type,
+                "changed": [],
+                "preserved": [],
+                "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч дүрэм хадгалагдсангүй.",
+            }
+        )
+
+    # Phase 53 (F-53-9): `payload.get("delay_hours", 2)` and `payload.get("is_active", True)`
+    # were written straight into an upsert, so a body naming only the message reset the delay
+    # to 2 hours and re-activated a rule the operator had switched off - which then messages
+    # customers on its own schedule. `rule_type` stays required because it is half of the
+    # upsert key; the other columns merge over the stored row.
+    stored_rows = {
+        str(row.get("rule_type")): row
+        for row in database.get_automated_rules(target_page_id)
+    }
+    values, changed, preserved, _cleared, _mask_echoes = _merged_settings(
+        payload, stored_rows.get(rule_type, {}), RETENTION_RULE_SPEC
     )
-    return {"success": True, "message": "Дүрэм амжилттай хадгалагдлаа"}
+    if not values["message_template"]:
+        raise HTTPException(status_code=400, detail="rule_type and message_template are required")
+
+    database.update_automated_rule(
+        page_id=target_page_id,
+        rule_type=rule_type,
+        delay_hours=values["delay_hours"],
+        message_template=values["message_template"],
+        is_active=bool(values["is_active"]),
+    )
+    # Deliberately not audited. A retention rule is marketing content, not an authorisation
+    # fact or a credential, and this codebase audits the first two; adding a row per rule
+    # edit would bury the recipient and payment rows that matter. Recorded here so the
+    # omission is a decision, not an oversight.
+    return {
+        "success": True,
+        "page_id": target_page_id,
+        "rule_type": rule_type,
+        "changed": changed,
+        "preserved": preserved,
+        "message": "Дүрэм амжилттай хадгалагдлаа",
+    }
 
 @app.post("/api/retention/broadcast")
 async def send_broadcast_api(payload: Dict[str, Any], request: Request):
@@ -2699,16 +3640,38 @@ async def send_broadcast_api(payload: Dict[str, Any], request: Request):
         require_auth=True,
         permission="retention:write",
     )
-    title = payload.get("title", "").strip()
-    message = payload.get("message", "").strip()
-    target_segment = payload.get("target_segment", "all")
-    channel = payload.get("channel", "all")
+    title = _payload_text(payload, "title")
+    message = _payload_text(payload, "message")
+    # Phase 55 (F-55-7): both are declared `str` and go straight into
+    # `INSERT INTO marketing_campaigns (... target_segment, channel ...)`, so an object here
+    # reached a SQL parameter and raised ProgrammingError. `or "all"` keeps an explicit null
+    # meaning "the default segment", which is what it meant before.
+    target_segment = _payload_text(payload, "target_segment", "all") or "all"
+    channel = _payload_text(payload, "channel", "all") or "all"
     
     if not title or not message:
         raise HTTPException(status_code=400, detail="Гарчиг болон зурвасын эх бичвэр шаардлагатай")
         
+    # Phase 55 (F-55-6). Same foreign key, one layer deeper: send_broadcast_api ->
+    # retention_service.send_broadcast -> database.create_marketing_campaign, whose INSERT into
+    # `marketing_campaigns.page_id` raised `IntegrityError` for a page that does not exist.
+    # Measured live, before the fix:
+    #   POST /api/retention/broadcast {"page_id": "p55_never_f", ...} -> HTTP 500
+    # HTTP 200 with success:false because the dashboard alerts `data.message` on that branch.
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    if not database.get_page(target_page_id):
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "sent": 0,
+                "page_id": target_page_id,
+                "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч кампэйн үүсгэсэнгүй.",
+            }
+        )
+
     res = await retention_service.send_broadcast(
-        page_id=pid or database.DEFAULT_PAGE_ID,
+        page_id=target_page_id,
         title=title,
         message=message,
         target_segment=target_segment,
@@ -2792,18 +3755,37 @@ async def create_appointment_manual_api(payload: Dict[str, Any], request: Reques
         require_auth=True,
         permission="appointments:write",
     )
-    name = payload.get("customer_name", "").strip()
-    phone = payload.get("customer_phone", "").strip()
-    service = payload.get("service_name", "").strip()
-    date_val = payload.get("appointment_date", "").strip()
-    time_val = payload.get("appointment_time", "").strip()
-    notes = payload.get("notes", "").strip()
+    name = _payload_text(payload, "customer_name")
+    phone = _payload_text(payload, "customer_phone")
+    service = _payload_text(payload, "service_name")
+    date_val = _payload_text(payload, "appointment_date")
+    time_val = _payload_text(payload, "appointment_time")
+    notes = _payload_text(payload, "notes")
 
     if not name or not phone or not date_val or not time_val:
         raise HTTPException(status_code=400, detail="Нэр, утас, огноо, цаг заавал шаардлагатай")
 
+    # Phase 55 (F-55-6). `appointments.page_id` carries a foreign key to `pages`, and nothing
+    # here checked the page existed, so `create_appointment` raised
+    # `sqlite3.IntegrityError: FOREIGN KEY constraint failed` and the operator saw a bare 500.
+    # Measured live, before the fix:
+    #   POST /api/appointments {"page_id": "p55_never_f", ...} -> HTTP 500 "Internal server error"
+    # The dashboard branches on `json.success` and alerts `json.message`, so this answers with
+    # HTTP 200 and success:false carrying the reason; an HTTPException would deliver `detail`
+    # instead and the dashboard would alert its slot-conflict fallback - the wrong diagnosis.
+    target_page_id = str(pid or database.DEFAULT_PAGE_ID)
+    if not database.get_page(target_page_id):
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "page_id": target_page_id,
+                "message": f"'{target_page_id}' хуудас олдсонгүй - ямар ч цаг захиалга хадгалагдсангүй.",
+            }
+        )
+
     appt = database.create_appointment(
-        page_id=pid or database.DEFAULT_PAGE_ID,
+        page_id=target_page_id,
         customer_name=name,
         customer_phone=phone,
         service_name=service or "Үйлчилгээ",
@@ -2824,9 +3806,40 @@ async def update_appointment_status_api(appointment_id: int, payload: Dict[str, 
     if not appt:
         raise HTTPException(status_code=404, detail="Appointment not found")
     core_security.verify_resource_tenant_ownership(user, appt.get("page_id"), require_auth=True)
-    new_status = payload.get("status", "CONFIRMED")
+    # Phase 55 (F-55-8). `status` was written through unchecked, and the column is a closed set:
+    # `database.is_slot_available` and `get_upcoming_appointments` both filter on
+    # `status = 'CONFIRMED'`, and the dashboard renders exactly these three. Measured live,
+    # before the fix:
+    #   POST /api/appointments/1/status {"status": {"a": 1}} -> HTTP 500 (ProgrammingError: the
+    #       dict reached the SQL parameter)
+    #   POST /api/appointments/1/status {"status": 12345}    -> HTTP 200, and the row then held
+    #       status '12345' - which no longer matches `status = 'CONFIRMED'`, so the slot the
+    #       customer had booked silently became bookable again for somebody else.
+    # HTTP 400 carries success:false and message because the dashboard reads `json.message` on
+    # its failure branch whatever the status code is.
+    # Checked inline rather than through `_payload_text` so that BOTH refusals - a value of the
+    # wrong type and a value outside the enum - carry the same `{success, written, message}`
+    # body. The dashboard alerts `json.message` on this branch, and `_payload_text` answers with
+    # `{"detail": ...}`, which would have made the operator see the generic fallback for one bad
+    # input and the real reason for another.
+    raw_status = payload.get("status", "CONFIRMED")
+    new_status = "" if raw_status is None or isinstance(raw_status, (dict, list, tuple, set)) \
+        else str(raw_status).strip()
+    if not new_status:
+        new_status = "CONFIRMED" if raw_status is None else ""
+    if new_status not in APPOINTMENT_STATUSES:
+        return JSONResponse(
+            {
+                "success": False,
+                "written": False,
+                "status": None,
+                "message": f"Цаг захиалгын төлөв нь {'/'.join(APPOINTMENT_STATUSES)}-ын нэг байх ёстой "
+                           f"(ирсэн утга: {raw_status!r}).",
+            },
+            status_code=400,
+        )
     success = database.update_appointment_status(appointment_id, new_status)
-    return {"success": success, "status": new_status}
+    return {"success": success, "written": bool(success), "status": new_status}
 
 @app.get("/api/appointments/summary")
 async def get_appointments_summary_api(request: Request, page_id: Optional[str] = Query(None)):

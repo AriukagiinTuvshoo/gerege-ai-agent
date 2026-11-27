@@ -59,7 +59,14 @@ class PageModel(Base):
     name = Column(String(255), nullable=False)
     category = Column(String(64), default="general")
     page_access_token = Column(Text, default="")
-    verify_token = Column(String(255), default="agent_verify_secret_token_123")
+    # B1 (Phase 52): the default used to be the string `agent_verify_secret_token_123`,
+    # which is printed in this repository. A column default is not documentation - it is a
+    # value the schema hands to every row that does not supply one, so any deployment built
+    # from these models started life with a webhook token that a reader of the public
+    # repository already knew. Empty is the only default that cannot be a secret somebody
+    # else also has: `core.security.meta_verify_token_is_usable("")` is False in every
+    # environment, so an unset token fails closed instead of failing open with a known value.
+    verify_token = Column(String(255), default="")
     gemini_api_key = Column(Text, default="")
     ai_provider = Column(String(64), default="gemini")
     client_username = Column(String(128), nullable=True)

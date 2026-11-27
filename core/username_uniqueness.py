@@ -55,6 +55,7 @@ tenants keeps a username is a business decision about a customer relationship, a
 not one a migration is allowed to make. The operator procedure for resolving a genuine
 collision is in `docs/operations/USERNAME_UNIQUENESS_MIGRATION.md`.
 """
+import sqlite3
 from typing import Any, Dict, List, Optional
 
 #: The index that enforces the invariant. Referenced by the migration, the CI gate and the
@@ -256,7 +257,21 @@ def _dialect_of(conn) -> str:
     if name:
         return str(name)
 
-    # Application DB-API connections.
+    # Application DB-API connections. The type hierarchy is asked first, because it is the
+    # only check that cannot be fooled by where a class happens to be defined.
+    #
+    # Phase 55 (F-55-9): `core.db_engine.RollbackOnCloseConnection` subclasses
+    # `sqlite3.Connection`, so `type(conn).__module__` is "core.db_engine" and contains no
+    # "sqlite". The `core.db_engine` fallback below was not reached either, because it sits
+    # inside `if inner is not None:` and a sqlite3 subclass has no `_conn` attribute. The
+    # answer was therefore "unknown", `_INDEX_DEFINITION_QUERIES` has no "unknown" entry, and
+    # `describe_index` returned None - so `legacy_duplicates_allowed()` reported that it had
+    # failed to restore `uq_pages_client_username_norm` after a CREATE UNIQUE INDEX that had
+    # succeeded. Measured: 2 failed + 4 errors across `test_e02_phase41_hardening.py` and
+    # `test_e02_phase42_admission_ownership.py`, on both dialects, because both run these
+    # cases against SQLite.
+    if isinstance(conn, sqlite3.Connection):
+        return "sqlite"
     module = (type(conn).__module__ or "").lower()
     if "sqlite" in module:
         return "sqlite"

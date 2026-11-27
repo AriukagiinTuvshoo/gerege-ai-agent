@@ -76,6 +76,11 @@ PUBLISHED_OR_PLACEHOLDER_VALUES = frozenset(
         # The admin password default in database.py (already guarded separately, listed so
         # there is one authoritative list).
         "admin2026",
+        # The `VERIFY_TOKEN` default in executive_bot_service.py: the Telegram
+        # `/start <secret>` owner secret (F-51-5). Guarded at the point of use by
+        # `core.security.owner_command_secret_is_usable`, listed here so this stays the one
+        # authoritative list of values this repository publishes.
+        "gerege_verify_2026",
         # Generic residues.
         "changeme",
         "change_me",
@@ -157,6 +162,13 @@ SECRETS_ENFORCED_ELSEWHERE: Dict[str, str] = {
 #: suite to set it globally, which switched on signature enforcement for every webhook test
 #: and turned `test_meta_webhook_image_url_cannot_reach_loopback` from a skip into a 403.
 #: The pair is now consistent: handshake configured => signature key required.
+#: `VERIFY_TOKEN` (the Telegram owner-command secret, F-51-5) is deliberately NOT required
+#: here, conditionally or otherwise. After the fix an unset value is the *safe* one: no secret
+#: can re-register the report recipient, so a deployment that never sets it has a strictly
+#: smaller attack surface than one that does. Forcing operators to invent a secret they do not
+#: need is the mistake this file already documents for `META_APP_SECRET` — it was measured to
+#: turn unrelated suites into failures while removing no risk. The enforcement lives at the
+#: point of use, in `core.security.owner_command_secret_is_usable`.
 CONDITIONAL_SECRETS: Dict[str, str] = {
     "META_APP_SECRET": "META_VERIFY_TOKEN",
     "TELEGRAM_WEBHOOK_SECRET": "TELEGRAM_BOT_TOKEN",

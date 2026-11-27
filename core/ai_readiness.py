@@ -182,6 +182,19 @@ def redacted(exc: Any) -> str:
 def classify_error(exc: Any) -> str:
     """Map an exception to one of :data:`ERROR_CLASSES`. Never raises."""
     try:
+        # O-51-2 (Phase 52). An exception that already knows its class says so, and that is
+        # better evidence than any needle. `core.ai_router` classifies each failure as it
+        # happens and attaches the result to the error it raises when the circuit breaker
+        # refuses a later call, which otherwise carries no cause of its own and classified as
+        # `other` - measured on this instance, where egress to Google is closed, so
+        # `gemini_error_class` reported "unclassified" for a condition that had a known,
+        # operator-actionable cause. Validated against ERROR_CLASSES, so a stray or invented
+        # attribute cannot add to the vocabulary: the pinned tuple stays the only source of
+        # class names, and `tests/test_e50_ai_readiness_truth.py` pins it by exact equality.
+        declared = getattr(exc, "gerege_error_class", None)
+        if isinstance(declared, str) and declared in ERROR_CLASSES:
+            return declared
+
         status = _status_code(exc)
         if status is not None:
             by_status = _class_for_status(status)

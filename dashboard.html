@@ -1896,7 +1896,13 @@
         <div class="space-y-4 text-xs">
           <div>
             <label class="text-stone-400 block mb-1 font-semibold">Facebook Page Access Token:</label>
-            <input id="settings-meta-token" type="password" placeholder="EAAQP..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono">
+              <input id="settings-meta-token" type="password" placeholder="EAAQP..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono">
+            <!-- B6 (Phase 52): the box above used to be filled from `p.page_access_token`,
+                 a field the API deliberately removes (Phase 49, F-49-2), so it rendered empty
+                 for every page — including the ones with a token stored. This note is where
+                 the truth now lives: whether a token exists, and what leaving the box empty
+                 does. Filled by updatePageUI(). -->
+            <p id="settings-meta-token-note" class="mt-1.5 text-[11px] leading-relaxed text-stone-400"></p>
           </div>
 
           <div class="p-4 rounded-xl bg-stone-50 border border-stone-200 space-y-3 text-xs">
@@ -2426,6 +2432,16 @@
         <div>
           <label class="block font-semibold text-stone-700 mb-1">QPay Нууц үг (Password)</label>
           <input type="password" id="setting-qpay-password" placeholder="••••••••••••" class="w-full px-3.5 py-2 rounded-xl border border-stone-200 text-stone-900 font-mono focus:outline-none focus:border-emerald-500">
+          <!-- F-53-7 (Phase 53): the box above used to be filled from `currentPage.qpay_password`,
+               a key `_sanitize_page_secrets()` pops from every page dict before it leaves the API.
+               So the box was blank even when a password was stored, and saving posted that blank
+               and destroyed the credential while the username survived. The mask is a placeholder
+               now, never a value, and removing a password takes an explicit tick. -->
+          <p id="settings-qpay-password-note" class="text-[10px] text-stone-400 mt-1"></p>
+          <label class="flex items-center gap-2 cursor-pointer select-none mt-1.5">
+            <input type="checkbox" id="setting-qpay-clear" class="rounded text-rose-600 focus:ring-rose-500 w-3.5 h-3.5">
+            <span class="text-[10px] text-stone-500 font-semibold">Хадгалагдсан QPay нууц үгийг устгах</span>
+          </label>
         </div>
 
         <div>
@@ -2510,6 +2526,14 @@
         <div>
           <label class="block font-semibold text-stone-700 mb-1">Telegram Bot Token (@BotFather)</label>
           <input type="password" id="input-exec-bot-token" placeholder="Жишээ: 7123456789:AAH..." class="w-full bg-[#FAF8F5] border border-stone-200/80 rounded-xl p-2.5 text-stone-900 font-mono focus:outline-none focus:border-indigo-500">
+          <!-- F-53-8 (Phase 53): the mask below is a placeholder, so an untouched form posts no
+               `telegram_bot_token` at all and the API keeps what is stored. Before this, the form
+               posted '' and the API stored it - one save from an untouched modal killed the bot. -->
+          <p id="settings-exec-bot-token-note" class="text-[10px] text-stone-400 mt-1"></p>
+          <label class="flex items-center gap-2 cursor-pointer select-none mt-1.5">
+            <input type="checkbox" id="input-exec-bot-token-clear" class="rounded text-rose-600 focus:ring-rose-500 w-3.5 h-3.5">
+            <span class="text-[10px] text-stone-500 font-semibold">Хадгалагдсан Bot Token-г устгах</span>
+          </label>
           <p class="text-[10px] text-stone-400 mt-1">@BotFather-аас шинэ бот үүсгэж авсан API Token.</p>
         </div>
 
@@ -3010,8 +3034,39 @@
       document.getElementById('kb-page-subtitle').innerText = `${p.name} өртөөний цадиг түүх, судар`;
       renderIndustryWorkspace(p);
 
-      // Token display
-      document.getElementById('settings-meta-token').value = p.page_access_token || '';
+        // Token display.
+      //
+      // B6 (Phase 52). This line used to read
+      //
+      //     document.getElementById('settings-meta-token').value = p.page_access_token || '';
+      //
+      // `p.page_access_token` does not exist. `database._sanitize_page_secrets()` pops the real
+      // value out of every page dict before it leaves the API (Phase 49, F-49-2) and ships
+      // `page_access_token_masked` plus `has_page_token` in its place, so the field was blank
+      // for every page — including the ones that DO have a token stored. An empty password box
+      // reads as "no token configured", which is a statement about the system that the client
+      // was not in a position to make, and it was wrong for every configured tenant.
+      //
+      // The masked value goes into `placeholder`, never into `value`. A placeholder is not
+      // submitted, so `saveCurrentPageSettings()` still posts an empty string and `save_page`'s
+      // `COALESCE(NULLIF(excluded.page_access_token,''), pages.page_access_token)` preserves the
+      // stored token. Putting the masked text into `value` would post it back; `save_page`
+      // clears a `•`/`****` echo to "" instead of storing it, but relying on that guard to undo
+      // a mistake the UI should never make is not a design.
+      const metaTokenElem = document.getElementById('settings-meta-token');
+      if (metaTokenElem) {
+        metaTokenElem.value = '';
+        const masked = (p.page_access_token_masked || '').trim();
+        metaTokenElem.placeholder = (p.has_page_token && masked) ? masked : 'EAAQP...';
+      }
+      const metaTokenNote = document.getElementById('settings-meta-token-note');
+      if (metaTokenNote) {
+        metaTokenNote.innerText = p.has_page_token
+          ? 'Token хадгалагдсан (' + (p.page_access_token_masked || '') + '). API жинхэнэ утгыг '
+            + 'буцаадаггүй тул энэ хайрцгийг хоосон орхивол хадгалагдсан token хэвээр үлдэнэ; '
+            + 'шинэ утга бичиж хадгалвал солигдоно.'
+          : 'Token хадгалагдаагүй. Facebook Page Access Token-оо энд оруулна уу.';
+      }
 
       // Webhook Callback URL display dynamically
       const webhookElem = document.getElementById('settings-webhook-callback-url');
@@ -3233,6 +3288,16 @@
           })
         });
         const inv = await res.json();
+        // Phase 56 (F-56-6). The response was parsed and then ignored: the success toast below
+        // fired for a 404 (no such page), a 400 (the amount was not a number) and a 500 alike, and
+        // `inv.pay_url` was undefined in all three - so the operator was told an invoice had been
+        // created, and no payment window opened. This is the money path, so the refusal is an
+        // alert rather than a toast, and it reads whichever key the server used: `detail` for this
+        // endpoint's HTTPExceptions, `error`/`message` for a JSON body.
+        if (!res.ok || inv.success === false) {
+          alert(inv.detail || inv.error || inv.message || 'Нэхэмжлэх үүсгэсэнгүй.');
+          return;
+        }
         closeCreateInvoiceModal();
         showToast('QPay нэхэмжлэх амжилттай үүслээ!');
         loadFintechData();
@@ -3250,7 +3315,21 @@
     function openQPaySettingsModal() {
       const currentPage = allPages.find(p => p.page_id === activePageId) || {};
       document.getElementById('setting-qpay-username').value = currentPage.qpay_username || '';
-      document.getElementById('setting-qpay-password').value = currentPage.qpay_password || '';
+      // F-53-7 (Phase 53): `currentPage.qpay_password` does not exist - `_sanitize_page_secrets()`
+      // pops the real password and ships `qpay_password_masked` in its place, so this line put ''
+      // in the box for every page that HAD a password, and `saveQPaySettings()` then posted that
+      // empty value and destroyed the stored credential. Measured live: after one save that
+      // changed nothing, `qpay_username` was still 'p53_merchant' and `qpay_password` was '' - a
+      // half-broken payment config the form could not show. The mask goes in the placeholder,
+      // which is never posted, and removing a password is now an explicit tick.
+      const qpayMasked = (currentPage.qpay_password_masked || '').trim();
+      const qpayPasswordBox = document.getElementById('setting-qpay-password');
+      qpayPasswordBox.value = '';
+      qpayPasswordBox.placeholder = qpayMasked || '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022';
+      document.getElementById('setting-qpay-clear').checked = false;
+      document.getElementById('settings-qpay-password-note').textContent = qpayMasked
+        ? 'Нууц үг хадгалагдсан (' + qpayMasked + '). Хоосон орхивол хэвээр үлдэнэ; солих бол шинийг бичнэ үү.'
+        : 'QPay нууц үг хадгалаагүй байна. API жинхэнэ утгыг хэзээ ч буцаадаггүй.';
       document.getElementById('setting-qpay-code').value = currentPage.qpay_invoice_code || '';
       document.getElementById('setting-ebarimt-enabled').checked = (currentPage.ebarimt_enabled !== 0);
       document.getElementById('qpay-settings-modal').classList.remove('hidden');
@@ -3264,6 +3343,12 @@
       const p = document.getElementById('setting-qpay-password').value.trim();
       const c = document.getElementById('setting-qpay-code').value.trim();
       const eb = document.getElementById('setting-ebarimt-enabled').checked ? 1 : 0;
+      // F-53-7: an empty box means "leave the stored password alone", so the key is omitted and
+      // the API merges. Only the explicit tick posts an empty string, which is the one form of
+      // this field the API treats as a clear.
+      const qpayPasswordField = document.getElementById('setting-qpay-clear').checked
+        ? { qpay_password: '' }
+        : (p ? { qpay_password: p } : {});
       const btn = document.getElementById('btn-save-qpay-settings');
 
       btn.disabled = true;
@@ -3273,13 +3358,12 @@
         const res = await fetch('/api/fintech/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+          body: JSON.stringify(Object.assign({
             page_id: activePageId,
             qpay_username: u,
-            qpay_password: p,
             qpay_invoice_code: c,
             ebarimt_enabled: eb
-          })
+          }, qpayPasswordField))
         });
         const data = await res.json();
         if (data.success) {
@@ -3465,9 +3549,17 @@
           document.getElementById('input-exec-chat-id').value = cfg.telegram_manager_chat_id || '';
           document.getElementById('input-exec-report-time').value = cfg.daily_report_time || '08:30';
           document.getElementById('select-exec-enabled').value = cfg.daily_report_enabled ? '1' : '0';
-          if (cfg.has_bot_token) {
-            document.getElementById('input-exec-bot-token').placeholder = cfg.telegram_bot_token_masked;
-          }
+          // F-53-8 (Phase 53): the value is cleared and the mask is a placeholder, so saving an
+          // untouched form posts no `telegram_bot_token` and the API keeps what is stored.
+          const execTokenBox = document.getElementById('input-exec-bot-token');
+          execTokenBox.value = '';
+          execTokenBox.placeholder = cfg.has_bot_token && cfg.telegram_bot_token_masked
+            ? cfg.telegram_bot_token_masked
+            : 'Жишээ: 7123456789:AAH...';
+          document.getElementById('input-exec-bot-token-clear').checked = false;
+          document.getElementById('settings-exec-bot-token-note').textContent = cfg.has_bot_token
+            ? 'Bot Token хадгалагдсан (' + (cfg.telegram_bot_token_masked || '') + '). Хоосон орхивол хэвээр үлдэнэ; солих бол шинийг бичнэ үү.'
+            : 'Bot Token хадгалаагүй байна. @BotFather-аас авсан API Token-г энд бичнэ үү.';
         }
 
         // 2. Report Preview
@@ -3562,6 +3654,12 @@
       const chatId = document.getElementById('input-exec-chat-id').value.trim();
       const reportTime = document.getElementById('input-exec-report-time').value.trim() || '08:30';
       const enabled = document.getElementById('select-exec-enabled').value === '1';
+      // F-53-8: the token box is empty whenever the operator did not retype the token, because the
+      // mask lives in the placeholder. Posting that empty value destroyed the stored token, so the
+      // key is omitted instead and only the explicit tick clears it.
+      const botTokenField = document.getElementById('input-exec-bot-token-clear').checked
+        ? { telegram_bot_token: '' }
+        : (botToken ? { telegram_bot_token: botToken } : {});
 
       const btn = document.getElementById('btn-save-exec-settings');
       btn.disabled = true;
@@ -3571,12 +3669,11 @@
         const res = await fetch('/api/executive/settings', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            telegram_bot_token: botToken,
+          body: JSON.stringify(Object.assign({
             telegram_manager_chat_id: chatId,
             daily_report_time: reportTime,
             daily_report_enabled: enabled
-          })
+          }, botTokenField))
         });
         const data = await res.json();
         if (data.success) {
@@ -3696,8 +3793,16 @@
 
     async function handleDeleteCurrentPage() {
       if (!confirm('Энэ хуудсыг системээс хасахдаа итгэлтэй байна уу?')) return;
-      await fetch('/api/pages/' + encodeURIComponent(activePageId), { method: 'DELETE' });
-      showToast('Хуудас устгагдлаа.');
+      // Phase 55 (F-55-5). The response was discarded and the toast claimed success
+      // unconditionally, so deleting a page that was already gone still said "устгагдлаа".
+      // The endpoint now answers status:"not_found" for exactly that case; read it.
+      const res = await fetch('/api/pages/' + encodeURIComponent(activePageId), { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.status !== 'deleted') {
+        showToast(data.message || data.error || 'Хуудас устгагдсангүй.');
+      } else {
+        showToast('Хуудас устгагдлаа.');
+      }
       activePageId = '100799479495809';
       await loadPages();
     }
@@ -3707,7 +3812,7 @@
       if (!p) return;
       const newToken = document.getElementById('settings-meta-token').value.trim();
 
-      await fetch('/api/pages', {
+      const res = await fetch('/api/pages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3717,6 +3822,16 @@
           knowledge_json: p.knowledge_json
         })
       });
+      // Phase 56 (F-56-6). This is the dashboard's own "Тохиргоо хадгалах" button, and it discarded
+      // the response: `POST /api/pages` answers 400 {"error":"Page ID болон Нэр шаардлагатай"}
+      // (measured live) and can 500 when the login-namespace trigger refuses a page_id, yet the
+      // toast said the settings had been saved either way. Phase 49's F-49-4 was about *what* this
+      // call stored; this is about whether the operator is told the truth about it.
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        showToast(data.error || data.detail || data.message || 'Тохиргоо хадгалагдсангүй.');
+        return;
+      }
       showToast('Тохиргоо хадгалагдлаа!');
       await loadPages();
     }
@@ -4050,12 +4165,20 @@
     }
 
     async function changeLeadStatus(id, newStatus) {
-      await fetch('/api/leads/' + id + '/status', {
+      // Phase 55 (F-55-5). The response was discarded and the toast claimed success
+      // unconditionally; the endpoint now answers 400 with a `message` for a status it will
+      // not store, so read it instead of announcing a change that did not happen.
+      const res = await fetch('/api/leads/' + id + '/status', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus })
       });
-      showToast('Төлөв амжилттай шинэчлэгдлээ!');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.status !== 'updated') {
+        showToast(data.message || data.error || 'Төлөв шинэчлэгдсэнгүй.');
+      } else {
+        showToast('Төлөв амжилттай шинэчлэгдлээ!');
+      }
     }
 
     function viewLeadNotes(notes) {
@@ -4182,12 +4305,24 @@
       const msg = txtInput.value.trim();
       if (!msg) return;
 
-      txtInput.value = '';
-      await fetch('/api/sessions/' + encodeURIComponent(selectedInboxSessionId) + '/send', {
+      // Phase 57 (F-57-1). The input was cleared BEFORE the request and the response was never
+      // read, so a refused send looked exactly like a delivered one and the manager's text was
+      // already gone. The server does refuse, for real: measured live, an unknown session answers
+      // 404 "Сесс олдсонгүй! (Session not found in this tenant)", an unresolvable tenant answers
+      // 403, and an empty message answers 400. The text is restored on failure so the reply can be
+      // corrected and sent again instead of retyped from memory.
+      const sendRes = await fetch('/api/sessions/' + encodeURIComponent(selectedInboxSessionId) + '/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: msg, page_id: activePageId })
       });
+      const sendData = await sendRes.json().catch(() => ({}));
+      if (!sendRes.ok || sendData.error) {
+        txtInput.value = msg;
+        showToast(sendData.detail || sendData.error || sendData.message || 'Мессеж илгээгдсэнгүй.');
+        return;
+      }
+      txtInput.value = '';
 
       selectSession(selectedInboxSessionId);
     }
@@ -4282,11 +4417,25 @@
       currentKb.bank = bankObj;
       currentKb.bank_accounts = bankObj;
 
-      await fetch('/api/knowledge?page_id=' + encodeURIComponent(activePageId), {
+      const saveRes = await fetch('/api/knowledge?page_id=' + encodeURIComponent(activePageId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(currentKb)
       });
+      // Phase 56 (F-56-4 + F-56-6). The name is `saveRes` and not `res` because this function has
+      // already declared `const res` for the GET that loads the current knowledge: a second `const`
+      // in the same scope is a SyntaxError, and a SyntaxError takes down the whole inline script
+      // block, not just this save. (`node --check` on the extracted block is what caught it.) `POST /api/knowledge` used to answer
+      // {"status":"success","message":"... амжилттай шинэчлэгдлээ!"} even when the page did not
+      // exist and the handler had written nothing, and this function never read the response. The
+      // endpoint now returns {"status":"error","written":false} for a page it cannot find, and this
+      // branch is what makes that visible: these are the bank-account details the agent answers
+      // from, so a silent no-op here means the AI keeps quoting an account nobody was told about.
+      const kbRes = await saveRes.json().catch(() => ({}));
+      if (!saveRes.ok || kbRes.status !== 'success') {
+        showToast(kbRes.message || kbRes.error || kbRes.detail || 'Дансны мэдээлэл хадгалагдсангүй.');
+        return;
+      }
 
       showToast('Холбоосууд болон дансны мэдээлэл хадгалагдлаа!');
       loadKnowledge();
@@ -4330,11 +4479,18 @@
         };
       });
 
-      await fetch('/api/knowledge?page_id=' + encodeURIComponent(activePageId), {
+      const saveRes = await fetch('/api/knowledge?page_id=' + encodeURIComponent(activePageId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(kb)
       });
+      // Phase 56 (F-56-4 + F-56-6): same defect as the bank-details save above, on the knowledge
+      // base itself - a success toast for a write that never happened.
+      const kbRes = await saveRes.json().catch(() => ({}));
+      if (!saveRes.ok || kbRes.status !== 'success') {
+        showToast(kbRes.message || kbRes.error || kbRes.detail || 'Мэдлэгийн сан хадгалагдсангүй.');
+        return;
+      }
 
       showToast('Мэдлэгийн сан амжилттай хадгалагдлаа!');
       loadKnowledge();
@@ -4520,7 +4676,15 @@
     }
 
     async function handleLogout() {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      // Phase 57 (F-57-3). The reload happened whatever the server said, so a refused logout was
+      // indistinguishable from a successful one — and the session cookie may still have been valid.
+      // The reload is kept (it is what reveals the true state) but the operator is told first.
+      const res = await fetch('/api/auth/logout', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        alert(data.detail || data.error || data.message ||
+              'Гарах хүсэлт бүтэлгүйтлээ - сесс хүчинтэй хэвээр байж болзошгүй.');
+      }
       window.location.reload();
     }
 
@@ -4954,12 +5118,31 @@
           return;
         }
 
+        // Phase 57 (F-57-2). Two defects here, both measured live. `parseInt(limit)` is NaN for
+        // anything non-numeric, `JSON.stringify` turns NaN into null, and the endpoint answers
+        // 200 with `changed: []`, `preserved: ["gemini_api_key","monthly_token_limit"]` while the
+        // stored limit keeps its old value (100000 in the probe). This function discarded that
+        // response and the toast below claimed the whole "хандалтын тохиргоо" was saved — so an
+        // operator who typed a limit was told a billing guard had been set when nothing changed.
         if (limit) {
-          await fetch('/api/pages/gemini_key', {
+          const parsedLimit = parseInt(limit, 10);
+          if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+            alert('Нэвтрэх нэр хадгалагдлаа. Харин token хязгаар нь эерэг тоо байх ёстой - ' +
+                  'хязгаар хадгалагдсангүй.');
+            return;
+          }
+          const limitRes = await fetch('/api/pages/gemini_key', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ page_id: activePageId, monthly_token_limit: parseInt(limit) })
+            body: JSON.stringify({ page_id: activePageId, monthly_token_limit: parsedLimit })
           });
+          const limitData = await limitRes.json().catch(() => ({}));
+          const ignored = limitData.ignored_fields || [];
+          if (!limitRes.ok || limitData.success === false || ignored.indexOf('monthly_token_limit') !== -1) {
+            alert('Нэвтрэх нэр хадгалагдлаа. Харин token хязгаар хадгалагдсангүй: ' +
+                  (limitData.message || limitData.detail || limitData.error || 'сервер татгалзлаа.'));
+            return;
+          }
         }
 
         showToast('Харилцагчийн хандалтын тохиргоо амжилттай хадгалагдлаа!');
@@ -5531,6 +5714,13 @@
       if (res.ok) {
         showToast('✅ Төлөв солигдлоо!');
         loadNoflowAutomationData();
+      } else {
+        // Phase 56 (F-56-7). There was no else: a 404 ("Автоматжуулалт олдсонгүй") or a 403 left
+        // the operator with no reaction at all, so a failed toggle looked like a slow click. The
+        // sibling create form already had this branch; the two write paths that could only fail
+        // silently were toggle and delete.
+        const err = await res.json().catch(() => ({}));
+        showToast(err.detail || err.error || err.message || 'Төлөв солигдсонгүй.');
       }
     }
 
@@ -5539,6 +5729,10 @@
       if (res.ok) {
         showToast('🗑️ Устгагдлаа!');
         loadNoflowAutomationData();
+      } else {
+        // Phase 56 (F-56-7): a refused delete said nothing at all.
+        const err = await res.json().catch(() => ({}));
+        showToast(err.detail || err.error || err.message || 'Устгагдсангүй.');
       }
     }
 

@@ -500,8 +500,16 @@ class TaskQueue:
                     stats["dead_letter"] = cnt
                 elif st == "FAILED":
                     stats["failed"] = cnt
-        except Exception:
-            pass
+        except Exception as exc:
+            # Phase 57 (F-57-8). The counts came back as the zeros they were initialised to, so
+            # /api/health reported a healthy empty queue when in fact the query had failed - and the
+            # caller's own fallback (`Readiness queue stats fallback`) never fired, because the
+            # exception was swallowed here. The zeros are kept so the health contract's shape does
+            # not change; the failure is logged.
+            logger.warning(
+                "task_jobs status counts could not be read; queue stats report zeros (%s: %s)",
+                type(exc).__name__, exc,
+            )
         finally:
             if cur is not None:
                 try:

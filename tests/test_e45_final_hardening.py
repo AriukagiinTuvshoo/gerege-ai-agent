@@ -21,7 +21,9 @@ These tests are deliberately behavioural where they can be: the IDOR ones call t
 function, and the F-44-C ones run the real pytest subprocess rather than grepping source.
 """
 
+import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -51,6 +53,39 @@ def _redis_is_reachable() -> bool:
     except Exception:
         return False
 
+
+def _postgres_is_reachable() -> bool:
+    """Whether `DATABASE_URL` names a live PostgreSQL.
+
+    F-51-1: the least-privilege guard (finding E-05) is a PostgreSQL property — SQLite has
+    no role system, so `assert_runtime_is_least_privileged` reports `enforced: False` and
+    returns. One test below pins the real verdict, and it must not silently pass on a
+    machine with no PostgreSQL: it skips, with the reason printed.
+    """
+    if not os.getenv("DATABASE_URL", "").strip().startswith("postgresql"):
+        return False
+    try:
+        from core.db_engine import get_db_connection
+
+        conn = get_db_connection()
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+requires_postgres = pytest.mark.skipif(
+    not _postgres_is_reachable(),
+    reason=(
+        "needs DATABASE_URL to name a reachable PostgreSQL: the least-privilege guard is "
+        "a role-system property, and on SQLite it reports enforced=False without deciding "
+        "anything. The environment-only verdict is what this test pins; the guard's "
+        "placement (evaluated on every schema bring-up) is pinned without a database below."
+    ),
+)
 
 requires_redis = pytest.mark.skipif(
     not _redis_is_reachable(),
@@ -192,7 +227,7 @@ class TestMetaVerifyToken:
         "ADMIN_PASSWORD": "9f2a1c7e5b8d4036a1e9c4f7b2d8e5a3",
     }
 
-    def _apply_valid_env(self, monkeypatch):
+    def _apply_valid_env(self, monkeypatch, tmp_path):
         """Everything the production startup path requires, so only F-44-B varies.
 
         `ENV=production` legitimately demands a shared rate-limit store (E-02 Phase 6), so
@@ -212,6 +247,54 @@ class TestMetaVerifyToken:
         from core import rate_limit as _rate_limit
 
         _rate_limit._shared_limiter = None
+
+        # F-51-1: pin the boot to a fresh SQLite database in tmp_path.
+        #
+        # These tests boot the real application in production mode, and whether that boot
+        # ever reached the webhook decision used to depend on two things that have nothing
+        # to do with it:
+        #
+        #   * `main.py` calls `database.init_db()` at module level, so only the *first*
+        #     import of `main` in a process boots the database at all;
+        #   * on a PostgreSQL boot `core.schema_manager.ensure_schema()` evaluates the
+        #     least-privilege guard, which refuses to start when the role it is handed is
+        #     more privileged than the model allows.
+        #
+        # Measured against this repository's local PostgreSQL, whose `gerege` role is a
+        # superuser that owns the database and 32 relations:
+        #
+        #     pytest tests/test_e45_final_hardening.py                    -> 2 failed
+        #     pytest tests/test_e36_health_monitoring.py tests/test_e45…  -> 34 passed
+        #
+        # The two boot tests passed only when some *other* module had already imported
+        # `main` with ENV not production, so the guard never ran for them. That made
+        # "F-48A-6: 2 tests fail in isolation" look like an environment complaint; it is a
+        # test-ordering defect, and the refusal it hit is the guard working as designed.
+        # SQLite has no role system, so pinning it here makes the handshake tests decide
+        # the handshake and nothing else, in any order. The PostgreSQL verdict is pinned
+        # separately, on its own terms, in TestLeastPrivilegeGuardIsEvaluatedOnEveryBoot.
+        # F-51-1b: pin all THREE resolvers to that one file.
+        #
+        # Setting `DATABASE_URL` alone is not enough, and the first version of this fix proved
+        # it: `database.DB_PATH` is a module attribute bound when `database` is first imported,
+        # so `core.schema_manager._alembic_config()` - and therefore the engine that reads
+        # `alembic_version` for the head-check - kept pointing wherever the process had been
+        # started, while `migrations/env.py` migrated the URL's file. With `DB_PATH` naming a
+        # file that does not exist, the two disagreed and the boot raised
+        #
+        #     RuntimeError: Schema migration failed: expected head '0008_tenant_not_null',
+        #                   database is at 'None'
+        #
+        # The tests passed only when `DB_PATH` happened to be unset, because then the module
+        # attribute named the repository's own `leads.db`, which is at head. A verdict that
+        # depends on how the runner was invoked is the defect this class exists to remove, so
+        # all three are pinned together - the same shape `_record_guard` uses below.
+        import database as database_module
+
+        target = str(tmp_path / "e45_boot.db")
+        monkeypatch.setattr(database_module, "DB_PATH", target, raising=False)
+        monkeypatch.setenv("DB_PATH", target)
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{target}")
 
     # 1. Production + unset -> not usable.
     def test_production_with_unset_token_is_not_usable(self, monkeypatch):
@@ -282,8 +365,8 @@ class TestMetaVerifyToken:
     # 8. The token's enforcement lives at the endpoint, not at startup, and that placement is
     #    deliberate: it only matters to Meta traffic, so a deployment that runs no Meta
     #    integration should still start. What must be true is that the handshake refuses.
-    def test_production_without_a_token_refuses_the_handshake(self, monkeypatch):
-        self._apply_valid_env(monkeypatch)
+    def test_production_without_a_token_refuses_the_handshake(self, monkeypatch, tmp_path):
+        self._apply_valid_env(monkeypatch, tmp_path)
         monkeypatch.setenv("ENV", "production")
         monkeypatch.delenv("META_VERIFY_TOKEN", raising=False)
         assert security.meta_verify_token_is_usable("") is False
@@ -306,9 +389,9 @@ class TestMetaVerifyToken:
     # 8b. And if a deployment somehow bypassed the startup check, the endpoint itself still
     #     refuses the published default. This is the defence-in-depth case.
     def test_endpoint_still_refuses_the_placeholder_even_if_startup_is_bypassed(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
-        self._apply_valid_env(monkeypatch)
+        self._apply_valid_env(monkeypatch, tmp_path)
         monkeypatch.setenv("ENV", "production")
         monkeypatch.setenv("META_VERIFY_TOKEN", security.PUBLIC_VERIFY_TOKEN_PLACEHOLDER)
         assert security.meta_verify_token_is_usable(
@@ -317,8 +400,8 @@ class TestMetaVerifyToken:
 
     @requires_redis
     # 9. ...and still works with a real token, so the fix is not "refuse everything".
-    def test_endpoint_accepts_a_real_token_in_production(self, monkeypatch):
-        self._apply_valid_env(monkeypatch)
+    def test_endpoint_accepts_a_real_token_in_production(self, monkeypatch, tmp_path):
+        self._apply_valid_env(monkeypatch, tmp_path)
         monkeypatch.setenv("ENV", "production")
         monkeypatch.setenv("META_VERIFY_TOKEN", "9f2a1c7e5b8d4036a1e9")
         import main
@@ -339,11 +422,13 @@ class TestMetaVerifyToken:
     @requires_redis
     # 10. A wrong token is refused with the same response as a missing configuration, so
     #     the endpoint does not tell an outsider that the deployment is misconfigured.
-    def test_wrong_token_is_indistinguishable_from_missing_configuration(self, monkeypatch):
+    def test_wrong_token_is_indistinguishable_from_missing_configuration(
+        self, monkeypatch, tmp_path
+    ):
         from starlette.testclient import TestClient
         import main
 
-        self._apply_valid_env(monkeypatch)
+        self._apply_valid_env(monkeypatch, tmp_path)
         monkeypatch.setenv("ENV", "production")
         monkeypatch.setenv("META_VERIFY_TOKEN", "9f2a1c7e5b8d4036a1e9")
         with TestClient(main.app, raise_server_exceptions=False) as client:
@@ -573,3 +658,192 @@ class TestSecretEnforcement:
         """The validator must actually run at startup, not merely exist."""
         body = open(os.path.join(REPO_ROOT, "main.py"), encoding="utf-8").read()
         assert "validate_production_secrets()" in body
+
+
+# ---------------------------------------------------------------------------
+# F-51-1 — the least-privilege decision is made on every boot, in any order
+# ---------------------------------------------------------------------------
+
+
+class TestLeastPrivilegeGuardIsEvaluatedOnEveryBoot:
+    """The property that import order used to decide for four tests in this file.
+
+    ``main.py`` calls ``database.init_db()`` at module level, so a process boots the
+    database exactly once — on the first ``import main``. ``init_db()`` reaches
+    ``core.schema_manager.ensure_schema()``, which evaluates the least-privilege guard
+    (finding E-05) on *both* of its paths. Whether the guard therefore ran for a given test
+    depended on which module imported ``main`` first, and with what ``ENV``:
+
+        pytest tests/test_e45_final_hardening.py                    -> 2 failed
+        pytest tests/test_e36_health_monitoring.py tests/test_e45…  -> 34 passed
+
+    Against this repository's local PostgreSQL the ``gerege`` role is a superuser that owns
+    the database and 32 relations, so a production boot on it is *refused* — correctly. The
+    two failing tests were therefore not reporting an application defect; they were
+    reporting that their own outcome had been decided elsewhere in the session. Phase 49
+    filed this as "environment, not code — still open" (F-48A-6). It is a test-ordering
+    defect, and both halves are now pinned: ``TestMetaVerifyToken`` boots on SQLite because
+    it is about the handshake, and the PostgreSQL verdict is asserted here on its own terms.
+    """
+
+    # 1. What switches the guard on is the environment, never the import order.
+    def test_enforcement_follows_the_environment(self, monkeypatch):
+        from core import db_privileges
+
+        monkeypatch.delenv("REQUIRE_LEAST_PRIVILEGE", raising=False)
+        monkeypatch.delenv("STRICT_SECURITY", raising=False)
+        monkeypatch.setenv("ENV", "development")
+        assert db_privileges.enforcement_enabled() is False
+
+        monkeypatch.setenv("ENV", "production")
+        assert db_privileges.enforcement_enabled() is True
+        monkeypatch.setenv("ENV", "prod")
+        assert db_privileges.enforcement_enabled() is True
+
+        monkeypatch.delenv("ENV", raising=False)
+        assert db_privileges.enforcement_enabled() is False
+        monkeypatch.setenv("STRICT_SECURITY", "1")
+        assert db_privileges.enforcement_enabled() is True
+
+        monkeypatch.delenv("STRICT_SECURITY", raising=False)
+        monkeypatch.setenv("REQUIRE_LEAST_PRIVILEGE", "1")
+        assert db_privileges.enforcement_enabled() is True, (
+            "the adversarial switch must work with no ENV at all, otherwise the suite "
+            "cannot exercise the guard without pretending to be a production deployment"
+        )
+
+    def _record_guard(self, monkeypatch, tmp_path):
+        """Point the application at a throwaway SQLite file and record guard calls.
+
+        Both resolvers are pinned to the *same* file on purpose. `database.DB_PATH` is a
+        module attribute computed at import, so setting `DATABASE_URL` alone leaves
+        `core.schema_manager._resolved_sqlite_path()` — and therefore the engine that reads
+        `alembic_version` — pointing at whatever the process imported, while `env.py`
+        migrates the URL's file. That disagreement is how a test ends up migrating the
+        repository's own `leads.db`; pinning the two together makes it impossible.
+        """
+        import database as database_module
+        from core import db_privileges, schema_manager
+
+        calls = []
+
+        def _recorder(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return {"dialect": "sqlite", "enforced": False, "violations": []}
+
+        target = str(tmp_path / "guard.db")
+        monkeypatch.setattr(db_privileges, "assert_runtime_is_least_privileged", _recorder)
+        monkeypatch.setattr(database_module, "DB_PATH", target, raising=False)
+        monkeypatch.setenv("DB_PATH", target)
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{target}")
+        return schema_manager, calls
+
+    # 2. A first boot — the deployment that applies migrations.
+    def test_a_first_boot_evaluates_the_guard(self, monkeypatch, tmp_path):
+        schema_manager, calls = self._record_guard(monkeypatch, tmp_path)
+        report = schema_manager.ensure_schema()
+        assert report["upgraded"] is True, "this must be the boot that applies migrations"
+        assert calls, "a first boot that never evaluates the guard is the E-05 hole"
+
+    # 3. The fast path — a restart against an already-migrated database. This is the path
+    #    an operator reaches right after changing the credential, so it is the one that
+    #    matters most, and the one an accidental early return would silently skip.
+    def test_the_already_at_head_fast_path_evaluates_the_guard(self, monkeypatch, tmp_path):
+        schema_manager, calls = self._record_guard(monkeypatch, tmp_path)
+        schema_manager.ensure_schema()
+        calls.clear()
+        report = schema_manager.ensure_schema()
+        assert report["upgraded"] is False, "the second bring-up must take the fast path"
+        assert calls, (
+            "the 'already at head' path must evaluate the guard too: that is the boot an "
+            "operator performs right after changing the database credential"
+        )
+
+    # 4. Why order mattered at all. Pinned so that moving the boot is a deliberate act.
+    def test_main_boots_the_database_at_import_time(self):
+        body = open(os.path.join(REPO_ROOT, "main.py"), encoding="utf-8").read()
+        assert re.search(r"^database\.init_db\(\)$", body, re.MULTILINE), (
+            "main.py no longer calls database.init_db() at module level. If the boot moved "
+            "into the lifespan then every test that boots the app now decides the guard for "
+            "itself: re-check TestMetaVerifyToken's DATABASE_URL pin (F-51-1) before "
+            "removing it, and re-measure the two orders quoted in this class's docstring."
+        )
+
+    # 5. SQLite decides nothing and says so. This is what makes the pin in
+    #    TestMetaVerifyToken honest rather than a way of dodging the guard.
+    def test_sqlite_reports_that_it_decided_nothing(self, monkeypatch, tmp_path):
+        from core import db_privileges
+
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'dialect.db'}")
+        monkeypatch.delenv("DB_PATH", raising=False)
+        report = db_privileges.assert_runtime_is_least_privileged(force=True)
+        assert report == {"dialect": "sqlite", "enforced": False, "violations": []}, (
+            "a dialect with no role system must claim no verdict, not a passing one"
+        )
+
+    # 6. On PostgreSQL the verdict matches the role that was actually handed over.
+    #    Adaptive on purpose: this must be true on an over-privileged bootstrap role (a
+    #    refusal) and on a properly provisioned one (a clean report), so the test states
+    #    the rule instead of assuming which environment it landed in.
+    @requires_postgres
+    def test_the_postgres_verdict_matches_the_role_it_is_given(self):
+        from core import db_privileges
+        from core.db_engine import get_db_connection
+
+        conn = get_db_connection()
+        try:
+            report = db_privileges.collect_runtime_privileges(conn)
+            violations = db_privileges.evaluate_runtime_privileges(report)
+            if not violations:
+                out = db_privileges.assert_runtime_is_least_privileged(conn=conn, force=True)
+                assert out["enforced"] is True
+                assert out["violations"] == []
+                return
+            with pytest.raises(db_privileges.PrivilegedRuntimeError) as exc:
+                db_privileges.assert_runtime_is_least_privileged(conn=conn, force=True)
+            message = str(exc.value)
+            # Every violation, not just the first: an operator fixing this wants the whole
+            # list in one restart rather than one round trip per violation.
+            for violation in violations:
+                assert f"  - {violation}" in message, f"missing from the refusal: {violation}"
+            assert db_privileges.RUNTIME_ROLE in message
+            assert "provision_roles.py" in message
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # 7. Outside a deployment the same violations must warn, not block — and warn on ONE
+    #    line, because a full list on every `python main.py` in development trains people
+    #    to ignore the message that matters in production.
+    @requires_postgres
+    def test_development_warns_on_one_line_instead_of_blocking(self, monkeypatch, caplog):
+        from core import db_privileges
+        from core.db_engine import get_db_connection
+
+        conn = get_db_connection()
+        try:
+            violations = db_privileges.evaluate_runtime_privileges(
+                db_privileges.collect_runtime_privileges(conn)
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if not violations:
+            pytest.skip(
+                "this PostgreSQL role is already least-privilege, so there is nothing to "
+                "warn about; the refusal path is covered by the test above"
+            )
+        monkeypatch.delenv("REQUIRE_LEAST_PRIVILEGE", raising=False)
+        monkeypatch.setenv("ENV", "development")
+        monkeypatch.delenv("STRICT_SECURITY", raising=False)
+        with caplog.at_level(logging.WARNING, logger="core.db_privileges"):
+            out = db_privileges.assert_runtime_is_least_privileged(force=False)
+        assert out["violations"] == violations, "the report must still carry the detail"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f"expected one warning, got {len(warnings)}"
+        assert "\n" not in warnings[0].getMessage(), "the development warning must stay one line"
+        assert str(len(violations)) in warnings[0].getMessage()

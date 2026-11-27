@@ -375,8 +375,18 @@ def test_1333_the_retention_permission_cannot_be_borrowed_to_rewrite_history(db)
         "cannot null page_id while the tenant still exists — that is not the FK action"
     )
 
-    rows = _rows("payment.confirmed")
-    assert len(rows) == 1
+    # F-53-10 (Phase 53): scoped to this invoice the way the `page.delete` assertion above is
+    # scoped to `doomed`. `payment.confirmed` is a shared action name, and this test used to
+    # count every row carrying it. Measured under PostgreSQL - where `database.get_connection()`
+    # resolves through `core.db_engine` and ignores `DB_PATH`, so every module shares one
+    # database - `test_p1_payment_security` leaves two `payment.confirmed` rows of its own
+    # (page `p1_tenant_a`, `INV-2026...`) and they accumulate one pair per run. So this
+    # assertion passed or failed on module ORDER: 21 passed alone, `assert 3 == 1` when
+    # `test_p1_payment_security` was listed first, 35 passed in the suite's sorted order.
+    # Both claims the test makes are unchanged - exactly one row for this invoice, and its
+    # amount untouched - they are just attributable to this test now.
+    rows = [r for r in _rows("payment.confirmed") if r[3] == "INV-1"]
+    assert len(rows) == 1, [r[3] for r in _rows("payment.confirmed")]
     assert "1000" in (rows[0][4] or ""), "the confirmed amount must be untouched"
 
 
