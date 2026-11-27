@@ -126,8 +126,17 @@ class ToolExecutionGuard:
                 resource_id=tool_name,
                 details={"call_index": self.total_calls, "args": args or {}},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Phase 57 (F-57-5). The audit row for an AI tool call was swallowed: the call still
+            # returned (True, "OK") and nothing recorded that `ai.tool.executed.<tool>` was lost.
+            # Audit is append-only evidence and every other phase in this repository treats a
+            # missing audit row as a finding, so the loss is at least logged with the tool, the
+            # page and the call index. Deliberately not raised: refusing the customer's message
+            # because an audit row could not be written is the worse failure.
+            logger.warning(
+                "audit row for ai.tool.executed.%s was not written (page %s, call #%s): %s: %s",
+                tool_name, self.page_id, self.total_calls, type(exc).__name__, exc,
+            )
         return True, "OK"
 
     def validate_invoice_amount(self, requested_amount: int, default_amount: int = 15000) -> int:

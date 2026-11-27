@@ -34,11 +34,14 @@ holding the table), not something to paper over by retrying for longer than the 
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
+
+logger = logging.getLogger("core.db_bounds")
 
 
 class BoundedOperationTimeout(RuntimeError):
@@ -270,8 +273,19 @@ def _apply_session_bounds(conn, *, statement_timeout: float, lock_timeout: float
     # bounds survive the first rollback.
     try:
         conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        # Phase 57 (F-57-6). Measured on PostgreSQL: with this commit the bound survives the first
+        # rollback (`SHOW idle_in_transaction_session_timeout` -> 1min); without it the value is
+        # gone (-> 0, meaning no bound at all). Swallowing the failure meant the protection this
+        # function exists to install could be absent with nothing on record - the same
+        # idle-in-transaction / lock-holding class as F-55-1, and a direct contradiction of this
+        # module's own doctrine in its docstring: "A blocked query must fail, not look like zero
+        # rows."
+        logger.warning(
+            "session bounds were applied but the commit failed; they will not survive the first "
+            "rollback (%s: %s)",
+            type(exc).__name__, exc,
+        )
 
 
 def run_scalar(

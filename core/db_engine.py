@@ -830,12 +830,28 @@ def get_db_connection(sqlite_path: Optional[str] = None):
     path = get_sqlite_db_path(sqlite_path)
     conn = sqlite3.connect(path, timeout=15.0, factory=RollbackOnCloseConnection)
     conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-    except Exception:
-        pass
+    # Phase 57 (F-57-7). These three PRAGMAs shared one `except Exception: pass`, so the first one
+    # that failed silently discarded the other two - and `PRAGMA foreign_keys=ON` is load-bearing:
+    # every Phase 55/56 guarantee that "the driver refuses a write naming a page that does not
+    # exist" depends on it. Measured on a read-only database file, where WAL cannot be enabled:
+    #
+    #     PRAGMA journal_mode=WAL -> OperationalError: attempt to write a readonly database
+    #     PRAGMA foreign_keys     -> 0      (enforcement OFF)
+    #     PRAGMA busy_timeout     -> 15000  (the connect() default, not the intended 5000)
+    #
+    # and, separately, with `foreign_keys` off an FK-violating write goes through:
+    # `INSERT INTO invoices (page_id) VALUES ('p57_never_created')` succeeded on a connection whose
+    # enforcement was off, which is exactly the guarantee Phase 55/56 rely on. With one try per
+    # PRAGMA the same read-only database yields foreign_keys=1 and busy_timeout=5000: the failure is
+    # contained to the setting that genuinely cannot be applied, and it is logged, not swallowed.
+    for pragma in ("journal_mode=WAL", "busy_timeout=5000", "foreign_keys=ON"):
+        try:
+            conn.execute(f"PRAGMA {pragma}")
+        except Exception as exc:
+            logger.warning(
+                "PRAGMA %s could not be applied to %s (%s: %s)",
+                pragma, path, type(exc).__name__, exc,
+            )
     return conn
 
 

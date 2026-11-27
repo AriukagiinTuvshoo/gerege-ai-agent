@@ -2056,8 +2056,25 @@ async def get_knowledge(request: Request, page_id: Optional[str] = Query(None)):
     if page_obj and page_obj.get("knowledge_json"):
         try:
             return JSONResponse(json.loads(page_obj["knowledge_json"]))
-        except Exception:
-            pass
+        except Exception as exc:
+            # Phase 57 (F-57-4). This fallback was silent. A page whose stored `knowledge_json` is
+            # not valid JSON was served the deployment's DEFAULT knowledge base with HTTP 200 and
+            # no log line anywhere. Measured live with a corrupt value written into the row:
+            #
+            #     GET /api/knowledge?page_id=p57_probe
+            #         -> 200 {"company":{"name":"Tuvshok ", ...}}      (the global default)
+            #         -> WARNING/ERROR lines mentioning knowledge: 0
+            #         -> the corrupt row was still in the database, unchanged
+            #
+            # So the agent answers from the default knowledge while the operator believes the
+            # page's own bank-account details are in effect, and nothing records the substitution.
+            # The response shape is deliberately unchanged - consumers read arbitrary KB keys - but
+            # the substitution is logged with the page id and the parse error (F-55-3's rule).
+            logger.warning(
+                "knowledge_json for page '%s' is not valid JSON (%s: %s); serving the default "
+                "knowledge base instead. The stored value was left untouched.",
+                target_id, type(exc).__name__, exc,
+            )
     return JSONResponse(knowledge_base.load_knowledge())
 
 @app.post("/api/knowledge")

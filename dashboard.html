@@ -4305,12 +4305,24 @@
       const msg = txtInput.value.trim();
       if (!msg) return;
 
-      txtInput.value = '';
-      await fetch('/api/sessions/' + encodeURIComponent(selectedInboxSessionId) + '/send', {
+      // Phase 57 (F-57-1). The input was cleared BEFORE the request and the response was never
+      // read, so a refused send looked exactly like a delivered one and the manager's text was
+      // already gone. The server does refuse, for real: measured live, an unknown session answers
+      // 404 "Сесс олдсонгүй! (Session not found in this tenant)", an unresolvable tenant answers
+      // 403, and an empty message answers 400. The text is restored on failure so the reply can be
+      // corrected and sent again instead of retyped from memory.
+      const sendRes = await fetch('/api/sessions/' + encodeURIComponent(selectedInboxSessionId) + '/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: msg, page_id: activePageId })
       });
+      const sendData = await sendRes.json().catch(() => ({}));
+      if (!sendRes.ok || sendData.error) {
+        txtInput.value = msg;
+        showToast(sendData.detail || sendData.error || sendData.message || 'Мессеж илгээгдсэнгүй.');
+        return;
+      }
+      txtInput.value = '';
 
       selectSession(selectedInboxSessionId);
     }
@@ -4664,7 +4676,15 @@
     }
 
     async function handleLogout() {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      // Phase 57 (F-57-3). The reload happened whatever the server said, so a refused logout was
+      // indistinguishable from a successful one — and the session cookie may still have been valid.
+      // The reload is kept (it is what reveals the true state) but the operator is told first.
+      const res = await fetch('/api/auth/logout', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        alert(data.detail || data.error || data.message ||
+              'Гарах хүсэлт бүтэлгүйтлээ - сесс хүчинтэй хэвээр байж болзошгүй.');
+      }
       window.location.reload();
     }
 
@@ -5098,12 +5118,31 @@
           return;
         }
 
+        // Phase 57 (F-57-2). Two defects here, both measured live. `parseInt(limit)` is NaN for
+        // anything non-numeric, `JSON.stringify` turns NaN into null, and the endpoint answers
+        // 200 with `changed: []`, `preserved: ["gemini_api_key","monthly_token_limit"]` while the
+        // stored limit keeps its old value (100000 in the probe). This function discarded that
+        // response and the toast below claimed the whole "хандалтын тохиргоо" was saved — so an
+        // operator who typed a limit was told a billing guard had been set when nothing changed.
         if (limit) {
-          await fetch('/api/pages/gemini_key', {
+          const parsedLimit = parseInt(limit, 10);
+          if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+            alert('Нэвтрэх нэр хадгалагдлаа. Харин token хязгаар нь эерэг тоо байх ёстой - ' +
+                  'хязгаар хадгалагдсангүй.');
+            return;
+          }
+          const limitRes = await fetch('/api/pages/gemini_key', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ page_id: activePageId, monthly_token_limit: parseInt(limit) })
+            body: JSON.stringify({ page_id: activePageId, monthly_token_limit: parsedLimit })
           });
+          const limitData = await limitRes.json().catch(() => ({}));
+          const ignored = limitData.ignored_fields || [];
+          if (!limitRes.ok || limitData.success === false || ignored.indexOf('monthly_token_limit') !== -1) {
+            alert('Нэвтрэх нэр хадгалагдлаа. Харин token хязгаар хадгалагдсангүй: ' +
+                  (limitData.message || limitData.detail || limitData.error || 'сервер татгалзлаа.'));
+            return;
+          }
         }
 
         showToast('Харилцагчийн хандалтын тохиргоо амжилттай хадгалагдлаа!');
