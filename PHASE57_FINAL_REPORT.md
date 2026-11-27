@@ -354,6 +354,12 @@ remain git-ignored and untracked.
 
 ---
 
-*The commit that carries this report is recorded in a follow-up commit, because a
-commit cannot contain its own sha.*
+**Commits.** `b13fd9e` — *Phase 57: a swallowed failure must still leave a trace
+(F-57-1..F-57-8)* — 8 files, +1582/−19 (the six source files, this report, and
+`tests/test_e57_silent_failure_truth.py`). A commit cannot record its own sha, so
+the line above is added by the follow-up commit that carries it.
+
+Pushed to `arena/d78ebf88-gerege-ai-agent` only. `origin/main` remains
+`c809654`: **no merge was performed and none is authorised here.** Merge, PR
+creation, deploy and `GEMINI_API_KEY` rotation stay the operator's actions.
 
