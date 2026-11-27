@@ -171,6 +171,35 @@ def import_manifest_from_excel_bytes(page_id: str, file_bytes: bytes, filename: 
     Багана: Код (Tracking), Утас (Phone), Нэр (Name), Жин (Weight), Үнэ (Price)
     """
     import openpyxl
+
+    # Phase 56 (F-56-5). Two defects in this function, both measured live:
+    #
+    #   POST /api/cargo/import-manifest?page_id=p56_never_created   (a valid one-row .xlsx)
+    #     -> HTTP 200 {"success":false,"message":"Excel уншихад алдаа гарлаа: FOREIGN KEY
+    #        constraint failed"}
+    #
+    # The Excel file parsed correctly; the database refused the write, because `cargo_packages`
+    # has a foreign key to `pages` (`migrations/versions/0003_foreign_keys.py`). One `try` wrapped
+    # both the parse and the write loop and named every failure "Excel уншихад алдаа гарлаа", so
+    # an operator was sent to look for a broken spreadsheet. The second defect: the rows that had
+    # already been committed before the failure were counted in `inserted_count` and then
+    # discarded, so a partially imported manifest was indistinguishable from a total failure.
+    #
+    # The page is checked up front, and the two stages are reported separately with the count of
+    # rows that did land. `upsert_cargo_package` is an idempotent upsert on
+    # `(page_id, tracking_code)`, so re-uploading the same file after a partial import is safe -
+    # which is why the loop is reported honestly rather than restructured into one transaction.
+    if not database.get_page(page_id):
+        return {
+            "success": False,
+            "stage": "page",
+            "written": 0,
+            "count": 0,
+            "message": f"'{page_id}' хуудас олдсонгүй - ямар ч ачаа бүртгэсэнгүй.",
+        }
+
+    stage = "read"
+    written = 0
     try:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
         sheet = wb.active
@@ -203,6 +232,7 @@ def import_manifest_from_excel_bytes(page_id: str, file_bytes: bytes, filename: 
             # 1-р баганыг шууд tracking гэж үзэх
             col_tracking = 0
 
+        stage = "write"
         inserted_count = 0
         for r in rows[1:]:
             if not r or len(r) <= col_tracking or not r[col_tracking]:
@@ -238,6 +268,7 @@ def import_manifest_from_excel_bytes(page_id: str, file_bytes: bytes, filename: 
                 status="IN_TRANSIT"
             )
             inserted_count += 1
+            written = inserted_count
 
         return {
             "success": True,
@@ -245,5 +276,28 @@ def import_manifest_from_excel_bytes(page_id: str, file_bytes: bytes, filename: 
             "count": inserted_count
         }
     except Exception as e:
-        logger.error(f"Error importing cargo manifest: {e}")
-        return {"success": False, "message": f"Excel уншихад алдаа гарлаа: {str(e)}"}
+        if stage == "read":
+            logger.error(f"Error reading cargo manifest {filename}: {e}", exc_info=e)
+            return {
+                "success": False,
+                "stage": "read",
+                "written": 0,
+                "count": 0,
+                "message": f"Excel файл уншигдсангүй ({type(e).__name__}): {e}",
+            }
+        # Phase 56 (F-55-3's rule applied here: the exception type is named, its traceback goes to
+        # the log, and the caller is told how much of the import actually landed.)
+        logger.error(
+            f"Error writing cargo manifest {filename} after {written} row(s): {e}", exc_info=e
+        )
+        return {
+            "success": False,
+            "stage": "write",
+            "written": written,
+            "count": written,
+            "message": (
+                f"{written} ачааг бүртгэсний дараа өгөгдлийн сангийн алдаа гарлаа "
+                f"({type(e).__name__}): үлдсэн мөрүүд импортлогдоогүй. "
+                f"Файлыг дахин илгээхэд өмнө бүртгэгдсэн ачаанууд давхардахгүй."
+            ),
+        }

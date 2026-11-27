@@ -228,18 +228,58 @@ def create_sqlite_snapshot(sqlite_path: Optional[str] = None) -> str:
         raise FileNotFoundError(f"SQLite database not found: {sqlite_path}")
     fd, snap_path = tempfile.mkstemp(prefix="gerege_sqlite_snap_", suffix=".db")
     os.close(fd)
+    # Phase 56 (F-56-9). Two connections were opened here - `dst` on the fresh snapshot and `src`
+    # on the live SQLite database that is about to be migrated - and both were closed on the last
+    # two lines of the body. `src.backup(dst)` is the statement that can actually fail (a locked
+    # database, a full disk, a corrupt page), and on failure it raised past both closes, leaving
+    # the live database held open for the rest of the migration process. `with dst:` commits or
+    # rolls the destination back but does not close it.
+    #
+    # The same shape as F-55-1 (59 request handlers leaked a write lock) and F-56-8 below, found
+    # by the AST sweep rather than by reading: "every `sqlite3.connect` in this repository is
+    # closed in a `finally`". The partial snapshot file is removed too, because the caller never
+    # learns its path when this raises.
     src = sqlite3.connect(sqlite_path)
-    dst = sqlite3.connect(snap_path)
-    with dst:
-        src.backup(dst)
-    dst.close()
-    src.close()
-    return snap_path
+    backed_up = False
+    try:
+        dst = sqlite3.connect(snap_path)
+        try:
+            with dst:
+                src.backup(dst)
+        finally:
+            dst.close()
+        backed_up = True
+        return snap_path
+    finally:
+        src.close()
+        if not backed_up:
+            try:
+                os.unlink(snap_path)
+            except OSError:
+                pass
 
 
 def inspect_sqlite_snapshot(snap_path: str) -> Dict[str, Any]:
-    """Read row counts, column names, table checksums, and financial totals from SQLite snapshot."""
+    """Read row counts, column names, table checksums, and financial totals from SQLite snapshot.
+
+    Phase 56 (F-56-8). The connection is opened here and released in a `finally`, around the
+    roughly fifty statements in `_inspect_sqlite_snapshot`. Before this, `conn.close()` was the
+    second-to-last line of the body, so any error in between - a snapshot missing a column, a
+    checksum computed over a corrupt page, a `None` where a total was expected - left the snapshot
+    file open for the rest of the migration process. That is the same class as F-55-1, in a script
+    rather than in a request handler: a SQLite connection holds a lock, and this one is opened on
+    the database that is about to be migrated. The signature is unchanged, and the body moved
+    verbatim into the helper below.
+    """
     conn = sqlite3.connect(snap_path)
+    try:
+        return _inspect_sqlite_snapshot(conn)
+    finally:
+        conn.close()
+
+
+def _inspect_sqlite_snapshot(conn) -> Dict[str, Any]:
+    """The body of :func:`inspect_sqlite_snapshot`. It owns no connection and closes none."""
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
@@ -290,7 +330,6 @@ def inspect_sqlite_snapshot(snap_path: str) -> Dict[str, Any]:
             cur.execute("SELECT COALESCE(SUM(price_amount), 0) FROM cargo_packages").fetchone()[0] or 0
         )
 
-    conn.close()
     return {
         "tables": table_stats,
         "overall_checksum": overall_checksum,

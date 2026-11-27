@@ -2072,22 +2072,46 @@ async def update_knowledge(payload: Dict[str, Any], request: Request, page_id: O
     page_obj = database.get_page(target_id)
     k_str = json.dumps(payload, ensure_ascii=False, indent=2)
 
-    if page_obj:
-        database.save_page(
-            page_id=target_id,
-            name=page_obj.get("name", "Page"),
-            category=page_obj.get("category", "general"),
-            page_access_token=page_obj.get("page_access_token", ""),
-            # Phase 49 (F-49-4): carry the stored value through, and never substitute the
-            # published placeholder — `save_page` preserves the stored secret on an empty one.
-            verify_token=page_obj.get("verify_token") or "",
-            knowledge_json=k_str,
-            gemini_api_key=page_obj.get("gemini_api_key", ""),
-            monthly_token_limit=page_obj.get("monthly_token_limit", 100000),
-            # `save_page`'s default is 1, so a knowledge edit used to re-enable a tenant
-            # that had been disabled. The stored state is carried through instead.
-            is_active=(0 if page_obj.get("is_active") in (0, False) else 1)
+    # Phase 56 (F-56-4). `if page_obj:` used to skip the save for a page that does not exist and
+    # then fall through to the same `{"status": "success"}` return, so the response claimed a
+    # knowledge-base update that had written nothing. Measured live:
+    #
+    #     POST /api/knowledge?page_id=p56_never_created  {"bank": {"account_name": "P56 probe bank"}}
+    #         -> HTTP 200 {"status":"success","message":"p56_never_created хуудасны мэдлэгийн сан
+    #            амжилттай шинэчлэгдлээ!"}
+    #         -> rows written: 0 (the page does not exist, so there was nothing to update)
+    #
+    # The positive control - the same body against a page that does exist - writes the row and
+    # returns a byte-identical message, so the two were indistinguishable to the caller. Both
+    # dashboard knowledge saves discarded the response entirely (F-56-6), which is how an operator
+    # came to be told that new bank-account details were saved while the agent kept answering from
+    # the stored ones. The refusal keeps this endpoint's own vocabulary (`status`), because that is
+    # what its consumer now branches on, and `agent.reset_sessions` is skipped: there is no page.
+    if not page_obj:
+        return JSONResponse(
+            {
+                "status": "error",
+                "written": False,
+                "page_id": target_id,
+                "message": f"'{target_id}' хуудас олдсонгүй - мэдлэгийн сан шинэчлэгдсэнгүй.",
+            }
         )
+
+    database.save_page(
+        page_id=target_id,
+        name=page_obj.get("name", "Page"),
+        category=page_obj.get("category", "general"),
+        page_access_token=page_obj.get("page_access_token", ""),
+        # Phase 49 (F-49-4): carry the stored value through, and never substitute the
+        # published placeholder — `save_page` preserves the stored secret on an empty one.
+        verify_token=page_obj.get("verify_token") or "",
+        knowledge_json=k_str,
+        gemini_api_key=page_obj.get("gemini_api_key", ""),
+        monthly_token_limit=page_obj.get("monthly_token_limit", 100000),
+        # `save_page`'s default is 1, so a knowledge edit used to re-enable a tenant
+        # that had been disabled. The stored state is carried through instead.
+        is_active=(0 if page_obj.get("is_active") in (0, False) else 1)
+    )
     if target_id == database.DEFAULT_PAGE_ID:
         knowledge_base.save_knowledge(payload)
 
@@ -2931,18 +2955,41 @@ async def create_invoice_manual_api(
         require_auth=True,
         permission="fintech:write",
     )
-    amount = int(payload.get("amount", 10000))
+    # Phase 56 (F-56-3): five body shapes reached this handler as an unhandled 500 - three through
+    # the unguarded `int(...)` above and two through a dict that travelled into a SQL parameter
+    # (see `_payload_int` and `_payload_text` for the request_ids). Phase 55 swept this class by
+    # grepping for `.strip()`, which is why an `int(payload.get(...))` in the same class survived it.
+    amount = _payload_int(payload, "amount", 10000)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Мөнгөн дүн 0-ээс их байх ёстой")
-    desc = payload.get("description", "Үйлчилгээний төлбөр")
+    desc = _payload_text(payload, "description", "Үйлчилгээний төлбөр")
     # Phase 36 (F-36-3): honour a trusted proxy's X-Forwarded-Proto so a TLS-terminated
     # deployment does not mint http:// payment callbacks and pay-page links.
     base_url = core_rate_limit.build_external_base_url(request)
+    # Phase 56 (F-56-3). `fintech_service.create_payment_order` reads `database.get_page(page_id)
+    # or {}` to pick up the page's QPay credentials, so a page that does not exist is
+    # indistinguishable from a page that has no QPay settings: the write went ahead and
+    # `invoices.page_id`'s foreign key raised. Measured live:
+    #
+    #     POST /api/fintech/create-invoice {"page_id":"p56_never_created","amount":1500}
+    #         -> HTTP 500 {"detail":"Internal server error","request_id":"d443b6c6cbc4aa47"}
+    #         -> invoices rows: 0
+    #
+    # A 404 rather than a 200 with `success:false`, because this handler returns the order dict
+    # directly and already refuses a bad amount with `HTTPException(400)` - there is no `success`
+    # key in its vocabulary to set to false. The service itself is left unchanged: its other four
+    # callers (agent.py:591, :738, :865 and cargo_service.py:45) take the page from a stored row,
+    # not from a request body, and the dashboard's consumer is fixed in the same phase (F-56-6).
+    if not database.get_page(page_id or database.DEFAULT_PAGE_ID):
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{page_id}' хуудас олдсонгүй - ямар ч нэхэмжлэх үүсгэсэнгүй.",
+        )
     order = await fintech_service.create_payment_order(
         page_id=page_id or database.DEFAULT_PAGE_ID,
         amount=amount,
         description=desc,
-        sender_id=payload.get("sender_id", "admin_manual"),
+        sender_id=_payload_text(payload, "sender_id", "admin_manual"),
         channel="manual",
         base_url=base_url
     )
@@ -3106,7 +3153,9 @@ APPOINTMENT_STATUSES = ("CONFIRMED", "COMPLETED", "CANCELLED")
 def _payload_text(payload: Dict[str, Any], key: str, default: str = "") -> str:
     """Phase 55 (F-55-7): the text form of a request field, or a 400 that names the field.
 
-    Twelve sites across six handlers read a body field as ``payload.get(key, "").strip()``,
+    Twenty call sites across ten handlers, covering twenty request fields (plus one site whose key
+    is not a literal, so it cannot be counted by name), read a body field as
+    ``payload.get(key, "").strip()`` (counted by walking the AST, not by grepping a literal),
     which assumes the client sent a string. Measured live, a body that sends a number or an
     object instead crashed the request with a bare 500 and no log line (see F-55-3):
 
@@ -3121,6 +3170,10 @@ def _payload_text(payload: Dict[str, Any], key: str, default: str = "") -> str:
     number is accepted as its text form because that is what the stored column wants. An
     object or a list is refused rather than stringified: ``str({"a": 1})`` would write Python
     syntax into a marketing row.
+
+    Phase 56 added the two `create-invoice` sites (`description`, `sender_id`), which is where the
+    count in the first line moved from eighteen to twenty; its sibling `_payload_int` below was
+    written for the third field of the same handler.
     """
     value = payload.get(key, default)
     if value is None:
@@ -3128,6 +3181,37 @@ def _payload_text(payload: Dict[str, Any], key: str, default: str = "") -> str:
     if isinstance(value, (dict, list, tuple, set)):
         raise HTTPException(status_code=400, detail=f"{key} must be a string")
     return str(value).strip()
+
+
+def _payload_int(payload: Dict[str, Any], key: str, default: int) -> int:
+    """Phase 56 (F-56-3): the integer form of a request field, or a 400 that names the field.
+
+    ``int(payload.get(key, default))`` assumes the client sent a number. Measured live on
+    ``POST /api/fintech/create-invoice``, three body shapes became an unhandled 500:
+
+        {"amount": "abc"}    -> ValueError  (request_id c562394d1e30f977)
+        {"amount": null}     -> TypeError   (request_id bbe3073d879e584f)
+        {"amount": {"a": 1}} -> TypeError   (request_id 27017758da8851e0)
+
+    An absent key takes the default, which is what ``payload.get`` already did. A *present* null is
+    refused rather than defaulted: this field is an amount of money, and quietly invoicing the
+    default 10000 because a client sent ``null`` is a worse answer than 400. A numeric string is
+    accepted because that is what an HTML form posts. ``bool`` is refused explicitly even though it
+    is an ``int`` subclass, so ``{"amount": true}`` cannot become a 1₮ invoice.
+    """
+    value = payload.get(key, default)
+    if isinstance(value, bool) or value is None:
+        raise HTTPException(status_code=400, detail=f"{key} must be a number")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{key} must be a number") from None
+    raise HTTPException(status_code=400, detail=f"{key} must be a number")
 
 
 def _settings_flag(value: Any) -> int:

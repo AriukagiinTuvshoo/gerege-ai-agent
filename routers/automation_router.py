@@ -51,6 +51,34 @@ class TrackedLinkCreate(BaseModel):
     code: Optional[str] = None
 
 
+def _resolve_existing_page(scoped_page_id: Optional[str], refusal: str) -> str:
+    """Phase 56 (F-56-1 / F-56-2): the page to write against, or a 404 that says so.
+
+    `enforce_tenant_scope` hands an admin back the page id they asked for **without an existence
+    check**, and both writers below insert into a table whose `page_id` is a foreign key to `pages`
+    (`migrations/versions/0003_foreign_keys.py`). Measured live before this change:
+
+        POST /api/automations/comments {"page_id": "p56_never_created", "name": "p56 probe", ...}
+            -> HTTP 500 {"detail":"Internal server error","request_id":"25429644f4999e19"}
+            -> comment_automations rows written: 0
+        POST /api/automations/links    {"page_id": "p56_never_created", "target_url": "https://..."}
+            -> HTTP 500 {"detail":"Internal server error","request_id":"e99762e418e3979b"}
+            -> tracked_links rows written: 0
+
+    The positive control - the same two bodies against a page that exists - returns 200 and writes
+    one row each, so the 500 was about the missing page and not about the payload.
+
+    A 404 rather than a 200 with a `success` flag, because this router's own refusals are already
+    `HTTPException(404, "Автоматжуулалт олдсонгүй")` and because both consumers in
+    `dashboard.html` branch on `res.ok`; until F-56-7 they said nothing at all on the failure path,
+    so a 4xx is what actually reaches the operator.
+    """
+    target = str(scoped_page_id or database.DEFAULT_PAGE_ID)
+    if not database.get_page(target):
+        raise HTTPException(status_code=404, detail=f"'{target}' хуудас олдсонгүй - {refusal}.")
+    return target
+
+
 @router.get("/api/automations/comments")
 async def list_comment_automations(request: Request, page_id: Optional[str] = None):
     scoped_page_id = await core_security.enforce_tenant_scope(
@@ -74,8 +102,9 @@ async def create_comment_automation(request: Request, payload: CommentAutomation
         permission="retention:write",
     )
     safe_cta_url = _validate_safe_url(payload.cta_url, required=False)
+    target_page_id = _resolve_existing_page(scoped_page_id, "ямар ч дүрэм үүсгэсэнгүй")
     created = database.create_comment_automation(
-        page_id=scoped_page_id or database.DEFAULT_PAGE_ID,
+        page_id=target_page_id,
         name=payload.name,
         dm_message_text=payload.dm_message_text,
         post_id=payload.post_id,
@@ -161,12 +190,13 @@ async def create_tracked_link(request: Request, payload: TrackedLinkCreate):
         permission="retention:write",
     )
     safe_target_url = _validate_safe_url(payload.target_url, required=True)
+    target_page_id = _resolve_existing_page(scoped_page_id, "ямар ч холбоос үүсгэсэнгүй")
     if payload.automation_id is not None:
         auto = database.get_comment_automation(payload.automation_id)
         if not auto or str(auto.get("page_id")) != str(scoped_page_id):
             raise HTTPException(status_code=403, detail="Автоматжуулалтын эрх хүрэлцэхгүй байна")
     created = database.create_tracked_link(
-        page_id=scoped_page_id or database.DEFAULT_PAGE_ID,
+        page_id=target_page_id,
         target_url=safe_target_url,
         title=payload.title,
         automation_id=payload.automation_id,

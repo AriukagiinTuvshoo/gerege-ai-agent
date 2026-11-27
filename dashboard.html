@@ -3288,6 +3288,16 @@
           })
         });
         const inv = await res.json();
+        // Phase 56 (F-56-6). The response was parsed and then ignored: the success toast below
+        // fired for a 404 (no such page), a 400 (the amount was not a number) and a 500 alike, and
+        // `inv.pay_url` was undefined in all three - so the operator was told an invoice had been
+        // created, and no payment window opened. This is the money path, so the refusal is an
+        // alert rather than a toast, and it reads whichever key the server used: `detail` for this
+        // endpoint's HTTPExceptions, `error`/`message` for a JSON body.
+        if (!res.ok || inv.success === false) {
+          alert(inv.detail || inv.error || inv.message || 'Нэхэмжлэх үүсгэсэнгүй.');
+          return;
+        }
         closeCreateInvoiceModal();
         showToast('QPay нэхэмжлэх амжилттай үүслээ!');
         loadFintechData();
@@ -3802,7 +3812,7 @@
       if (!p) return;
       const newToken = document.getElementById('settings-meta-token').value.trim();
 
-      await fetch('/api/pages', {
+      const res = await fetch('/api/pages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3812,6 +3822,16 @@
           knowledge_json: p.knowledge_json
         })
       });
+      // Phase 56 (F-56-6). This is the dashboard's own "Тохиргоо хадгалах" button, and it discarded
+      // the response: `POST /api/pages` answers 400 {"error":"Page ID болон Нэр шаардлагатай"}
+      // (measured live) and can 500 when the login-namespace trigger refuses a page_id, yet the
+      // toast said the settings had been saved either way. Phase 49's F-49-4 was about *what* this
+      // call stored; this is about whether the operator is told the truth about it.
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        showToast(data.error || data.detail || data.message || 'Тохиргоо хадгалагдсангүй.');
+        return;
+      }
       showToast('Тохиргоо хадгалагдлаа!');
       await loadPages();
     }
@@ -4385,11 +4405,25 @@
       currentKb.bank = bankObj;
       currentKb.bank_accounts = bankObj;
 
-      await fetch('/api/knowledge?page_id=' + encodeURIComponent(activePageId), {
+      const saveRes = await fetch('/api/knowledge?page_id=' + encodeURIComponent(activePageId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(currentKb)
       });
+      // Phase 56 (F-56-4 + F-56-6). The name is `saveRes` and not `res` because this function has
+      // already declared `const res` for the GET that loads the current knowledge: a second `const`
+      // in the same scope is a SyntaxError, and a SyntaxError takes down the whole inline script
+      // block, not just this save. (`node --check` on the extracted block is what caught it.) `POST /api/knowledge` used to answer
+      // {"status":"success","message":"... амжилттай шинэчлэгдлээ!"} even when the page did not
+      // exist and the handler had written nothing, and this function never read the response. The
+      // endpoint now returns {"status":"error","written":false} for a page it cannot find, and this
+      // branch is what makes that visible: these are the bank-account details the agent answers
+      // from, so a silent no-op here means the AI keeps quoting an account nobody was told about.
+      const kbRes = await saveRes.json().catch(() => ({}));
+      if (!saveRes.ok || kbRes.status !== 'success') {
+        showToast(kbRes.message || kbRes.error || kbRes.detail || 'Дансны мэдээлэл хадгалагдсангүй.');
+        return;
+      }
 
       showToast('Холбоосууд болон дансны мэдээлэл хадгалагдлаа!');
       loadKnowledge();
@@ -4433,11 +4467,18 @@
         };
       });
 
-      await fetch('/api/knowledge?page_id=' + encodeURIComponent(activePageId), {
+      const saveRes = await fetch('/api/knowledge?page_id=' + encodeURIComponent(activePageId), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(kb)
       });
+      // Phase 56 (F-56-4 + F-56-6): same defect as the bank-details save above, on the knowledge
+      // base itself - a success toast for a write that never happened.
+      const kbRes = await saveRes.json().catch(() => ({}));
+      if (!saveRes.ok || kbRes.status !== 'success') {
+        showToast(kbRes.message || kbRes.error || kbRes.detail || 'Мэдлэгийн сан хадгалагдсангүй.');
+        return;
+      }
 
       showToast('Мэдлэгийн сан амжилттай хадгалагдлаа!');
       loadKnowledge();
@@ -5634,6 +5675,13 @@
       if (res.ok) {
         showToast('✅ Төлөв солигдлоо!');
         loadNoflowAutomationData();
+      } else {
+        // Phase 56 (F-56-7). There was no else: a 404 ("Автоматжуулалт олдсонгүй") or a 403 left
+        // the operator with no reaction at all, so a failed toggle looked like a slow click. The
+        // sibling create form already had this branch; the two write paths that could only fail
+        // silently were toggle and delete.
+        const err = await res.json().catch(() => ({}));
+        showToast(err.detail || err.error || err.message || 'Төлөв солигдсонгүй.');
       }
     }
 
@@ -5642,6 +5690,10 @@
       if (res.ok) {
         showToast('🗑️ Устгагдлаа!');
         loadNoflowAutomationData();
+      } else {
+        // Phase 56 (F-56-7): a refused delete said nothing at all.
+        const err = await res.json().catch(() => ({}));
+        showToast(err.detail || err.error || err.message || 'Устгагдсангүй.');
       }
     }
 
