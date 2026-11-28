@@ -285,13 +285,15 @@ async def send_telegram_message(chat_id: Any, text: str, page_id: Optional[str] 
     except Exception as e:
         logger.error(f"Telegram илгээх алдаа: {e}")
 
-async def notify_manager_telegram(lead_info: Dict[str, Any]):
-    """Шинэ бүртгэл үүсмэгц Менежерийн Telegram руу түргэн мэдэгдэл өгөх"""
-    manager_id = os.getenv("TELEGRAM_MANAGER_CHAT_ID", "").strip()
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+async def notify_manager_telegram(lead_info: Dict[str, Any], page_id: Optional[str] = None):
+    """Шинэ бүртгэл үүсмэгц тухайн салбарын Менежерийн Telegram руу түргэн мэдэгдэл өгөх"""
+    target_pid = page_id or lead_info.get("page_id")
+    page = database.get_page(target_pid) if target_pid else None
+    manager_id = ((page.get("telegram_manager_chat_id") if page else None) or os.getenv("TELEGRAM_MANAGER_CHAT_ID", "")).strip()
+    bot_token = ((page.get("telegram_bot_token") if page else None) or os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
     if not manager_id or not bot_token:
         return
-    
+
     msg = (
         f"🚨 ШИНЭ БҮРТГЭЛ ИРЛЭЭ! (Lead #{lead_info.get('id')})\n"
         f"🏢 Хуудас: {lead_info.get('service', 'Ерөнхий')}\n"
@@ -300,64 +302,18 @@ async def notify_manager_telegram(lead_info: Dict[str, Any]):
         f"🌐 Суваг: {lead_info.get('channel', 'web')}\n"
         f"⏰ Огноо: {lead_info.get('created_at', 'Яг одоо')}"
     )
-    await send_telegram_message(manager_id, msg)
+    await send_telegram_message(manager_id, msg, page_id=target_pid)
 
 # -------------------------------------------------------------
 # 2. АЮУЛГҮЙ БАЙДАЛ БА СЕСС (RBAC Dependency)
 # -------------------------------------------------------------
 async def get_current_user(
     request: Optional[Request] = None,
-    authorization: Optional[str] = None,
-    session_token_cookie: Optional[str] = None,
-    token: Optional[str] = None,
-    auth_token: Optional[str] = None,
-    client_token: Optional[str] = None,
     **kwargs
 ) -> Optional[Dict[str, Any]]:
-    """Хүсэлтээс нэвтэрсэн хэрэглэгчийн эрх болон хуудасны ID-г авах (Bulletproof extraction)"""
-    token_str = None
-    
-    # 1. Хэрэв request дамжуулсан бол request-ээс шүүх
-    if request:
-        auth_h = request.headers.get("Authorization", "")
-        if auth_h.startswith("Bearer "):
-            token_str = auth_h[7:].strip()
-        if not token_str:
-            c = request.cookies.get("session_token")
-            if c:
-                token_str = str(c).strip()
-        if not token_str:
-            q = request.query_params.get("token") or request.query_params.get("auth_token") or request.query_params.get("client_token")
-            if q:
-                token_str = str(q).strip()
-
-    # 2. Шууд аргументээр ирсэн бол
-    if not token_str:
-        if authorization and isinstance(authorization, str) and authorization.startswith("Bearer "):
-            token_str = authorization[7:].strip()
-        elif session_token_cookie and isinstance(session_token_cookie, str):
-            token_str = session_token_cookie.strip()
-        elif token and isinstance(token, str):
-            token_str = token.strip()
-        elif auth_token and isinstance(auth_token, str):
-            token_str = auth_token.strip()
-        elif client_token and isinstance(client_token, str):
-            token_str = client_token.strip()
-
-    if not token_str:
-        return None
-
-    # Сессийг баазаас шалгах
-    session = database.get_session(token_str)
-    if session:
-        return session
-
-    # Хэрэв шууд Magic Token дамжуулсан бол
-    client_page = database.authenticate_client(token_str)
-    if client_page:
-        sess_token = database.create_session(role="client", page_id=client_page["page_id"])
-        return database.get_session(sess_token)
-
+    """Deprecated wrapper: delegates strictly to core_security.resolve_current_user."""
+    if request is not None:
+        return await core_security.resolve_current_user(request)
     return None
 
 # -------------------------------------------------------------
@@ -503,15 +459,7 @@ async def auth_login(payload: Dict[str, Any], request: Request, response: Respon
 
 @app.get("/api/auth/me")
 async def auth_me(request: Request):
-    auth_header = request.headers.get("Authorization")
-    cookie_token = request.cookies.get("session_token")
-    query_token = request.query_params.get("token") or request.query_params.get("client_token")
-    
-    user = await get_current_user(
-        authorization=auth_header,
-        session_token_cookie=cookie_token,
-        token=query_token
-    )
+    user = await core_security.resolve_current_user(request)
     if not user:
         return JSONResponse({"authenticated": False, "role": "guest"})
 
@@ -837,13 +785,15 @@ async def redirect_tracked_link(code: str, request: Request):
 # 5. TELEGRAM WEBHOOK (Customer Chatbot & Owner Executive Commands)
 # -------------------------------------------------------------
 @app.post("/telegram/webhook")
-async def telegram_webhook_events(request: Request, background_tasks: BackgroundTasks):
+@app.post("/telegram/webhook/{path_page_id}")
+async def telegram_webhook_events(request: Request, background_tasks: BackgroundTasks, path_page_id: Optional[str] = None):
     try:
         header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if not core_security.verify_telegram_webhook_secret(header_secret):
             logger.warning("Telegram webhook rejected by fail-closed secret check")
             return Response(content="Forbidden", status_code=403)
 
+        target_page_id = str(path_page_id or database.DEFAULT_PAGE_ID)
         data = await request.json()
         message = data.get("message", {})
         chat_id = message.get("chat", {}).get("id")
@@ -853,7 +803,7 @@ async def telegram_webhook_events(request: Request, background_tasks: Background
 
         if voice_data and chat_id:
             file_id = voice_data.get("file_id")
-            page_data = database.get_page(database.DEFAULT_PAGE_ID) or {}
+            page_data = database.get_page(target_page_id) or {}
             bot_token = page_data.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
             if bot_token and file_id:
                 try:
@@ -874,10 +824,10 @@ async def telegram_webhook_events(request: Request, background_tasks: Background
                 owner_reply = await executive_bot_service.handle_owner_command(
                     chat_id=str(chat_id),
                     text=user_text,
-                    page_id=database.DEFAULT_PAGE_ID
+                    page_id=target_page_id
                 )
                 if owner_reply:
-                    background_tasks.add_task(send_telegram_message, chat_id, owner_reply)
+                    background_tasks.add_task(send_telegram_message, chat_id, owner_reply, target_page_id)
                     return {"status": "ok", "mode": "owner_command"}
 
             # 2. Энгийн харилцагчийн AI чатбот хариу (Текст болон Дуут зурвас)
@@ -888,13 +838,13 @@ async def telegram_webhook_events(request: Request, background_tasks: Background
                 audio_mime="audio/ogg" if message.get("voice") else "audio/mpeg",
                 sender_id=f"tg_{chat_id}",
                 channel="telegram",
-                page_id=database.DEFAULT_PAGE_ID
+                page_id=target_page_id
             )
             reply_text = result.get("reply", "")
             if reply_text:
-                background_tasks.add_task(send_telegram_message, chat_id, reply_text)
+                background_tasks.add_task(send_telegram_message, chat_id, reply_text, target_page_id)
             if result.get("registered") and result.get("reg_info"):
-                background_tasks.add_task(notify_manager_telegram, result["reg_info"])
+                background_tasks.add_task(notify_manager_telegram, result["reg_info"], target_page_id)
                 
         return {"status": "ok"}
     except Exception as e:
@@ -908,6 +858,38 @@ async def telegram_webhook_events(request: Request, background_tasks: Background
 async def get_widget_js():
     return FileResponse("widget.js", media_type="application/javascript")
 
+def _sign_web_sender_id(sender_id: str) -> str:
+    secret = (os.getenv("APP_SECRET_KEY") or os.getenv("SESSION_SECRET") or "gerege-web-chat-secret").encode("utf-8")
+    sig = hmac.new(secret, sender_id.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return f"{sender_id}.{sig}"
+
+
+def _resolve_safe_web_sender_id(request: Request, requested_sender_id: Optional[str], user: Optional[Dict[str, Any]]) -> tuple[str, Optional[str]]:
+    """
+    P0-5: Prevent unauthenticated callers from impersonating tg_*/meta_*/ig_* or arbitrary web_* sender IDs.
+    Returns (effective_sender_id, new_signed_cookie_value_if_created).
+    """
+    raw_sid = str(requested_sender_id or "").strip()
+    if not user and raw_sid.startswith(("tg_", "meta_", "ig_")):
+        raise HTTPException(status_code=403, detail="Вэб чатаас гадаад сувгийн sender_id ашиглах боломжгүй!")
+    if user:
+        return (raw_sid or f"web_auth_{user.get('page_id', 'admin')}"), None
+
+    cookie_val = request.cookies.get("gerege_web_sid", "")
+    if cookie_val and "." in cookie_val:
+        cid, csig = cookie_val.rsplit(".", 1)
+        expected = _sign_web_sender_id(cid).rsplit(".", 1)[1]
+        if hmac.compare_digest(csig, expected) and cid.startswith("web_"):
+            return cid, None
+
+    if raw_sid and not core_security.is_production_mode():
+        return raw_sid, _sign_web_sender_id(raw_sid)
+
+    import secrets as _secrets
+    new_sid = f"web_{_secrets.token_hex(12)}"
+    return new_sid, _sign_web_sender_id(new_sid)
+
+
 @app.post("/api/chat")
 async def web_chat_endpoint(payload: Dict[str, Any], request: Request, background_tasks: BackgroundTasks):
     _limit_hit = core_rate_limit.check_request_limit(request, "api_chat")
@@ -918,21 +900,22 @@ async def web_chat_endpoint(payload: Dict[str, Any], request: Request, backgroun
             headers={"Retry-After": str(_limit_hit["retry_after"])},
         )
     message = _payload_text(payload, "message")
-    sender_id = payload.get("sender_id", "web_user")
-    
+
     # Хэрэв client нэвтэрсэн бол зөвхөн өөрийн хуудсаар хязгаарлана
-    user = await get_current_user(
-        authorization=request.headers.get("Authorization"),
-        session_token_cookie=request.cookies.get("session_token")
-    )
-    if user and user.get("role") == "client":
+    user = await core_security.resolve_current_user(request)
+    if user and not core_security.is_admin_role(user.get("role")):
         page_id = user["page_id"]
     else:
         page_id = str(payload.get("page_id", database.DEFAULT_PAGE_ID))
-    
+
+    sender_id, new_web_cookie = _resolve_safe_web_sender_id(request, payload.get("sender_id"), user)
+
     if not message:
-        return JSONResponse({"reply": "Та мессежээ бичнэ үү.", "registered": False})
-        
+        resp = JSONResponse({"reply": "Та мессежээ бичнэ үү.", "registered": False})
+        if new_web_cookie:
+            resp.set_cookie("gerege_web_sid", new_web_cookie, httponly=True, samesite="lax", max_age=86400 * 30)
+        return resp
+
     result = await asyncio.to_thread(
         agent.process_message,
         text=message,
@@ -941,9 +924,12 @@ async def web_chat_endpoint(payload: Dict[str, Any], request: Request, backgroun
         page_id=page_id
     )
     if result.get("registered") and result.get("reg_info"):
-        background_tasks.add_task(notify_manager_telegram, result["reg_info"])
-        
-    return JSONResponse(result)
+        background_tasks.add_task(notify_manager_telegram, result["reg_info"], page_id)
+
+    resp = JSONResponse(result)
+    if new_web_cookie:
+        resp.set_cookie("gerege_web_sid", new_web_cookie, httponly=True, samesite="lax", max_age=86400 * 30)
+    return resp
 
 @app.post("/api/manychat")
 @app.get("/api/manychat")
@@ -1029,6 +1015,15 @@ async def upload_receipt_endpoint(
     image_bytes = await file.read()
     if len(image_bytes) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Файлын хэмжээ 10MB-аас хэтэрсэн байна!")
+    # Magic-byte image MIME validation (P0-6)
+    is_valid_image = (
+        image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+        or image_bytes.startswith(b"\xff\xd8\xff")
+        or image_bytes.startswith(b"GIF8")
+        or (image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP")
+    )
+    if not is_valid_image:
+        raise HTTPException(status_code=400, detail="Зөвхөн PNG, JPEG, GIF, WebP зурган файл оруулна уу!")
     result = await asyncio.to_thread(
         agent.process_message,
         text=text or "",
@@ -1866,7 +1861,7 @@ def _save_page_sheets_list(page_id: str, sheets_list: List[Dict[str, Any]]):
         # been disabled. The stored state is carried through instead.
         is_active=(0 if page_obj.get("is_active") in (0, False) else 1)
     )
-    agent.reset_sessions()
+    agent.reset_sessions(page_id=page_id)
 
 @app.get("/api/pages/{page_id}/sheets")
 async def list_page_sheets_endpoint(page_id: str, request: Request):
@@ -2621,7 +2616,8 @@ async def serve_payment_page(invoice_id: str, request: Request):
         description=inv.get("description", "Үйлчилгээний төлбөр"),
         company_name=company_name,
         qr_image_url=inv.get("qr_image_url") or "",
-        deep_links=inv.get("deep_links") or []
+        deep_links=inv.get("deep_links") or [],
+        show_demo_simulate=not core_security.is_production_mode()
     )
     return HTMLResponse(content=rendered)
 
@@ -3865,6 +3861,17 @@ async def voice_chat_endpoint(
     text: Optional[str] = Form("")
 ):
     """Вэб симулятор болон гадаад сувгаас дуут зурвас хүлээн авч Gemini AI-аар боловсруулах"""
+    _limit_hit = core_rate_limit.check_request_limit(request, "api_upload_receipt")
+    if _limit_hit:
+        return JSONResponse(
+            {"detail": "Хэт олон хүсэлт илгээлээ. Түр хүлээнэ үү."},
+            status_code=429,
+            headers={"Retry-After": str(_limit_hit["retry_after"])},
+        )
+    user = await core_security.resolve_current_user(request)
+    if not user and core_security.is_production_mode():
+        raise HTTPException(status_code=401, detail="Нэвтрэлт шаардлагатай")
+
     upload = file or audio_file
     if not upload:
         raise HTTPException(status_code=400, detail="Аудио файл шаардлагатай")
@@ -3872,7 +3879,14 @@ async def voice_chat_endpoint(
     audio_bytes = await upload.read()
     if len(audio_bytes) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Аудио файлын хэмжээ 10MB-аас хэтэрсэн байна!")
-    pid = page_id or database.DEFAULT_PAGE_ID
+    if len(audio_bytes) < 16 or audio_bytes.lstrip()[:1] == b"<":
+        raise HTTPException(status_code=400, detail="Буруу эсвэл гэмтэлтэй аудио файл байна")
+
+    if user and not core_security.is_admin_role(user.get("role")):
+        pid = user["page_id"]
+    else:
+        pid = page_id or database.DEFAULT_PAGE_ID
+    effective_sender_id, _ = _resolve_safe_web_sender_id(request, sender_id, user)
     mime = upload.content_type or "audio/webm"
     fname = (upload.filename or "").lower()
     if "ogg" in mime or fname.endswith(".ogg"):
@@ -3887,7 +3901,7 @@ async def voice_chat_endpoint(
         text=text or "",
         audio_bytes=audio_bytes,
         audio_mime=mime,
-        sender_id=sender_id,
+        sender_id=effective_sender_id,
         channel="web_voice",
         page_id=pid
     )
@@ -3987,7 +4001,7 @@ async def serve_branch_portal_or_page(branch_slug: str):
             "page_id": matched_page.get("page_id"),
             "name": matched_page.get("name"),
             "client_username": matched_page.get("client_username") or ""
-        }, ensure_ascii=False)
+        }, ensure_ascii=False).replace("<", "\\u003c")
         inject_script = f"<script>window.__INITIAL_BRANCH_HINT__ = {branch_hint};</script></head>"
         html_str = html_str.replace("</head>", inject_script, 1)
 

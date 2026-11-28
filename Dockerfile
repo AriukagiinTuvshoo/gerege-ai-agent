@@ -59,7 +59,6 @@ COPY requirements.txt requirements-dev.txt ./
 COPY . .
 
 RUN mkdir -p /app/static/qrcodes /app/backups && \
-    python -c "import database; database.init_db()" && \
     chown -R gerege:gerege /app
 
 USER gerege

@@ -166,28 +166,34 @@ def build_bank_deep_links(qr_text: str) -> List[Dict[str, Any]]:
 # -------------------------------------------------------------
 def generate_ebarimt(amount: int, merchant_tin: str = "6408194", company_name: str = "Гэрэгэ Системс") -> Dict[str, Any]:
     """
-    И-Баримт POSAPI 3.0 стандартын дагуу 33 оронтой QR код болон сугалааны дугаар үүсгэх
-    - Сугалаа: 2 монгол крилл үсэг + 8 тоо (Жишээ: АБ48192041)
-    - НӨАТ: 10%
-    - НХАТ: 1%
+    И-Баримт POSAPI 3.0 татварын задаргаа.
+    P0-11: Бодит POSAPI 3.0 (EBARIMT_POSAPI_URL) холбоогүй үед хуурамч сугалааны дугаар
+    болон 33 оронтой ДДТД санамсаргүйгээр үүсгэж хэрэглэгчид илгээхийг хориглоно.
     """
-    cyrillic_letters = "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЭЮЯ"
-    let1 = random.choice(cyrillic_letters)
-    let2 = random.choice(cyrillic_letters)
-    digits = "".join([str(random.randint(0, 9)) for _ in range(8)])
-    lottery_number = f"{let1}{let2}{digits}"
-
-    # 33 оронтой фискал код (ДДТД - Дахин давтагдашгүй төлбөрийн дугаар)
-    fiscal_33 = "".join([str(random.randint(0, 9)) for _ in range(33)])
-
-    # Татварын задаргаа
     vat = int(amount / 1.1 * 0.1)
     city_tax = int(amount * 0.01) if amount > 5000 else 0
     subtotal = amount - vat - city_tax
 
+    posapi_url = os.getenv("EBARIMT_POSAPI_URL", "").strip()
+    if not posapi_url:
+        return {
+            "lottery": "",
+            "qr_data": "",
+            "posapi_configured": False,
+            "amount": amount,
+            "subtotal": subtotal,
+            "vat": vat,
+            "city_tax": city_tax,
+            "merchant_tin": merchant_tin,
+            "company_name": company_name,
+            "issued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    # POSAPI 3.0 endpoint тохируулсан үед гадаад сервисийн хариуг ашиглах (fallback-гүй)
     return {
-        "lottery": lottery_number,
-        "qr_data": fiscal_33,
+        "lottery": "",
+        "qr_data": "",
+        "posapi_configured": True,
         "amount": amount,
         "subtotal": subtotal,
         "vat": vat,

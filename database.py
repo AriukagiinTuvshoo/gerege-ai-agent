@@ -540,6 +540,8 @@ def delete_customer_data(page_id: str, sender_id: Optional[str] = None, phone: O
             deleted["memories"] += max(0, cursor.rowcount)
             cursor.execute("DELETE FROM registrations WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
             deleted["registrations"] += max(0, cursor.rowcount)
+            cursor.execute("DELETE FROM messages WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
+            deleted["messages"] += max(0, cursor.rowcount)
             cursor.execute("DELETE FROM session_states WHERE page_id = ? AND sender_id = ?", (str(page_id), str(sender_id)))
         if phone:
             cursor.execute("DELETE FROM registrations WHERE page_id = ? AND phone = ?", (str(page_id), str(phone)))
@@ -1628,7 +1630,7 @@ def get_conversation_history(sender_id: str, limit: int = 50, page_id: Optional[
         cursor.execute("""
             SELECT * FROM messages
             WHERE sender_id = ? AND page_id = ?
-            ORDER BY created_at ASC
+            ORDER BY id DESC
             LIMIT ?
         """, (sender_id, str(page_id), limit))
         rows = cursor.fetchall()
@@ -1637,7 +1639,7 @@ def get_conversation_history(sender_id: str, limit: int = 50, page_id: Optional[
         # blocks a WAL checkpoint under SQLite. See the note on `log_message`.
     finally:
         conn.close()
-    return [dict(row) for row in rows]
+    return [dict(row) for row in reversed(rows)]
 
 def get_active_sessions(page_id: Optional[str] = None) -> List[Dict]:
     """
@@ -2772,12 +2774,10 @@ def create_appointment(
         ))
         a_id = cursor.lastrowid
         conn.commit()
-        # Phase 55 (F-55-1): released in a `finally`. An exception between
-        # `get_connection()` and `conn.close()` used to leak this connection holding its
-        # write lock, so whichever request lost the race waited the full 5s busy_timeout
-        # and then failed with `database is locked` (SQLite) or lost a pool slot
-        # (PostgreSQL). Measured: an IntegrityError from a foreign key on `page_id`
-        # made the very next `save_page` raise `OperationalError`.
+    except Exception as exc:
+        if "unique" in str(exc).lower() or "constraint" in str(exc).lower():
+            return None
+        raise
     finally:
         conn.close()
 

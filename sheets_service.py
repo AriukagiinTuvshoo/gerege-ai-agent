@@ -443,14 +443,14 @@ def get_page_sheets_lookup_context(page_data: Optional[Dict[str, Any]], user_tex
     if not non_empty_sheets:
         return ""
 
-    # Extract meaningful search tokens from user_text
-    raw_tokens = re.findall(r"[A-Za-zА-Яа-яӨөҮүЁё0-9\-]{2,}", user_text or "")
+    # Extract meaningful search tokens from user_text (require >=4 chars to avoid broad PII leaks)
+    raw_tokens = re.findall(r"[A-Za-zА-Яа-яӨөҮүЁё0-9\-]{4,}", user_text or "")
     stop_words = {
-        "сайн", "байна", "танай", "танайх", "юу", "ямар", "хэд", "хэдэн", "бараа",
-        "ачаа", "карго", "үнэ", "мэдээлэл", "хүснэгт", "шалгах", "шалгаад", "өгөөч",
-        "ирсэн", "болов", "хэзээ", "хаана", "байна", "вэ", "бэ", "энэ", "тэр", "миний"
+        "сайн", "байна", "танай", "танайх", "ямар", "хэдэн", "бараа",
+        "ачаа", "карго", "мэдээлэл", "хүснэгт", "шалгах", "шалгаад", "өгөөч",
+        "ирсэн", "болов", "хэзээ", "хаана", "энэ", "тэр", "миний"
     }
-    candidates = [t for t in raw_tokens if t.lower() not in stop_words and len(t) >= 2]
+    candidates = [t for t in raw_tokens if t.lower() not in stop_words and len(t) >= 4]
 
     matched_rows: List[Dict[str, str]] = []
     seen_ChangeKeys = set()

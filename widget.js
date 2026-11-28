@@ -200,6 +200,15 @@
   `;
   document.head.appendChild(style);
 
+  function escapeHtml(str) {
+    return String(str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   // Widget Elements
   const container = document.createElement('div');
   container.innerHTML = `
@@ -211,7 +220,7 @@
         <div style="display:flex; align-items:center; gap:9px;">
           <div class="ai-status-pulse"></div>
           <div>
-            <div style="font-weight:700; font-size:13.5px; color:#ffffff; letter-spacing:-0.2px;">${botTitle}</div>
+            <div style="font-weight:700; font-size:13.5px; color:#ffffff; letter-spacing:-0.2px;">${escapeHtml(botTitle)}</div>
             <div style="font-size:10px; color:#94a3b8;">Шууд хариулахад бэлэн</div>
           </div>
         </div>
@@ -253,6 +262,7 @@
     try {
       const res = await fetch(serverUrl + '/api/chat', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           message: text, 
@@ -260,8 +270,12 @@
           page_id: pageId || undefined
         })
       });
-      const data = await res.json();
       typingDiv.style.display = 'none';
+      if (!res.ok) {
+        appendMsg('bot', 'Уучлаарай, хүсэлт амжилтгүй боллоо (' + res.status + ').');
+        return;
+      }
+      const data = await res.json();
       if (data.reply) {
         appendMsg('bot', data.reply);
       }
@@ -271,18 +285,10 @@
     }
   };
 
-  function escapeHtml(str) {
-    return String(str || '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
-
   function formatSafeBotMessage(str) {
     const escaped = escapeHtml(str);
     return escaped
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
       .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:#60a5fa;text-decoration:underline;font-weight:600;">$1</a>')
       .replace(/\n/g, '<br>');
   }

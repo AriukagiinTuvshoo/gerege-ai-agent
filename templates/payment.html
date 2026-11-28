@@ -25,7 +25,7 @@
     }
   </style>
 </head>
-<body class="min-h-full flex flex-col justify-between p-4 sm:p-6 bg-radial from-slate-900 via-slate-950 to-black">
+<body class="min-h-full flex flex-col justify-between p-4 sm:p-6 bg-radial from-slate-900 via-slate-950 to-black overflow-x-hidden">
 
   <!-- Header -->
   <header class="w-full max-w-md mx-auto flex items-center justify-between py-2">
@@ -125,13 +125,15 @@
         <span class="text-[11px] text-slate-400">1 сек авто</span>
       </div>
 
-      <!-- Demo Simulator Button (Хэрэглэгчид шууд туршиж үзүүлэх товч) -->
+      {% if show_demo_simulate %}
+      <!-- Demo Simulator Button (Зөвхөн хөгжүүлэлтийн горимд харагдана) -->
       <div class="mt-4 pt-3 border-t border-dashed border-slate-800 text-center">
         <button onclick="simulatePayment()" id="btn-simulate" class="w-full py-2.5 px-4 rounded-xl text-xs font-semibold bg-gradient-to-r from-emerald-500/20 to-teal-500/20 hover:from-emerald-500/30 hover:to-teal-500/30 text-emerald-300 border border-emerald-500/30 active:scale-[0.99] transition flex items-center justify-center gap-2">
           <span>⚡ Төлбөр шалгах (Demo Simulate)</span>
         </button>
         <p class="text-[10px] text-slate-400 mt-1">Туршилт: Банкны шилжүүлэг амжилттай болсныг 1 секундэд автоматаар баталгаажуулж үзэх</p>
       </div>
+      {% endif %}
 
     </div>
 
@@ -213,8 +215,8 @@
     // Phase 25: tojson, not "{{ invoice_id }}". A value interpolated into a JS string
     // literal needs JS escaping; HTML escaping turns `"` into `&#34;`, which the JS
     // parser still reads as a quote terminator in some positions and which the browser
-    // displays wrong in text contexts. tojson also escapes `<` as \u003c, closing the
-    // `</script>` breakout.
+    // displays wrong in text contexts. tojson also escapes `<` as \u003c, preventing
+    // script-tag breakout.
     const invoiceId = {{ invoice_id|tojson }};
     let isPaid = false;
 

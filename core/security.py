@@ -717,7 +717,7 @@ CSP_STYLE_SRC = (
     "https://cdnjs.cloudflare.com",
     "https://fonts.googleapis.com",
 )
-CSP_FONT_SRC = ("'self'", "https://fonts.gstatic.com", "data:")
+CSP_FONT_SRC = ("'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com", "data:")
 CSP_IMG_SRC = ("'self'", "data:", "blob:", "https:")
 CSP_CONNECT_SRC = ("'self'",)
 #: Nothing is embedded in an iframe today — `docs.google.com` and `sheets.new` in

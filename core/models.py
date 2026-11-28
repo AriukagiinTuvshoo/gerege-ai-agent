@@ -365,12 +365,15 @@ class AppointmentModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow, server_default=TS_DEFAULT)
 
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_appointment_slot",
             "page_id",
             "appointment_date",
             "appointment_time",
             "service_name",
-            name="uq_appointment_slot",
+            unique=True,
+            sqlite_where=text("status != 'CANCELLED'"),
+            postgresql_where=text("status != 'CANCELLED'"),
         ),
         Index("idx_appointments_page_date", "page_id", "appointment_date"),
         Index("idx_appointments_phone", "customer_phone"),

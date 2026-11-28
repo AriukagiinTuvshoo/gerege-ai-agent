@@ -267,7 +267,6 @@ async def handle_owner_command(chat_id: str, text: str, page_id: Optional[str] =
 
         # Эзний Chat ID-г хадгалах (анх удаа холбож буй эсвэл нууц кодоор баталгаажсан үед)
         if slot_is_empty or is_registered_owner or secret_matches:
-            os.environ["TELEGRAM_MANAGER_CHAT_ID"] = str(chat_id)
             if page_id:
                 database.update_page_telegram_settings(
                     page_id=page_id,
@@ -303,8 +302,8 @@ async def handle_owner_command(chat_id: str, text: str, page_id: Optional[str] =
             "• `/help` — Тусламж"
         )
 
-    # Бусад удирдлагын командуудыг зөвхөн бүртгэлтэй эзэн дуудах эрхтэй
-    if existing_mgr_id and str(existing_mgr_id) != str(chat_id):
+    # Бусад удирдлагын командуудыг зөвхөн бүртгэлтэй эзэн дуудах эрхтэй (хоосон үед ч хаана)
+    if not existing_mgr_id or str(existing_mgr_id) != str(chat_id):
         return None
 
     elif cmd in ["/today", "өнөөдөр"]:
